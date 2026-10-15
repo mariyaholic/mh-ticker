@@ -1,5 +1,28 @@
 # Changelog — MH Ticker
 
+## 2026-10-15 — 1.2.1: no hiding for the shell's own windows; strip self-heals   [claude.impl]
+
+**Files:** `src/{dock,ui}.rs`, `Cargo.toml` (1.2.1). Same change as AO Ticker 0.6.1.
+
+**What.** Maria saw the docked strip vanish on clicking the taskbar search box and, sometimes, an app icon.
+- **Cause (fullscreen check).** The strip hides when the foreground window covers its whole monitor (a game). Some of
+  Windows' own shell windows are monitor-sized: the touch-keyboard host's `Windows.UI.Core.CoreWindow` is
+  0,0-1920,1080 here (Verified: window listing), and Search/Start use the same kind of host window. Clicking them made
+  the strip read them as a fullscreen app. `dock::shell_window` now excludes shell classes (CoreWindow, the XAML
+  thumbnail/overflow islands, ForegroundStaging, Task View, the desktop and taskbars) and shell processes (explorer,
+  SearchHost, StartMenuExperienceHost, ShellExperienceHost, ShellHost, TextInputHost). Hidden or DWM-cloaked foreground
+  windows never count either.
+- **Self-heal.** Every check (each foreground change, then every 500 ms) now puts a taskbar or corner strip back where
+  the app placed it, and re-shows it if something outside hid it. Floating is left alone. A screenshot/automation tool
+  that hides and moves other windows left the strip stranded mid-screen before this change.
+- **Faster re-raise.** A foreground change also schedules a re-check 150 ms later, because a taskbar click raises the
+  taskbar just after the foreground event.
+
+**Verify.** 20 tests pass (`cargo test`, new `shell_windows_are_not_fullscreen_apps`); clippy clean. Live, by script, without input to the shell: an outside `SetWindowPos` to mid-screen
+was undone within 0.9 s, an outside `ShowWindow(SW_HIDE)` re-shown within 0.9 s, and the taskbar raised over the strip
+gave way in 185-208 ms (three tries each). **Unverified:** the search box and app-icon clicks themselves (no synthetic
+input to Explorer); that Search's flyout window is monitor-sized is inferred from the touch-keyboard host, not seen.
+
 ## 2026-10-15 — public repo, MIT license, v1.2.0 release   [claude.impl]
 
 - Own git repository (`main`), published as https://github.com/mariyaholic/mh-ticker (public, per Maria).

@@ -48,6 +48,9 @@ const WM_DOCK: u32 = WM_APP + 3;
 const WM_FGCHANGE: u32 = WM_APP + 4;
 const TRAY_ID: u32 = 1;
 const TIMER_DOCK: usize = 1;
+/// One-shot re-check soon after a foreground change: a taskbar click raises the taskbar a moment
+/// after the foreground event, so the immediate check can miss it.
+const TIMER_RECHECK: usize = 3;
 const CMD_STRIP: usize = 1001;
 const CMD_TOP: usize = 1002;
 const CMD_STATUS: usize = 1003;
@@ -657,7 +660,8 @@ fn set_topmost(hwnd: HWND, on: bool) {
 }
 
 /// Docked housekeeping, on every foreground change and every 500 ms: hide while a fullscreen
-/// app is in front, and climb back above the taskbar after a taskbar click.
+/// app is in front, climb back above the taskbar after a taskbar click, and undo anything else
+/// that moved or hid the strip behind its back (a screenshot or automation tool, a shell restart).
 fn dock_check(hwnd: HWND) {
     let Some((strip, dock, was)) =
         with_ui(|u| (u.mode == Mode::Strip, u.mode == Mode::Strip && u.cfg.placement().on_taskbar(), u.suppressed))
@@ -670,6 +674,7 @@ fn dock_check(hwnd: HWND) {
         with_ui(|u| u.suppressed = fullscreen);
         apply_visibility(hwnd);
     }
+    heal(hwnd);
     if dock && !fullscreen && dock::taskbar_above(hwnd) {
         set_topmost(hwnd, true);
         // Seen 2026-10-15: the taskbar stayed above a topmost strip that re-asserted HWND_TOPMOST
@@ -677,6 +682,32 @@ fn dock_check(hwnd: HWND) {
         if dock::taskbar_above(hwnd) {
             set_topmost(hwnd, false);
             set_topmost(hwnd, true);
+        }
+    }
+}
+
+/// Put the strip back where (and as) the app placed it if something outside changed it. Floating
+/// is left alone: the user drags it, and a drag saves on `WM_EXITSIZEMOVE`.
+fn heal(hwnd: HWND) {
+    let Some((show, fixed, want)) = with_ui(|u| {
+        (u.mode == Mode::Strip).then(|| (u.cfg.strip_visible && !u.suppressed, u.cfg.placement() != Placement::Floating, u.strip_rect))
+    })
+    .flatten() else {
+        return;
+    };
+    unsafe {
+        if show && IsWindowVisible(hwnd) == 0 {
+            relayout_and_place(hwnd);
+            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            return;
+        }
+        if !show || !fixed || want.right <= want.left {
+            return;
+        }
+        let mut r: RECT = std::mem::zeroed();
+        GetWindowRect(hwnd, &mut r);
+        if (r.left, r.top, r.right, r.bottom) != (want.left, want.top, want.right, want.bottom) {
+            relayout_and_place(hwnd);
         }
     }
 }
@@ -1016,6 +1047,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             DefWindowProcW(hwnd, msg, wp, lp)
         }
         WM_FGCHANGE => {
+            dock_check(hwnd);
+            SetTimer(hwnd, TIMER_RECHECK, 150, None);
+            0
+        }
+        WM_TIMER if wp == TIMER_RECHECK => {
+            KillTimer(hwnd, TIMER_RECHECK);
             dock_check(hwnd);
             0
         }

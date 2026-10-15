@@ -22,14 +22,17 @@
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
-use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM, POINT, RECT};
+use windows_sys::Win32::Foundation::{CloseHandle, BOOL, HWND, LPARAM, POINT, RECT};
+use windows_sys::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
 use windows_sys::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
     MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY,
 };
+use windows_sys::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION};
 use windows_sys::Win32::UI::Shell::{SHAppBarMessage, ABM_GETSTATE, ABS_AUTOHIDE, APPBARDATA};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    FindWindowExW, FindWindowW, GetClassNameW, GetForegroundWindow, GetWindow, GetWindowRect, GW_HWNDPREV,
+    FindWindowExW, FindWindowW, GetClassNameW, GetForegroundWindow, GetWindow, GetWindowRect, GetWindowThreadProcessId,
+    IsWindowVisible, GW_HWNDPREV,
 };
 
 const UNKNOWN: i32 = i32::MIN;
@@ -244,20 +247,71 @@ pub fn spans(tb: HWND, r: &RECT) -> (Gap, Gap) {
     gaps(r, &seen)
 }
 
+/// Windows' own shell surfaces: the desktop, the taskbar, and the hosts of Start, Search, the
+/// thumbnails and flyouts, the touch keyboard. Several of them are monitor-sized windows (Search's
+/// and the touch keyboard's are 0,0-1920,1080 on a 1080p screen), so taking the foreground made
+/// the strip read them as a fullscreen app and hide: seen 2026-10-15 on clicking the taskbar
+/// search box and app icons.
+pub fn shell_window(class: &str, exe: &str) -> bool {
+    const CLASSES: [&str; 11] = [
+        "Progman",
+        "WorkerW",
+        "Shell_TrayWnd",
+        "Shell_SecondaryTrayWnd",
+        "Windows.UI.Core.CoreWindow",
+        "XamlExplorerHostIslandWindow",
+        "XamlExplorerHostIslandWindow_WASDK",
+        "TopLevelWindowForOverflowXamlIsland",
+        "ForegroundStaging",
+        "MultitaskingViewFrame",
+        "NotifyIconOverflowWindow",
+    ];
+    const HOSTS: [&str; 7] = [
+        "explorer.exe",
+        "searchhost.exe",
+        "searchapp.exe",
+        "startmenuexperiencehost.exe",
+        "shellexperiencehost.exe",
+        "shellhost.exe",
+        "textinputhost.exe",
+    ];
+    let exe = exe.rsplit(['\\', '/']).next().unwrap_or(exe).to_ascii_lowercase();
+    CLASSES.contains(&class) || HOSTS.contains(&exe.as_str())
+}
+
+/// File name of the process that owns `h` ("" when it cannot be read).
+fn exe_of(h: HWND) -> String {
+    unsafe {
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(h, &mut pid);
+        let p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if p.is_null() {
+            return String::new();
+        }
+        let mut buf = [0u16; 260];
+        let mut n = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(p, 0, buf.as_mut_ptr(), &mut n) != 0;
+        CloseHandle(p);
+        if ok { String::from_utf16_lossy(&buf[..n as usize]) } else { String::new() }
+    }
+}
+
 /// True when the foreground window covers its whole monitor (a game, a fullscreen video).
-/// The desktop and the taskbar themselves never count.
+/// Windows' own shell surfaces (`shell_window`) and hidden or cloaked windows never count.
 pub fn fullscreen_foreground(own: HWND) -> bool {
     unsafe {
         let fg = GetForegroundWindow();
-        if fg.is_null() || fg == own {
+        if fg.is_null() || fg == own || IsWindowVisible(fg) == 0 {
+            return false;
+        }
+        let mut cloaked = 0u32;
+        let got = DwmGetWindowAttribute(fg, DWMWA_CLOAKED as u32, &mut cloaked as *mut u32 as _, 4);
+        if got == 0 && cloaked != 0 {
             return false;
         }
         let mut buf = [0u16; 64];
         let n = GetClassNameW(fg, buf.as_mut_ptr(), buf.len() as i32);
         let class = String::from_utf16_lossy(&buf[..n.max(0) as usize]);
-        if matches!(class.as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd") {
-            return false;
-        }
         let mut r = RECT { left: 0, top: 0, right: 0, bottom: 0 };
         GetWindowRect(fg, &mut r);
         let mut mi: MONITORINFO = std::mem::zeroed();
@@ -266,7 +320,9 @@ pub fn fullscreen_foreground(own: HWND) -> bool {
             return false;
         }
         let m = mi.rcMonitor;
-        r.left <= m.left && r.top <= m.top && r.right >= m.right && r.bottom >= m.bottom
+        let covers = r.left <= m.left && r.top <= m.top && r.right >= m.right && r.bottom >= m.bottom;
+        // the process lookup only runs for a monitor-sized window
+        covers && !shell_window(&class, &exe_of(fg))
     }
 }
 
@@ -411,6 +467,17 @@ pub fn spawn_probe(changed: Box<dyn Fn() + Send>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shell_windows_are_not_fullscreen_apps() {
+        assert!(shell_window("Windows.UI.Core.CoreWindow", r"C:\Windows\SystemApps\MicrosoftWindows.Client.CBS_cw5n1h2txyewy\SearchHost.exe"));
+        assert!(shell_window("Shell_TrayWnd", ""));
+        assert!(shell_window("SomethingNew", r"C:\Windows\SystemApps\X\StartMenuExperienceHost.exe"));
+        assert!(shell_window("XamlExplorerHostIslandWindow", r"C:\Windows\explorer.exe"));
+        assert!(!shell_window("RiotWindowClass", r"C:\Riot Games\League of Legends\Game\League of Legends.exe"));
+        assert!(!shell_window("UnityWndClass", ""));
+        assert!(!shell_window("Chrome_WidgetWin_1", r"C:\Program Files\Google\Chrome\Application\chrome.exe"));
+    }
 
     const TB: RECT = RECT { left: 0, top: 1015, right: 1920, bottom: 1080 };
 
