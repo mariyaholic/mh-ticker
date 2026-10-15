@@ -112,3 +112,15 @@ A fork of AO Ticker (Argonaut Oak `apps/ao_ticker`, commit `aaa93149`). The Argo
 (the local Market Terminal feed and the MT5 investor bridge, which needs an MT5 login) are
 removed and replaced by CNBC. The strip, the taskbar dock, the panel and its morph animation,
 and the tray are the same code.
+
+## Download
+
+Grab `MH_Ticker.exe` from the [latest release](https://github.com/mariyaholic/mh-ticker/releases/latest)
+and double-click it. The exe is not code-signed, so Windows SmartScreen may say it "protected your
+PC" the first time: choose *More info → Run anyway*, or build it yourself from this source.
+
+## License
+
+[MIT](LICENSE) © 2026 mariyaholic. You may use, change and share this code, as long as the copyright
+notice and the license text stay with it. If you build on it, please credit this repository as the
+original source.

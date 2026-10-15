@@ -1,5 +1,14 @@
 # Changelog — MH Ticker
 
+## 2026-10-15 — public repo, MIT license, v1.2.0 release   [claude.impl]
+
+- Own git repository (`main`), published as https://github.com/mariyaholic/mh-ticker (public, per Maria).
+- `LICENSE`: MIT, © 2026 mariyaholic (Maria asked that reusers credit the original source; MIT requires
+  keeping the copyright notice). `Cargo.toml` gains `license`, `repository`, `authors`.
+- `.gitattributes` pins LF; `.cargo/config.toml` (this machine's D: target dir) is untracked, and the README's
+  Build section says how to set a target dir elsewhere.
+- README: Download (release exe, SmartScreen note) and License sections.
+
 ## 2026-10-15 — 1.2.0: Position menu, for taskbars without room left of Start   [claude.impl]
 
 **What.** Maria pointed out that not everyone has free space on the left of the taskbar. A left-aligned taskbar (the

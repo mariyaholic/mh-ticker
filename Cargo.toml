@@ -3,6 +3,9 @@ name = "mh_ticker"
 version = "1.2.0"
 edition = "2021"
 description = "MH Ticker: a price strip docked in the Windows taskbar that opens into a centred panel. Public CNBC quotes, no login, no server."
+license = "MIT"
+repository = "https://github.com/mariyaholic/mh-ticker"
+authors = ["mariyaholic"]
 
 [[bin]]
 name = "MH_Ticker"
