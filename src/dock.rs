@@ -151,7 +151,8 @@ pub fn set_target(tb: HWND) {
     TARGET.store(tb as isize, Ordering::Relaxed);
 }
 
-fn target() -> HWND {
+/// The taskbar the strip docks to (the main one unless a display was picked).
+pub fn target() -> HWND {
     match TARGET.load(Ordering::Relaxed) {
         0 => taskbar(),
         h => h as HWND,

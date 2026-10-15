@@ -1,5 +1,27 @@
 # Changelog — MH Ticker
 
+## 2026-10-15 — 1.2.2: docked strip owned by the taskbar, so it stays above it with Search/Start open   [claude.impl]
+
+**Files:** `src/{dock,ui}.rs`, `Cargo.toml` (1.2.2). Same change as AO Ticker 0.6.2.
+
+**What.** Maria sent a screenshot after 1.2.1: with the taskbar search open, the docked strip was still gone.
+- **Real cause (logged, not the fullscreen check).** A 0.1 s log of foreground, `IsWindowVisible` and
+  `GetWindowBand` while Maria opened Search and clicked app icons showed the strip **visible** the whole time. Search's
+  window is 1000 px wide (`SearchHost` CoreWindow 525,77-1525,1080, band 13), not monitor-sized. While Start or Search is
+  open, Windows moves the taskbar from z-band 1 to band 6. A plain topmost window stays in band 1, under it. App-icon
+  clicks raised the taskbar over the strip for 0.2-0.4 s until the re-raise. So 1.2.1's shell-window rule was a guess
+  that did not cover this; it stays as a guard.
+- **Fix.** A docked strip is now an owned window of its taskbar (`GWLP_HWNDPARENT`, `own_by_taskbar` in `ui.rs`).
+  Windows keeps an owned window above its owner and carries it into the owner's band. Other placements and the panel
+  are unowned. The owner is re-checked on every dock check, so a new taskbar after an Explorer restart is picked up.
+
+**Verify.** Experiment first: a test box owned by the taskbar moved to band 6 with it when Search opened, and a plain
+topmost box stayed under it. Two-process test: when the owner's process exits, the owned window survives and its owner
+field reads 0. After the change: 20 tests pass, clippy clean. Search opened via the shell's Search CLSID (no synthetic
+input): strip band 6, nothing above it. Taskbar raised over the strip by script: the strip is on top again within
+0-6 ms (1.2.1: 125-208 ms). Outside move and hide undone within 0.9 s. **Unverified:** a real Explorer restart, a
+secondary-monitor taskbar.
+
 ## 2026-10-15 — 1.2.1: no hiding for the shell's own windows; strip self-heals   [claude.impl]
 
 **Files:** `src/{dock,ui}.rs`, `Cargo.toml` (1.2.1). Same change as AO Ticker 0.6.1.

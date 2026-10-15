@@ -674,6 +674,7 @@ fn dock_check(hwnd: HWND) {
         with_ui(|u| u.suppressed = fullscreen);
         apply_visibility(hwnd);
     }
+    own_by_taskbar(hwnd, dock);
     heal(hwnd);
     if dock && !fullscreen && dock::taskbar_above(hwnd) {
         set_topmost(hwnd, true);
@@ -682,6 +683,24 @@ fn dock_check(hwnd: HWND) {
         if dock::taskbar_above(hwnd) {
             set_topmost(hwnd, false);
             set_topmost(hwnd, true);
+        }
+    }
+}
+
+/// A docked strip is an owned window of its taskbar. Windows keeps an owned window above its owner,
+/// and moves it with the owner into a higher z-band: while Start or Search is open the taskbar
+/// leaves the normal band (1) for band 6, where a plain topmost window cannot follow, so the strip
+/// sat under the taskbar (seen 2026-10-15 by GetWindowBand logging). Ownership also stops a taskbar
+/// click from covering the strip until the next re-raise. Every other placement (and the panel) is
+/// unowned. An Explorer restart gives a new taskbar; a dead owner in another process only clears the
+/// owner field (tested 2026-10-15 with two processes), so the next check re-points it.
+fn own_by_taskbar(hwnd: HWND, dock: bool) {
+    let want = if dock { dock::target() } else { null_mut() };
+    unsafe {
+        if GetWindowLongPtrW(hwnd, GWLP_HWNDPARENT) as HWND != want {
+            SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, want as isize);
+            let top = with_ui(|u| u.cfg.topmost || u.cfg.placement().on_taskbar()).unwrap_or(true);
+            set_topmost(hwnd, top);
         }
     }
 }
