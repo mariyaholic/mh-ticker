@@ -12,7 +12,7 @@ XAG    56.590  DOW 52,048   NAS 29,801.50  ●
 
 ![MH Ticker in the gap next to the tray](docs/strip_next_to_tray.png)
 
-## download
+## Download
 
 Grab `MH_Ticker.exe` from the [latest release](https://github.com/mariyaholic/mh-ticker/releases/latest) and
 Double click it. If prompted, simply select Run anyway. 
