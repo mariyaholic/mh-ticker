@@ -1,10 +1,11 @@
 # MH Ticker
 
-_Made with love by [Maria](https://github.com/mariyaholic)._
+_made with love by [maria](https://github.com/mariyaholic)_
 
-A price strip that lives in an empty part of the Windows taskbar. Click it and it glides out into
-a centred panel; minimise it and it glides back. Prices come from CNBC's public quote
-service, so there is **no login, no account and no server**: one exe, double-click, done.
+a little price strip that sits in the empty part of ur windows taskbar. click it and it glides out into a
+bigger window in the middle of the screen, hit minimize and it glides right back into the taskbar. prices
+come from cnbc's public quotes so theres **no login, no account, no server** - its literally just one exe,
+double click and ur done
 
 ```
 XAU 4,153.73   BTC 81,219   S&P 7,743.75
@@ -13,114 +14,115 @@ XAG    56.590  DOW 52,048   NAS 29,801.50  ●
 
 ![MH Ticker in the gap next to the tray](docs/strip_next_to_tray.png)
 
-## Use
+## download
 
-- **Run:** double-click `MH_Ticker.exe`. It docks itself into a free part of the taskbar: left of the
-  Start button when the icons are centred, otherwise between the app icons and the tray. It follows
-  the icons as apps open and close. Only one copy runs at a time.
-- **Expand:** click the strip, or left-click the tray icon. The panel has one card per symbol:
-  - the price;
-  - the day change in % and points, and the previous close;
-  - the source and the price's age;
-  - a sparkline of the last hour. It already holds the past hour at launch (CNBC 1-minute bars),
-    then rolls forward live.
-- **Back to the taskbar:** the minimise button (top right), **Esc**, or the tray icon again.
-- **Choose the symbols:** right-click → *Symbols*. Tick or untick from a list of 23 (metals, crypto, US futures, oil,
-  gas, copper, FX, the dollar index, US yields, VIX, Nikkei, DAX, FTSE, Hang Seng). The strip and the panel change at
-  once, no restart. At most 12 show; *Reset to default* brings back the six.
-- **Right-click → Position** picks where the strip sits:
-  - **Auto** (default): in the taskbar. It uses the gap left of the Start button while that is roomy (icons centred,
-    the Windows 11 default). Otherwise it uses the gap between the app icons and the tray (icons aligned left, or a
-    crowded centre). With neither (an auto-hide or vertical taskbar), it goes to the bottom-right corner, just above
-    the taskbar.
-  - **Taskbar, left of Start** / **Taskbar, next to the tray**: that gap only.
-  - **Floating**: one row anywhere; drag it, and its spot is saved.
-  - **Four corners**: one row in that corner of the screen.
-  - **Display 1 / 2 / ...** (only with several screens): which screen, and so which taskbar, it uses.
-- **Quit, or other options:** right-click the strip or the tray icon. The menu has *Expand view*
-  (the default), *Symbols*, *Position*, *Show strip*, *Always on top*, the current status,
-  *Open config folder* and *Quit*. No Task Manager needed.
-- **Tray only:** untick *Show strip*. The tray icon still shows every price in its tooltip and opens the panel.
-- **Fullscreen apps:** the strip hides itself while a fullscreen app (a game) is in front.
+grab `MH_Ticker.exe` from the [latest release](https://github.com/mariyaholic/mh-ticker/releases/latest) and
+double click it. its not code-signed so windows smartscreen might say it "protected your PC" the first time -
+just hit *More info → Run anyway*, or build it urself from the source if u'd rather (see build below)
 
-**The tray icon** is a small chart line on a dark tile: green = live, amber = some prices not
-fresh (a market is closed), red = offline. Windows 11 puts new tray icons in the hidden **^**
-flyout. To keep it on the taskbar, drag it from the flyout onto the taskbar, or turn it on in
-*Settings → Personalization → Taskbar → Other system tray icons → MH Ticker*.
+## how to use it
 
-## Prices
+- **run it:** double click `MH_Ticker.exe` and it docks itself into whatever free space ur taskbar has - left of
+  the start button if ur icons are centred, or between ur app icons and the tray if theyre on the left. it moves
+  along with the icons as u open and close apps. only one copy runs at a time so u cant accidentally stack them
+- **expand it:** click the strip (or left click the tray icon) and u get a card for each symbol with:
+  - the price
+  - the day change in % and points, plus the previous close
+  - where the price is from and how old it is
+  - a little line of the last hour. it already has the past hour the moment u launch it (it pulls cnbc's
+    1-minute bars) and then just keeps moving forward live
+- **put it back:** the minimize button top right, **Esc**, or the tray icon again
+- **pick ur symbols:** right click → *Symbols* and tick whatever u want from 23 of them (metals, crypto, us
+  futures, oil, gas, copper, fx, the dollar index, us yields, vix, nikkei, dax, ftse, hang seng). the strip and
+  the panel change right away, no restart. max 12 at once, and *Reset to default* gets u back the original six
+- **move it:** right click → *Position*, since not everyone has free space on the left of their taskbar:
+  - **Auto** (default) - stays in the taskbar and finds the space itself. it uses the left of start while theres
+    room there, otherwise next to the tray, and if ur taskbar has no room at all (auto-hide or a vertical one) it
+    goes to the bottom right corner just above the taskbar
+  - **Taskbar, left of Start** / **Taskbar, next to the tray** - if u want it locked to one side
+  - **Floating** - drag it wherever u want and it remembers the spot
+  - **the four corners** - one row tucked into that corner of the screen
+  - **Display 1 / 2 / ...** - only shows up if u have more than one screen, picks which one (and so which taskbar)
+- **quit or whatever else:** right click the strip or the tray icon. u get *Expand view*, *Symbols*, *Position*,
+  *Show strip*, *Always on top*, what its currently doing, *Open config folder* and *Quit* - so no more going to
+  task manager every time u need it killed
+- **tray only:** untick *Show strip* if u just want the tray icon. hovering it still shows every price and clicking
+  it still opens the panel
+- **games/fullscreen stuff:** it hides itself while something fullscreen is in front so it wont sit on top of ur game
 
-One batched HTTPS request every 3 s covers every row; the connection is kept alive between
-requests. The default six:
+**the tray icon** is a tiny chart line on a dark tile - green means live, amber means some prices arent fresh (a
+market's probably closed), red means offline. windows 11 likes to hide new tray icons in the **^** flyout, so if u
+want it out on the taskbar just drag it out of there, or turn it on in *Settings → Personalization → Taskbar →
+Other system tray icons → MH Ticker*
 
-| Row | CNBC symbol | What it is | Timing |
+## where the prices come from
+
+one request every 3 seconds grabs every row at once over a connection that stays open, so its super light. the
+default six:
+
+| Row | CNBC symbol | what it is | timing |
 |---|---|---|---|
 | XAU | `XAU=` | gold spot, USD | real-time |
 | XAG | `XAG=` | silver spot, USD | real-time |
-| BTC | `BTC.CB=` | bitcoin on Coinbase | real-time |
-| DOW | `@DJ.1` | Dow futures, front month | **delayed ~10 min** |
-| S&P | `@SP.1` | S&P 500 futures, front month | **delayed ~10 min** |
-| NAS | `@ND.1` | Nasdaq 100 futures, front month | **delayed ~10 min** |
+| BTC | `BTC.CB=` | bitcoin on coinbase | real-time |
+| DOW | `@DJ.1` | dow futures, front month | **delayed ~10 min** |
+| S&P | `@SP.1` | s&p 500 futures, front month | **delayed ~10 min** |
+| NAS | `@ND.1` | nasdaq 100 futures, front month | **delayed ~10 min** |
 
-- **More in the Symbols menu:** XPT platinum and ETH (real-time); WTI, Brent, natural gas and copper futures
-  (delayed); EUR/USD, GBP/USD, USD/JPY and the dollar index; the US 10- and 2-year yields; VIX; Nikkei, DAX,
-  FTSE and Hang Seng (delayed).
-- **Delayed rows** are labelled *CNBC delayed* in the panel and get 15 min of extra grace before
-  they are dimmed as stale.
-- **Cash indices** (`.DJI`, `.SPX`, `.NDX`) only move during US hours; the futures trade almost
-  around the clock.
-- **Unofficial endpoints:** they are public but undocumented, fine for personal use. CNBC can
-  change them; if it does, the dot turns red and the tray menu shows the error.
+- **theres more in the Symbols menu:** platinum and eth (real-time), wti, brent, natural gas and copper futures
+  (delayed), eur/usd, gbp/usd, usd/jpy and the dollar index, the us 10 and 2 year yields, vix, and nikkei, dax,
+  ftse and hang seng (delayed)
+- **delayed ones** say *CNBC delayed* in the panel and get an extra 15 min before theyre dimmed as stale, since
+  theyre always ~10 min behind anyway
+- **why futures and not the actual indexes:** the cash indexes (`.DJI`, `.SPX`, `.NDX`) only move during us
+  hours, the futures trade pretty much around the clock
+- **heads up:** these are public but undocumented cnbc endpoints, totally fine for personal use but cnbc could
+  change them whenever. if that happens the dot turns red and the tray menu tells u whats wrong
 
-## Settings
+## settings
 
-`%LOCALAPPDATA%\MH_Ticker\config.json` is written with defaults on first run (*Open config folder*
-in the menu). Restart the app after editing it by hand (the Symbols menu needs no restart). Settings:
-- `rows`: the shown symbols, each `label`, CNBC `symbol`, `digits` and an optional `name`.
-- `catalog`: the Symbols menu's list, same fields. Any symbol CNBC's quote pages show works, e.g.
-  `AUD=` for AUD/USD or `@SI.1` for silver futures; add it here and tick it in the menu.
-- `poll_s`: seconds between quote requests.
-- `stale_after_s` and `delayed_grace_s`: when a price is dimmed.
-- `placement` (`auto`, `taskbar_left`, `taskbar_right`, `floating`, `top_right`, `bottom_right`,
-  `top_left`, `bottom_left`) and `monitor` (e.g. `\\.\DISPLAY2`; empty = main screen).
-- `dock_rows`, `dock_font_pt`: the taskbar grid.
-- `font`, `font_pt`, `opacity`, `topmost`.
-- `x`/`y`: the saved spot in Floating.
+`%LOCALAPPDATA%\MH_Ticker\config.json` gets made with the defaults the first time u run it (*Open config folder*
+in the menu takes u there). if u edit it by hand restart the app after (the menus dont need a restart tho).
+whats in there:
+- `rows`: the symbols that show, each with a `label`, the cnbc `symbol`, `digits` and an optional `name`
+- `catalog`: the list the Symbols menu shows, same fields. any symbol cnbc's quote pages have works, like
+  `AUD=` for aud/usd or `@SI.1` for silver futures - add it here and then tick it in the menu
+- `poll_s`: seconds between price requests
+- `stale_after_s` and `delayed_grace_s`: when a price gets dimmed
+- `placement` (`auto`, `taskbar_left`, `taskbar_right`, `floating`, `top_right`, `bottom_right`, `top_left`,
+  `bottom_left`) and `monitor` (like `\\.\DISPLAY2`, empty = main screen)
+- `dock_rows`, `dock_font_pt`: the grid when its in the taskbar
+- `font`, `font_pt`, `opacity`, `topmost`
+- `x`/`y`: where it was left in Floating
 
-`MH_Ticker --probe` prints one pass over the quotes and the hour of bars, then exits. Use it to
-check a new symbol.
+`MH_Ticker --probe` does one pass over the prices and the last hour of bars, prints it and exits - handy for
+checking a new symbol actually works before u add it
 
-## Build
+## building it urself
 
-Requires Windows and Rust (stable).
+u need windows and rust (stable)
 
 ```sh
 cargo test
 cargo build --release
 ```
 
-The exe is `target/release/MH_Ticker.exe`; copy it next to this README for double-click use. To
-build elsewhere (another drive, say), set `CARGO_TARGET_DIR` or keep an untracked `.cargo/config.toml`
-with `[build] target-dir = "..."`; the author's machine uses `D:/mariyaholic-build/mh-ticker/target`.
+the exe ends up at `target/release/MH_Ticker.exe`, copy it next to this readme if u want to double click it from
+here. if u want the build somewhere else (another drive or whatever) set `CARGO_TARGET_DIR` or keep an untracked
+`.cargo/config.toml` with `[build] target-dir = "..."` - mine goes to `D:/mariyaholic-build/mh-ticker/target`
 
-Plain Win32/GDI: no GUI toolkit, no webview, no GPU context. About 5 MB of private memory and
-~0.1% of one core.
+its plain win32/gdi - no gui toolkit, no webview, no gpu stuff - so it only uses about 5 MB of memory and like
+~0.1% of one cpu core
 
-## Where it came from
+## where it came from
 
-A fork of AO Ticker (Argonaut Oak `apps/ao_ticker`, commit `aaa93149`). The Argonaut Oak sources
-(the local Market Terminal feed and the MT5 investor bridge, which needs an MT5 login) are
-removed and replaced by CNBC. The strip, the taskbar dock, the panel and its morph animation,
-and the tray are the same code.
+its a fork of AO Ticker, a ticker i had built for my own trading setup (Argonaut Oak `apps/ao_ticker`, commit
+`aaa93149`). i essentially just wanted the widget and the expanded view as its own one click app, so the
+argonaut oak bits (the local market terminal feed and the mt5 investor bridge, which needs an mt5 login) got
+taken out and swapped for cnbc. the strip, the taskbar docking, the panel and its animation and the tray are
+all the same code
 
-## Download
+## license
 
-Grab `MH_Ticker.exe` from the [latest release](https://github.com/mariyaholic/mh-ticker/releases/latest)
-and double-click it. The exe is not code-signed, so Windows SmartScreen may say it "protected your
-PC" the first time: choose *More info → Run anyway*, or build it yourself from this source.
-
-## License
-
-[MIT](LICENSE) © 2026 mariyaholic. You may use, change and share this code, as long as the copyright
-notice and the license text stay with it. If you build on it, please credit this repository as the
-original source.
+[MIT](LICENSE) © 2026 mariyaholic - use it, change it, share it, just keep the copyright notice and the license
+text with it. and if u build something on top of it please credit this repo as the original source
