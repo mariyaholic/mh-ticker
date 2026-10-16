@@ -1,5 +1,22 @@
 # Changelog — MH Ticker
 
+## 2026-10-16 — 1.2.3: its own app icon   [claude.impl]
+
+**Files:** `assets/{icon.ico,icon_256.png,make_icon.py,app.rc}`, `build.rs` (new), `src/ui.rs` (class icon), `Cargo.toml`
+(1.2.3).
+
+**What.** Maria asked for the icon setup AO Ticker got, in its own variant so the two don't look the same.
+- **Design:** the tray icon's slate tile and its dip-then-climb price line, drawn as a violet-to-rose gradient with a
+  soft fill under it and a small four-point sparkle at the tip (AO's is a green line ending in a live dot).
+  `assets/make_icon.py` draws each of the nine sizes (16-256 px) separately at 8x; the sparkle is left out below 24 px.
+- **Embedding:** `build.rs` compiles `assets/app.rc` with windres (shipped with the windows-gnu Rust toolchain) and links
+  it as icon 1. Without windres (e.g. an MSVC-only setup) the build warns and keeps the generic icon. The window class
+  uses icon 1 too.
+
+**Verify.** `cargo build --release` (no windres warning), 20 tests, clippy clean. `Icon.ExtractAssociatedIcon` on the
+exe returns the new tile; the size sheet was checked on light and dark. `--probe` runs, and the strip docks and
+self-heals as before.
+
 ## 2026-10-15 — 1.2.2: docked strip owned by the taskbar, so it stays above it with Search/Start open   [claude.impl]
 
 **Files:** `src/{dock,ui}.rs`, `Cargo.toml` (1.2.2). Same change as AO Ticker 0.6.2.

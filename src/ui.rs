@@ -1283,7 +1283,8 @@ pub fn run(cfg: Config, board: Arc<Mutex<Board>>) {
             cbClsExtra: 0,
             cbWndExtra: 0,
             hInstance: inst,
-            hIcon: null_mut(),
+            // icon 1 = assets/icon.ico, embedded by build.rs (null when built without windres)
+            hIcon: LoadIconW(inst, 1 as _),
             hCursor: LoadCursorW(null_mut(), IDC_ARROW),
             hbrBackground: null_mut(),
             lpszMenuName: null(),

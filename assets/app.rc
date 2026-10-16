@@ -1,0 +1,2 @@
+// MH Ticker resources, compiled by build.rs (windres). Icon 1 is the exe icon Explorer and shortcuts show.
+1 ICON "icon.ico"
