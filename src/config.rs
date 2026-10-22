@@ -1,15 +1,63 @@
-//! Settings in `%LOCALAPPDATA%\MH_Ticker\config.json`, written with defaults on first run.
-//! Nothing secret lives here: every source is public.
+//! Settings in `%LOCALAPPDATA%\MH_Ticker\<profile>.json`, written with defaults on first run.
+//! Every market source is public, so nothing here is a credential — except `webhook`, which is a
+//! bearer secret (see `Alert`).
 //!
 //! `rows` are the symbols on the strip; `catalog` is the pick list behind the menu's *Symbols*
-//! submenu. Ticking a catalog entry shows it, unticking hides it; the strip keeps catalog order.
-//! Any other CNBC symbol can be added to `catalog` (or `rows`) by hand.
+//! submenu and the Ultra symbol picker. Ticking a catalog entry shows it, unticking hides it; the
+//! strip keeps catalog order. Any other CNBC symbol can be added to `catalog` (or `rows`) by hand.
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 /// The strip, dock grid and panel stay readable up to this many symbols.
 pub const MAX_ROWS: usize = 12;
+
+/// Which product this process is. One engine, two builds: the profile picks the config file,
+/// the single-instance mutex and the window title, so the two can run side by side and never
+/// fight over each other's settings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Profile {
+    /// Executable name without `.exe`, also the mutex suffix and window title.
+    pub id: &'static str,
+    /// Config file inside the data folder (`classic.json`, `ultra.json`).
+    pub config_file: &'static str,
+    /// The Ultra build: theme menu, symbol picker, alerts and webhooks.
+    pub ultra: bool,
+}
+
+impl Profile {
+    /// The original: one theme, no settings beyond placement and symbols.
+    pub const fn classic() -> Self {
+        Self { id: "MH_Ticker", config_file: "config.json", ultra: false }
+    }
+
+    /// The heavy build: aesthetics and alerts.
+    pub const fn ultra() -> Self {
+        Self { id: "MH_Ticker_Ultra", config_file: "config_ultra.json", ultra: true }
+    }
+
+    pub fn title(self) -> &'static str {
+        if self.ultra { "MH Ticker Ultra" } else { "MH Ticker" }
+    }
+
+    pub fn folder(self) -> PathBuf {
+        let base = std::env::var("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("."));
+        base.join("MH_Ticker")
+    }
+}
+
+/// Set once at launch by `mh_ticker::launch`. Every path and mutex below reads it, so no call
+/// site has to thread the profile through.
+static PROFILE: OnceLock<Profile> = OnceLock::new();
+
+pub fn init(p: Profile) {
+    let _ = PROFILE.set(p);
+}
+
+pub fn profile() -> Profile {
+    *PROFILE.get_or_init(Profile::classic)
+}
 
 /// Where the strip sits (the menu's Position submenu).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -100,6 +148,40 @@ pub struct Config {
     /// Last strip position in screen pixels when undocked; None = top-right of the work area.
     pub x: Option<i32>,
     pub y: Option<i32>,
+
+    // --- Ultra only. `serde(default)` keeps a classic config parsing unchanged. ---
+    /// Theme name (`theme::ALL`). Ignored by the classic build, which has exactly one.
+    pub theme: String,
+    /// Panel face override (`theme::FACES`). Unset = the theme's own face. Ignored by the classic
+    /// build, and refused (with the theme's face kept) when it names a face that is not listed.
+    pub theme_font: Option<String>,
+    /// Price alerts, checked after each poll.
+    pub alerts: Vec<Alert>,
+    /// Where alerts are also POSTed (Discord/Slack incoming webhook, ntfy topic, generic endpoint).
+    /// This is a bearer secret: anyone with the URL can post to that channel. It is never printed
+    /// in a note, tooltip or `--probe` line.
+    pub webhook: Option<String>,
+}
+
+/// One price threshold. Fires when the last price crosses `above` upward or `below` downward, at
+/// most once per `cooldown_s`, and never for a stale quote (a closed market frozen at a level
+/// would otherwise retrigger forever).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Alert {
+    /// The row's `label`, so the alert follows the symbol if the catalogue reorders.
+    pub label: String,
+    pub above: Option<f64>,
+    pub below: Option<f64>,
+    pub cooldown_s: f64,
+    /// UTC seconds the alert last fired. Persisted so a restart does not re-fire immediately.
+    pub last: f64,
+}
+
+impl Default for Alert {
+    fn default() -> Self {
+        Self { label: String::new(), above: None, below: None, cooldown_s: 900.0, last: 0.0 }
+    }
 }
 
 fn row(label: &str, symbol: &str, digits: u32, name: &str) -> Row {
@@ -160,6 +242,10 @@ impl Default for Config {
             dock_rows: 2,
             x: None,
             y: None,
+            theme: "midnight".into(),
+            theme_font: None,
+            alerts: Vec::new(),
+            webhook: None,
         }
     }
 }
@@ -209,8 +295,8 @@ pub fn toggle(cfg: &mut Config, symbol: &str) -> bool {
 }
 
 pub fn path() -> PathBuf {
-    let base = std::env::var("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("."));
-    base.join("MH_Ticker").join("config.json")
+    let p = profile();
+    p.folder().join(p.config_file)
 }
 
 pub fn load() -> Config {

@@ -3,7 +3,7 @@
 use crate::config::Row;
 use std::collections::HashMap;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Quote {
     pub symbol: String,
     /// CNBC's name for it, e.g. "Dow Jones Fut (Dec'26)".
@@ -15,6 +15,21 @@ pub struct Quote {
     pub ts: Option<f64>,
     /// False when CNBC marks the quote as delayed (its index futures, ~10 min).
     pub realtime: bool,
+    // --- Fields the 3-second response already carries. Every one of them is `None`/empty when
+    // CNBC omits it, and a few are sent as `0.00` for symbols that have no such value (see
+    // `positive`), so nothing below may be assumed present.
+    /// The session's open, when CNBC sends one.
+    pub open: Option<f64>,
+    pub high: Option<f64>,
+    pub low: Option<f64>,
+    /// Day volume; absent for FX, yields and spot metals.
+    pub volume: Option<f64>,
+    pub yr_hi: Option<f64>,
+    pub yr_lo: Option<f64>,
+    /// The day the 52-week high was set, as CNBC sends it (a bare date).
+    pub yr_hi_date: Option<String>,
+    /// ISO code, when CNBC names one (`USD`, `EUR`, …).
+    pub currency: String,
 }
 
 /// Overall state, shown by the dot on the strip and the tray icon colour.
@@ -50,6 +65,9 @@ pub struct Board {
     /// `backfill_gen` bumps each time a fresh set arrives.
     pub backfill: Vec<Vec<(f64, f64)>>,
     pub backfill_gen: u64,
+    /// Seconds between quote requests. The UI owns it (`Poll every` in the menu) and the feed
+    /// thread reads it each pass, so a change takes effect on the next tick without a restart.
+    pub poll_s: f64,
 }
 
 fn empty_cell(r: &Row) -> Cell {
@@ -66,6 +84,7 @@ impl Board {
             note: "starting".into(),
             backfill: Vec::new(),
             backfill_gen: 0,
+            poll_s: 3.0,
         }
     }
 
@@ -133,7 +152,7 @@ mod tests {
     use super::*;
 
     fn q(sym: &str, ts: Option<f64>, realtime: bool) -> Quote {
-        Quote { symbol: sym.into(), name: String::new(), price: 1.0, change_pct: None, prev_close: None, ts, realtime }
+        Quote { symbol: sym.into(), price: 1.0, ts, realtime, ..Quote::default() }
     }
 
     #[test]
