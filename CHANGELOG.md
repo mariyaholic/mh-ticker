@@ -1,5 +1,113 @@
 # Changelog — MH Ticker
 
+## 2026-10-22 — 1.4.0: a theme catalogue, and the nine card features in both builds   [freebuff.impl]
+
+**Files:** `src/theme.rs` (rewritten: 26 palettes, 4 tiers, 13 faces), `src/panel.rs` (card layout,
+range bar, 52-week badge, markers, pixel styling), `src/model.rs` + `src/source.rs` (eight more quote
+fields), `src/ui.rs` (tiered menus, Font menu, animation timer, cached back buffer, click-to-open,
+copy), `src/config.rs` (`theme_font`), `src/shot.rs` + `examples/shots.rs` (new), `Cargo.toml`
+(1.4.0, optional `png`), `shots/` (generated), `THEMES.md` (new), `README.md`, `ARCHITECTURE.md`,
+`FEATURES.md`.
+
+**What.** Two asks from Maria: the classic build should inherit the nine byte-free card features
+rather than stay minimalist, and the theme work should become a real catalogue — basic colours, then
+gradients, then animated ones, then retro pixelated ones, and the same for fonts. Plus screenshots.
+
+- **The nine, in both builds.** Day range (a track with the price as a marker), the day-open marker
+on the line, session high/low dashes, the 52-week badge with the date of its high when the line has
+room, absolute change beside the %, volume where CNBC sends one, currency, click a card to open it
+on CNBC, and `Copy <label> <price>` in the card's context menu. Eight new fields per quote
+(`open`, `high`, `low`, `volume`, `yrhiprice`, `yrloprice`, `yrhidate`, `currencyCode`) parsed from
+the response the app was already downloading: **0 extra bytes of traffic**.
+- **`0.00` is not a price.** `positive()` drops it: CNBC sends `high`/`low` = 0.00 for spot silver and
+platinum and `yrloprice` = 0.00 for six of the 23 catalogue symbols, and a zero drawn on the card
+reads as a real level. A test pins the JSON that does this.
+- **26 palettes in four tiers, and the tier is a rendering rule.** `Kind::{Flat, Gradient, Animated,
+Pixel}` drives band count, corner radius, antialiasing, scanlines and the animation — not just a
+menu heading, so a palette cannot claim to be animated and be painted flat.
+- **Animated backgrounds that cost nothing until you open one.** A 96-band ring cycling
+`bg → bg_to → bg_mid → bg` is pre-built with the theme; a frame picks a different starting index.
+The 9-second loop is repainted at 10 fps **only while the panel is open**, and `sync_anim` kills the
+`WM_TIMER` on collapse and on any static theme.
+- **The back buffer is cached.** `paint` used to `CreateCompatibleBitmap` on every repaint; at 10 fps
+that is a ~1.2 MB allocation ten times a second. One buffer now lives on `Ui` until the window
+resizes. `MH_Ticker_Ultra` at 60 s: **6.38 → 5.83 MB** private, CPU 0.52 → **0.23 %**.
+- **Menus that scale.** 26 themes in one popup is a wall, so Theme nests four tier submenus (each
+with a greyed line saying what the tier does) and Font nests System/Mono/Serif/Bitmap. Both are built
+from `theme::ALL` and `theme::FACES`, so adding a palette is one array entry.
+- **Screenshots are generated, not drawn.** `cargo run --example shots --features shots` renders
+every theme through the real `panel::draw` into a 760 × 394 bitmap and writes a PNG; animated themes
+get three frames. The PNG encoder sits behind the `shots` feature, so **neither shipped exe links
+it**.
+- **Cards grew** 224 × 132 → 236 × 150 for the range bar and the lo/hi + 52-week line. The panel is
+760 × 394 (1.14 MiB of bitmap, up from 0.99). `prev` is right-aligned on the change row and **dropped
+when it would collide**, because a clipped "rev 29,638" is worse than no previous close.
+
+**Verify.** `cargo test --release`: **40 passed, 0 failed** (was 31). `cargo clippy --release
+--all-targets`: clean. Both binaries build and `--probe` returns six quotes and 61 bars each with
+their own config. 36 screenshots rendered; card layout checked mechanically (no text run within 8 px
+of a card edge, no two runs touching, on six themes × six cards) and reviewed by eye.
+
+**Numbers.** Private RAM at 60 s: classic **5.71 MB** (was 5.77), Ultra **5.83 MB** (was 6.38). CPU:
+classic 0.44 %, Ultra 0.23 %. Binary 1,068,544 → **1,091,072 B** (+22.5 KB) for both.
+
+**Next.** The `up`/`down` semantic rule holds, but a monochrome retro theme cannot express direction
+by hue alone — `gameboy` and `phosphor` bend it with a red-leaning fall. If that ever looks wrong in
+use, the honest fix is a direction glyph, not another colour.
+
+## 2026-10-22 — 1.3.0: two builds, gzip, themes, hover, alerts   [freebuff.impl]
+
+**Files:** `Cargo.toml` (lib + two bins, ureq `gzip`, 1.3.0), `src/lib.rs` (new), `src/bin/{classic,ultra}.rs` (new),
+`src/theme.rs` (new), `src/alerts.rs` (new), `src/{config,panel,ui,model,source}.rs`, `src/main.rs` (deleted),
+`README.md`, `ARCHITECTURE.md`, `FEATURES.md`.
+
+**What.** Maria's brief: ship a heavy "Ultra" build where the design work goes, keep the original exe and its one
+theme exactly as they are, and let both builds receive the fixes. Plus the QoL list from the review, research on
+webhooks/Discord, other data sources, and a symbol picker prototype.
+
+- **One engine, two products.** `src/` became a library; `src/bin/classic.rs` and `src/bin/ultra.rs` are ~10 lines
+each. The profile (`config::Profile`) fixes the config file, the single-instance mutex and the window title, so
+`MH_Ticker.exe` and `MH_Ticker_Ultra.exe` run side by side on separate settings. No feature branch in the engine:
+the classic build has fewer *menu entries*, not a different code path.
+- **gzip.** `ureq` was declared `default-features = false`, which silently turned off its `gzip` feature, so CNBC's
+chart JSON came down uncompressed. With `gzip` on, the same six-symbol refresh is **2,535,894 → 316,824 B**
+(12.5 %) and the quote batch **5,346 → 1,345 B** (25 %): **20.63 → 3.35 MB/h, 6.2x**. That is why the full hour of
+history now costs nothing and was *not* gated on the panel being open.
+- **Day-based line colour (bug).** `panel::spark` coloured on `last >= first sample of the rolling hour` while the
+card's % is the *day's* change, so a symbol up 1.2 % could draw a red line. It now colours on `day_baseline` -
+the previous close, else the open implied by the change % - and the guide line moved there too. One function, the
+same one the card's number uses.
+- **Hover crosshair.** `WM_MOUSEMOVE` is quantised to 5 s buckets and only invalidates when the target actually
+changes; the crosshair names the sample (`-12m  4,155.24`) instead of sliding under the cursor every frame.
+`panel::hit` and `panel::card_rect` are shared with the painter, so a click can't disagree with the pixels.
+- **Themes (Ultra).** `theme.rs` owns 5 palettes (midnight/graphite/aurora/terminal/paper), 64-band vertical
+gradients with the brushes built **once per theme** (never per frame, or the panel would allocate ~1 MB per
+repaint), and per-theme panel fonts. `up`/`down` stay semantic and separate from `accent`; a test enforces it.
+- **Symbol picker (Ultra).** A chip strip inside the panel, toggled by the button beside the minimize cross. The
+panel grows in place and stays centred.
+- **Alerts + webhook (Ultra).** Threshold crossings only on fresh quotes (a market closed at a level would retrigger
+forever), floored 30 s cooldown, tray balloon plus an optional POST to a Discord/Slack/ntfy webhook. The post runs
+on a detached thread and reports back by `WM_ALERT`, because `Ui` is thread-local. Errors are reduced to
+"HTTP <code>"/"network" and URLs are redacted to the host: for a webhook the URL *is* the credential.
+- **Poll interval menu.** `poll_s` existed in the config with no way to reach it. The feed now reads the cadence
+from the shared `Board`, so a change applies on the next tick instead of needing a restart.
+
+**Verify.** `cargo test --release`: **31 passed, 0 failed** (was 20). New tests cover the day baseline, the
+crosshair's sample lookup, picker geometry/hit-testing, the alert firing rules (cooldown, stale quotes, the
+cooldown floor) and that no message can leak a webhook URL. `--probe` on both exes: 6 quotes and 60-61 one-minute
+bars each, exit 0, and separate `config.json` / `config_ultra.json` written. RAM and CPU with the project's own
+`.probe_tmp/measure.ps1`, 60 s window, one build at a time: **1.2.3 4.64→5.73 MB / 0.42 %**, **1.3.0 classic
+4.70→5.77 / 0.44 %** (parity within 0.06 MB), **Ultra 4.79→6.38 / 0.52 %** (+0.6 MB, the price of being heavy).
+Binaries: 954,880 → 1,068,544 B each. Clippy `--all-targets` clean (it surfaced a new class:
+`pub fn` taking `HDC`/`HWND` became real public API when the crate became a library, so the library now
+exports only `launch` and `config::Profile` and everything else is `pub(crate)`).
+
+**Unverified.** The panel was not driven by hand in this pass, so the theme gradients, the crosshair and the picker
+are correct at the geometry/unit level but have not been seen rendered. Bytes were measured on the wire with
+`curl`, not instrumented inside the app. Webhook delivery was exercised against `payload()`/`redact()` only, not
+against a live Discord channel. The webhook URL is stored in plaintext in the config: DPAPI (`CryptProtectData`)
+is the recommended follow-up, not done here.
+
 ## 2026-10-16 — 1.2.3: its own app icon   [claude.impl]
 
 **Files:** `assets/{icon.ico,icon_256.png,make_icon.py,app.rc}`, `build.rs` (new), `src/ui.rs` (class icon), `Cargo.toml`
