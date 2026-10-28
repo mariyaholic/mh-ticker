@@ -45,7 +45,7 @@ const string MH_WINDOW_NEW_YORK = "08:00-17:00"
 const bool MH_BROKER_VERIFIED = false
 const int MH_BROKER_OFFSET_MIN = 0
 const int MH_BROKER_REOPEN_MIN = 1320
-const int MH_BROKER_REOPEN_DAY = 7
+const int MH_BROKER_REOPEN_DAY = 1
 const string MH_SPEC_VERSION = "1.0.0"
 const string MH_TZDB_VERSION = "2025b"
 

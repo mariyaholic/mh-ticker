@@ -378,12 +378,13 @@ fn fill(template: &str, spec: &Spec, from: DateTime<Utc>, to: DateTime<Utc>) -> 
         writeln!(mq5_sessions).unwrap();
     }
     let broker = &spec.broker;
+    let pine_reopen_day = if broker.reopen_days[0] == 7 { 1 } else { broker.reopen_days[0] + 1 };
     let pine_broker = format!(
         "const bool MH_BROKER_VERIFIED = {}\nconst int MH_BROKER_OFFSET_MIN = {}\nconst int MH_BROKER_REOPEN_MIN = {}\nconst int MH_BROKER_REOPEN_DAY = {}",
         rust_bool(broker.verified),
         broker.winter_offset_minutes,
         minutes(&broker.reopen_local)?,
-        broker.reopen_days[0]
+        pine_reopen_day
     );
     let mut mq5_constants = String::new();
     writeln!(mq5_constants, "const bool MH_BROKER_VERIFIED = {};", rust_bool(broker.verified)).unwrap();
@@ -498,6 +499,7 @@ mod tests {
         assert!(!mq5.contains("[] = {};"), "MQL5 empty arrays are invalid");
         assert!(!pine.lines().filter(|l| l.trim_start().starts_with("const ")).any(|l| l.ends_with(';')));
         assert!(pine.contains("0700-1600:23456"));
+        assert!(pine.contains("MH_BROKER_REOPEN_DAY = 1"), "spec day 7 (Sunday) is Pine day 1");
         assert!(pine.contains("syminfo.timezone"));
         assert!(pine.contains("not auto-detected"));
         assert!(mq5.contains("NOT AFFILIATED WITH METAMOQUOTES"));
