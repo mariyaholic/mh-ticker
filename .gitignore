@@ -1,0 +1,7 @@
+# Build outputs (the target dir lives on D:, see .cargo/config.toml)
+*.exe
+/target/
+dist/
+
+# Machine-local build settings (e.g. a target dir on another drive): not for other machines
+/.cargo/config.toml

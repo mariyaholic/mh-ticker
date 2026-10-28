@@ -1,0 +1,47 @@
+[package]
+name = "mh_ticker"
+version = "1.2.3"
+edition = "2021"
+description = "MH Ticker: a price strip docked in the Windows taskbar that opens into a centred panel. Public CNBC quotes, no login, no server."
+license = "MIT"
+repository = "https://github.com/mariyaholic/mh-ticker"
+authors = ["mariyaholic"]
+
+[[bin]]
+name = "MH_Ticker"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# HTTPS through Windows' own TLS (SChannel) via native-tls: no bundled certificate store.
+ureq = { version = "2.12", default-features = false, features = ["json", "native-tls"] }
+native-tls = "0.2"
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_UI_Accessibility",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_Graphics_Dwm",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+# UI Automation (COM) for the taskbar dock: finds the Start button's position.
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+    "Win32_UI_Accessibility",
+] }
+
+[profile.release]
+opt-level = "s"
+lto = "thin"
+codegen-units = 4
+strip = true
+panic = "abort"
