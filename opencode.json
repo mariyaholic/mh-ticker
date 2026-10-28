@@ -1,15 +1,3723 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  "permission": {
-    "external_directory": "deny",
-    "bash": {
-      "*": "allow",
-      "git push*": "deny",
-      "git remote*": "deny",
-      "*publish*": "deny",
-      "curl *": "deny",
-      "wget *": "deny"
+  "websearch": false,
+  "permissions": [
+    {
+      "action": "*",
+      "resource": "*",
+      "effect": "allow"
     },
-    "webfetch": "deny"
-  }
+    {
+      "action": "external_directory",
+      "resource": "*",
+      "effect": "deny"
+    },
+    {
+      "action": "webfetch",
+      "resource": "*",
+      "effect": "deny"
+    },
+    {
+      "action": "websearch",
+      "resource": "*",
+      "effect": "deny"
+    },
+    {
+      "action": "codesearch",
+      "resource": "*",
+      "effect": "deny"
+    }
+  ],
+  "policies": [
+    {
+      "action": "tool.use",
+      "resource": "webfetch:*",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "websearch:*",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "codesearch:*",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:curl *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* curl *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/curl *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(curl *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;curl *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|curl *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&curl *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`curl *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(curl *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:wget *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* wget *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/wget *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(wget *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;wget *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|wget *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&wget *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`wget *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(wget *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:nc *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* nc *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/nc *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(nc *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;nc *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|nc *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&nc *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`nc *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(nc *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:ncat *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* ncat *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/ncat *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(ncat *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;ncat *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|ncat *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&ncat *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`ncat *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(ncat *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:netcat *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* netcat *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/netcat *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(netcat *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;netcat *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|netcat *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&netcat *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`netcat *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(netcat *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:socat *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* socat *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/socat *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(socat *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;socat *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|socat *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&socat *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`socat *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(socat *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:telnet *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* telnet *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/telnet *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(telnet *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;telnet *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|telnet *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&telnet *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`telnet *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(telnet *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:ssh *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* ssh *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/ssh *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(ssh *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;ssh *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|ssh *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&ssh *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`ssh *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(ssh *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:scp *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* scp *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/scp *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(scp *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;scp *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|scp *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&scp *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`scp *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(scp *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:sftp *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* sftp *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/sftp *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(sftp *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;sftp *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|sftp *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&sftp *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`sftp *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(sftp *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:ftp *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* ftp *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/ftp *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(ftp *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;ftp *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|ftp *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&ftp *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`ftp *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(ftp *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:rsync *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* rsync *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/rsync *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(rsync *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;rsync *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|rsync *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&rsync *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`rsync *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(rsync *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:aria2c *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* aria2c *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/aria2c *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(aria2c *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;aria2c *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|aria2c *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&aria2c *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`aria2c *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(aria2c *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:lynx *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* lynx *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/lynx *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(lynx *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;lynx *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|lynx *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&lynx *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`lynx *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(lynx *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:w3m *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* w3m *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/w3m *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(w3m *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;w3m *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|w3m *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&w3m *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`w3m *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(w3m *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:links *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* links *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/links *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(links *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;links *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|links *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&links *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`links *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(links *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:httpie *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* httpie *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/httpie *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(httpie *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;httpie *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|httpie *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&httpie *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`httpie *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(httpie *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:http *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* http *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/http *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(http *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;http *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|http *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&http *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`http *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(http *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:xh *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* xh *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/xh *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(xh *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;xh *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|xh *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&xh *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`xh *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(xh *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:gh *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* gh *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/gh *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(gh *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;gh *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|gh *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&gh *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`gh *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(gh *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:nslookup *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* nslookup *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/nslookup *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(nslookup *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;nslookup *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|nslookup *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&nslookup *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`nslookup *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(nslookup *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:dig *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* dig *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/dig *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(dig *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;dig *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|dig *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&dig *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`dig *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(dig *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:host *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* host *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/host *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(host *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;host *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|host *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&host *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`host *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(host *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:git push *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* git push *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/git push *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(git push *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;git push *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|git push *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&git push *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`git push *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(git push *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:git remote *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* git remote *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/git remote *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(git remote *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;git remote *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|git remote *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&git remote *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`git remote *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(git remote *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:git clone *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* git clone *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/git clone *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(git clone *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;git clone *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|git clone *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&git clone *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`git clone *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(git clone *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:git fetch *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* git fetch *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/git fetch *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(git fetch *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;git fetch *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|git fetch *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&git fetch *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`git fetch *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(git fetch *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:git pull *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* git pull *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/git pull *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(git pull *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;git pull *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|git pull *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&git pull *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`git pull *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(git pull *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:git ls-remote *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* git ls-remote *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/git ls-remote *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(git ls-remote *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;git ls-remote *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|git ls-remote *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&git ls-remote *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`git ls-remote *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(git ls-remote *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:git submodule *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* git submodule *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/git submodule *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(git submodule *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;git submodule *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|git submodule *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&git submodule *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`git submodule *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(git submodule *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:git send-email *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* git send-email *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/git send-email *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(git send-email *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;git send-email *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|git send-email *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&git send-email *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`git send-email *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(git send-email *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:go get *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* go get *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/go get *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(go get *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;go get *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|go get *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&go get *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`go get *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(go get *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:go run *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* go run *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/go run *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(go run *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;go run *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|go run *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&go run *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`go run *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(go run *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:go install *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* go install *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/go install *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(go install *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;go install *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|go install *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&go install *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`go install *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(go install *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:go mod download *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* go mod download *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/go mod download *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(go mod download *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;go mod download *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|go mod download *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&go mod download *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`go mod download *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(go mod download *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:go env -w *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* go env -w *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/go env -w *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(go env -w *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;go env -w *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|go env -w *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&go env -w *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`go env -w *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(go env -w *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:go generate *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* go generate *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/go generate *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(go generate *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;go generate *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|go generate *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&go generate *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`go generate *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(go generate *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:cargo install *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* cargo install *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/cargo install *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(cargo install *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;cargo install *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|cargo install *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&cargo install *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`cargo install *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(cargo install *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:cargo add *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* cargo add *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/cargo add *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(cargo add *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;cargo add *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|cargo add *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&cargo add *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`cargo add *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(cargo add *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:cargo search *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* cargo search *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/cargo search *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(cargo search *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;cargo search *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|cargo search *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&cargo search *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`cargo search *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(cargo search *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:cargo publish *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* cargo publish *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/cargo publish *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(cargo publish *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;cargo publish *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|cargo publish *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&cargo publish *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`cargo publish *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(cargo publish *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:cargo login *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* cargo login *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/cargo login *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(cargo login *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;cargo login *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|cargo login *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&cargo login *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`cargo login *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(cargo login *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:cargo update *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* cargo update *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/cargo update *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(cargo update *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;cargo update *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|cargo update *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&cargo update *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`cargo update *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(cargo update *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:rustup *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* rustup *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/rustup *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(rustup *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;rustup *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|rustup *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&rustup *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`rustup *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(rustup *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:npm *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* npm *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/npm *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(npm *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;npm *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|npm *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&npm *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`npm *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(npm *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:npx *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* npx *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/npx *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(npx *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;npx *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|npx *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&npx *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`npx *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(npx *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:pnpm *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* pnpm *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/pnpm *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(pnpm *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;pnpm *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|pnpm *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&pnpm *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`pnpm *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(pnpm *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:yarn *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* yarn *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/yarn *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(yarn *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;yarn *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|yarn *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&yarn *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`yarn *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(yarn *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:bun *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* bun *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/bun *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(bun *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;bun *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|bun *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&bun *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`bun *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(bun *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:bunx *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* bunx *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/bunx *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(bunx *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;bunx *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|bunx *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&bunx *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`bunx *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(bunx *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:deno *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* deno *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/deno *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(deno *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;deno *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|deno *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&deno *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`deno *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(deno *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:pip *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* pip *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/pip *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(pip *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;pip *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|pip *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&pip *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`pip *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(pip *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:pip3 *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* pip3 *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/pip3 *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(pip3 *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;pip3 *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|pip3 *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&pip3 *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`pip3 *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(pip3 *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:pipx *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* pipx *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/pipx *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(pipx *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;pipx *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|pipx *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&pipx *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`pipx *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(pipx *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:uv *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* uv *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/uv *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(uv *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;uv *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|uv *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&uv *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`uv *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(uv *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:uvx *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* uvx *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/uvx *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(uvx *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;uvx *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|uvx *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&uvx *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`uvx *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(uvx *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:gem *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* gem *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/gem *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(gem *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;gem *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|gem *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&gem *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`gem *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(gem *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:apt *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* apt *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/apt *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(apt *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;apt *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|apt *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&apt *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`apt *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(apt *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:apt-get *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* apt-get *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/apt-get *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(apt-get *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;apt-get *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|apt-get *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&apt-get *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`apt-get *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(apt-get *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:dpkg *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* dpkg *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/dpkg *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(dpkg *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;dpkg *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|dpkg *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&dpkg *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`dpkg *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(dpkg *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:python -c *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* python -c *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/python -c *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(python -c *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;python -c *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|python -c *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&python -c *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`python -c *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(python -c *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:python3 -c *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* python3 -c *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/python3 -c *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(python3 -c *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;python3 -c *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|python3 -c *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&python3 -c *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`python3 -c *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(python3 -c *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:node -e *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* node -e *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/node -e *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(node -e *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;node -e *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|node -e *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&node -e *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`node -e *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(node -e *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:node --eval *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* node --eval *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/node --eval *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(node --eval *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;node --eval *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|node --eval *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&node --eval *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`node --eval *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(node --eval *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:perl -e *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* perl -e *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/perl -e *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(perl -e *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;perl -e *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|perl -e *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&perl -e *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`perl -e *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(perl -e *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:ruby -e *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* ruby -e *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/ruby -e *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(ruby -e *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;ruby -e *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|ruby -e *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&ruby -e *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`ruby -e *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(ruby -e *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:php -r *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* php -r *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/php -r *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(php -r *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;php -r *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|php -r *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&php -r *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`php -r *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(php -r *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:osascript *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* osascript *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/osascript *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(osascript *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;osascript *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|osascript *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&osascript *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`osascript *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(osascript *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:opencode *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* opencode *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/opencode *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(opencode *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;opencode *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|opencode *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&opencode *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`opencode *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(opencode *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:sudo *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* sudo *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/sudo *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(sudo *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;sudo *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|sudo *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&sudo *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`sudo *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(sudo *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:su *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* su *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/su *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(su *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;su *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|su *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&su *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`su *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(su *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:docker *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* docker *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/docker *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(docker *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;docker *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|docker *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&docker *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`docker *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(docker *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:podman *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* podman *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/podman *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(podman *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;podman *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|podman *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&podman *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`podman *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(podman *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:unshare *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* unshare *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/unshare *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(unshare *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;unshare *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|unshare *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&unshare *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`unshare *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(unshare *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:nsenter *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* nsenter *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/nsenter *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(nsenter *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;nsenter *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|nsenter *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&nsenter *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`nsenter *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(nsenter *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:iptables *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* iptables *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/iptables *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(iptables *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;iptables *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|iptables *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&iptables *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`iptables *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(iptables *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:nft *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* nft *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/nft *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(nft *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;nft *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|nft *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&nft *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`nft *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(nft *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:tinyproxy *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* tinyproxy *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/tinyproxy *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(tinyproxy *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;tinyproxy *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|tinyproxy *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&tinyproxy *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`tinyproxy *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(tinyproxy *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:chromium *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* chromium *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/chromium *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(chromium *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;chromium *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|chromium *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&chromium *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`chromium *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(chromium *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:firefox *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* firefox *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/firefox *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(firefox *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;firefox *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|firefox *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&firefox *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`firefox *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(firefox *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:xdg-open *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:* xdg-open *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/xdg-open *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*(xdg-open *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*;xdg-open *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*|xdg-open *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*&xdg-open *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*`xdg-open *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*$(xdg-open *",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/dev/tcp/*",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*/dev/udp/*",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*publish*",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*http://*",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*https://*",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "shell:*ftp://*",
+      "effect": "deny"
+    }
+  ]
 }
