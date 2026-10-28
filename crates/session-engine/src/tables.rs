@@ -52,7 +52,9 @@ mod tests {
         use chrono::Offset;
         let tz: chrono_tz::Tz = iana.parse().unwrap();
         let t = Utc.timestamp_opt(unix, 0).single().unwrap();
-        tz.offset_from_utc_datetime(&t.naive_utc()).fix().local_minus_utc()
+        tz.offset_from_utc_datetime(&t.naive_utc())
+            .fix()
+            .local_minus_utc()
     }
 
     #[test]
@@ -97,8 +99,18 @@ mod tests {
         assert!(!text.contains("[] = {};"));
         for table in ZONE_TABLES {
             for tr in table.transitions {
-                assert!(text.contains(&tr.at.to_string()), "{} transition {} missing from MQL5", table.iana, tr.at);
-                assert!(text.contains(&tr.offset_s.to_string()), "{} offset {} missing from MQL5", table.iana, tr.offset_s);
+                assert!(
+                    text.contains(&tr.at.to_string()),
+                    "{} transition {} missing from MQL5",
+                    table.iana,
+                    tr.at
+                );
+                assert!(
+                    text.contains(&tr.offset_s.to_string()),
+                    "{} offset {} missing from MQL5",
+                    table.iana,
+                    tr.offset_s
+                );
             }
         }
     }
@@ -118,9 +130,15 @@ mod tests {
     fn wall_clock_examples() {
         let ny = table_for("America/New_York").unwrap();
         // 2025-01-15 13:00 UTC = 08:00 EST
-        assert_eq!(wall_clock(ny, 1_736_946_000), Some(1_736_946_000 - 5 * 3600));
+        assert_eq!(
+            wall_clock(ny, 1_736_946_000),
+            Some(1_736_946_000 - 5 * 3600)
+        );
         let london = table_for("Europe/London").unwrap();
         // 2025-07-15 07:00 UTC = 08:00 BST
-        assert_eq!(wall_clock(london, 1_752_562_800), Some(1_752_562_800 + 3600));
+        assert_eq!(
+            wall_clock(london, 1_752_562_800),
+            Some(1_752_562_800 + 3600)
+        );
     }
 }

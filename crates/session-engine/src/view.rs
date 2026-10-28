@@ -7,9 +7,14 @@
 use chrono::{DateTime, Duration, Utc};
 use chrono_tz::Tz;
 
-use crate::engine::{default_overlap, offset_label, short_zone, status_at, BrokerStatus, ReopenConfidence};
+use crate::engine::{
+    default_overlap, offset_label, short_zone, status_at, BrokerStatus, ReopenConfidence,
+};
 use crate::zones::WINDOWS_ZONE_DATA_VERSION;
-use crate::{coverage_years, hhmm, BrokerRule, SessionRule, BROKER_DEFAULT, SESSION_RULES, SPEC_VERSION, TZDB_VERSION};
+use crate::{
+    coverage_years, hhmm, BrokerRule, SessionRule, BROKER_DEFAULT, SESSION_RULES, SPEC_VERSION,
+    TZDB_VERSION,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tone {
@@ -38,7 +43,12 @@ pub struct DeviceInfo {
 
 impl DeviceInfo {
     pub fn unavailable(windows_id: Option<String>, territory: Option<String>) -> Self {
-        Self { iana: None, source: DeviceSource::Unavailable, windows_id, territory }
+        Self {
+            iana: None,
+            source: DeviceSource::Unavailable,
+            windows_id,
+            territory,
+        }
     }
 }
 
@@ -96,7 +106,9 @@ pub fn fmt_seconds_clock(zone: Tz, now: DateTime<Utc>) -> String {
 }
 
 pub fn fmt_server_clock(now: DateTime<Utc>, offset_min: i32) -> String {
-    (now + Duration::minutes(offset_min as i64)).format("%H:%M").to_string()
+    (now + Duration::minutes(offset_min as i64))
+        .format("%H:%M")
+        .to_string()
 }
 
 /// Compact countdown: `45s`, `12m`, `2h 05m`, `3d 4h`.
@@ -154,7 +166,12 @@ fn session_row(rule: &SessionRule, now: DateTime<Utc>) -> ViewRow {
     }
 }
 
-fn broker_row(rule: &BrokerRule, status: &BrokerStatus, now: DateTime<Utc>, offset_set: bool) -> ViewRow {
+fn broker_row(
+    rule: &BrokerRule,
+    status: &BrokerStatus,
+    now: DateTime<Utc>,
+    offset_set: bool,
+) -> ViewRow {
     let detail = match status.confidence {
         ReopenConfidence::Verified => match status.next_reopen {
             Some(at) => format!("reopens in {}", countdown(now, at)),
@@ -163,7 +180,11 @@ fn broker_row(rule: &BrokerRule, status: &BrokerStatus, now: DateTime<Utc>, offs
         ReopenConfidence::Unverified => match status.estimate {
             Some(at) => {
                 let local = at + Duration::minutes(status.offset_min as i64);
-                format!("unknown · est {} {}", local.format("%a"), local.format("%H:%M"))
+                format!(
+                    "unknown · est {} {}",
+                    local.format("%a"),
+                    local.format("%H:%M")
+                )
             }
             None => "reopen unknown".into(),
         },
@@ -172,9 +193,17 @@ fn broker_row(rule: &BrokerRule, status: &BrokerStatus, now: DateTime<Utc>, offs
     ViewRow {
         title: rule.label.to_uppercase(),
         clock: fmt_server_clock(now, status.offset_min),
-        state: if offset_set { format!("{} set", offset_label(status.offset_min)) } else { offset_label(status.offset_min) },
+        state: if offset_set {
+            format!("{} set", offset_label(status.offset_min))
+        } else {
+            offset_label(status.offset_min)
+        },
         detail,
-        tone: if status.confidence == ReopenConfidence::Verified { Tone::Closed } else { Tone::Unknown },
+        tone: if status.confidence == ReopenConfidence::Verified {
+            Tone::Closed
+        } else {
+            Tone::Unknown
+        },
         device: false,
     }
 }
@@ -210,35 +239,63 @@ fn device_row(info: &DeviceInfo, now: DateTime<Utc>) -> ViewRow {
 
 fn overlap_line(now: DateTime<Utc>) -> (OverlapLine, bool) {
     let ov = default_overlap(now);
-    let first = crate::session(ov.first).map(|s| s.label.to_uppercase()).unwrap_or_else(|| ov.first.to_uppercase());
-    let second = crate::session(ov.second).map(|s| s.label.to_uppercase()).unwrap_or_else(|| ov.second.to_uppercase());
+    let first = crate::session(ov.first)
+        .map(|s| s.label.to_uppercase())
+        .unwrap_or_else(|| ov.first.to_uppercase());
+    let second = crate::session(ov.second)
+        .map(|s| s.label.to_uppercase())
+        .unwrap_or_else(|| ov.second.to_uppercase());
     let head = format!("{first}\u{2013}{second} OVERLAP");
     if !ov.in_coverage {
         return (
-            OverlapLine { text: format!("{head} · outside tzdb coverage"), tone: Tone::Unknown },
+            OverlapLine {
+                text: format!("{head} · outside tzdb coverage"),
+                tone: Tone::Unknown,
+            },
             false,
         );
     }
     match ov.active {
         Some(i) => (
-            OverlapLine { text: format!("{head} · open · ends in {}", countdown(now, i.end)), tone: Tone::Open },
+            OverlapLine {
+                text: format!("{head} · open · ends in {}", countdown(now, i.end)),
+                tone: Tone::Open,
+            },
             true,
         ),
         None => match ov.next {
             Some(i) => (
-                OverlapLine { text: format!("{head} · closed · next in {}", countdown(now, i.start)), tone: Tone::Closed },
+                OverlapLine {
+                    text: format!("{head} · closed · next in {}", countdown(now, i.start)),
+                    tone: Tone::Closed,
+                },
                 true,
             ),
-            None => (OverlapLine { text: format!("{head} · none this week"), tone: Tone::Closed }, true),
+            None => (
+                OverlapLine {
+                    text: format!("{head} · none this week"),
+                    tone: Tone::Closed,
+                },
+                true,
+            ),
         },
     }
 }
 
 pub fn build_view(now: DateTime<Utc>, opts: &ViewOptions) -> SessionView {
-    let broker = BROKER_DEFAULT.with_overrides(opts.broker_offset_min, opts.broker_reopen_min, opts.broker_rule_verified);
+    let broker = BROKER_DEFAULT.with_overrides(
+        opts.broker_offset_min,
+        opts.broker_reopen_min,
+        opts.broker_rule_verified,
+    );
     let broker_status = broker.status_at(now);
     let mut rows: Vec<ViewRow> = SESSION_RULES.iter().map(|r| session_row(r, now)).collect();
-    rows.push(broker_row(&broker, &broker_status, now, opts.broker_offset_min.is_some()));
+    rows.push(broker_row(
+        &broker,
+        &broker_status,
+        now,
+        opts.broker_offset_min.is_some(),
+    ));
     rows.push(device_row(&opts.device, now));
     debug_assert_eq!(rows.len(), 6);
     debug_assert_eq!(rows.iter().filter(|r| r.device).count(), 1);
@@ -250,7 +307,12 @@ pub fn build_view(now: DateTime<Utc>, opts: &ViewOptions) -> SessionView {
         SPEC_VERSION,
         WINDOWS_ZONE_DATA_VERSION
     );
-    SessionView { rows, overlap, caveat, coverage_ok }
+    SessionView {
+        rows,
+        overlap,
+        caveat,
+        coverage_ok,
+    }
 }
 
 /// Convenience for the panel: the four ordered session rules, then broker.
@@ -284,7 +346,10 @@ mod tests {
         };
         let v = build_view(utc("2025-01-15T14:00:00Z"), &opts);
         let titles: Vec<&str> = v.rows.iter().map(|r| r.title.as_str()).collect();
-        assert_eq!(titles, ["SYDNEY", "TOKYO", "LONDON", "NEW YORK", "BROKER", "DEVICE"]);
+        assert_eq!(
+            titles,
+            ["SYDNEY", "TOKYO", "LONDON", "NEW YORK", "BROKER", "DEVICE"]
+        );
         assert_eq!(v.rows.iter().filter(|r| r.device).count(), 1);
         assert_eq!(v.rows[0].clock, "01:00", "Sydney is UTC+11 in January");
         assert_eq!(v.rows[1].clock, "23:00");
@@ -299,7 +364,12 @@ mod tests {
     #[test]
     fn device_row_stays_separate_even_when_it_matches_a_session_zone() {
         let opts = ViewOptions {
-            device: DeviceInfo { iana: Some("Australia/Sydney".into()), source: DeviceSource::Auto, windows_id: None, territory: None },
+            device: DeviceInfo {
+                iana: Some("Australia/Sydney".into()),
+                source: DeviceSource::Auto,
+                windows_id: None,
+                territory: None,
+            },
             ..ViewOptions::default()
         };
         let v = build_view(utc("2025-01-15T14:00:00Z"), &opts);
@@ -335,10 +405,25 @@ mod tests {
 
     #[test]
     fn verified_override_shows_a_real_countdown() {
-        let rule = BrokerRule { verified: true, winter_offset_min: 120, summer_offset_min: 120, reopen_min: 0, ..BROKER_DEFAULT };
+        let rule = BrokerRule {
+            verified: true,
+            winter_offset_min: 120,
+            summer_offset_min: 120,
+            reopen_min: 0,
+            ..BROKER_DEFAULT
+        };
         let status = rule.status_at(utc("2025-01-15T12:00:00Z"));
-        assert_eq!(status.next_reopen, Some(utc("2025-01-18T22:00:00Z")), "default preset reopens on Sunday");
-        let opts = ViewOptions { broker_offset_min: Some(120), broker_reopen_min: Some(0), broker_rule_verified: true, ..ViewOptions::default() };
+        assert_eq!(
+            status.next_reopen,
+            Some(utc("2025-01-18T22:00:00Z")),
+            "default preset reopens on Sunday"
+        );
+        let opts = ViewOptions {
+            broker_offset_min: Some(120),
+            broker_reopen_min: Some(0),
+            broker_rule_verified: true,
+            ..ViewOptions::default()
+        };
         let v = build_view(utc("2025-01-15T12:00:00Z"), &opts);
         assert_eq!(v.rows[4].detail, "reopens in 3d 10h");
     }
@@ -349,7 +434,10 @@ mod tests {
         assert_eq!(countdown(now, now + Duration::seconds(45)), "45s");
         assert_eq!(countdown(now, now + Duration::minutes(12)), "12m");
         assert_eq!(countdown(now, now + Duration::minutes(125)), "2h 05m");
-        assert_eq!(countdown(now, now + Duration::days(2) + Duration::hours(4)), "2d 4h");
+        assert_eq!(
+            countdown(now, now + Duration::days(2) + Duration::hours(4)),
+            "2d 4h"
+        );
         assert_eq!(countdown(now, now - Duration::hours(1)), "0s");
     }
 

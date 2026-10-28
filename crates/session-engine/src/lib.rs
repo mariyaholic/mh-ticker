@@ -77,7 +77,12 @@ impl SessionRule {
 impl BrokerRule {
     /// Apply the user's config overrides. An explicit offset always means a fixed
     /// clock; it never claims to be the broker's seasonal rule.
-    pub fn with_overrides(&self, offset_min: Option<i32>, reopen_min: Option<u16>, verified: bool) -> BrokerRule {
+    pub fn with_overrides(
+        &self,
+        offset_min: Option<i32>,
+        reopen_min: Option<u16>,
+        verified: bool,
+    ) -> BrokerRule {
         let mut r = *self;
         if let Some(off) = offset_min {
             r.winter_offset_min = off;

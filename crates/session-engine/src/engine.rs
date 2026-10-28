@@ -4,7 +4,10 @@
 use chrono::{DateTime, Datelike, Duration, LocalResult, NaiveDate, TimeZone, Utc, Weekday};
 use chrono_tz::Tz;
 
-use crate::{coverage_contains, BrokerRule, SessionRule, BROKER_DEFAULT, COVERAGE_FROM, COVERAGE_TO, OVERLAP_PAIR};
+use crate::{
+    coverage_contains, BrokerRule, SessionRule, BROKER_DEFAULT, COVERAGE_FROM, COVERAGE_TO,
+    OVERLAP_PAIR,
+};
 
 /// A UTC interval, half-open: `start <= t < end`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,7 +54,12 @@ impl SessionStatus {
 
 /// Resolve one local wall-clock minute according to the pinned policies:
 /// ambiguous -> earliest; nonexistent -> move forward an hour until it exists.
-pub fn resolve_local(zone: Tz, date: NaiveDate, minute_of_day: u16, nonexistent_shift: bool) -> Option<DateTime<Utc>> {
+pub fn resolve_local(
+    zone: Tz,
+    date: NaiveDate,
+    minute_of_day: u16,
+    nonexistent_shift: bool,
+) -> Option<DateTime<Utc>> {
     let naive = date.and_hms_opt(minute_of_day as u32 / 60, minute_of_day as u32 % 60, 0)?;
     match zone.from_local_datetime(&naive) {
         LocalResult::Single(dt) => Some(dt.with_timezone(&Utc)),
@@ -86,7 +94,11 @@ fn date_days(from: NaiveDate, to: NaiveDate) -> impl Iterator<Item = NaiveDate> 
 }
 
 /// All intervals of `rule` that could touch `[from, to)`, in UTC.
-pub fn intervals_between(rule: &SessionRule, from: DateTime<Utc>, to: DateTime<Utc>) -> Vec<Interval> {
+pub fn intervals_between(
+    rule: &SessionRule,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+) -> Vec<Interval> {
     if to <= from {
         return Vec::new();
     }
@@ -99,9 +111,17 @@ pub fn intervals_between(rule: &SessionRule, from: DateTime<Utc>, to: DateTime<U
         if !rule.is_day(date.weekday()) {
             continue;
         }
-        let Some(start) = resolve_local(zone, date, rule.open_min, true) else { continue };
-        let close_date = if rule.close_min <= rule.open_min { date + Duration::days(1) } else { date };
-        let Some(end) = resolve_local(zone, close_date, rule.close_min, true) else { continue };
+        let Some(start) = resolve_local(zone, date, rule.open_min, true) else {
+            continue;
+        };
+        let close_date = if rule.close_min <= rule.open_min {
+            date + Duration::days(1)
+        } else {
+            date
+        };
+        let Some(end) = resolve_local(zone, close_date, rule.close_min, true) else {
+            continue;
+        };
         if start < end && start < to && end > from {
             out.push(Interval { start, end });
         }
@@ -116,14 +136,26 @@ pub fn status_at(rule: &SessionRule, now: DateTime<Utc>) -> SessionStatus {
     let intervals = intervals_between(rule, now - Duration::days(3), now + Duration::days(10));
     let active = intervals.iter().copied().find(|i| i.contains(now));
     let next = if let Some(i) = active {
-        Some(Boundary { at: i.end, kind: BoundaryKind::Close })
-    } else {
-        intervals.iter().filter(|i| i.start > now).min_by_key(|i| i.start).map(|i| Boundary {
-            at: i.start,
-            kind: BoundaryKind::Open,
+        Some(Boundary {
+            at: i.end,
+            kind: BoundaryKind::Close,
         })
+    } else {
+        intervals
+            .iter()
+            .filter(|i| i.start > now)
+            .min_by_key(|i| i.start)
+            .map(|i| Boundary {
+                at: i.start,
+                kind: BoundaryKind::Open,
+            })
     };
-    SessionStatus { id: rule.id, active, next, in_coverage: coverage_contains(now) }
+    SessionStatus {
+        id: rule.id,
+        active,
+        next,
+        in_coverage: coverage_contains(now),
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -135,7 +167,11 @@ pub struct OverlapStatus {
     pub in_coverage: bool,
 }
 
-pub fn overlap_at(first: &'static SessionRule, second: &'static SessionRule, now: DateTime<Utc>) -> OverlapStatus {
+pub fn overlap_at(
+    first: &'static SessionRule,
+    second: &'static SessionRule,
+    now: DateTime<Utc>,
+) -> OverlapStatus {
     let a = intervals_between(first, now - Duration::days(3), now + Duration::days(10));
     let b = intervals_between(second, now - Duration::days(3), now + Duration::days(10));
     let mut both = Vec::new();
@@ -206,7 +242,9 @@ impl BrokerRule {
             if !self.reopen_days[date.weekday().num_days_from_monday() as usize] {
                 continue;
             }
-            let Some(naive) = date.and_hms_opt(self.reopen_min as u32 / 60, self.reopen_min as u32 % 60, 0) else {
+            let Some(naive) =
+                date.and_hms_opt(self.reopen_min as u32 / 60, self.reopen_min as u32 % 60, 0)
+            else {
                 continue;
             };
             let naive_utc = Utc.from_utc_datetime(&naive);
@@ -216,7 +254,10 @@ impl BrokerRule {
             offsets.dedup();
             for off in offsets {
                 let candidate = naive_utc - Duration::minutes(off as i64);
-                if candidate <= now || !coverage_contains(candidate) || self.offset_at(candidate) != off {
+                if candidate <= now
+                    || !coverage_contains(candidate)
+                    || self.offset_at(candidate) != off
+                {
                     continue;
                 }
                 if best.is_none_or(|b| candidate < b) {
@@ -232,7 +273,11 @@ impl BrokerRule {
         let estimate = self.next_reopen_estimate(now);
         let in_coverage = coverage_contains(now) && estimate.is_some_and(coverage_contains);
         let (next_reopen, confidence, note) = if !in_coverage {
-            (None, ReopenConfidence::OutsideCoverage, "outside generated tzdb coverage")
+            (
+                None,
+                ReopenConfidence::OutsideCoverage,
+                "outside generated tzdb coverage",
+            )
         } else if !self.verified {
             (None, ReopenConfidence::Unverified, "broker rule unverified")
         } else {
@@ -323,7 +368,11 @@ mod tests {
         assert_eq!(sat.next.unwrap().at, utc("2025-01-20T13:00:00Z"));
         let sydney = session("sydney").unwrap();
         let sat = status_at(sydney, utc("2025-01-18T12:00:00Z"));
-        assert_eq!(sat.next.unwrap().at, utc("2025-01-19T20:00:00Z"), "Monday 07:00 AEDT");
+        assert_eq!(
+            sat.next.unwrap().at,
+            utc("2025-01-19T20:00:00Z"),
+            "Monday 07:00 AEDT"
+        );
     }
 
     #[test]
@@ -333,7 +382,10 @@ mod tests {
         assert!(before.is_open());
         assert_eq!(before.next.unwrap().at, utc("2025-03-28T17:00:00Z"));
         let after = status_at(london, utc("2025-03-31T09:00:00Z"));
-        assert!(after.is_open(), "Monday 10:00 BST is still inside 08:00-17:00 local");
+        assert!(
+            after.is_open(),
+            "Monday 10:00 BST is still inside 08:00-17:00 local"
+        );
         assert_eq!(after.next.unwrap().at, utc("2025-03-31T16:00:00Z"));
 
         let ny = session("new_york").unwrap();
@@ -356,17 +408,23 @@ mod tests {
         let winter = status_at(tokyo, utc("2025-01-15T08:00:00Z"));
         let summer = status_at(tokyo, utc("2025-07-15T08:00:00Z"));
         assert_eq!(winter.next.unwrap().at, utc("2025-01-15T09:00:00Z"));
-        assert_eq!(summer.next.unwrap().at, utc("2025-07-15T09:00:00Z"), "Tokyo has no DST");
+        assert_eq!(
+            summer.next.unwrap().at,
+            utc("2025-07-15T09:00:00Z"),
+            "Tokyo has no DST"
+        );
     }
 
     #[test]
     fn ambiguous_and_nonexistent_local_times_follow_the_policy() {
         let ny = chrono_tz::America::New_York;
         // 2025-11-02 01:30 occurs twice (EDT then EST); earliest = 05:30Z.
-        let amb = resolve_local(ny, NaiveDate::from_ymd_opt(2025, 11, 2).unwrap(), 90, true).unwrap();
+        let amb =
+            resolve_local(ny, NaiveDate::from_ymd_opt(2025, 11, 2).unwrap(), 90, true).unwrap();
         assert_eq!(amb, utc("2025-11-02T05:30:00Z"));
         // 2025-03-09 02:30 does not exist; move forward to 03:30 EDT = 07:30Z.
-        let gap = resolve_local(ny, NaiveDate::from_ymd_opt(2025, 3, 9).unwrap(), 150, true).unwrap();
+        let gap =
+            resolve_local(ny, NaiveDate::from_ymd_opt(2025, 3, 9).unwrap(), 150, true).unwrap();
         assert_eq!(gap, utc("2025-03-09T07:30:00Z"));
     }
 
@@ -422,7 +480,11 @@ mod tests {
         assert_eq!(summer.next_reopen.unwrap(), utc("2025-03-12T21:00:00Z"));
 
         let friday = rule.status_at(utc("2025-01-17T21:00:00Z"));
-        assert_eq!(friday.next_reopen.unwrap(), utc("2025-01-19T22:00:00Z"), "next Monday 00:00 server");
+        assert_eq!(
+            friday.next_reopen.unwrap(),
+            utc("2025-01-19T22:00:00Z"),
+            "next Monday 00:00 server"
+        );
     }
 
     #[test]

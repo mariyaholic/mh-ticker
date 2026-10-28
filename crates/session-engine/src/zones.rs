@@ -25,7 +25,9 @@ fn table() -> &'static Map {
                 continue;
             }
             let mut parts = line.split('\t');
-            let (Some(id), Some(territory), Some(iana)) = (parts.next(), parts.next(), parts.next()) else {
+            let (Some(id), Some(territory), Some(iana)) =
+                (parts.next(), parts.next(), parts.next())
+            else {
                 continue;
             };
             // DATA is a &'static str, so its line slices are static too.
@@ -73,20 +75,50 @@ mod tests {
 
     #[test]
     fn common_windows_zones_map_to_iana() {
-        assert_eq!(map_windows_zone("AUS Eastern Standard Time", None), Some("Australia/Sydney"));
-        assert_eq!(map_windows_zone("Tokyo Standard Time", None), Some("Asia/Tokyo"));
-        assert_eq!(map_windows_zone("GMT Standard Time", None), Some("Europe/London"));
-        assert_eq!(map_windows_zone("Eastern Standard Time", None), Some("America/New_York"));
+        assert_eq!(
+            map_windows_zone("AUS Eastern Standard Time", None),
+            Some("Australia/Sydney")
+        );
+        assert_eq!(
+            map_windows_zone("Tokyo Standard Time", None),
+            Some("Asia/Tokyo")
+        );
+        assert_eq!(
+            map_windows_zone("GMT Standard Time", None),
+            Some("Europe/London")
+        );
+        assert_eq!(
+            map_windows_zone("Eastern Standard Time", None),
+            Some("America/New_York")
+        );
     }
 
     #[test]
     fn territory_overrides_win_then_fall_back_to_001() {
-        assert_eq!(map_windows_zone("Eastern Standard Time", Some("CA")), Some("America/Toronto"));
-        assert_eq!(map_windows_zone("Eastern Standard Time", Some("US")), Some("America/New_York"));
-        assert_eq!(map_windows_zone("Eastern Standard Time", Some("ZZ")), Some("America/New_York"));
-        assert_eq!(map_windows_zone("GMT Standard Time", Some("IE")), Some("Europe/Dublin"));
-        assert_eq!(map_windows_zone("GMT Standard Time", Some("ZZ")), Some("Europe/London"));
-        assert_eq!(map_windows_zone("AUS Eastern Standard Time", Some("AU")), Some("Australia/Sydney"));
+        assert_eq!(
+            map_windows_zone("Eastern Standard Time", Some("CA")),
+            Some("America/Toronto")
+        );
+        assert_eq!(
+            map_windows_zone("Eastern Standard Time", Some("US")),
+            Some("America/New_York")
+        );
+        assert_eq!(
+            map_windows_zone("Eastern Standard Time", Some("ZZ")),
+            Some("America/New_York")
+        );
+        assert_eq!(
+            map_windows_zone("GMT Standard Time", Some("IE")),
+            Some("Europe/Dublin")
+        );
+        assert_eq!(
+            map_windows_zone("GMT Standard Time", Some("ZZ")),
+            Some("Europe/London")
+        );
+        assert_eq!(
+            map_windows_zone("AUS Eastern Standard Time", Some("AU")),
+            Some("Australia/Sydney")
+        );
     }
 
     #[test]

@@ -13,7 +13,9 @@ fn utc(s: &str) -> DateTime<Utc> {
 }
 
 fn text<'a>(v: &'a Value, key: &str) -> &'a str {
-    v.get(key).and_then(Value::as_str).unwrap_or_else(|| panic!("missing {key}"))
+    v.get(key)
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("missing {key}"))
 }
 
 #[test]
@@ -36,8 +38,14 @@ fn session_and_overlap_vectors() {
         for (id, want) in sessions {
             let rule = session(id).unwrap_or_else(|| panic!("{name}: unknown session {id}"));
             let got = status_at(rule, now);
-            assert_eq!(got.is_open(), want["open"].as_bool().unwrap(), "{name}/{id} open");
-            let next = got.next.unwrap_or_else(|| panic!("{name}/{id}: no next boundary"));
+            assert_eq!(
+                got.is_open(),
+                want["open"].as_bool().unwrap(),
+                "{name}/{id} open"
+            );
+            let next = got
+                .next
+                .unwrap_or_else(|| panic!("{name}/{id}: no next boundary"));
             let kind = text(want, "next");
             let want_kind = match kind {
                 "open" => BoundaryKind::Open,
@@ -45,19 +53,43 @@ fn session_and_overlap_vectors() {
                 other => panic!("{name}/{id}: bad kind {other}"),
             };
             assert_eq!(next.kind, want_kind, "{name}/{id} kind");
-            assert_eq!(next.at, utc(text(want, "next_utc")), "{name}/{id} next instant");
+            assert_eq!(
+                next.at,
+                utc(text(want, "next_utc")),
+                "{name}/{id} next instant"
+            );
         }
         let ov = default_overlap(now);
         let want = &case["overlap"];
-        assert_eq!(ov.active.is_some(), want["open"].as_bool().unwrap(), "{name} overlap open");
+        assert_eq!(
+            ov.active.is_some(),
+            want["open"].as_bool().unwrap(),
+            "{name} overlap open"
+        );
         if want["open"].as_bool().unwrap() {
             let active = ov.active.unwrap();
-            assert_eq!(active.start, utc(text(want, "current_start")), "{name} overlap start");
-            assert_eq!(active.end, utc(text(want, "current_end")), "{name} overlap end");
+            assert_eq!(
+                active.start,
+                utc(text(want, "current_start")),
+                "{name} overlap start"
+            );
+            assert_eq!(
+                active.end,
+                utc(text(want, "current_end")),
+                "{name} overlap end"
+            );
         } else {
             let next = ov.next.unwrap_or_else(|| panic!("{name}: no next overlap"));
-            assert_eq!(next.start, utc(text(want, "next_start")), "{name} next overlap start");
-            assert_eq!(next.end, utc(text(want, "next_end")), "{name} next overlap end");
+            assert_eq!(
+                next.start,
+                utc(text(want, "next_start")),
+                "{name} next overlap start"
+            );
+            assert_eq!(
+                next.end,
+                utc(text(want, "next_end")),
+                "{name} next overlap end"
+            );
         }
     }
 }
@@ -85,9 +117,21 @@ fn broker_vectors() {
         };
         let got = rule.status_at(now);
         assert_eq!(got.confidence, ReopenConfidence::Verified, "{name}");
-        assert_eq!(got.offset_min, case["offset_minutes"].as_i64().unwrap() as i32, "{name} offset");
-        assert_eq!(got.server_now, utc(text(case, "server_utc")), "{name} server clock");
-        assert_eq!(got.next_reopen, Some(utc(text(case, "next_reopen"))), "{name} reopen");
+        assert_eq!(
+            got.offset_min,
+            case["offset_minutes"].as_i64().unwrap() as i32,
+            "{name} offset"
+        );
+        assert_eq!(
+            got.server_now,
+            utc(text(case, "server_utc")),
+            "{name} server clock"
+        );
+        assert_eq!(
+            got.next_reopen,
+            Some(utc(text(case, "next_reopen"))),
+            "{name} reopen"
+        );
     }
 }
 

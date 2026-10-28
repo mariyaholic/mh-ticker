@@ -27,14 +27,16 @@ use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{CloseHandle, BOOL, HWND, LPARAM, POINT, RECT};
 use windows_sys::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
 use windows_sys::Win32::Graphics::Gdi::{
-    EnumDisplayMonitors, GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
-    MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY,
+    EnumDisplayMonitors, GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow, HDC, HMONITOR,
+    MONITORINFO, MONITORINFOEXW, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY,
 };
-use windows_sys::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION};
+use windows_sys::Win32::System::Threading::{
+    OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+};
 use windows_sys::Win32::UI::Shell::{SHAppBarMessage, ABM_GETSTATE, ABS_AUTOHIDE, APPBARDATA};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    FindWindowExW, FindWindowW, GetClassNameW, GetForegroundWindow, GetWindow, GetWindowRect, GetWindowThreadProcessId,
-    IsWindowVisible, GW_HWNDPREV,
+    FindWindowExW, FindWindowW, GetClassNameW, GetForegroundWindow, GetWindow, GetWindowRect,
+    GetWindowThreadProcessId, IsWindowVisible, GW_HWNDPREV,
 };
 
 const UNKNOWN: i32 = i32::MIN;
@@ -70,7 +72,12 @@ pub fn rect(h: HWND) -> Option<RECT> {
     if h.is_null() {
         return None;
     }
-    let mut r = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+    let mut r = RECT {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
     (unsafe { GetWindowRect(h, &mut r) } != 0).then_some(r)
 }
 
@@ -92,7 +99,11 @@ fn monitor_info(h: HMONITOR) -> Option<Monitor> {
         if GetMonitorInfoW(h, &mut mi as *mut MONITORINFOEXW as *mut MONITORINFO) == 0 {
             return None;
         }
-        let n = mi.szDevice.iter().position(|c| *c == 0).unwrap_or(mi.szDevice.len());
+        let n = mi
+            .szDevice
+            .iter()
+            .position(|c| *c == 0)
+            .unwrap_or(mi.szDevice.len());
         Some(Monitor {
             handle: h,
             device: String::from_utf16_lossy(&mi.szDevice[..n]),
@@ -114,7 +125,14 @@ unsafe extern "system" fn collect(h: HMONITOR, _: HDC, _: *mut RECT, data: LPARA
 /// Every display, primary first.
 pub fn monitors() -> Vec<Monitor> {
     let mut list: Vec<Monitor> = Vec::new();
-    unsafe { EnumDisplayMonitors(std::ptr::null_mut(), std::ptr::null(), Some(collect), &mut list as *mut Vec<Monitor> as LPARAM) };
+    unsafe {
+        EnumDisplayMonitors(
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            Some(collect),
+            &mut list as *mut Vec<Monitor> as LPARAM,
+        )
+    };
     list.sort_by_key(|m| (!m.primary, m.bounds.left, m.bounds.top));
     list
 }
@@ -125,7 +143,12 @@ pub fn monitor(device: Option<&str>) -> Option<Monitor> {
     device
         .and_then(|d| all.iter().find(|m| m.device == d).cloned())
         .or_else(|| all.iter().find(|m| m.primary).cloned())
-        .or_else(|| unsafe { monitor_info(MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY)) })
+        .or_else(|| unsafe {
+            monitor_info(MonitorFromPoint(
+                POINT { x: 0, y: 0 },
+                MONITOR_DEFAULTTOPRIMARY,
+            ))
+        })
 }
 
 /// The taskbar on `mon`: the main one, or the secondary taskbar Windows puts on that display
@@ -137,7 +160,12 @@ pub fn taskbar_on(mon: &Monitor) -> HWND {
             return main;
         }
         let class = wide("Shell_SecondaryTrayWnd");
-        let mut h = FindWindowExW(std::ptr::null_mut(), std::ptr::null_mut(), class.as_ptr(), std::ptr::null());
+        let mut h = FindWindowExW(
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            class.as_ptr(),
+            std::ptr::null(),
+        );
         while !h.is_null() {
             if MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST) == mon.handle {
                 return h;
@@ -206,12 +234,20 @@ pub fn gaps(tb: &RECT, s: &Seen) -> (Gap, Gap) {
         Some((tb.left, tb.left + (tb.right - tb.left) * 24 / 100))
     } else {
         // Widgets sits left of Start only when the icons are centred
-        let from = if known(wr) && wr <= s.start_left && wr > tb.left { wr } else { tb.left };
+        let from = if known(wr) && wr <= s.start_left && wr > tb.left {
+            wr
+        } else {
+            tb.left
+        };
         (s.start_left > from).then_some((from, s.start_left))
     };
     let right = known(s.icons_right).then(|| {
         // Widgets moves next to the tray when the icons are left-aligned
-        let to = if known(wl) && wl >= s.icons_right && wl < s.tray_left { wl } else { s.tray_left };
+        let to = if known(wl) && wl >= s.icons_right && wl < s.tray_left {
+            wl
+        } else {
+            s.tray_left
+        };
         (s.icons_right, to)
     });
     (left, right.filter(|(a, b)| b > a))
@@ -243,7 +279,10 @@ pub fn choose(left: Gap, right: Gap, min_w: i32) -> Option<Side> {
 pub fn spans(tb: HWND, r: &RECT) -> (Gap, Gap) {
     let seen = Seen {
         start_left: START_LEFT.load(Ordering::Relaxed),
-        widgets: (WIDGETS_LEFT.load(Ordering::Relaxed), WIDGETS_RIGHT.load(Ordering::Relaxed)),
+        widgets: (
+            WIDGETS_LEFT.load(Ordering::Relaxed),
+            WIDGETS_RIGHT.load(Ordering::Relaxed),
+        ),
         icons_right: ICONS_RIGHT.load(Ordering::Relaxed),
         tray_left: tray_left(tb, r),
     };
@@ -278,7 +317,11 @@ pub fn shell_window(class: &str, exe: &str) -> bool {
         "shellhost.exe",
         "textinputhost.exe",
     ];
-    let exe = exe.rsplit(['\\', '/']).next().unwrap_or(exe).to_ascii_lowercase();
+    let exe = exe
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(exe)
+        .to_ascii_lowercase();
     CLASSES.contains(&class) || HOSTS.contains(&exe.as_str())
 }
 
@@ -295,7 +338,11 @@ fn exe_of(h: HWND) -> String {
         let mut n = buf.len() as u32;
         let ok = QueryFullProcessImageNameW(p, 0, buf.as_mut_ptr(), &mut n) != 0;
         CloseHandle(p);
-        if ok { String::from_utf16_lossy(&buf[..n as usize]) } else { String::new() }
+        if ok {
+            String::from_utf16_lossy(&buf[..n as usize])
+        } else {
+            String::new()
+        }
     }
 }
 
@@ -315,7 +362,12 @@ pub fn fullscreen_foreground(own: HWND) -> bool {
         let mut buf = [0u16; 64];
         let n = GetClassNameW(fg, buf.as_mut_ptr(), buf.len() as i32);
         let class = String::from_utf16_lossy(&buf[..n.max(0) as usize]);
-        let mut r = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+        let mut r = RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
         GetWindowRect(fg, &mut r);
         let mut mi: MONITORINFO = std::mem::zeroed();
         mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
@@ -323,7 +375,8 @@ pub fn fullscreen_foreground(own: HWND) -> bool {
             return false;
         }
         let m = mi.rcMonitor;
-        let covers = r.left <= m.left && r.top <= m.top && r.right >= m.right && r.bottom >= m.bottom;
+        let covers =
+            r.left <= m.left && r.top <= m.top && r.right >= m.right && r.bottom >= m.bottom;
         // the process lookup only runs for a monitor-sized window
         covers && !shell_window(&class, &exe_of(fg))
     }
@@ -351,7 +404,9 @@ pub fn taskbar_above(own: HWND) -> bool {
 }
 
 #[cfg(windows)]
-use windows::Win32::UI::Accessibility::{IUIAutomation, IUIAutomationElement, IUIAutomationTreeWalker};
+use windows::Win32::UI::Accessibility::{
+    IUIAutomation, IUIAutomationElement, IUIAutomationTreeWalker,
+};
 
 /// A taskbar element found once by AutomationId and then read by its cached element.
 #[cfg(windows)]
@@ -366,7 +421,12 @@ struct Button {
 #[cfg(windows)]
 impl Button {
     fn new(id: &'static str, absent_retry: Duration) -> Self {
-        Self { id, el: None, retry_at: None, absent_retry }
+        Self {
+            id,
+            el: None,
+            retry_at: None,
+            absent_retry,
+        }
     }
 
     fn reset(&mut self) {
@@ -376,13 +436,22 @@ impl Button {
 
     fn find(&self, uia: &IUIAutomation, tb: HWND) -> Option<IUIAutomationElement> {
         use windows::core::{BSTR, VARIANT};
-        use windows::Win32::UI::Accessibility::{TreeScope_Descendants, UIA_AutomationIdPropertyId};
+        use windows::Win32::UI::Accessibility::{
+            TreeScope_Descendants, UIA_AutomationIdPropertyId,
+        };
         if tb.is_null() {
             return None;
         }
         unsafe {
-            let root = uia.ElementFromHandle(windows::Win32::Foundation::HWND(tb)).ok()?;
-            let cond = uia.CreatePropertyCondition(UIA_AutomationIdPropertyId, &VARIANT::from(BSTR::from(self.id))).ok()?;
+            let root = uia
+                .ElementFromHandle(windows::Win32::Foundation::HWND(tb))
+                .ok()?;
+            let cond = uia
+                .CreatePropertyCondition(
+                    UIA_AutomationIdPropertyId,
+                    &VARIANT::from(BSTR::from(self.id)),
+                )
+                .ok()?;
             root.FindFirst(TreeScope_Descendants, &cond).ok()
         }
     }
@@ -429,47 +498,75 @@ fn icons_right(walker: &IUIAutomationTreeWalker, frame: &IUIAutomationElement) -
 /// Poll the taskbar every 2 s; call `changed` when anything the gaps depend on moved.
 #[cfg(windows)]
 pub fn spawn_probe(changed: Box<dyn Fn() + Send>) {
-    let _ = thread::Builder::new().name("dock-probe".into()).spawn(move || {
-        use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED};
-        use windows::Win32::UI::Accessibility::CUIAutomation;
-        let uia: Option<IUIAutomation> = unsafe {
-            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-            CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).ok()
-        };
-        let Some(uia) = uia else { return };
-        let Ok(walker) = (unsafe { uia.ControlViewWalker() }) else { return };
-        let mut start = Button::new("StartButton", Duration::from_secs(4));
-        let mut widgets = Button::new("WidgetsButton", Duration::from_secs(30));
-        let mut frame = Button::new("TaskbarFrame", Duration::from_secs(4));
-        let mut tray = Button::new("SystemTrayIcon", Duration::from_secs(30));
-        let mut last_tb: HWND = std::ptr::null_mut();
-        let tray_class = wide("TrayNotifyWnd");
-        loop {
-            if !PAUSED.load(Ordering::Relaxed) {
-                let tb = target();
-                if tb != last_tb {
-                    last_tb = tb;
-                    for b in [&mut start, &mut widgets, &mut frame, &mut tray] {
-                        b.reset();
+    let _ = thread::Builder::new()
+        .name("dock-probe".into())
+        .spawn(move || {
+            use windows::Win32::System::Com::{
+                CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
+            };
+            use windows::Win32::UI::Accessibility::CUIAutomation;
+            let uia: Option<IUIAutomation> = unsafe {
+                let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+                CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).ok()
+            };
+            let Some(uia) = uia else { return };
+            let Ok(walker) = (unsafe { uia.ControlViewWalker() }) else {
+                return;
+            };
+            let mut start = Button::new("StartButton", Duration::from_secs(4));
+            let mut widgets = Button::new("WidgetsButton", Duration::from_secs(30));
+            let mut frame = Button::new("TaskbarFrame", Duration::from_secs(4));
+            let mut tray = Button::new("SystemTrayIcon", Duration::from_secs(30));
+            let mut last_tb: HWND = std::ptr::null_mut();
+            let tray_class = wide("TrayNotifyWnd");
+            loop {
+                if !PAUSED.load(Ordering::Relaxed) {
+                    let tb = target();
+                    if tb != last_tb {
+                        last_tb = tb;
+                        for b in [&mut start, &mut widgets, &mut frame, &mut tray] {
+                            b.reset();
+                        }
+                    }
+                    let s = start.edges(&uia, tb).map_or(UNKNOWN, |e| e.0);
+                    let (wl, wr) = widgets.edges(&uia, tb).unwrap_or((UNKNOWN, UNKNOWN));
+                    frame.edges(&uia, tb);
+                    let ir = frame
+                        .el
+                        .as_ref()
+                        .and_then(|f| icons_right(&walker, f))
+                        .unwrap_or(UNKNOWN);
+                    let has_tray_wnd = unsafe {
+                        !FindWindowExW(
+                            tb,
+                            std::ptr::null_mut(),
+                            tray_class.as_ptr(),
+                            std::ptr::null(),
+                        )
+                        .is_null()
+                    };
+                    let tl = if has_tray_wnd {
+                        UNKNOWN
+                    } else {
+                        tray.edges(&uia, tb).map_or(UNKNOWN, |e| e.0)
+                    };
+                    let mut moved = false;
+                    for (a, v) in [
+                        (&START_LEFT, s),
+                        (&WIDGETS_LEFT, wl),
+                        (&WIDGETS_RIGHT, wr),
+                        (&ICONS_RIGHT, ir),
+                        (&TRAY_LEFT, tl),
+                    ] {
+                        moved |= a.swap(v, Ordering::Relaxed) != v;
+                    }
+                    if moved {
+                        changed();
                     }
                 }
-                let s = start.edges(&uia, tb).map_or(UNKNOWN, |e| e.0);
-                let (wl, wr) = widgets.edges(&uia, tb).unwrap_or((UNKNOWN, UNKNOWN));
-                frame.edges(&uia, tb);
-                let ir = frame.el.as_ref().and_then(|f| icons_right(&walker, f)).unwrap_or(UNKNOWN);
-                let has_tray_wnd = unsafe { !FindWindowExW(tb, std::ptr::null_mut(), tray_class.as_ptr(), std::ptr::null()).is_null() };
-                let tl = if has_tray_wnd { UNKNOWN } else { tray.edges(&uia, tb).map_or(UNKNOWN, |e| e.0) };
-                let mut moved = false;
-                for (a, v) in [(&START_LEFT, s), (&WIDGETS_LEFT, wl), (&WIDGETS_RIGHT, wr), (&ICONS_RIGHT, ir), (&TRAY_LEFT, tl)] {
-                    moved |= a.swap(v, Ordering::Relaxed) != v;
-                }
-                if moved {
-                    changed();
-                }
+                thread::sleep(Duration::from_secs(2));
             }
-            thread::sleep(Duration::from_secs(2));
-        }
-    });
+        });
 }
 
 /// The taskbar probe needs Windows UI Automation; there is no portable equivalent.
@@ -482,19 +579,44 @@ mod tests {
 
     #[test]
     fn shell_windows_are_not_fullscreen_apps() {
-        assert!(shell_window("Windows.UI.Core.CoreWindow", r"C:\Windows\SystemApps\MicrosoftWindows.Client.CBS_cw5n1h2txyewy\SearchHost.exe"));
+        assert!(shell_window(
+            "Windows.UI.Core.CoreWindow",
+            r"C:\Windows\SystemApps\MicrosoftWindows.Client.CBS_cw5n1h2txyewy\SearchHost.exe"
+        ));
         assert!(shell_window("Shell_TrayWnd", ""));
-        assert!(shell_window("SomethingNew", r"C:\Windows\SystemApps\X\StartMenuExperienceHost.exe"));
-        assert!(shell_window("XamlExplorerHostIslandWindow", r"C:\Windows\explorer.exe"));
-        assert!(!shell_window("RiotWindowClass", r"C:\Riot Games\League of Legends\Game\League of Legends.exe"));
+        assert!(shell_window(
+            "SomethingNew",
+            r"C:\Windows\SystemApps\X\StartMenuExperienceHost.exe"
+        ));
+        assert!(shell_window(
+            "XamlExplorerHostIslandWindow",
+            r"C:\Windows\explorer.exe"
+        ));
+        assert!(!shell_window(
+            "RiotWindowClass",
+            r"C:\Riot Games\League of Legends\Game\League of Legends.exe"
+        ));
         assert!(!shell_window("UnityWndClass", ""));
-        assert!(!shell_window("Chrome_WidgetWin_1", r"C:\Program Files\Google\Chrome\Application\chrome.exe"));
+        assert!(!shell_window(
+            "Chrome_WidgetWin_1",
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+        ));
     }
 
-    const TB: RECT = RECT { left: 0, top: 1015, right: 1920, bottom: 1080 };
+    const TB: RECT = RECT {
+        left: 0,
+        top: 1015,
+        right: 1920,
+        bottom: 1080,
+    };
 
     fn seen(start_left: i32, widgets: (i32, i32), icons_right: i32, tray_left: i32) -> Seen {
-        Seen { start_left, widgets, icons_right, tray_left }
+        Seen {
+            start_left,
+            widgets,
+            icons_right,
+            tray_left,
+        }
     }
 
     #[test]
@@ -504,7 +626,10 @@ mod tests {
         assert_eq!((l, r), (Some((0, 504)), Some((1416, 1599))));
         assert_eq!(choose(l, r, 140), Some(Side::Left));
         // Widgets on, at the far left
-        assert_eq!(gaps(&TB, &seen(504, (0, 170), 1416, 1599)).0, Some((170, 504)));
+        assert_eq!(
+            gaps(&TB, &seen(504, (0, 170), 1416, 1599)).0,
+            Some((170, 504))
+        );
     }
 
     #[test]
@@ -518,8 +643,14 @@ mod tests {
 
     #[test]
     fn choose_prefers_left_until_right_is_clearly_wider() {
-        assert_eq!(choose(Some((0, 300)), Some((0, 380)), 140), Some(Side::Left));
-        assert_eq!(choose(Some((0, 300)), Some((0, 400)), 140), Some(Side::Right));
+        assert_eq!(
+            choose(Some((0, 300)), Some((0, 380)), 140),
+            Some(Side::Left)
+        );
+        assert_eq!(
+            choose(Some((0, 300)), Some((0, 400)), 140),
+            Some(Side::Right)
+        );
         assert_eq!(choose(Some((0, 100)), Some((0, 90)), 140), None);
         assert_eq!(choose(None, Some((0, 150)), 140), Some(Side::Right));
     }

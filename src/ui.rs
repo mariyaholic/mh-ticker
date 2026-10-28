@@ -23,8 +23,8 @@
 use crate::config::{self, Config, Placement};
 use crate::device;
 use crate::dock;
-use crate::panel;
 use crate::model::{fmt_change, fmt_price, Board, Cell, Link};
+use crate::panel;
 use mh_session::view::{build_view, DeviceInfo, SessionView, ViewOptions};
 use std::cell::RefCell;
 use std::ptr::{null, null_mut};
@@ -32,13 +32,19 @@ use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use windows_sys::Win32::Foundation::*;
-use windows_sys::Win32::Graphics::Dwm::{DwmFlush, DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND};
+use windows_sys::Win32::Graphics::Dwm::{
+    DwmFlush, DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+};
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_ESCAPE};
-use windows_sys::Win32::UI::HiDpi::{GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
+use windows_sys::Win32::UI::HiDpi::{
+    GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_ESCAPE,
+};
 use windows_sys::Win32::UI::Shell::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
@@ -183,7 +189,11 @@ thread_local! {
 }
 
 fn with_ui<R>(f: impl FnOnce(&mut Ui) -> R) -> Option<R> {
-    UI.with(|cell| cell.try_borrow_mut().ok().and_then(|mut g| g.as_mut().map(f)))
+    UI.with(|cell| {
+        cell.try_borrow_mut()
+            .ok()
+            .and_then(|mut g| g.as_mut().map(f))
+    })
 }
 
 /// False when another MH Ticker already runs (one strip, one tray icon).
@@ -197,12 +207,28 @@ pub fn single_instance() -> bool {
 
 fn make_font(cfg: &Config, dpi: u32) -> HFONT {
     let face = wide(&cfg.font);
-    let pt = if cfg.placement().on_taskbar() { cfg.dock_font_pt } else { cfg.font_pt };
+    let pt = if cfg.placement().on_taskbar() {
+        cfg.dock_font_pt
+    } else {
+        cfg.font_pt
+    };
     let height = -(pt * dpi as i32 / 72);
     unsafe {
         CreateFontW(
-            height, 0, 0, 0, FW_SEMIBOLD as _, 0, 0, 0, DEFAULT_CHARSET as _, OUT_DEFAULT_PRECIS as _,
-            CLIP_DEFAULT_PRECIS as _, CLEARTYPE_QUALITY as _, (DEFAULT_PITCH | FF_DONTCARE) as _, face.as_ptr(),
+            height,
+            0,
+            0,
+            0,
+            FW_SEMIBOLD as _,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET as _,
+            OUT_DEFAULT_PRECIS as _,
+            CLIP_DEFAULT_PRECIS as _,
+            CLEARTYPE_QUALITY as _,
+            (DEFAULT_PITCH | FF_DONTCARE) as _,
+            face.as_ptr(),
         )
     }
 }
@@ -214,7 +240,12 @@ fn make_icon(color: COLORREF) -> HICON {
         let n = GetSystemMetrics(SM_CXSMICON).max(16);
         let screen = GetDC(null_mut());
         let dc = CreateCompatibleDC(screen);
-        let full = RECT { left: 0, top: 0, right: n, bottom: n };
+        let full = RECT {
+            left: 0,
+            top: 0,
+            right: n,
+            bottom: n,
+        };
         let radius = n / 3;
         // mask: 1 = transparent, 0 = opaque (the rounded tile)
         let mask = CreateBitmap(n, n, 1, 1, null());
@@ -230,12 +261,23 @@ fn make_icon(color: COLORREF) -> HICON {
         SelectObject(dc, tile);
         RoundRect(dc, 0, 0, n + 1, n + 1, radius, radius);
         let f = |a: i32| a * n / 16;
-        let line = [POINT { x: f(3), y: f(11) }, POINT { x: f(6), y: f(8) }, POINT { x: f(9), y: f(10) }, POINT { x: f(13), y: f(4) }];
+        let line = [
+            POINT { x: f(3), y: f(11) },
+            POINT { x: f(6), y: f(8) },
+            POINT { x: f(9), y: f(10) },
+            POINT { x: f(13), y: f(4) },
+        ];
         let pen = CreatePen(PS_SOLID, (n / 8).max(2), color);
         SelectObject(dc, pen);
         Polyline(dc, line.as_ptr(), line.len() as i32);
         SelectObject(dc, old);
-        let info = ICONINFO { fIcon: 1, xHotspot: 0, yHotspot: 0, hbmMask: mask, hbmColor: colour };
+        let info = ICONINFO {
+            fIcon: 1,
+            xHotspot: 0,
+            yHotspot: 0,
+            hbmMask: mask,
+            hbmColor: colour,
+        };
         let icon = CreateIconIndirect(&info);
         DeleteObject(pen);
         DeleteObject(tile);
@@ -253,10 +295,21 @@ fn cell_texts(c: &Cell) -> (String, String, COLORREF, Option<(String, COLORREF)>
     match &c.quote {
         Some(q) => {
             let change = q.change_pct.map(|p| {
-                let col = if c.stale { DIM } else if p >= 0.0 { UP } else { DOWN };
+                let col = if c.stale {
+                    DIM
+                } else if p >= 0.0 {
+                    UP
+                } else {
+                    DOWN
+                };
                 (fmt_change(p), col)
             });
-            (label, fmt_price(q.price, c.digits), if c.stale { DIM } else { PRICE }, change)
+            (
+                label,
+                fmt_price(q.price, c.digits),
+                if c.stale { DIM } else { PRICE },
+                change,
+            )
         }
         None => (label, "--".into(), DIM, None),
     }
@@ -270,7 +323,12 @@ fn text_size(dc: HDC, s: &str) -> (i32, i32) {
 }
 
 fn text_run(x: i32, y: i32, s: &str, color: COLORREF) -> Run {
-    Run { x, y, text: s.encode_utf16().collect(), color }
+    Run {
+        x,
+        y,
+        text: s.encode_utf16().collect(),
+        color,
+    }
 }
 
 /// Free mode: everything on one row.
@@ -317,10 +375,22 @@ fn layout_grid(dc: HDC, cells: &[Cell], dpi: u32, rows: usize, show_change: bool
             x += gap_l;
         }
         let texts: Vec<_> = col.iter().map(cell_texts).collect();
-        let lw = texts.iter().map(|t| text_size(dc, &t.0).0).max().unwrap_or(0);
-        let pw = texts.iter().map(|t| text_size(dc, &t.1).0).max().unwrap_or(0);
+        let lw = texts
+            .iter()
+            .map(|t| text_size(dc, &t.0).0)
+            .max()
+            .unwrap_or(0);
+        let pw = texts
+            .iter()
+            .map(|t| text_size(dc, &t.1).0)
+            .max()
+            .unwrap_or(0);
         let cw = if show_change {
-            texts.iter().filter_map(|t| t.3.as_ref().map(|(c, _)| text_size(dc, c).0)).max().unwrap_or(0)
+            texts
+                .iter()
+                .filter_map(|t| t.3.as_ref().map(|(c, _)| text_size(dc, c).0))
+                .max()
+                .unwrap_or(0)
         } else {
             0
         };
@@ -370,7 +440,9 @@ fn layout(u: &Ui, avail: Option<i32>) -> Frame {
                         }
                     }
                 }
-                pick.unwrap_or_else(|| layout_grid(dc, &cells[..cells.len().min(1)], u.dpi, rows, false))
+                pick.unwrap_or_else(|| {
+                    layout_grid(dc, &cells[..cells.len().min(1)], u.dpi, rows, false)
+                })
             }
         };
         SelectObject(dc, old);
@@ -383,7 +455,16 @@ fn layout(u: &Ui, avail: Option<i32>) -> Frame {
 fn draw_strip(u: &Ui, dc: HDC) {
     unsafe {
         let (w, h) = (u.frame.w.max(1), u.frame.h.max(1));
-        FillRect(dc, &RECT { left: 0, top: 0, right: w, bottom: h }, u.bg);
+        FillRect(
+            dc,
+            &RECT {
+                left: 0,
+                top: 0,
+                right: w,
+                bottom: h,
+            },
+            u.bg,
+        );
         let old_font = SelectObject(dc, u.font);
         SetBkMode(dc, TRANSPARENT as _);
         for r in &u.frame.runs {
@@ -405,7 +486,18 @@ fn draw_strip(u: &Ui, dc: HDC) {
 fn draw_panel(u: &Ui, dc: HDC, w: i32, h: i32) {
     if let Some(f) = &u.fonts {
         let view = session_view(u);
-        panel::draw(dc, w, h, &u.view, &u.hist, f, u.dpi, u.hover, crate::source::now_s(), view.as_ref());
+        panel::draw(
+            dc,
+            w,
+            h,
+            &u.view,
+            &u.hist,
+            f,
+            u.dpi,
+            u.hover,
+            crate::source::now_s(),
+            view.as_ref(),
+        );
     }
 }
 
@@ -452,7 +544,12 @@ fn draw_morph(m: &Morph, dc: HDC, w: i32, h: i32) {
         StretchBlt(dc, 0, 0, w, h, src, 0, 0, m.from_sz.0, m.from_sz.1, SRCCOPY);
         let alpha = ((m.t - 0.1) / 0.7).clamp(0.0, 1.0);
         SelectObject(src, m.to);
-        let blend = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, BlendFlags: 0, SourceConstantAlpha: (alpha * 255.0) as u8, AlphaFormat: 0 };
+        let blend = BLENDFUNCTION {
+            BlendOp: AC_SRC_OVER as u8,
+            BlendFlags: 0,
+            SourceConstantAlpha: (alpha * 255.0) as u8,
+            AlphaFormat: 0,
+        };
         AlphaBlend(dc, 0, 0, w, h, src, 0, 0, m.to_sz.0, m.to_sz.1, blend);
         SelectObject(src, old);
         DeleteDC(src);
@@ -548,9 +645,22 @@ fn primary_work() -> RECT {
 fn corner(work: &RECT, p: Placement, f: &Frame, m: i32) -> RECT {
     let left = matches!(p, Placement::TopLeft | Placement::BottomLeft);
     let top = matches!(p, Placement::TopRight | Placement::TopLeft);
-    let x = if left { work.left + m } else { work.right - m - f.w };
-    let y = if top { work.top + m } else { work.bottom - m - f.h };
-    RECT { left: x, top: y, right: x + f.w, bottom: y + f.h }
+    let x = if left {
+        work.left + m
+    } else {
+        work.right - m - f.w
+    };
+    let y = if top {
+        work.top + m
+    } else {
+        work.bottom - m - f.h
+    };
+    RECT {
+        left: x,
+        top: y,
+        right: x + f.w,
+        bottom: y + f.h,
+    }
 }
 
 /// Recompute the strip frame and where it goes (`Placement`):
@@ -568,7 +678,8 @@ fn strip_place(u: &mut Ui) -> RECT {
     dock::set_target(tb);
     let work = mon.as_ref().map(|m| m.work).unwrap_or_else(primary_work);
     if p.on_taskbar() {
-        let bar = dock::rect(tb).filter(|r| r.right - r.left > r.bottom - r.top && !dock::autohide());
+        let bar =
+            dock::rect(tb).filter(|r| r.right - r.left > r.bottom - r.top && !dock::autohide());
         if let Some(r) = bar {
             let (left, right) = dock::spans(tb, &r);
             let gap = match p {
@@ -584,7 +695,12 @@ fn strip_place(u: &mut Ui) -> RECT {
             if let Some((a, b)) = gap {
                 u.frame = layout(u, Some(b - a - 2 * margin));
                 let (x, y) = (a + margin, r.top + (r.bottom - r.top - u.frame.h) / 2);
-                return RECT { left: x, top: y, right: x + u.frame.w, bottom: y + u.frame.h };
+                return RECT {
+                    left: x,
+                    top: y,
+                    right: x + u.frame.w,
+                    bottom: y + u.frame.h,
+                };
             }
         }
         u.frame = layout(u, Some((work.right - work.left) / 2));
@@ -602,9 +718,21 @@ fn strip_place(u: &mut Ui) -> RECT {
     } else {
         let r = u.strip_rect;
         let right_half = (r.left + r.right) / 2 > (work.left + work.right) / 2;
-        (if right_half && r.right > r.left { r.right - w } else { r.left }, r.top)
+        (
+            if right_half && r.right > r.left {
+                r.right - w
+            } else {
+                r.left
+            },
+            r.top,
+        )
     };
-    RECT { left: x, top: y, right: x + w, bottom: y + h }
+    RECT {
+        left: x,
+        top: y,
+        right: x + w,
+        bottom: y + h,
+    }
 }
 
 /// Re-fit and move the strip (no-op while the panel is open or morphing).
@@ -619,7 +747,15 @@ fn relayout_and_place(hwnd: HWND) {
         return;
     };
     unsafe {
-        SetWindowPos(hwnd, null_mut(), r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
+        SetWindowPos(
+            hwnd,
+            null_mut(),
+            r.left,
+            r.top,
+            r.right - r.left,
+            r.bottom - r.top,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        );
         InvalidateRect(hwnd, null(), 0);
     }
 }
@@ -663,7 +799,10 @@ fn on_feed(hwnd: HWND) {
 }
 
 fn apply_visibility(hwnd: HWND) {
-    let Some(show) = with_ui(|u| u.mode != Mode::Strip || (u.cfg.strip_visible && !u.suppressed)) else { return };
+    let Some(show) = with_ui(|u| u.mode != Mode::Strip || (u.cfg.strip_visible && !u.suppressed))
+    else {
+        return;
+    };
     dock::set_paused(!show);
     unsafe {
         let visible = IsWindowVisible(hwnd) != 0;
@@ -679,7 +818,15 @@ fn apply_visibility(hwnd: HWND) {
 
 fn set_topmost(hwnd: HWND, on: bool) {
     unsafe {
-        SetWindowPos(hwnd, if on { HWND_TOPMOST } else { HWND_NOTOPMOST }, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        SetWindowPos(
+            hwnd,
+            if on { HWND_TOPMOST } else { HWND_NOTOPMOST },
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
     }
 }
 
@@ -687,9 +834,13 @@ fn set_topmost(hwnd: HWND, on: bool) {
 /// app is in front, climb back above the taskbar after a taskbar click, and undo anything else
 /// that moved or hid the strip behind its back (a screenshot or automation tool, a shell restart).
 fn dock_check(hwnd: HWND) {
-    let Some((strip, dock, was)) =
-        with_ui(|u| (u.mode == Mode::Strip, u.mode == Mode::Strip && u.cfg.placement().on_taskbar(), u.suppressed))
-    else {
+    let Some((strip, dock, was)) = with_ui(|u| {
+        (
+            u.mode == Mode::Strip,
+            u.mode == Mode::Strip && u.cfg.placement().on_taskbar(),
+            u.suppressed,
+        )
+    }) else {
         return;
     };
     // Every placement steps aside for a fullscreen app; only a taskbar one climbs back over the taskbar.
@@ -733,7 +884,13 @@ fn own_by_taskbar(hwnd: HWND, dock: bool) {
 /// is left alone: the user drags it, and a drag saves on `WM_EXITSIZEMOVE`.
 fn heal(hwnd: HWND) {
     let Some((show, fixed, want)) = with_ui(|u| {
-        (u.mode == Mode::Strip).then(|| (u.cfg.strip_visible && !u.suppressed, u.cfg.placement() != Placement::Floating, u.strip_rect))
+        (u.mode == Mode::Strip).then(|| {
+            (
+                u.cfg.strip_visible && !u.suppressed,
+                u.cfg.placement() != Placement::Floating,
+                u.strip_rect,
+            )
+        })
     })
     .flatten() else {
         return;
@@ -755,7 +912,15 @@ fn heal(hwnd: HWND) {
     }
 }
 
-unsafe extern "system" fn on_win_event(_: HWINEVENTHOOK, _: u32, _: HWND, _: i32, _: i32, _: u32, _: u32) {
+unsafe extern "system" fn on_win_event(
+    _: HWINEVENTHOOK,
+    _: u32,
+    _: HWND,
+    _: i32,
+    _: i32,
+    _: u32,
+    _: u32,
+) {
     let h = STRIP.load(Ordering::Relaxed);
     if h != 0 {
         PostMessageW(h as HWND, WM_FGCHANGE, 0, 0);
@@ -779,10 +944,25 @@ fn ease_in_out(t: f64) -> f64 {
 /// synchronously and paced by `DwmFlush` (one frame per vsync). Blocks the UI thread for `ms`;
 /// posted feed updates wait in the queue meanwhile.
 #[allow(clippy::too_many_arguments)]
-fn run_morph(hwnd: HWND, a: RECT, b: RECT, from: (HBITMAP, (i32, i32)), to: (HBITMAP, (i32, i32)), alpha: (u8, u8), ms: f64, ease: fn(f64) -> f64) {
+fn run_morph(
+    hwnd: HWND,
+    a: RECT,
+    b: RECT,
+    from: (HBITMAP, (i32, i32)),
+    to: (HBITMAP, (i32, i32)),
+    alpha: (u8, u8),
+    ms: f64,
+    ease: fn(f64) -> f64,
+) {
     with_ui(|u| {
         u.mode = Mode::Morph;
-        u.morph = Some(Morph { from: from.0, from_sz: from.1, to: to.0, to_sz: to.1, t: 0.0 });
+        u.morph = Some(Morph {
+            from: from.0,
+            from_sz: from.1,
+            to: to.0,
+            to_sz: to.1,
+            t: 0.0,
+        });
     });
     let start = Instant::now();
     loop {
@@ -794,11 +974,24 @@ fn run_morph(hwnd: HWND, a: RECT, b: RECT, from: (HBITMAP, (i32, i32)), to: (HBI
             }
         });
         let lerp = |p: i32, q: i32| p + ((q - p) as f64 * e).round() as i32;
-        let (l, tp, r, bt) = (lerp(a.left, b.left), lerp(a.top, b.top), lerp(a.right, b.right), lerp(a.bottom, b.bottom));
+        let (l, tp, r, bt) = (
+            lerp(a.left, b.left),
+            lerp(a.top, b.top),
+            lerp(a.right, b.right),
+            lerp(a.bottom, b.bottom),
+        );
         let op = (alpha.0 as f64 + (alpha.1 as f64 - alpha.0 as f64) * e).round() as u8;
         unsafe {
             SetLayeredWindowAttributes(hwnd, 0, op, LWA_ALPHA);
-            SetWindowPos(hwnd, null_mut(), l, tp, r - l, bt - tp, SWP_NOZORDER | SWP_NOACTIVATE);
+            SetWindowPos(
+                hwnd,
+                null_mut(),
+                l,
+                tp,
+                r - l,
+                bt - tp,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
             RedrawWindow(hwnd, null(), null_mut(), RDW_INVALIDATE | RDW_UPDATENOW);
             DwmFlush();
         }
@@ -825,7 +1018,12 @@ fn panel_rect(near: &RECT, w: i32, h: i32) -> RECT {
         let wa = mi.rcWork;
         let x = wa.left + (wa.right - wa.left - w) / 2;
         let y = wa.top + (wa.bottom - wa.top - h) / 2;
-        RECT { left: x, top: y, right: x + w, bottom: y + h }
+        RECT {
+            left: x,
+            top: y,
+            right: x + w,
+            bottom: y + h,
+        }
     }
 }
 
@@ -855,13 +1053,29 @@ fn expand(hwnd: HWND) {
         if IsWindowVisible(hwnd) == 0 {
             ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         }
-        SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
         SetForegroundWindow(hwnd);
     }
     run_morph(hwnd, a, b, from, to, (op, 255), EXPAND_MS, ease_out);
     with_ui(|u| u.mode = Mode::Panel);
     unsafe {
-        SetWindowPos(hwnd, null_mut(), b.left, b.top, b.right - b.left, b.bottom - b.top, SWP_NOZORDER | SWP_NOACTIVATE);
+        SetWindowPos(
+            hwnd,
+            null_mut(),
+            b.left,
+            b.top,
+            b.right - b.left,
+            b.bottom - b.top,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        );
         InvalidateRect(hwnd, null(), 0);
         SetFocus(hwnd);
     }
@@ -881,7 +1095,14 @@ fn collapse(hwnd: HWND) {
         u.strip_rect = strip_place(u);
         let fsz = (u.frame.w.max(1), u.frame.h.max(1));
         let to = snapshot(hwnd, fsz.0, fsz.1, |dc| draw_strip(u, dc));
-        Some((a, u.strip_rect, (from, psz), (to, fsz), std::mem::replace(&mut u.prev_fg, null_mut()), u.cfg.opacity))
+        Some((
+            a,
+            u.strip_rect,
+            (from, psz),
+            (to, fsz),
+            std::mem::replace(&mut u.prev_fg, null_mut()),
+            u.cfg.opacity,
+        ))
     })
     .flatten() else {
         return;
@@ -889,7 +1110,15 @@ fn collapse(hwnd: HWND) {
     run_morph(hwnd, a, b, from, to, (255, op), COLLAPSE_MS, ease_in_out);
     with_ui(|u| u.mode = Mode::Strip);
     unsafe {
-        SetWindowPos(hwnd, null_mut(), b.left, b.top, b.right - b.left, b.bottom - b.top, SWP_NOZORDER | SWP_NOACTIVATE);
+        SetWindowPos(
+            hwnd,
+            null_mut(),
+            b.left,
+            b.top,
+            b.right - b.left,
+            b.bottom - b.top,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        );
         InvalidateRect(hwnd, null(), 0);
         if !prev.is_null() && IsWindow(prev) != 0 && prev != hwnd {
             SetForegroundWindow(prev);
@@ -902,13 +1131,30 @@ fn collapse(hwnd: HWND) {
 fn menu(hwnd: HWND) {
     let Some((visible, top, docked, status, open, list, shown, sessions_on)) = with_ui(|u| {
         let list = config::menu_list(&u.cfg);
-        let shown: Vec<bool> = list.iter().map(|r| config::is_shown(&u.cfg, &r.symbol)).collect();
-        let note = if u.view.note.is_empty() { link_name(u.view.link).to_string() } else { u.view.note.clone() };
-        (u.cfg.strip_visible, u.cfg.topmost, u.cfg.placement().on_taskbar(), note, u.mode != Mode::Strip, list, shown, u.cfg.sessions.enabled)
+        let shown: Vec<bool> = list
+            .iter()
+            .map(|r| config::is_shown(&u.cfg, &r.symbol))
+            .collect();
+        let note = if u.view.note.is_empty() {
+            link_name(u.view.link).to_string()
+        } else {
+            u.view.note.clone()
+        };
+        (
+            u.cfg.strip_visible,
+            u.cfg.topmost,
+            u.cfg.placement().on_taskbar(),
+            note,
+            u.mode != Mode::Strip,
+            list,
+            shown,
+            u.cfg.sessions.enabled,
+        )
     }) else {
         return;
     };
-    let (placement, cur_mon) = with_ui(|u| (u.cfg.placement(), u.cfg.monitor.clone())).unwrap_or((Placement::Auto, None));
+    let (placement, cur_mon) =
+        with_ui(|u| (u.cfg.placement(), u.cfg.monitor.clone())).unwrap_or((Placement::Auto, None));
     let mons = dock::monitors();
     let cmd = unsafe {
         let m = CreatePopupMenu();
@@ -924,40 +1170,98 @@ fn menu(hwnd: HWND) {
         for (i, r) in list.iter().enumerate() {
             let on = shown[i];
             let locked = if on { n_shown <= 1 } else { full };
-            let flags = MF_STRING | if on { MF_CHECKED } else { 0 } | if locked { MF_GRAYED } else { 0 };
-            let text = if r.name.is_empty() { r.label.clone() } else { format!("{}\t{}", r.label, r.name) };
+            let flags =
+                MF_STRING | if on { MF_CHECKED } else { 0 } | if locked { MF_GRAYED } else { 0 };
+            let text = if r.name.is_empty() {
+                r.label.clone()
+            } else {
+                format!("{}\t{}", r.label, r.name)
+            };
             add(syms, flags, CMD_SYM + i, &text);
         }
         AppendMenuW(syms, MF_SEPARATOR, 0, null());
         add(syms, MF_STRING, CMD_RESET, "Reset to default");
-        item(MF_STRING, CMD_PANEL, if open { "Back to taskbar" } else { "Expand view" });
+        item(
+            MF_STRING,
+            CMD_PANEL,
+            if open {
+                "Back to taskbar"
+            } else {
+                "Expand view"
+            },
+        );
         SetMenuDefaultItem(m, CMD_PANEL as u32, 0);
         add(m, MF_POPUP, syms as usize, &format!("Symbols ({n_shown})"));
         AppendMenuW(m, MF_SEPARATOR, 0, null());
-        item(MF_STRING | if visible { MF_CHECKED } else { 0 }, CMD_STRIP, "Show strip");
+        item(
+            MF_STRING | if visible { MF_CHECKED } else { 0 },
+            CMD_STRIP,
+            "Show strip",
+        );
         // Position: where the strip sits (and on which display, when there are several).
         let pos = CreatePopupMenu();
         for (i, p) in Placement::ALL.iter().enumerate() {
             add(pos, MF_STRING, CMD_POS + i, p.label());
         }
-        let cur = Placement::ALL.iter().position(|p| *p == placement).unwrap_or(0);
+        let cur = Placement::ALL
+            .iter()
+            .position(|p| *p == placement)
+            .unwrap_or(0);
         let last = CMD_POS + Placement::ALL.len() - 1;
-        CheckMenuRadioItem(pos, CMD_POS as u32, last as u32, (CMD_POS + cur) as u32, MF_BYCOMMAND);
+        CheckMenuRadioItem(
+            pos,
+            CMD_POS as u32,
+            last as u32,
+            (CMD_POS + cur) as u32,
+            MF_BYCOMMAND,
+        );
         if mons.len() > 1 {
             AppendMenuW(pos, MF_SEPARATOR, 0, null());
             let primary = mons.iter().position(|d| d.primary).unwrap_or(0);
-            let active = mons.iter().position(|d| Some(&d.device) == cur_mon.as_ref()).unwrap_or(primary);
+            let active = mons
+                .iter()
+                .position(|d| Some(&d.device) == cur_mon.as_ref())
+                .unwrap_or(primary);
             for (i, d) in mons.iter().enumerate() {
-                let (w, h) = (d.bounds.right - d.bounds.left, d.bounds.bottom - d.bounds.top);
+                let (w, h) = (
+                    d.bounds.right - d.bounds.left,
+                    d.bounds.bottom - d.bounds.top,
+                );
                 let main = if d.primary { ", main" } else { "" };
-                add(pos, MF_STRING, CMD_MON + i, &format!("Display {}{main}\t{w} x {h}", i + 1));
+                add(
+                    pos,
+                    MF_STRING,
+                    CMD_MON + i,
+                    &format!("Display {}{main}\t{w} x {h}", i + 1),
+                );
             }
             let lastm = CMD_MON + mons.len() - 1;
-            CheckMenuRadioItem(pos, CMD_MON as u32, lastm as u32, (CMD_MON + active) as u32, MF_BYCOMMAND);
+            CheckMenuRadioItem(
+                pos,
+                CMD_MON as u32,
+                lastm as u32,
+                (CMD_MON + active) as u32,
+                MF_BYCOMMAND,
+            );
         }
-        add(m, MF_POPUP | if open { MF_GRAYED } else { 0 }, pos as usize, "Position");
-        item(MF_STRING | if top || docked { MF_CHECKED } else { 0 } | if docked { MF_GRAYED } else { 0 }, CMD_TOP, "Always on top");
-        item(MF_STRING | if sessions_on { MF_CHECKED } else { 0 }, CMD_SESSIONS, "Session timers");
+        add(
+            m,
+            MF_POPUP | if open { MF_GRAYED } else { 0 },
+            pos as usize,
+            "Position",
+        );
+        item(
+            MF_STRING
+                | if top || docked { MF_CHECKED } else { 0 }
+                | if docked { MF_GRAYED } else { 0 },
+            CMD_TOP,
+            "Always on top",
+        );
+        item(
+            MF_STRING | if sessions_on { MF_CHECKED } else { 0 },
+            CMD_SESSIONS,
+            "Session timers",
+        );
         AppendMenuW(m, MF_SEPARATOR, 0, null());
         let status: String = status.chars().take(90).collect();
         item(MF_STRING | MF_GRAYED, CMD_STATUS, &status);
@@ -968,7 +1272,15 @@ fn menu(hwnd: HWND) {
         let mut pt = POINT { x: 0, y: 0 };
         GetCursorPos(&mut pt);
         SetForegroundWindow(hwnd);
-        let cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, null());
+        let cmd = TrackPopupMenu(
+            m,
+            TPM_RETURNCMD | TPM_RIGHTBUTTON,
+            pt.x,
+            pt.y,
+            0,
+            hwnd,
+            null(),
+        );
         PostMessageW(hwnd, WM_NULL, 0, 0);
         DestroyMenu(m);
         cmd as usize
@@ -1017,13 +1329,20 @@ fn menu(hwnd: HWND) {
                 "MH Ticker 1.3.0\n\nmade with love by maria\nMIT licensed.\n\nSession times are conventions, not guaranteed exchange hours.\nNot financial advice.\n\nNot affiliated with TradingView or MetaQuotes; MT5 is a MetaQuotes trademark.",
             );
             let title = wide("About MH Ticker");
-            MessageBoxW(hwnd, text.as_ptr(), title.as_ptr(), MB_OK | MB_ICONINFORMATION);
+            MessageBoxW(
+                hwnd,
+                text.as_ptr(),
+                title.as_ptr(),
+                MB_OK | MB_ICONINFORMATION,
+            );
         },
         CMD_FOLDER => {
             if let Some(dir) = config::path().parent() {
                 let d = wide(&dir.to_string_lossy());
                 let op = wide("open");
-                unsafe { ShellExecuteW(hwnd, op.as_ptr(), d.as_ptr(), null(), null(), SW_SHOWNORMAL) };
+                unsafe {
+                    ShellExecuteW(hwnd, op.as_ptr(), d.as_ptr(), null(), null(), SW_SHOWNORMAL)
+                };
             }
         }
         CMD_EXIT => unsafe {
@@ -1082,7 +1401,15 @@ fn apply_rows(hwnd: HWND) {
     };
     match panel {
         Some(r) => unsafe {
-            SetWindowPos(hwnd, null_mut(), r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
+            SetWindowPos(
+                hwnd,
+                null_mut(),
+                r.left,
+                r.top,
+                r.right - r.left,
+                r.bottom - r.top,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
             InvalidateRect(hwnd, null(), 0);
         },
         None => relayout_and_place(hwnd),
@@ -1105,7 +1432,15 @@ fn apply_sessions(hwnd: HWND) {
     .flatten();
     if let Some(r) = rect {
         unsafe {
-            SetWindowPos(hwnd, null_mut(), r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
+            SetWindowPos(
+                hwnd,
+                null_mut(),
+                r.left,
+                r.top,
+                r.right - r.left,
+                r.bottom - r.top,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
         }
     }
     unsafe { InvalidateRect(hwnd, null(), 0) };
@@ -1170,14 +1505,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_NCHITTEST => {
             let Some((mode, dock, header, btn)) = with_ui(|u| {
                 let g = panel::geometry(u.view.cells.len(), u.dpi, u.cfg.sessions.enabled);
-                (u.mode, u.cfg.placement() != Placement::Floating, g.header, g.btn)
+                (
+                    u.mode,
+                    u.cfg.placement() != Placement::Floating,
+                    g.header,
+                    g.btn,
+                )
             }) else {
                 return HTCLIENT as LRESULT;
             };
             match mode {
                 Mode::Strip if !dock => HTCAPTION as LRESULT,
                 Mode::Panel => {
-                    let mut pt = POINT { x: (lp & 0xffff) as i16 as i32, y: ((lp >> 16) & 0xffff) as i16 as i32 };
+                    let mut pt = POINT {
+                        x: (lp & 0xffff) as i16 as i32,
+                        y: ((lp >> 16) & 0xffff) as i16 as i32,
+                    };
                     ScreenToClient(hwnd, &mut pt);
                     if pt.y < header && !panel::in_rect(&btn, pt.x, pt.y) {
                         HTCAPTION as LRESULT
@@ -1198,7 +1541,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_SETCURSOR => {
             let fixed = |u: &Ui| u.cfg.placement() != Placement::Floating;
-            let hand = with_ui(|u| (u.mode == Mode::Strip && fixed(u)) || (u.mode == Mode::Panel && u.hover)).unwrap_or(false);
+            let hand = with_ui(|u| {
+                (u.mode == Mode::Strip && fixed(u)) || (u.mode == Mode::Panel && u.hover)
+            })
+            .unwrap_or(false);
             if hand && (lp & 0xffff) as u32 == HTCLIENT {
                 SetCursor(LoadCursorW(null_mut(), IDC_HAND));
                 return 1;
@@ -1206,10 +1552,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             DefWindowProcW(hwnd, msg, wp, lp)
         }
         WM_LBUTTONUP => {
-            let (x, y) = ((lp & 0xffff) as i16 as i32, ((lp >> 16) & 0xffff) as i16 as i32);
+            let (x, y) = (
+                (lp & 0xffff) as i16 as i32,
+                ((lp >> 16) & 0xffff) as i16 as i32,
+            );
             let what = with_ui(|u| {
                 let g = panel::geometry(u.view.cells.len(), u.dpi, u.cfg.sessions.enabled);
-                (u.mode, u.cfg.placement() != Placement::Floating, panel::in_rect(&g.btn, x, y))
+                (
+                    u.mode,
+                    u.cfg.placement() != Placement::Floating,
+                    panel::in_rect(&g.btn, x, y),
+                )
             });
             match what {
                 Some((Mode::Strip, true, _)) => expand(hwnd),
@@ -1219,7 +1572,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_MOUSEMOVE => {
-            let (x, y) = ((lp & 0xffff) as i16 as i32, ((lp >> 16) & 0xffff) as i16 as i32);
+            let (x, y) = (
+                (lp & 0xffff) as i16 as i32,
+                ((lp >> 16) & 0xffff) as i16 as i32,
+            );
             let state = with_ui(|u| {
                 if u.mode != Mode::Panel {
                     return (false, false);
@@ -1234,7 +1590,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             });
             if let Some((changed, track)) = state {
                 if track {
-                    let mut tme = TRACKMOUSEEVENT { cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: hwnd, dwHoverTime: 0 };
+                    let mut tme = TRACKMOUSEEVENT {
+                        cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                        dwFlags: TME_LEAVE,
+                        hwndTrack: hwnd,
+                        dwHoverTime: 0,
+                    };
                     TrackMouseEvent(&mut tme);
                 }
                 if changed {
@@ -1285,7 +1646,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 u.dpi = dpi;
                 u.font = make_font(&u.cfg, dpi);
                 u.fonts = u.fonts.take().map(|_| panel::Fonts::new(&u.cfg.font, dpi));
-                (u.mode == Mode::Panel).then(|| panel::geometry(u.view.cells.len(), dpi, u.cfg.sessions.enabled))
+                (u.mode == Mode::Panel)
+                    .then(|| panel::geometry(u.view.cells.len(), dpi, u.cfg.sessions.enabled))
             })
             .flatten();
             match open {
@@ -1293,7 +1655,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     let mut r: RECT = std::mem::zeroed();
                     GetWindowRect(hwnd, &mut r);
                     let b = panel_rect(&r, g.w, g.h);
-                    SetWindowPos(hwnd, null_mut(), b.left, b.top, g.w, g.h, SWP_NOZORDER | SWP_NOACTIVATE);
+                    SetWindowPos(
+                        hwnd,
+                        null_mut(),
+                        b.left,
+                        b.top,
+                        g.w,
+                        g.h,
+                        SWP_NOZORDER | SWP_NOACTIVATE,
+                    );
                 }
                 None => relayout_and_place(hwnd),
             }
@@ -1361,19 +1731,46 @@ pub fn run(cfg: Config, board: Arc<Mutex<Board>>) {
         };
         RegisterClassW(&wc);
         let title = wide("MH Ticker");
-        let ex = WS_EX_TOOLWINDOW | WS_EX_LAYERED | if cfg.topmost || cfg.placement().on_taskbar() { WS_EX_TOPMOST } else { 0 };
-        let hwnd = CreateWindowExW(ex, class.as_ptr(), title.as_ptr(), WS_POPUP, 0, 0, 10, 10, null_mut(), null_mut(), inst, null());
+        let ex = WS_EX_TOOLWINDOW
+            | WS_EX_LAYERED
+            | if cfg.topmost || cfg.placement().on_taskbar() {
+                WS_EX_TOPMOST
+            } else {
+                0
+            };
+        let hwnd = CreateWindowExW(
+            ex,
+            class.as_ptr(),
+            title.as_ptr(),
+            WS_POPUP,
+            0,
+            0,
+            10,
+            10,
+            null_mut(),
+            null_mut(),
+            inst,
+            null(),
+        );
         if hwnd.is_null() {
             return;
         }
         STRIP.store(hwnd as isize, Ordering::Relaxed);
         SetLayeredWindowAttributes(hwnd, 0, cfg.opacity, LWA_ALPHA);
         let corner = DWMWCP_ROUND;
-        DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE as _, &corner as *const _ as _, std::mem::size_of_val(&corner) as u32);
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE as _,
+            &corner as *const _ as _,
+            std::mem::size_of_val(&corner) as u32,
+        );
 
         let dpi = GetDpiForWindow(hwnd).max(96);
         let tc_name = wide("TaskbarCreated");
-        let view = board.lock().map(|b| b.clone()).unwrap_or_else(|_| Board::new(&cfg.rows));
+        let view = board
+            .lock()
+            .map(|b| b.clone())
+            .unwrap_or_else(|_| Board::new(&cfg.rows));
         let ui = Ui {
             hwnd,
             font: make_font(&cfg, dpi),
@@ -1390,7 +1787,12 @@ pub fn run(cfg: Config, board: Arc<Mutex<Board>>) {
             taskbar_created: RegisterWindowMessageW(tc_name.as_ptr()),
             mode: Mode::Strip,
             morph: None,
-            strip_rect: RECT { left: 0, top: 0, right: 0, bottom: 0 },
+            strip_rect: RECT {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            },
             fonts: None,
             hist: panel::History::new(),
             hover: false,
@@ -1407,16 +1809,28 @@ pub fn run(cfg: Config, board: Arc<Mutex<Board>>) {
         tray(hwnd, NIM_ADD, icon, &tip);
         apply_visibility(hwnd);
 
-        SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, null_mut(), Some(on_win_event), 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+        SetWinEventHook(
+            EVENT_SYSTEM_FOREGROUND,
+            EVENT_SYSTEM_FOREGROUND,
+            null_mut(),
+            Some(on_win_event),
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+        );
         SetTimer(hwnd, TIMER_DOCK, 500, None);
 
         let target = hwnd as isize;
         dock::spawn_probe(Box::new(move || {
             PostMessageW(target as HWND, WM_DOCK, 0, 0);
         }));
-        crate::source::spawn(cfg, board, Box::new(move || {
-            PostMessageW(target as HWND, WM_FEED, 0, 0);
-        }));
+        crate::source::spawn(
+            cfg,
+            board,
+            Box::new(move || {
+                PostMessageW(target as HWND, WM_FEED, 0, 0);
+            }),
+        );
 
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {

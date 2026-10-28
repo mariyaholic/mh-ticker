@@ -42,7 +42,10 @@ impl Placement {
 
     /// A compact grid in a taskbar gap (always on top, re-raised over the taskbar).
     pub fn on_taskbar(self) -> bool {
-        matches!(self, Placement::Auto | Placement::TaskbarLeft | Placement::TaskbarRight)
+        matches!(
+            self,
+            Placement::Auto | Placement::TaskbarLeft | Placement::TaskbarRight
+        )
     }
 
     pub fn label(self) -> &'static str {
@@ -90,7 +93,13 @@ pub struct SessionConfig {
 
 impl Default for SessionConfig {
     fn default() -> Self {
-        Self { enabled: true, broker_offset_min: None, broker_reopen_min: None, broker_rule_verified: false, device_zone: None }
+        Self {
+            enabled: true,
+            broker_offset_min: None,
+            broker_reopen_min: None,
+            broker_rule_verified: false,
+            device_zone: None,
+        }
     }
 }
 
@@ -128,12 +137,20 @@ pub struct Config {
 }
 
 fn row(label: &str, symbol: &str, digits: u32, name: &str) -> Row {
-    Row { label: label.into(), symbol: symbol.into(), digits, name: name.into() }
+    Row {
+        label: label.into(),
+        symbol: symbol.into(),
+        digits,
+        name: name.into(),
+    }
 }
 
 /// The symbols shown on a fresh install (and by *Reset to default*).
 pub fn default_rows() -> Vec<Row> {
-    default_catalog().into_iter().filter(|r| ["XAU", "XAG", "BTC", "DOW", "S&P", "NAS"].contains(&r.label.as_str())).collect()
+    default_catalog()
+        .into_iter()
+        .filter(|r| ["XAU", "XAG", "BTC", "DOW", "S&P", "NAS"].contains(&r.label.as_str()))
+        .collect()
 }
 
 /// CNBC symbols checked live on 2026-10-15. "delayed" = CNBC marks them ~10 min behind.
@@ -192,7 +209,11 @@ impl Default for Config {
 
 impl Config {
     pub fn placement(&self) -> Placement {
-        self.placement.unwrap_or(if self.dock { Placement::Auto } else { Placement::Floating })
+        self.placement.unwrap_or(if self.dock {
+            Placement::Auto
+        } else {
+            Placement::Floating
+        })
     }
 
     pub fn set_placement(&mut self, p: Placement) {
@@ -230,12 +251,17 @@ pub fn toggle(cfg: &mut Config, symbol: &str) -> bool {
         return false;
     }
     let shown: Vec<String> = cfg.rows.iter().map(|r| r.symbol.clone()).collect();
-    cfg.rows = menu_list(cfg).into_iter().filter(|r| r.symbol == symbol || shown.contains(&r.symbol)).collect();
+    cfg.rows = menu_list(cfg)
+        .into_iter()
+        .filter(|r| r.symbol == symbol || shown.contains(&r.symbol))
+        .collect();
     true
 }
 
 pub fn path() -> PathBuf {
-    let base = std::env::var("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("."));
+    let base = std::env::var("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."));
     base.join("MH_Ticker").join("config.json")
 }
 
@@ -284,13 +310,19 @@ mod tests {
     fn toggle_keeps_catalog_order_and_limits() {
         let mut c = Config::default();
         assert!(toggle(&mut c, "ETH.CB="));
-        assert_eq!(symbols(&c.rows), ["XAU=", "XAG=", "BTC.CB=", "ETH.CB=", "@DJ.1", "@SP.1", "@ND.1"]);
+        assert_eq!(
+            symbols(&c.rows),
+            ["XAU=", "XAG=", "BTC.CB=", "ETH.CB=", "@DJ.1", "@SP.1", "@ND.1"]
+        );
         assert!(toggle(&mut c, "XAU="));
         assert!(!is_shown(&c, "XAU="));
         c.rows.truncate(1);
         let last = c.rows[0].symbol.clone();
         assert!(!toggle(&mut c, &last), "the last symbol stays");
-        let mut full = Config { rows: default_catalog(), ..Config::default() };
+        let mut full = Config {
+            rows: default_catalog(),
+            ..Config::default()
+        };
         full.rows.truncate(MAX_ROWS);
         assert!(!toggle(&mut full, ".HSI"), "no more than MAX_ROWS");
     }
@@ -318,7 +350,9 @@ mod tests {
 
     #[test]
     fn old_config_without_catalog_gets_the_default_one() {
-        let c: Config = serde_json::from_str(r#"{"rows":[{"label":"XAU","symbol":"XAU=","digits":2}]}"#).unwrap();
+        let c: Config =
+            serde_json::from_str(r#"{"rows":[{"label":"XAU","symbol":"XAU=","digits":2}]}"#)
+                .unwrap();
         assert_eq!(c.rows.len(), 1);
         assert_eq!(c.catalog, default_catalog());
     }

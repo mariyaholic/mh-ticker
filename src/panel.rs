@@ -6,7 +6,7 @@
 
 use crate::model::{fmt_change, fmt_price, Board, Cell};
 
-use crate::ui::{link_color, link_name, BG, DIM, DOWN, LABEL, PRICE, UP, AMBER};
+use crate::ui::{link_color, link_name, AMBER, BG, DIM, DOWN, LABEL, PRICE, UP};
 use mh_session::view::{SessionView, Tone};
 use std::collections::VecDeque;
 use windows_sys::Win32::Foundation::{COLORREF, POINT, RECT, SIZE};
@@ -39,8 +39,20 @@ pub struct Fonts {
 fn font(face: &[u16], pt: i32, weight: u32, dpi: u32) -> HFONT {
     unsafe {
         CreateFontW(
-            -(pt * dpi as i32 / 72), 0, 0, 0, weight as _, 0, 0, 0, DEFAULT_CHARSET as _, OUT_DEFAULT_PRECIS as _,
-            CLIP_DEFAULT_PRECIS as _, CLEARTYPE_QUALITY as _, (DEFAULT_PITCH | FF_DONTCARE) as _, face.as_ptr(),
+            -(pt * dpi as i32 / 72),
+            0,
+            0,
+            0,
+            weight as _,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET as _,
+            OUT_DEFAULT_PRECIS as _,
+            CLIP_DEFAULT_PRECIS as _,
+            CLEARTYPE_QUALITY as _,
+            (DEFAULT_PITCH | FF_DONTCARE) as _,
+            face.as_ptr(),
         )
     }
 }
@@ -48,7 +60,11 @@ fn font(face: &[u16], pt: i32, weight: u32, dpi: u32) -> HFONT {
 impl Fonts {
     pub fn new(face: &str, dpi: u32) -> Self {
         let f: Vec<u16> = face.encode_utf16().chain(std::iter::once(0)).collect();
-        Self { big: font(&f, 18, FW_SEMIBOLD, dpi), mid: font(&f, 11, FW_SEMIBOLD, dpi), small: font(&f, 9, FW_NORMAL, dpi) }
+        Self {
+            big: font(&f, 18, FW_SEMIBOLD, dpi),
+            mid: font(&f, 11, FW_SEMIBOLD, dpi),
+            small: font(&f, 9, FW_NORMAL, dpi),
+        }
     }
 }
 
@@ -93,15 +109,27 @@ fn seed(row: &mut VecDeque<(f64, f64)>, bars: &[(f64, f64)]) {
 
 impl History {
     pub fn new() -> Self {
-        Self { labels: Vec::new(), rows: Vec::new(), gen: 0, backfilled: false }
+        Self {
+            labels: Vec::new(),
+            rows: Vec::new(),
+            gen: 0,
+            backfilled: false,
+        }
     }
 
     /// Re-key the series when the board's rows changed (by label; new rows start empty).
     fn align(&mut self, board: &Board) {
-        if self.labels.len() == board.cells.len() && self.labels.iter().zip(&board.cells).all(|(l, c)| *l == c.label) {
+        if self.labels.len() == board.cells.len()
+            && self
+                .labels
+                .iter()
+                .zip(&board.cells)
+                .all(|(l, c)| *l == c.label)
+        {
             return;
         }
-        let mut old: Vec<(String, Series)> = self.labels.drain(..).zip(self.rows.drain(..)).collect();
+        let mut old: Vec<(String, Series)> =
+            self.labels.drain(..).zip(self.rows.drain(..)).collect();
         for c in &board.cells {
             let row = match old.iter().position(|(l, _)| *l == c.label) {
                 Some(i) => old.swap_remove(i).1,
@@ -159,10 +187,29 @@ pub fn geometry(n: usize, dpi: u32, sessions: bool) -> Geo {
     let rows = n.div_ceil(COLS).max(1) as i32;
     let (pad, gap, card_w, card_h, header) = (s(16), s(10), s(224), s(132), s(48));
     let w = 2 * pad + cols as i32 * card_w + (cols as i32 - 1) * gap;
-    let block = if sessions { s(SESSIONS_GAP) + s(SESSIONS_H) } else { 0 };
+    let block = if sessions {
+        s(SESSIONS_GAP) + s(SESSIONS_H)
+    } else {
+        0
+    };
     let h = header + rows * card_h + (rows - 1) * gap + block + s(36);
-    let btn = RECT { left: w - s(12) - s(38), top: s(10), right: w - s(12), bottom: s(10) + s(30) };
-    Geo { w, h, header, btn, cols, pad, gap, card_w, card_h }
+    let btn = RECT {
+        left: w - s(12) - s(38),
+        top: s(10),
+        right: w - s(12),
+        bottom: s(10) + s(30),
+    };
+    Geo {
+        w,
+        h,
+        header,
+        btn,
+        cols,
+        pad,
+        gap,
+        card_w,
+        card_h,
+    }
 }
 
 pub fn in_rect(r: &RECT, x: i32, y: i32) -> bool {
@@ -309,19 +356,41 @@ fn spark(dc: HDC, f: &Fonts, r: RECT, pts: Option<&VecDeque<(f64, f64)>>, dpi: u
         }
     };
     let (t0, tspan) = (now - WINDOW_S, WINDOW_S);
-    let (lo, hi) = pts.iter().fold((f64::MAX, f64::MIN), |(lo, hi), p| (lo.min(p.1), hi.max(p.1)));
+    let (lo, hi) = pts.iter().fold((f64::MAX, f64::MIN), |(lo, hi), p| {
+        (lo.min(p.1), hi.max(p.1))
+    });
     let (w, h) = ((r.right - r.left) as f64, (r.bottom - r.top) as f64);
     let span = hi - lo;
-    let y_of = |v: f64| if span > 0.0 { r.bottom as f64 - (v - lo) / span * h } else { r.top as f64 + h / 2.0 };
-    let line: Vec<POINT> =
-        pts.iter().map(|&(t, v)| POINT { x: r.left + ((t - t0) / tspan * w).clamp(0.0, w).round() as i32, y: y_of(v).round() as i32 }).collect();
+    let y_of = |v: f64| {
+        if span > 0.0 {
+            r.bottom as f64 - (v - lo) / span * h
+        } else {
+            r.top as f64 + h / 2.0
+        }
+    };
+    let line: Vec<POINT> = pts
+        .iter()
+        .map(|&(t, v)| POINT {
+            x: r.left + ((t - t0) / tspan * w).clamp(0.0, w).round() as i32,
+            y: y_of(v).round() as i32,
+        })
+        .collect();
     let first = pts.front().unwrap().1;
     let last = pts.back().unwrap().1;
     let color = if last >= first { UP } else { DOWN };
     unsafe {
         // reference line at the first sample
         let gy = y_of(first).round() as i32;
-        fill_rect(dc, RECT { left: r.left, top: gy, right: r.right, bottom: gy + 1 }, GUIDE);
+        fill_rect(
+            dc,
+            RECT {
+                left: r.left,
+                top: gy,
+                right: r.right,
+                bottom: gy + 1,
+            },
+            GUIDE,
+        );
         let pen = CreatePen(PS_SOLID, s(2).max(1), color);
         let old = SelectObject(dc, pen);
         Polyline(dc, line.as_ptr(), line.len() as i32);
@@ -333,7 +402,15 @@ fn spark(dc: HDC, f: &Fonts, r: RECT, pts: Option<&VecDeque<(f64, f64)>>, dpi: u
     }
 }
 
-fn card(dc: HDC, f: &Fonts, dpi: u32, r: RECT, c: &Cell, hist: Option<&VecDeque<(f64, f64)>>, now: f64) {
+fn card(
+    dc: HDC,
+    f: &Fonts,
+    dpi: u32,
+    r: RECT,
+    c: &Cell,
+    hist: Option<&VecDeque<(f64, f64)>>,
+    now: f64,
+) {
     let s = |v: i32| v * dpi as i32 / 96;
     fill_round(dc, r, s(12), CARD);
     let (ix, rx) = (r.left + s(14), r.right - s(14));
@@ -341,7 +418,14 @@ fn card(dc: HDC, f: &Fonts, dpi: u32, r: RECT, c: &Cell, hist: Option<&VecDeque<
     match &c.quote {
         None => {
             text(dc, f.big, ix, r.top + s(30), "--", DIM);
-            text(dc, f.small, ix, r.top + s(68), "no price from any source", DIM);
+            text(
+                dc,
+                f.small,
+                ix,
+                r.top + s(68),
+                "no price from any source",
+                DIM,
+            );
         }
         Some(q) => {
             let src = if q.realtime { "CNBC" } else { "CNBC delayed" };
@@ -349,18 +433,56 @@ fn card(dc: HDC, f: &Fonts, dpi: u32, r: RECT, c: &Cell, hist: Option<&VecDeque<
                 Some(t) => format!("{src} \u{b7} {}", fmt_age(now - t)),
                 None => src.to_string(),
             };
-            text_right(dc, f.small, rx, r.top + s(13), &tag, if c.stale { AMBER } else { DIM });
-            text(dc, f.big, ix, r.top + s(30), &fmt_price(q.price, c.digits), if c.stale { DIM } else { PRICE });
+            text_right(
+                dc,
+                f.small,
+                rx,
+                r.top + s(13),
+                &tag,
+                if c.stale { AMBER } else { DIM },
+            );
+            text(
+                dc,
+                f.big,
+                ix,
+                r.top + s(30),
+                &fmt_price(q.price, c.digits),
+                if c.stale { DIM } else { PRICE },
+            );
             match q.change_pct {
                 Some(p) => {
-                    let col = if c.stale { DIM } else if p >= 0.0 { UP } else { DOWN };
+                    let col = if c.stale {
+                        DIM
+                    } else if p >= 0.0 {
+                        UP
+                    } else {
+                        DOWN
+                    };
                     let (open, abs) = match q.prev_close {
                         Some(prev) => (prev, q.price - prev),
                         None => day_open(q.price, p),
                     };
-                    let abs_s = format!("{}{}", if abs >= 0.0 { "+" } else { "-" }, fmt_price(abs.abs(), c.digits));
-                    text(dc, f.mid, ix, r.top + s(66), &format!("{}   {}", fmt_change(p), abs_s), col);
-                    text_right(dc, f.small, rx, r.top + s(68), &format!("prev {}", fmt_price(open, c.digits)), DIM);
+                    let abs_s = format!(
+                        "{}{}",
+                        if abs >= 0.0 { "+" } else { "-" },
+                        fmt_price(abs.abs(), c.digits)
+                    );
+                    text(
+                        dc,
+                        f.mid,
+                        ix,
+                        r.top + s(66),
+                        &format!("{}   {}", fmt_change(p), abs_s),
+                        col,
+                    );
+                    text_right(
+                        dc,
+                        f.small,
+                        rx,
+                        r.top + s(68),
+                        &format!("prev {}", fmt_price(open, c.digits)),
+                        DIM,
+                    );
                 }
                 None => {
                     text(dc, f.small, ix, r.top + s(68), "no day change", DIM);
@@ -368,19 +490,48 @@ fn card(dc: HDC, f: &Fonts, dpi: u32, r: RECT, c: &Cell, hist: Option<&VecDeque<
             }
         }
     }
-    spark(dc, f, RECT { left: ix, top: r.top + s(94), right: rx, bottom: r.bottom - s(12) }, hist, dpi, now);
+    spark(
+        dc,
+        f,
+        RECT {
+            left: ix,
+            top: r.top + s(94),
+            right: rx,
+            bottom: r.bottom - s(12),
+        },
+        hist,
+        dpi,
+        now,
+    );
 }
 
 fn session_block(dc: HDC, f: &Fonts, dpi: u32, top: i32, w: i32, view: &SessionView) {
     let s = |v: i32| v * dpi as i32 / 96;
     let pad = s(16);
     let (left, right) = (pad, w - pad);
-    fill_round(dc, RECT { left, top, right, bottom: top + s(SESSIONS_H) }, s(12), CARD);
+    fill_round(
+        dc,
+        RECT {
+            left,
+            top,
+            right,
+            bottom: top + s(SESSIONS_H),
+        },
+        s(12),
+        CARD,
+    );
     let ix = left + s(12);
     let rx = right - s(12);
     text(dc, f.small, ix, top + s(8), "SESSIONS", LABEL);
     let overlap_w = fit(dc, f.small, &view.overlap.text, (rx - ix) * 2 / 3);
-    text_right(dc, f.small, rx, top + s(8), &overlap_w, tone_color(view.overlap.tone));
+    text_right(
+        dc,
+        f.small,
+        rx,
+        top + s(8),
+        &overlap_w,
+        tone_color(view.overlap.tone),
+    );
 
     // Fixed order from the shared spec: four sessions, broker, one device row.
     let n = view.rows.len().max(1) as i32;
@@ -388,10 +539,38 @@ fn session_block(dc: HDC, f: &Fonts, dpi: u32, top: i32, w: i32, view: &SessionV
     for (i, row) in view.rows.iter().enumerate() {
         let x = ix + i as i32 * col_w;
         let max_w = col_w - s(6);
-        text(dc, f.small, x, top + s(30), &fit(dc, f.small, &row.title, max_w), if row.device { AMBER } else { LABEL });
-        text(dc, f.mid, x, top + s(42), &fit(dc, f.mid, &row.clock, max_w), PRICE);
-        text(dc, f.small, x, top + s(64), &fit(dc, f.small, &row.state, max_w), tone_color(row.tone));
-        text(dc, f.small, x, top + s(78), &fit(dc, f.small, &row.detail, max_w), DIM);
+        text(
+            dc,
+            f.small,
+            x,
+            top + s(30),
+            &fit(dc, f.small, &row.title, max_w),
+            if row.device { AMBER } else { LABEL },
+        );
+        text(
+            dc,
+            f.mid,
+            x,
+            top + s(42),
+            &fit(dc, f.mid, &row.clock, max_w),
+            PRICE,
+        );
+        text(
+            dc,
+            f.small,
+            x,
+            top + s(64),
+            &fit(dc, f.small, &row.state, max_w),
+            tone_color(row.tone),
+        );
+        text(
+            dc,
+            f.small,
+            x,
+            top + s(78),
+            &fit(dc, f.small, &row.detail, max_w),
+            DIM,
+        );
     }
     let caveat = fit(dc, f.small, &view.caveat, rx - ix);
     text(dc, f.small, ix, top + s(96), &caveat, DIM);
@@ -414,7 +593,16 @@ pub fn draw(
     let s = |v: i32| v * dpi as i32 / 96;
     let g = geometry(board.cells.len(), dpi, sessions.is_some());
     unsafe {
-        fill_rect(dc, RECT { left: 0, top: 0, right: w, bottom: h }, BG);
+        fill_rect(
+            dc,
+            RECT {
+                left: 0,
+                top: 0,
+                right: w,
+                bottom: h,
+            },
+            BG,
+        );
         SetBkMode(dc, TRANSPARENT as _);
     }
     // header: title, link dot + source, minimise button
@@ -425,19 +613,51 @@ pub fn draw(
     let dx = g.pad + s(2) + tw + s(14);
     fill_ellipse(dc, dx, ty + (lh - d) / 2, d, link_color(board.link));
     let sh = line_height(dc, f.small);
-    text(dc, f.small, dx + d + s(7), ty + (lh - sh) / 2, link_name(board.link), LABEL);
+    text(
+        dc,
+        f.small,
+        dx + d + s(7),
+        ty + (lh - sh) / 2,
+        link_name(board.link),
+        LABEL,
+    );
     if hover {
         fill_round(dc, g.btn, s(8), BTN_HOVER);
     }
-    let (cx, cy) = ((g.btn.left + g.btn.right) / 2, (g.btn.top + g.btn.bottom) / 2);
+    let (cx, cy) = (
+        (g.btn.left + g.btn.right) / 2,
+        (g.btn.top + g.btn.bottom) / 2,
+    );
     let (bar, thick) = (s(12), s(2).max(2));
-    fill_rect(dc, RECT { left: cx - bar / 2, top: cy - thick / 2, right: cx + bar / 2, bottom: cy - thick / 2 + thick }, if hover { PRICE } else { LABEL });
+    fill_rect(
+        dc,
+        RECT {
+            left: cx - bar / 2,
+            top: cy - thick / 2,
+            right: cx + bar / 2,
+            bottom: cy - thick / 2 + thick,
+        },
+        if hover { PRICE } else { LABEL },
+    );
 
     for (i, c) in board.cells.iter().enumerate() {
         let (col, row) = ((i % g.cols) as i32, (i / g.cols) as i32);
         let x = g.pad + col * (g.card_w + g.gap);
         let y = g.header + row * (g.card_h + g.gap);
-        card(dc, f, dpi, RECT { left: x, top: y, right: x + g.card_w, bottom: y + g.card_h }, c, hist.row(i), now);
+        card(
+            dc,
+            f,
+            dpi,
+            RECT {
+                left: x,
+                top: y,
+                right: x + g.card_w,
+                bottom: y + g.card_h,
+            },
+            c,
+            hist.row(i),
+            now,
+        );
     }
 
     let rows = board.cells.len().div_ceil(COLS).max(1) as i32;
@@ -448,10 +668,25 @@ pub fn draw(
 
     let fy = h - s(27);
     let note: String = board.note.chars().take(70).collect();
-    let lines = if hist.backfilled { "lines: last hour (1-min bars, then live)" } else { "lines: last hour, filling live" };
-    let left = if note.is_empty() { lines.to_string() } else { format!("{note}   \u{b7}   {lines}") };
+    let lines = if hist.backfilled {
+        "lines: last hour (1-min bars, then live)"
+    } else {
+        "lines: last hour, filling live"
+    };
+    let left = if note.is_empty() {
+        lines.to_string()
+    } else {
+        format!("{note}   \u{b7}   {lines}")
+    };
     text(dc, f.small, g.pad + s(2), fy, &left, DIM);
-    text_right(dc, f.small, w - g.pad - s(2), fy, "Esc or \u{2014} to dock", DIM);
+    text_right(
+        dc,
+        f.small,
+        w - g.pad - s(2),
+        fy,
+        "Esc or \u{2014} to dock",
+        DIM,
+    );
 }
 
 #[cfg(test)]
@@ -469,7 +704,12 @@ mod tests {
 
     #[test]
     fn history_seeds_from_bars_keeps_live_points_and_rolls_an_hour() {
-        let cell = Cell { label: "XAU".into(), digits: 2, quote: None, stale: true };
+        let cell = Cell {
+            label: "XAU".into(),
+            digits: 2,
+            quote: None,
+            stale: true,
+        };
         let mut b = Board::new(&[]);
         b.cells = vec![cell];
         let now = 10_000.0;
@@ -477,7 +717,9 @@ mod tests {
         let mut h = History::new();
         h.labels = vec!["XAU".into()];
         h.rows = vec![VecDeque::from(vec![(now - 100.0, 9.0)])];
-        b.backfill = vec![(0..61).map(|i| (now - 3600.0 + 60.0 * i as f64, i as f64)).collect()];
+        b.backfill = vec![(0..61)
+            .map(|i| (now - 3600.0 + 60.0 * i as f64, i as f64))
+            .collect()];
         b.backfill_gen = 1;
         h.record(&b, now);
         let row = h.row(0).unwrap();

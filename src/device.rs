@@ -14,7 +14,12 @@ use crate::config::SessionConfig;
 /// is labelled "configured" rather than "auto-detected".
 pub fn current(cfg: &SessionConfig) -> DeviceInfo {
     let (windows_id, territory) = probe();
-    if let Some(zone) = cfg.device_zone.as_deref().map(str::trim).filter(|z| !z.is_empty()) {
+    if let Some(zone) = cfg
+        .device_zone
+        .as_deref()
+        .map(str::trim)
+        .filter(|z| !z.is_empty())
+    {
         if is_valid_iana(zone) {
             return DeviceInfo {
                 iana: Some(zone.to_string()),
@@ -38,7 +43,9 @@ pub fn current(cfg: &SessionConfig) -> DeviceInfo {
 #[cfg(windows)]
 fn probe() -> (String, Option<String>) {
     use windows_sys::Win32::Globalization::{GetUserDefaultGeoName, GetUserDefaultLocaleName};
-    use windows_sys::Win32::System::Time::{GetDynamicTimeZoneInformation, DYNAMIC_TIME_ZONE_INFORMATION};
+    use windows_sys::Win32::System::Time::{
+        GetDynamicTimeZoneInformation, DYNAMIC_TIME_ZONE_INFORMATION,
+    };
 
     let mut dtzi: DYNAMIC_TIME_ZONE_INFORMATION = unsafe { std::mem::zeroed() };
     let rc = unsafe { GetDynamicTimeZoneInformation(&mut dtzi) };
@@ -54,7 +61,11 @@ fn probe() -> (String, Option<String>) {
         let mut locale = [0u16; 85];
         let n = unsafe { GetUserDefaultLocaleName(locale.as_mut_ptr(), locale.len() as i32) };
         territory = if n > 0 {
-            from_wide(&locale).rsplit('-').next().filter(|t| t.len() == 2).map(str::to_string)
+            from_wide(&locale)
+                .rsplit('-')
+                .next()
+                .filter(|t| t.len() == 2)
+                .map(str::to_string)
         } else {
             None
         };
@@ -79,7 +90,10 @@ mod tests {
 
     #[test]
     fn configured_zone_is_labelled_configured() {
-        let cfg = SessionConfig { device_zone: Some("Europe/Berlin".into()), ..SessionConfig::default() };
+        let cfg = SessionConfig {
+            device_zone: Some("Europe/Berlin".into()),
+            ..SessionConfig::default()
+        };
         let d = current(&cfg);
         assert_eq!(d.iana.as_deref(), Some("Europe/Berlin"));
         assert_eq!(d.source, DeviceSource::Configured);
@@ -87,7 +101,10 @@ mod tests {
 
     #[test]
     fn invalid_configured_zone_falls_back_to_detection_not_a_guess() {
-        let cfg = SessionConfig { device_zone: Some("Not/AZone".into()), ..SessionConfig::default() };
+        let cfg = SessionConfig {
+            device_zone: Some("Not/AZone".into()),
+            ..SessionConfig::default()
+        };
         let d = current(&cfg);
         assert_ne!(d.source, DeviceSource::Configured);
         assert!(d.iana.as_deref().is_none_or(is_valid_iana));
