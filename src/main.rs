@@ -8,6 +8,7 @@
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
 mod config;
+mod device;
 mod dock;
 mod model;
 mod panel;

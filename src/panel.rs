@@ -7,6 +7,7 @@
 use crate::model::{fmt_change, fmt_price, Board, Cell};
 
 use crate::ui::{link_color, link_name, BG, DIM, DOWN, LABEL, PRICE, UP, AMBER};
+use mh_session::view::{SessionView, Tone};
 use std::collections::VecDeque;
 use windows_sys::Win32::Foundation::{COLORREF, POINT, RECT, SIZE};
 use windows_sys::Win32::Graphics::Gdi::*;
@@ -18,6 +19,9 @@ const HIST_CAP: usize = 3600;
 const SAMPLE_S: f64 = 1.0;
 /// A bar point closer than this to a live sample is redundant.
 const BAR_DEDUP_S: f64 = 45.0;
+/// Height of the session-timer strip (96-dpi px): overlap line, six clocks, caveat.
+const SESSIONS_H: i32 = 112;
+const SESSIONS_GAP: i32 = 10;
 
 const fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
     r as u32 | (g as u32) << 8 | (b as u32) << 16
@@ -149,13 +153,14 @@ pub struct Geo {
     card_h: i32,
 }
 
-pub fn geometry(n: usize, dpi: u32) -> Geo {
+pub fn geometry(n: usize, dpi: u32, sessions: bool) -> Geo {
     let s = |v: i32| v * dpi as i32 / 96;
     let cols = n.clamp(1, COLS);
     let rows = n.div_ceil(COLS).max(1) as i32;
     let (pad, gap, card_w, card_h, header) = (s(16), s(10), s(224), s(132), s(48));
     let w = 2 * pad + cols as i32 * card_w + (cols as i32 - 1) * gap;
-    let h = header + rows * card_h + (rows - 1) * gap + s(36);
+    let block = if sessions { s(SESSIONS_GAP) + s(SESSIONS_H) } else { 0 };
+    let h = header + rows * card_h + (rows - 1) * gap + block + s(36);
     let btn = RECT { left: w - s(12) - s(38), top: s(10), right: w - s(12), bottom: s(10) + s(30) };
     Geo { w, h, header, btn, cols, pad, gap, card_w, card_h }
 }
@@ -203,6 +208,43 @@ fn line_height(dc: HDC, font: HFONT) -> i32 {
         GetTextExtentPoint32W(dc, t.as_ptr(), t.len() as i32, &mut sz);
         SelectObject(dc, old);
         sz.cy
+    }
+}
+
+/// Truncate `s` with an ellipsis so it fits `max_w` in `font`.
+fn fit(dc: HDC, font: HFONT, s: &str, max_w: i32) -> String {
+    let width = |text: &str| {
+        let t = utf16(text);
+        let mut sz = SIZE { cx: 0, cy: 0 };
+        unsafe {
+            let old = SelectObject(dc, font);
+            GetTextExtentPoint32W(dc, t.as_ptr(), t.len() as i32, &mut sz);
+            SelectObject(dc, old);
+        }
+        sz.cx
+    };
+    if width(s) <= max_w {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    for ch in s.chars() {
+        let mut trial = out.clone();
+        trial.push(ch);
+        trial.push('\u{2026}');
+        if width(&trial) > max_w {
+            break;
+        }
+        out.push(ch);
+    }
+    out.push('\u{2026}');
+    out
+}
+
+fn tone_color(tone: Tone) -> COLORREF {
+    match tone {
+        Tone::Open => UP,
+        Tone::Closed => DIM,
+        Tone::Unknown => AMBER,
     }
 }
 
@@ -329,11 +371,48 @@ fn card(dc: HDC, f: &Fonts, dpi: u32, r: RECT, c: &Cell, hist: Option<&VecDeque<
     spark(dc, f, RECT { left: ix, top: r.top + s(94), right: rx, bottom: r.bottom - s(12) }, hist, dpi, now);
 }
 
+fn session_block(dc: HDC, f: &Fonts, dpi: u32, top: i32, w: i32, view: &SessionView) {
+    let s = |v: i32| v * dpi as i32 / 96;
+    let pad = s(16);
+    let (left, right) = (pad, w - pad);
+    fill_round(dc, RECT { left, top, right, bottom: top + s(SESSIONS_H) }, s(12), CARD);
+    let ix = left + s(12);
+    let rx = right - s(12);
+    text(dc, f.small, ix, top + s(8), "SESSIONS", LABEL);
+    let overlap_w = fit(dc, f.small, &view.overlap.text, (rx - ix) * 2 / 3);
+    text_right(dc, f.small, rx, top + s(8), &overlap_w, tone_color(view.overlap.tone));
+
+    // Fixed order from the shared spec: four sessions, broker, one device row.
+    let n = view.rows.len().max(1) as i32;
+    let col_w = (rx - ix) / n;
+    for (i, row) in view.rows.iter().enumerate() {
+        let x = ix + i as i32 * col_w;
+        let max_w = col_w - s(6);
+        text(dc, f.small, x, top + s(30), &fit(dc, f.small, &row.title, max_w), if row.device { AMBER } else { LABEL });
+        text(dc, f.mid, x, top + s(42), &fit(dc, f.mid, &row.clock, max_w), PRICE);
+        text(dc, f.small, x, top + s(64), &fit(dc, f.small, &row.state, max_w), tone_color(row.tone));
+        text(dc, f.small, x, top + s(78), &fit(dc, f.small, &row.detail, max_w), DIM);
+    }
+    let caveat = fit(dc, f.small, &view.caveat, rx - ix);
+    text(dc, f.small, ix, top + s(96), &caveat, DIM);
+}
+
 /// Paint the whole panel into `dc` (w × h is the panel's size from `geometry`).
 #[allow(clippy::too_many_arguments)]
-pub fn draw(dc: HDC, w: i32, h: i32, board: &Board, hist: &History, f: &Fonts, dpi: u32, hover: bool, now: f64) {
+pub fn draw(
+    dc: HDC,
+    w: i32,
+    h: i32,
+    board: &Board,
+    hist: &History,
+    f: &Fonts,
+    dpi: u32,
+    hover: bool,
+    now: f64,
+    sessions: Option<&SessionView>,
+) {
     let s = |v: i32| v * dpi as i32 / 96;
-    let g = geometry(board.cells.len(), dpi);
+    let g = geometry(board.cells.len(), dpi, sessions.is_some());
     unsafe {
         fill_rect(dc, RECT { left: 0, top: 0, right: w, bottom: h }, BG);
         SetBkMode(dc, TRANSPARENT as _);
@@ -359,6 +438,12 @@ pub fn draw(dc: HDC, w: i32, h: i32, board: &Board, hist: &History, f: &Fonts, d
         let x = g.pad + col * (g.card_w + g.gap);
         let y = g.header + row * (g.card_h + g.gap);
         card(dc, f, dpi, RECT { left: x, top: y, right: x + g.card_w, bottom: y + g.card_h }, c, hist.row(i), now);
+    }
+
+    let rows = board.cells.len().div_ceil(COLS).max(1) as i32;
+    let block_top = g.header + rows * g.card_h + (rows - 1) * g.gap + s(SESSIONS_GAP);
+    if let Some(view) = sessions {
+        session_block(dc, f, dpi, block_top, w, view);
     }
 
     let fy = h - s(27);
@@ -408,11 +493,19 @@ mod tests {
 
     #[test]
     fn geometry_fits_six_cards_in_two_rows() {
-        let g = geometry(6, 96);
+        let g = geometry(6, 96, false);
         assert_eq!(g.w, 2 * 16 + 3 * 224 + 2 * 10);
         assert_eq!(g.h, 48 + 2 * 132 + 10 + 36);
         assert!(g.btn.right < g.w && g.btn.top > 0);
-        assert_eq!(geometry(2, 96).w, 2 * 16 + 2 * 224 + 10);
+        assert_eq!(geometry(2, 96, false).w, 2 * 16 + 2 * 224 + 10);
+    }
+
+    #[test]
+    fn geometry_reserves_room_for_the_session_block() {
+        let without = geometry(6, 96, false);
+        let with = geometry(6, 96, true);
+        assert_eq!(with.h - without.h, SESSIONS_GAP + SESSIONS_H);
+        assert_eq!(with.w, without.w);
     }
 
     #[test]

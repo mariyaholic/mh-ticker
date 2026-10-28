@@ -21,9 +21,11 @@
 //! `wndproc`, so the `UI` RefCell is never borrowed across those calls.
 
 use crate::config::{self, Config, Placement};
+use crate::device;
 use crate::dock;
 use crate::panel;
 use crate::model::{fmt_change, fmt_price, Board, Cell, Link};
+use mh_session::view::{build_view, DeviceInfo, SessionView, ViewOptions};
 use std::cell::RefCell;
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicIsize, Ordering};
@@ -58,6 +60,8 @@ const CMD_FOLDER: usize = 1004;
 const CMD_EXIT: usize = 1005;
 const CMD_PANEL: usize = 1007;
 const CMD_RESET: usize = 1008;
+const CMD_SESSIONS: usize = 1009;
+const CMD_ABOUT: usize = 1010;
 /// Symbols submenu: CMD_SYM + index into `config::menu_list`.
 const CMD_SYM: usize = 2000;
 /// Position submenu: CMD_POS + index into `Placement::ALL`, CMD_MON + index into `dock::monitors()`.
@@ -165,6 +169,8 @@ struct Ui {
     /// The minimise button is hovered.
     hover: bool,
     tracking: bool,
+    /// Cached Windows device-zone mapping; refreshed on setting/time/resume changes.
+    device_zone: DeviceInfo,
     /// Foreground window before the panel opened; it gets focus back on collapse.
     prev_fg: HWND,
     /// Last tray tooltip refresh.
@@ -398,8 +404,26 @@ fn draw_strip(u: &Ui, dc: HDC) {
 
 fn draw_panel(u: &Ui, dc: HDC, w: i32, h: i32) {
     if let Some(f) = &u.fonts {
-        panel::draw(dc, w, h, &u.view, &u.hist, f, u.dpi, u.hover, crate::source::now_s());
+        let view = session_view(u);
+        panel::draw(dc, w, h, &u.view, &u.hist, f, u.dpi, u.hover, crate::source::now_s(), view.as_ref());
     }
+}
+
+fn session_view(u: &Ui) -> Option<SessionView> {
+    if !u.cfg.sessions.enabled {
+        return None;
+    }
+    let opts = ViewOptions {
+        broker_offset_min: u.cfg.sessions.broker_offset_min,
+        broker_reopen_min: u.cfg.sessions.broker_reopen_min,
+        broker_rule_verified: u.cfg.sessions.broker_rule_verified,
+        device: u.device_zone.clone(),
+    };
+    Some(build_view(chrono::Utc::now(), &opts))
+}
+
+fn refresh_device(u: &mut Ui) {
+    u.device_zone = device::current(&u.cfg.sessions);
 }
 
 /// Render into a fresh w x h bitmap compatible with the window.
@@ -817,7 +841,7 @@ fn expand(hwnd: HWND) {
         u.hover = false;
         u.prev_fg = unsafe { GetForegroundWindow() };
         let a = u.strip_rect;
-        let g = panel::geometry(u.view.cells.len(), u.dpi);
+        let g = panel::geometry(u.view.cells.len(), u.dpi, u.cfg.sessions.enabled);
         let b = panel_rect(&a, g.w, g.h);
         let fsz = (u.frame.w.max(1), u.frame.h.max(1));
         let from = snapshot(hwnd, fsz.0, fsz.1, |dc| draw_strip(u, dc));
@@ -876,11 +900,11 @@ fn collapse(hwnd: HWND) {
 }
 
 fn menu(hwnd: HWND) {
-    let Some((visible, top, docked, status, open, list, shown)) = with_ui(|u| {
+    let Some((visible, top, docked, status, open, list, shown, sessions_on)) = with_ui(|u| {
         let list = config::menu_list(&u.cfg);
         let shown: Vec<bool> = list.iter().map(|r| config::is_shown(&u.cfg, &r.symbol)).collect();
         let note = if u.view.note.is_empty() { link_name(u.view.link).to_string() } else { u.view.note.clone() };
-        (u.cfg.strip_visible, u.cfg.topmost, u.cfg.placement().on_taskbar(), note, u.mode != Mode::Strip, list, shown)
+        (u.cfg.strip_visible, u.cfg.topmost, u.cfg.placement().on_taskbar(), note, u.mode != Mode::Strip, list, shown, u.cfg.sessions.enabled)
     }) else {
         return;
     };
@@ -933,9 +957,11 @@ fn menu(hwnd: HWND) {
         }
         add(m, MF_POPUP | if open { MF_GRAYED } else { 0 }, pos as usize, "Position");
         item(MF_STRING | if top || docked { MF_CHECKED } else { 0 } | if docked { MF_GRAYED } else { 0 }, CMD_TOP, "Always on top");
+        item(MF_STRING | if sessions_on { MF_CHECKED } else { 0 }, CMD_SESSIONS, "Session timers");
         AppendMenuW(m, MF_SEPARATOR, 0, null());
         let status: String = status.chars().take(90).collect();
         item(MF_STRING | MF_GRAYED, CMD_STATUS, &status);
+        item(MF_STRING, CMD_ABOUT, "About MH Ticker");
         item(MF_STRING, CMD_FOLDER, "Open config folder");
         AppendMenuW(m, MF_SEPARATOR, 0, null());
         item(MF_STRING, CMD_EXIT, "Quit");
@@ -979,6 +1005,20 @@ fn menu(hwnd: HWND) {
             });
             set_topmost(hwnd, !top);
         }
+        CMD_SESSIONS => {
+            with_ui(|u| {
+                u.cfg.sessions.enabled = !sessions_on;
+                config::save(&u.cfg);
+            });
+            apply_sessions(hwnd);
+        }
+        CMD_ABOUT => unsafe {
+            let text = wide(
+                "MH Ticker 1.3.0\n\nMade by Maria\nApache-2.0 licensed.\n\nSession times are conventions, not guaranteed exchange hours.\nNot financial advice.\n\nNot affiliated with TradingView or MetaQuotes; MT5 is a MetaQuotes trademark.",
+            );
+            let title = wide("About MH Ticker");
+            MessageBoxW(hwnd, text.as_ptr(), title.as_ptr(), MB_OK | MB_ICONINFORMATION);
+        },
         CMD_FOLDER => {
             if let Some(dir) = config::path().parent() {
                 let d = wide(&dir.to_string_lossy());
@@ -1032,7 +1072,7 @@ fn apply_rows(hwnd: HWND) {
         }
         u.hist.record(&u.view, crate::source::now_s());
         (u.mode == Mode::Panel).then(|| {
-            let g = panel::geometry(u.view.cells.len(), u.dpi);
+            let g = panel::geometry(u.view.cells.len(), u.dpi, u.cfg.sessions.enabled);
             let mut cur: RECT = unsafe { std::mem::zeroed() };
             unsafe { GetWindowRect(hwnd, &mut cur) };
             panel_rect(&cur, g.w, g.h)
@@ -1050,6 +1090,27 @@ fn apply_rows(hwnd: HWND) {
     unsafe { PostMessageW(hwnd, WM_FEED, 0, 0) };
 }
 
+/// The Sessions menu toggled the panel block: save it and resize the open panel in place.
+fn apply_sessions(hwnd: HWND) {
+    let rect = with_ui(|u| {
+        refresh_device(u);
+        if u.mode != Mode::Panel {
+            return None;
+        }
+        let g = panel::geometry(u.view.cells.len(), u.dpi, u.cfg.sessions.enabled);
+        let mut cur: RECT = unsafe { std::mem::zeroed() };
+        unsafe { GetWindowRect(hwnd, &mut cur) };
+        Some(panel_rect(&cur, g.w, g.h))
+    })
+    .flatten();
+    if let Some(r) = rect {
+        unsafe {
+            SetWindowPos(hwnd, null_mut(), r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+    }
+    unsafe { InvalidateRect(hwnd, null(), 0) };
+}
+
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
         WM_FEED => {
@@ -1062,8 +1123,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_SETTINGCHANGE => {
+            with_ui(refresh_device);
             PostMessageW(hwnd, WM_DOCK, 0, 0);
             DefWindowProcW(hwnd, msg, wp, lp)
+        }
+        WM_TIMECHANGE | WM_POWERBROADCAST => {
+            // A clock change or resume: recompute from the current wall clock and
+            // re-read the dynamic zone key. The panel already redraws on the timer.
+            with_ui(refresh_device);
+            InvalidateRect(hwnd, null(), 0);
+            0
         }
         WM_FGCHANGE => {
             dock_check(hwnd);
@@ -1100,7 +1169,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         // Panel: the header (minus the button) drags it.
         WM_NCHITTEST => {
             let Some((mode, dock, header, btn)) = with_ui(|u| {
-                let g = panel::geometry(u.view.cells.len(), u.dpi);
+                let g = panel::geometry(u.view.cells.len(), u.dpi, u.cfg.sessions.enabled);
                 (u.mode, u.cfg.placement() != Placement::Floating, g.header, g.btn)
             }) else {
                 return HTCLIENT as LRESULT;
@@ -1139,7 +1208,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_LBUTTONUP => {
             let (x, y) = ((lp & 0xffff) as i16 as i32, ((lp >> 16) & 0xffff) as i16 as i32);
             let what = with_ui(|u| {
-                let g = panel::geometry(u.view.cells.len(), u.dpi);
+                let g = panel::geometry(u.view.cells.len(), u.dpi, u.cfg.sessions.enabled);
                 (u.mode, u.cfg.placement() != Placement::Floating, panel::in_rect(&g.btn, x, y))
             });
             match what {
@@ -1155,7 +1224,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 if u.mode != Mode::Panel {
                     return (false, false);
                 }
-                let g = panel::geometry(u.view.cells.len(), u.dpi);
+                let g = panel::geometry(u.view.cells.len(), u.dpi, u.cfg.sessions.enabled);
                 let over = panel::in_rect(&g.btn, x, y);
                 let track = !u.tracking;
                 u.tracking = true;
@@ -1216,7 +1285,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 u.dpi = dpi;
                 u.font = make_font(&u.cfg, dpi);
                 u.fonts = u.fonts.take().map(|_| panel::Fonts::new(&u.cfg.font, dpi));
-                (u.mode == Mode::Panel).then(|| panel::geometry(u.view.cells.len(), dpi))
+                (u.mode == Mode::Panel).then(|| panel::geometry(u.view.cells.len(), dpi, u.cfg.sessions.enabled))
             })
             .flatten();
             match open {
@@ -1326,6 +1395,7 @@ pub fn run(cfg: Config, board: Arc<Mutex<Board>>) {
             hist: panel::History::new(),
             hover: false,
             tracking: false,
+            device_zone: device::current(&cfg.sessions),
             prev_fg: null_mut(),
             tip_at: None,
             tray_click_at: None,

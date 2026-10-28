@@ -20,7 +20,9 @@
 //! A secondary monitor's taskbar has none; there the probe reads the first tray button instead.
 
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, Ordering};
+#[cfg(windows)]
 use std::thread;
+#[cfg(windows)]
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{CloseHandle, BOOL, HWND, LPARAM, POINT, RECT};
 use windows_sys::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
@@ -348,9 +350,11 @@ pub fn taskbar_above(own: HWND) -> bool {
     false
 }
 
+#[cfg(windows)]
 use windows::Win32::UI::Accessibility::{IUIAutomation, IUIAutomationElement, IUIAutomationTreeWalker};
 
 /// A taskbar element found once by AutomationId and then read by its cached element.
+#[cfg(windows)]
 struct Button {
     id: &'static str,
     el: Option<IUIAutomationElement>,
@@ -359,6 +363,7 @@ struct Button {
     absent_retry: Duration,
 }
 
+#[cfg(windows)]
 impl Button {
     fn new(id: &'static str, absent_retry: Duration) -> Self {
         Self { id, el: None, retry_at: None, absent_retry }
@@ -412,6 +417,7 @@ impl Button {
 }
 
 /// Right edge of the last child of `TaskbarFrame`: where the taskbar icons end.
+#[cfg(windows)]
 fn icons_right(walker: &IUIAutomationTreeWalker, frame: &IUIAutomationElement) -> Option<i32> {
     unsafe {
         let last = walker.GetLastChildElement(frame).ok()?;
@@ -421,6 +427,7 @@ fn icons_right(walker: &IUIAutomationTreeWalker, frame: &IUIAutomationElement) -
 }
 
 /// Poll the taskbar every 2 s; call `changed` when anything the gaps depend on moved.
+#[cfg(windows)]
 pub fn spawn_probe(changed: Box<dyn Fn() + Send>) {
     let _ = thread::Builder::new().name("dock-probe".into()).spawn(move || {
         use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED};
@@ -464,6 +471,10 @@ pub fn spawn_probe(changed: Box<dyn Fn() + Send>) {
         }
     });
 }
+
+/// The taskbar probe needs Windows UI Automation; there is no portable equivalent.
+#[cfg(not(windows))]
+pub fn spawn_probe(_changed: Box<dyn Fn() + Send>) {}
 
 #[cfg(test)]
 mod tests {

@@ -71,6 +71,29 @@ pub struct Row {
     pub name: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SessionConfig {
+    /// Show the session block in the expanded panel.
+    pub enabled: bool,
+    /// Fixed broker offset in minutes. `None` keeps the generated preset.
+    pub broker_offset_min: Option<i32>,
+    /// Broker reopen time in minutes after server midnight. `None` keeps the preset.
+    pub broker_reopen_min: Option<u16>,
+    /// The user has confirmed the broker's offset/reopen rule. Until then the
+    /// panel shows the next verified reopen as unknown.
+    pub broker_rule_verified: bool,
+    /// Manual IANA zone for the device row when Windows detection fails or is
+    /// wrong. `None` means auto-detect and show unavailable when mapping fails.
+    pub device_zone: Option<String>,
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        Self { enabled: true, broker_offset_min: None, broker_reopen_min: None, broker_rule_verified: false, device_zone: None }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -100,6 +123,8 @@ pub struct Config {
     /// Last strip position in screen pixels when undocked; None = top-right of the work area.
     pub x: Option<i32>,
     pub y: Option<i32>,
+    /// Session timers. Missing in configs from before this feature: defaults are written in.
+    pub sessions: SessionConfig,
 }
 
 fn row(label: &str, symbol: &str, digits: u32, name: &str) -> Row {
@@ -160,6 +185,7 @@ impl Default for Config {
             dock_rows: 2,
             x: None,
             y: None,
+            sessions: SessionConfig::default(),
         }
     }
 }
@@ -219,7 +245,8 @@ pub fn load() -> Config {
         Ok(text) => {
             let cfg: Config = serde_json::from_str(&text).unwrap_or_default();
             // A config from before the Symbols menu has no catalog: write the default one in.
-            if !text.contains("\"catalog\"") {
+            // A config from before session timers gets the new `sessions` block too.
+            if !text.contains("\"catalog\"") || !text.contains("\"sessions\"") {
                 save(&cfg);
             }
             cfg
@@ -294,5 +321,33 @@ mod tests {
         let c: Config = serde_json::from_str(r#"{"rows":[{"label":"XAU","symbol":"XAU=","digits":2}]}"#).unwrap();
         assert_eq!(c.rows.len(), 1);
         assert_eq!(c.catalog, default_catalog());
+    }
+
+    #[test]
+    fn old_config_gets_session_defaults_without_disturbing_quotes() {
+        let c: Config = serde_json::from_str(
+            r#"{"poll_s":7.5,"rows":[{"label":"XAU","symbol":"XAU=","digits":2}],"topmost":false}"#,
+        )
+        .unwrap();
+        assert_eq!(c.poll_s, 7.5);
+        assert!(!c.topmost);
+        assert_eq!(c.rows.len(), 1);
+        assert_eq!(c.sessions, SessionConfig::default());
+        assert!(c.sessions.enabled);
+        assert!(!c.sessions.broker_rule_verified);
+    }
+
+    #[test]
+    fn session_settings_round_trip_and_keep_unknown_quote_keys_untouched() {
+        let mut c = Config::default();
+        c.sessions.broker_offset_min = Some(120);
+        c.sessions.broker_reopen_min = Some(0);
+        c.sessions.broker_rule_verified = true;
+        c.sessions.device_zone = Some("Europe/Berlin".into());
+        let text = serde_json::to_string(&c).unwrap();
+        let back: Config = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.sessions, c.sessions);
+        assert_eq!(back.rows, c.rows);
+        assert_eq!(back.poll_s, c.poll_s);
     }
 }
