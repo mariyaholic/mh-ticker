@@ -1,8 +1,0 @@
-2c2d700 2026-10-16 08:11:33 +0800 mariyaholic 1.2.3: own app icon, a violet-to-rose price line with a sparkle
-fedd985 2026-10-15 22:08:41 +0800 mariyaholic 1.2.2: docked strip is owned by the taskbar, so it stays above it with Search/Start open
-78e9e23 2026-10-15 21:46:48 +0800 mariyaholic 1.2.1: strip no longer hides for the shell's own windows; self-heals; README titles capitalised
-8c5a236 2026-10-15 19:04:20 +0800 mariyaholic Update README.md
-58c8f53 2026-10-15 18:57:05 +0800 mariyaholic README: rewrite in Maria's own voice
-970373a 2026-10-15 18:51:36 +0800 mariyaholic Add MIT license, crate metadata, download and license notes
-0c1e64d 2026-10-15 18:47:42 +0800 mariyaholic Pin LF line endings with .gitattributes
-cb95693 2026-10-15 18:47:31 +0800 mariyaholic MH Ticker 1.2.0: taskbar price strip with symbol and position menus

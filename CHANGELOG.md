@@ -1,5 +1,10 @@
 # Changelog — MH Ticker
 
+## [Unreleased]
+
+- Add session timers, a portable session engine, and generated Pine and MQL5 indicators.
+- Review Windows cross-builds, resource compilation, documentation, and release preparation.
+
 ## 2026-10-28 — 1.3.0 licence follow-up   [agent]
 
 - Licence stays **MIT** (Manager ruling 2026-10-28): restored the original `LICENSE`, removed the Apache-2.0

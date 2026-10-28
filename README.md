@@ -101,7 +101,7 @@ indicator files from it; `--check` fails if anything drifted. The shared UTC gol
   with MetaQuotes; MT5 is a MetaQuotes trademark.
 
 See [docs/SESSIONS.md](docs/SESSIONS.md) for the rules, limits and verification status, and
-[TESTING.md](TESTING.md) for what still needs a real Windows/MT5/TradingView check.
+[docs/TESTING.md](docs/TESTING.md) for what still needs a real Windows/MT5/TradingView check.
 
 ## Building it Yourself
 
@@ -125,3 +125,18 @@ It's plain win32/gdi - no GUI toolkit, no webview, no GPU stuff - so it only use
 
 [MIT](LICENSE) © 2026 mariyaholic - Use it, change it, share it, just keep the copyright notice and the license
 text with it. And if u build something on top of it please credit this repo as the original source!
+
+## Privacy and offline behaviour
+
+Session timers use bundled time-zone data and work offline. The quote feed sends configured symbols to
+CNBC over HTTPS; prices and charts require a network connection. Settings are stored locally in
+`%LOCALAPPDATA%\MH_Ticker`. No account or local server is required.
+
+Windows binaries are not code-signed yet and may trigger Microsoft SmartScreen. Review the source and
+verify the checksum before running a binary. MH Ticker is free and open source (MIT).
+
+For release builds, run `scripts/build-windows.ps1` on Windows or `scripts/build-windows.sh` on Linux
+with the Windows GNU target and MinGW installed. Both write the executable and SHA256SUMS to `dist/`;
+the Linux script supports `DIST_DIR` and `CARGO_TARGET_DIR`. The scripts use the last commit time as
+`SOURCE_DATE_EPOCH` unless set. Rust 1.99.1 and the lockfile are used for the reviewed build; byte-for-byte
+reproducibility across toolchain versions and machines has not been verified.

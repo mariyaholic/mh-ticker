@@ -12,12 +12,12 @@ dependencies added by this feature and the existing application; transitive crat
 | --- | --- | --- | --- |
 | `chrono` | 0.4.45 (`=0.4.45`) | MIT OR Apache-2.0 | UTC instants, dates, durations |
 | `chrono-tz` | 0.10.4 (`=0.10.4`) | MIT OR Apache-2.0 | Compiled IANA zone database |
-| `serde` | 1 | MIT OR Apache-2.0 | Config and spec serialization |
-| `serde_json` | 1 | MIT OR Apache-2.0 | Config, spec and golden vectors |
-| `ureq` | 2.12 | MIT OR Apache-2.0 | Existing CNBC quote fetch (unchanged) |
-| `native-tls` | 0.2 | MIT OR Apache-2.0 | Existing Windows SChannel TLS (unchanged) |
-| `windows-sys` | 0.59 | MIT OR Apache-2.0 | Existing Win32 bindings; session adapter uses `Win32_System_Time` and `Win32_Globalization` |
-| `windows` | 0.58 | MIT OR Apache-2.0 | Existing UI Automation taskbar dock (unchanged) |
+| `serde` | 1.0.229 | MIT OR Apache-2.0 | Config and spec serialization |
+| `serde_json` | 1.0.154 | MIT OR Apache-2.0 | Config, spec and golden vectors |
+| `ureq` | 2.12.1 | MIT OR Apache-2.0 | Existing CNBC quote fetch (unchanged) |
+| `native-tls` | 0.2.18 | MIT OR Apache-2.0 | Existing Windows SChannel TLS (unchanged) |
+| `windows-sys` | 0.59.0 | MIT OR Apache-2.0 | Existing Win32 bindings; session adapter uses `Win32_System_Time` and `Win32_Globalization` |
+| `windows` | 0.58.0 | MIT OR Apache-2.0 | Existing UI Automation taskbar dock (unchanged) |
 
 ## Data
 

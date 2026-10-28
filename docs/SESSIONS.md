@@ -121,7 +121,7 @@ overlap and broker results. Rust tests run every vector. The cases cover:
 - fixed-offset and US-DST broker reopen examples.
 
 The Pine and MQL5 files are generated from the same rules and numbers, but this machine has no TradingView or
-MT5 terminal, so their runtime behaviour is **not verified here** (see [TESTING.md](../TESTING.md)).
+MT5 terminal, so their runtime behaviour is **not verified here** (see [TESTING.md](TESTING.md)).
 
 ## Pine v6 boilerplate
 
