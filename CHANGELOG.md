@@ -1,5 +1,35 @@
 # Changelog — MH Ticker
 
+## 2026-10-28 — 1.3.0: session timers, plus Pine v6 and MQL5 boilerplates   [agent]
+
+**Files:** `spec/sessions.json`, `spec/golden/vectors.json`, `crates/session-engine/**`, `crates/specgen/**`,
+`pine/MH_Sessions.pine`, `mql5/MH_Sessions.mq5`, `src/{config,device,panel,ui,dock,main}.rs`, `Cargo.toml`,
+`docs/SESSIONS.md`, `TESTING.md`, `THIRD_PARTY.md`.
+
+**What.** Added the v1 session-timer feature from `docs/ARCHITECTURE.md`.
+- **Panel:** in the expanded view, a fixed-order block for Sydney, Tokyo, London and New York (local clock,
+  open/closed, next-transition countdown), the highlighted London–New York overlap, the broker server clock
+  and next reopen, and **exactly one** Windows device-zone clock. Rows never reorder or disappear; a failed
+  zone mapping shows the device row as unavailable. New *Session timers* menu toggle and an *About MH Ticker*
+  item with "Made by Maria".
+- **Engine:** a platform-independent `mh-session` workspace crate with half-open intervals, `earliest`
+  ambiguous-local handling, forward-shift for nonexistent local times, DST/weekend/overlap logic, and a
+  broker rule with an explicit verified/unverified state. It builds and tests on Linux with `cargo test`.
+- **Shared rules:** `spec/sessions.json` generates the Rust constants, bounded MQL5 IANA transition tables,
+  Pine session strings and both indicator files. `cargo run -p mh-specgen -- --check` guards drift. Shared UTC
+  golden vectors cover DST transitions, both mismatch weeks, overlap, weekend reopen, exact open/close, leap
+  day, year rollover and broker reopen.
+- **Pine v6:** table-only boilerplate. Pine cannot read the chart/device zone, so the extra clock is a manual
+  IANA `input.string` (default `syminfo.timezone`) and the docs never claim auto-detection.
+- **MQL5:** display-only, strictly read-only, no trading functions. Generated bounded transition tables,
+  measured or overridden server offset, visible unknown state, device clock from `TimeLocal()`/`TimeGMT()`.
+- **Config:** a new optional `sessions` object; old configs keep every quote/placement setting and get the
+  defaults. No new network calls.
+
+**Verify.** `cargo test` (34 tests: 26 engine, 4 golden, 4 generator), `cargo run -p mh-specgen -- --check`,
+and a Linux cross-platform `cargo check` of the app source. Rustfmt/clippy are not installed on this box. Real
+Windows, MT5 and TradingView behaviour is not verified here; see `TESTING.md`.
+
 ## 2026-10-16 — 1.2.3: its own app icon   [claude.impl]
 
 **Files:** `assets/{icon.ico,icon_256.png,make_icon.py,app.rc}`, `build.rs` (new), `src/ui.rs` (class icon), `Cargo.toml`

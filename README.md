@@ -34,6 +34,16 @@ Double click it. If prompted, simply select Run anyway.
 - **Pick ur symbols:** right click → *Symbols* and tick whatever u want from 23 of them (metals, crypto, us
   futures, oil, gas, copper, fx, the dollar index, us yields, vix, nikkei, dax, ftse, hang seng). the strip and
   the panel change right away, no restart. max 12 at once, and *Reset to default* gets u back the original six
+- **Session timers:** the expanded panel also shows Sydney, Tokyo, London and New York in that fixed order,
+  with local time, open/closed and a countdown to the next open or close. Below them are the London–New York
+  overlap, the broker server clock, and exactly one device-zone clock detected from Windows. Right click →
+  *Session timers* hides or shows the block. The times are common FX-session conventions, not guaranteed
+  exchange hours; there is no holiday calendar in v1. See [docs/SESSIONS.md](docs/SESSIONS.md).
+- **Broker clock:** the default preset is a reported, *unverified* Exness-style rule, so the panel shows the
+  server time but marks the next reopen unknown until u confirm the rule in config. Set
+  `sessions.broker_offset_min`, `sessions.broker_reopen_min` and `sessions.broker_rule_verified` in
+  `config.json` if u have checked them against ur own server. A configured offset is an estimate, not a live
+  feed.
 - **Move it:** right click → *Position*, since not everyone has free space on the left of their taskbar:
   - **Auto** (default) - Stays in the taskbar and finds the space itself. it uses the left of start while theres
     room there, otherwise next to the tray, and if ur taskbar has no room at all (auto-hide or a vertical one) it
@@ -66,17 +76,44 @@ whats in there:
 - `dock_rows`, `dock_font_pt`: the grid when its in the taskbar
 - `font`, `font_pt`, `opacity`, `topmost`
 - `x`/`y`: where it was left in Floating
+- `sessions`: `enabled`, optional `broker_offset_min` / `broker_reopen_min`, `broker_rule_verified`, and an
+  optional `device_zone` IANA name (e.g. `Europe/Berlin`) if Windows detection fails or picks the wrong zone.
+  A configured device zone is labelled *configured*, not *auto-detected*.
 
 `MH_Ticker --probe` does one pass over the prices and the last hour of bars, prints it and exits - handy for
 checking a new symbol actually works before u add it
 
+## Session engine and indicators
+
+The session rules live in one versioned spec, [`spec/sessions.json`](spec/sessions.json), pinned to tzdb
+2025b. `cargo run -p mh-specgen` generates the Rust constants, the bounded MQL5 transition tables and both
+indicator files from it; `--check` fails if anything drifted. The shared UTC golden vectors are in
+[`spec/golden/vectors.json`](spec/golden/vectors.json).
+
+- **Rust engine:** `crates/session-engine` is platform independent and tests on Linux/macOS/Windows with
+  `cargo test`. It handles half-open `[open, close)` intervals, DST transitions, the London–New York overlap
+  and weekend reopen.
+- **Pine v6:** [`pine/MH_Sessions.pine`](pine/MH_Sessions.pine) is a display-only boilerplate. Pine cannot
+  read the chart or device time zone, so its one extra clock is a manual `input.string` IANA dropdown
+  (default `syminfo.timezone`, the exchange zone) and is never auto-detected. It updates on bar events, so it
+  shows the last update and has no session countdowns.
+- **MQL5:** [`mql5/MH_Sessions.mq5`](mql5/MH_Sessions.mq5) is display-only, strictly read-only, with no
+  trading functions. It embeds bounded IANA transition tables and fails visibly outside their coverage. The
+  broker offset is an estimate from `TimeTradeServer()`/`TimeGMT()` or a configured override. Not affiliated
+  with MetaQuotes; MT5 is a MetaQuotes trademark.
+
+See [docs/SESSIONS.md](docs/SESSIONS.md) for the rules, limits and verification status, and
+[TESTING.md](TESTING.md) for what still needs a real Windows/MT5/TradingView check.
+
 ## Building it Yourself
 
-You only need Windows 10 onwards and Rust (most recent stable release).
+You only need Windows 10 onwards and Rust (most recent stable release). The app is Win32-only, but the session
+engine and generator are portable:
 
 ```sh
-cargo test
-cargo build --release
+cargo test                 # session engine + generator + golden vectors, any OS
+cargo run -p mh-specgen -- --check
+cargo build --release -p mh_ticker
 ```
 
 The exe ends up at `target/release/MH_Ticker.exe`, copy it next to this readme if u want to double click it from
