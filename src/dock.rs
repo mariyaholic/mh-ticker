@@ -502,13 +502,25 @@ pub fn spawn_probe(changed: Box<dyn Fn() + Send>) {
         .name("dock-probe".into())
         .spawn(move || {
             use windows::Win32::System::Com::{
-                CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
+                CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
+                COINIT_MULTITHREADED,
             };
             use windows::Win32::UI::Accessibility::CUIAutomation;
-            let uia: Option<IUIAutomation> = unsafe {
-                let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-                CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).ok()
-            };
+            // A failed initialization, including RPC_E_CHANGED_MODE, cannot be balanced
+            // with CoUninitialize and cannot safely create this MTA automation client.
+            if unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_err() {
+                return;
+            }
+            struct ComGuard;
+            impl Drop for ComGuard {
+                fn drop(&mut self) {
+                    unsafe { CoUninitialize() }
+                }
+            }
+            // Declared before the COM objects so they drop first on every return.
+            let _com = ComGuard;
+            let uia: Option<IUIAutomation> =
+                unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).ok() };
             let Some(uia) = uia else { return };
             let Ok(walker) = (unsafe { uia.ControlViewWalker() }) else {
                 return;
