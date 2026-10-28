@@ -1,3 +1,5 @@
+Made by Maria
+
 # MH Ticker
 
 _made with love by [maria](https://github.com/mariyaholic)_

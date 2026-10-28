@@ -1,0 +1,11 @@
+# Agent brief — MH Ticker: Session timers feature (branch feature/session-timers)
+
+Made by Maria. Licence: Apache-2.0 (LICENSE, NOTICE), relicensed from MIT on this branch by the copyright holder's instruction. Credit name is "Maria" only.
+
+1. This repo is a COPY of MH Ticker. Work only on branch `feature/session-timers`. Never commit to, merge into, or rewrite `main`. Do not touch the original at /workspace/desk/... .
+2. Follow docs/ARCHITECTURE.md, v1 scope only: pure session engine + Windows zone adapter + panel section in MH Ticker (Sydney, Tokyo, London, New York, broker server time, then one auto-detected device-zone clock), plus the Pine v6 and MQL5 indicator boilerplates in their own folders with shared golden vectors. Pine: scripts cannot read the chart or device time zone; use an `input.string` time-zone setting (default `syminfo.timezone`) and say so in its docs. Do not claim auto-detection in Pine.
+3. MT5 / MQL5: indicator is display-only, strictly read-only; no trading functions. Not affiliated with MetaQuotes; MT5 is a MetaQuotes trademark. Not affiliated with TradingView.
+4. Tests are required: unit + golden-vector tests for the session engine (DST transitions, overlaps, weekend reopen). Rust: there is no Windows target on this box (no rustup/mingw). Keep the session engine in a platform-independent module/crate that builds and tests on Linux with `cargo test`; keep Win32 code behind `#[cfg(windows)]`. If the existing crate cannot build on Linux, put the engine in a workspace member crate that can, and list everything needing real Windows in TESTING.md. Do not install toolchains.
+5. No network publishing: no git push, no remotes, no publishing, no uploads. Stay inside this directory. Never read or print credentials.
+6. Keep LICENSE/NOTICE; README keeps "Made by Maria" as its first line; About screen shows "Made by Maria"; SPDX headers on new files; third-party deps MIT/BSD/ISC/Apache-2.0/Zlib only, recorded in THIRD_PARTY.md.
+7. Commit locally in small commits (author Maria). Finish with STATUS.md: what is built, commands and results, LOC added, tests needing real Windows, open issues.
