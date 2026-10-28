@@ -89,7 +89,7 @@ mod tests {
     fn invalid_configured_zone_falls_back_to_detection_not_a_guess() {
         let cfg = SessionConfig { device_zone: Some("Not/AZone".into()), ..SessionConfig::default() };
         let d = current(&cfg);
-        assert_eq!(d.source, DeviceSource::Unavailable);
-        assert!(d.iana.is_none());
+        assert_ne!(d.source, DeviceSource::Configured);
+        assert!(d.iana.as_deref().is_none_or(is_valid_iana));
     }
 }

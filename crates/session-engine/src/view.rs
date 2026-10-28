@@ -163,7 +163,7 @@ fn broker_row(rule: &BrokerRule, status: &BrokerStatus, now: DateTime<Utc>, offs
         ReopenConfidence::Unverified => match status.estimate {
             Some(at) => {
                 let local = at + Duration::minutes(status.offset_min as i64);
-                format!("unknown · preset · est {} {}", local.format("%a"), local.format("%H:%M"))
+                format!("unknown · est {} {}", local.format("%a"), local.format("%H:%M"))
             }
             None => "reopen unknown".into(),
         },
