@@ -23,3 +23,15 @@ strategy tester clocks, server offset, DST and table coverage edges. Check Pine 
 manual zone input, bar-event updates and historical/realtime behavior. Compare shared vectors across
 both platforms before claiming parity. Pine cannot detect the chart or device zone. MT5 is a
 MetaQuotes trademark; the project is not affiliated with MetaQuotes or TradingView.
+
+## Review follow-up
+
+Offline checks use `cargo test --offline`, `cargo fmt --all --check`, `cargo clippy --offline
+--workspace --all-targets --target x86_64-pc-windows-gnu`, and the Windows test compile above
+with `--offline`. The Windows application tests are cross-compiled, not executed on Linux.
+On a real Windows PC exercise COM initialization failure and shutdown, hook removal and callbacks,
+including repeated shutdown. Verify `scripts/build-windows.ps1` with native toolchains and paths
+containing spaces, check the icon resource, and compare clean builds before making reproducibility
+claims. Native MSVC without windres may omit the icon. Measure resource use and verify any release
+link against the shipping build. Complete source and indicator review and compare indicator output
+on their platforms before publication.

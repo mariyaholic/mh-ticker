@@ -2,7 +2,7 @@
 
 _made with love by [maria](https://github.com/mariyaholic)_
 
-A little, extremely resource efficient (~5 MB RAM, and any potato CPU won't feel it) price ticker that sits in the empty part of ur windows taskbar. Click it and it glides out into a
+A little price ticker that sits in the empty part of ur windows taskbar. Click it and it glides out into a
 bigger window in the middle of the screen, hit minimize and it glides right back into the taskbar. Prices
 come from CNBC's public quotes. You don't need any login, code, payment, whatever. Just click the .exe file!
 ```
@@ -14,8 +14,7 @@ XAG    56.590  DOW 52,048   NAS 29,801.50  ●
 
 ## Download
 
-Grab `MH_Ticker.exe` from the [latest release](https://github.com/mariyaholic/mh-ticker/releases/latest) and
-Double click it. If prompted, simply select Run anyway. 
+Build `MH_Ticker.exe` using the instructions in [Testing](docs/TESTING.md). The historical release link and resource-use figures have not been verified for this build.
 
 ## How to use it
 

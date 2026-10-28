@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+- Validate quote timestamps and balance COM initialization and foreground hook cleanup.
+- Audit locked dependency licences and clarify unverified release and platform checks.
+
 - Add session timers, a portable session engine, and generated Pine and MQL5 indicators.
 - Review Windows cross-builds, resource compilation, documentation, and release preparation.
 
