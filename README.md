@@ -89,4 +89,3 @@ It's plain win32/gdi - no GUI toolkit, no webview, no GPU stuff - so it only use
 ## License
 
 [Apache-2.0](LICENSE) © 2026 Maria (https://github.com/mariyaholic). See [NOTICE](NOTICE).
-text with it. And if u build something on top of it please credit this repo as the original source!
