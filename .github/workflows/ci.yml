@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: MIT
+name: CI
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4 # TODO pin to commit SHA before publishing
+      - uses: dtolnay/rust-toolchain@stable # TODO pin to commit SHA before publishing
+        with:
+          toolchain: 1.99.1
+          components: rustfmt, clippy
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked
+      - run: cargo build --workspace --locked
+      - run: cargo test --workspace --locked
+      - run: cargo run --locked -p mh-specgen -- --check

@@ -5,3 +5,6 @@ dist/
 
 # Machine-local build settings (e.g. a target dir on another drive): not for other machines
 /.cargo/config.toml
+
+# Local scratch output
+/scratch/
