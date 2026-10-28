@@ -81,7 +81,7 @@ mod tests {
 
     #[test]
     fn tables_are_bounded_and_ordered() {
-        assert!(TABLE_FROM < TABLE_TO);
+        const { assert!(TABLE_FROM < TABLE_TO) };
         for table in ZONE_TABLES {
             assert_eq!(offset_at(table, TABLE_FROM - 1), None);
             assert_eq!(offset_at(table, TABLE_TO), None);
