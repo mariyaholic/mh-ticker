@@ -1,8 +1,8 @@
-<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!-- SPDX-License-Identifier: MIT -->
 # Third-party software and data
 
-Made by Maria. The MH Ticker application and the session engine/indicators are Apache-2.0; see
-[LICENSE](LICENSE) and [NOTICE](NOTICE).
+made with love by maria. The MH Ticker application, the session engine and the Pine/MQL5 indicators in this
+repository are MIT; see [LICENSE](LICENSE).
 
 Only MIT, BSD, ISC, Apache-2.0 and Zlib dependencies are intentionally used. The table records the direct
 dependencies added by this feature and the existing application; transitive crates are pinned by
@@ -25,10 +25,11 @@ dependencies added by this feature and the existing application; transitive crat
   (the `tz` distribution's `LICENSE` permits use and redistribution).
 - **Windows-to-IANA mapping**: `crates/session-engine/data/windows-zones.tsv` is a pinned, reviewable subset of
   CLDR `windowsZones` version 48 (001 defaults plus selected territory overrides). It is hand-maintained in
-  this repository, not copied wholesale. CLDR is published by the Unicode Consortium; its data licence is the
-  Unicode License v3, which is **not on the approved dependency licence list** for this project. This is an
-  open item for the Manager (see [STATUS.md](STATUS.md) and [TESTING.md](TESTING.md)); unknown mappings fail
-  visibly rather than guessing.
+  this repository, not copied wholesale. CLDR is published by the Unicode Consortium under the
+  Unicode License v3, approved for this project by the Manager on 2026-10-28. The full licence text is in
+  [`crates/session-engine/data/LICENSE-UNICODE-CLDR.txt`](crates/session-engine/data/LICENSE-UNICODE-CLDR.txt).
+  Credit: "Contains data from the Unicode Common Locale Data Repository (CLDR), Copyright © 1991-2026
+  Unicode, Inc." Unknown mappings fail visibly rather than guessing.
 - **Pine Script and MQL5 files** contain only project code and generated project data. No third-party
   indicator code is reused. TradingView and MetaQuotes are not affiliated with this project; MT5 is a
   MetaQuotes trademark.
