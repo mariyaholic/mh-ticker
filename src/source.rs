@@ -69,21 +69,72 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 /// "2026-10-15T04:29:41.313-0400" -> UTC epoch seconds. A bare date (a closed cash market's
 /// last close) has no time of day and returns None, so the row reads as stale.
 pub fn parse_time(s: &str) -> Option<f64> {
+    // CNBC timestamps use an ISO-like date, seconds and a numeric UTC offset.
+    fn digits(s: &str, len: usize) -> Option<i64> {
+        (s.len() == len && s.bytes().all(|b| b.is_ascii_digit())).then(|| s.parse().ok())?
+    }
     let (date, rest) = s.split_once('T')?;
-    let mut d = date.split('-').map(|p| p.parse::<i64>().ok());
-    let (y, mo, da) = (d.next()??, d.next()??, d.next()??);
-    let split = rest.rfind(['+', '-']).filter(|&i| i >= 8)?;
+    let mut d = date.split('-');
+    let (y, mo, da) = (
+        digits(d.next()?, 4)?,
+        digits(d.next()?, 2)?,
+        digits(d.next()?, 2)?,
+    );
+    if d.next().is_some() || y == 0 || !(1..=12).contains(&mo) {
+        return None;
+    }
+    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let max_day = match mo {
+        2 if leap => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    if !(1..=max_day).contains(&da) {
+        return None;
+    }
+    let split = rest.rfind(['+', '-'])?;
     let (clock, zone) = rest.split_at(split);
     let mut c = clock.split(':');
-    let h: f64 = c.next()?.parse().ok()?;
-    let mi: f64 = c.next()?.parse().ok()?;
-    let se: f64 = c.next().unwrap_or("0").parse().ok()?;
+    let h = digits(c.next()?, 2)?;
+    let mi = digits(c.next()?, 2)?;
+    let seconds = c.next()?;
+    if c.next().is_some() {
+        return None;
+    }
+    let (whole, fraction) = seconds.split_once('.').unwrap_or((seconds, ""));
+    let se = digits(whole, 2)?;
+    if h > 23
+        || mi > 59
+        || se > 59
+        || (seconds.contains('.')
+            && (fraction.is_empty() || !fraction.bytes().all(|b| b.is_ascii_digit())))
+    {
+        return None;
+    }
+    let frac = if fraction.is_empty() {
+        0.0
+    } else {
+        format!("0.{fraction}").parse::<f64>().ok()?
+    };
+    let z = &zone[1..];
+    if !z.is_ascii() {
+        return None;
+    }
+    let (zh, zm) = if z.len() == 4 {
+        (digits(&z[..2], 2)?, digits(&z[2..], 2)?)
+    } else if z.len() == 5 && z.as_bytes()[2] == b':' {
+        (digits(&z[..2], 2)?, digits(&z[3..], 2)?)
+    } else {
+        return None;
+    };
+    if zh > 23 || zm > 59 {
+        return None;
+    }
     let sign = if zone.starts_with('-') { -1.0 } else { 1.0 };
-    let z = zone[1..].replace(':', "");
-    let zh: f64 = z.get(0..2)?.parse().ok()?;
-    let zm: f64 = z.get(2..4).unwrap_or("0").parse().ok()?;
-    let local = days_from_civil(y, mo, da) as f64 * 86_400.0 + h * 3600.0 + mi * 60.0 + se;
-    Some(local - sign * (zh * 3600.0 + zm * 60.0))
+    let local =
+        days_from_civil(y, mo, da) as f64 * 86_400.0 + (h * 3600 + mi * 60 + se) as f64 + frac;
+    Some(local - sign * (zh * 3600 + zm * 60) as f64)
 }
 
 /// `restQuote` body -> quotes.
@@ -438,6 +489,25 @@ mod tests {
         assert!((utc - 1_792_052_981.313).abs() < 1e-3, "{utc}");
         assert_eq!(parse_time("2026-10-15T08:29:41.313+0000"), Some(utc));
         assert_eq!(parse_time("2026-10-14"), None);
+    }
+
+    #[test]
+    fn rejects_malformed_timestamps() {
+        for s in [
+            "999999999999999999-01-01T00:00:00+0000",
+            "2025-02-29T00:00:00+0000",
+            "2026-13-01T00:00:00+0000",
+            "2026-01-01T24:00:00+0000",
+            "2026-01-01T00:00:NaN+0000",
+            "2026-01-01T00:00:00+0000junk",
+            "2026-01-01T00:00:00.+0000",
+            "2026-01-01T00:00:00+2400",
+            "2026-01-01T00:00:00+0é0",
+            "2026-01-01T00:00:00:00+0000",
+        ] {
+            assert_eq!(parse_time(s), None, "{s}");
+        }
+        assert!(parse_time("2024-02-29T23:59:59.5+05:30").is_some());
     }
 
     #[test]
