@@ -1,0 +1,213 @@
+{
+  "spdx": "Apache-2.0",
+  "spec_version": "1.0.0",
+  "tzdb_version": "2025b",
+  "note": "Shared UTC golden vectors. Rust tests assert them; the Pine/MQL5 harnesses use the same instants and generated rules.",
+  "cases": [
+    {
+      "name": "winter_midweek_london_open",
+      "utc": "2025-01-15T08:00:00Z",
+      "sessions": {
+        "sydney": { "open": false, "next": "open", "next_utc": "2025-01-15T20:00:00Z" },
+        "tokyo": { "open": true, "next": "close", "next_utc": "2025-01-15T09:00:00Z" },
+        "london": { "open": true, "next": "close", "next_utc": "2025-01-15T17:00:00Z" },
+        "new_york": { "open": false, "next": "open", "next_utc": "2025-01-15T13:00:00Z" }
+      },
+      "overlap": { "open": false, "next_start": "2025-01-15T13:00:00Z", "next_end": "2025-01-15T17:00:00Z" }
+    },
+    {
+      "name": "winter_overlap",
+      "utc": "2025-01-15T14:00:00Z",
+      "sessions": {
+        "sydney": { "open": false, "next": "open", "next_utc": "2025-01-15T20:00:00Z" },
+        "tokyo": { "open": false, "next": "open", "next_utc": "2025-01-16T00:00:00Z" },
+        "london": { "open": true, "next": "close", "next_utc": "2025-01-15T17:00:00Z" },
+        "new_york": { "open": true, "next": "close", "next_utc": "2025-01-15T22:00:00Z" }
+      },
+      "overlap": { "open": true, "current_start": "2025-01-15T13:00:00Z", "current_end": "2025-01-15T17:00:00Z" }
+    },
+    {
+      "name": "us_dst_starts_before_uk",
+      "utc": "2025-03-12T12:30:00Z",
+      "sessions": {
+        "sydney": { "open": false, "next": "open", "next_utc": "2025-03-12T20:00:00Z" },
+        "tokyo": { "open": false, "next": "open", "next_utc": "2025-03-13T00:00:00Z" },
+        "london": { "open": true, "next": "close", "next_utc": "2025-03-12T17:00:00Z" },
+        "new_york": { "open": true, "next": "close", "next_utc": "2025-03-12T21:00:00Z" }
+      },
+      "overlap": { "open": true, "current_start": "2025-03-12T12:00:00Z", "current_end": "2025-03-12T17:00:00Z" }
+    },
+    {
+      "name": "uk_ends_before_us",
+      "utc": "2025-10-28T12:30:00Z",
+      "sessions": {
+        "sydney": { "open": false, "next": "open", "next_utc": "2025-10-28T20:00:00Z" },
+        "tokyo": { "open": false, "next": "open", "next_utc": "2025-10-29T00:00:00Z" },
+        "london": { "open": true, "next": "close", "next_utc": "2025-10-28T17:00:00Z" },
+        "new_york": { "open": true, "next": "close", "next_utc": "2025-10-28T21:00:00Z" }
+      },
+      "overlap": { "open": true, "current_start": "2025-10-28T12:00:00Z", "current_end": "2025-10-28T17:00:00Z" }
+    },
+    {
+      "name": "sydney_dst_ends",
+      "utc": "2025-04-07T00:00:00Z",
+      "sessions": {
+        "sydney": { "open": true, "next": "close", "next_utc": "2025-04-07T06:00:00Z" },
+        "tokyo": { "open": true, "next": "close", "next_utc": "2025-04-07T09:00:00Z" },
+        "london": { "open": false, "next": "open", "next_utc": "2025-04-07T07:00:00Z" },
+        "new_york": { "open": false, "next": "open", "next_utc": "2025-04-07T12:00:00Z" }
+      },
+      "overlap": { "open": false, "next_start": "2025-04-07T12:00:00Z", "next_end": "2025-04-07T16:00:00Z" }
+    },
+    {
+      "name": "sydney_dst_starts",
+      "utc": "2025-10-05T21:00:00Z",
+      "sessions": {
+        "sydney": { "open": true, "next": "close", "next_utc": "2025-10-06T05:00:00Z" },
+        "tokyo": { "open": false, "next": "open", "next_utc": "2025-10-06T00:00:00Z" },
+        "london": { "open": false, "next": "open", "next_utc": "2025-10-06T07:00:00Z" },
+        "new_york": { "open": false, "next": "open", "next_utc": "2025-10-06T12:00:00Z" }
+      },
+      "overlap": { "open": false, "next_start": "2025-10-06T12:00:00Z", "next_end": "2025-10-06T16:00:00Z" }
+    },
+    {
+      "name": "weekend_all_closed",
+      "utc": "2025-01-18T12:00:00Z",
+      "sessions": {
+        "sydney": { "open": false, "next": "open", "next_utc": "2025-01-19T20:00:00Z" },
+        "tokyo": { "open": false, "next": "open", "next_utc": "2025-01-20T00:00:00Z" },
+        "london": { "open": false, "next": "open", "next_utc": "2025-01-20T08:00:00Z" },
+        "new_york": { "open": false, "next": "open", "next_utc": "2025-01-20T13:00:00Z" }
+      },
+      "overlap": { "open": false, "next_start": "2025-01-20T13:00:00Z", "next_end": "2025-01-20T17:00:00Z" }
+    },
+    {
+      "name": "friday_new_york_still_open",
+      "utc": "2025-01-17T21:30:00Z",
+      "sessions": {
+        "sydney": { "open": false, "next": "open", "next_utc": "2025-01-19T20:00:00Z" },
+        "tokyo": { "open": false, "next": "open", "next_utc": "2025-01-20T00:00:00Z" },
+        "london": { "open": false, "next": "open", "next_utc": "2025-01-20T08:00:00Z" },
+        "new_york": { "open": true, "next": "close", "next_utc": "2025-01-17T22:00:00Z" }
+      },
+      "overlap": { "open": false, "next_start": "2025-01-20T13:00:00Z", "next_end": "2025-01-20T17:00:00Z" }
+    },
+    {
+      "name": "year_rollover_without_holidays",
+      "utc": "2025-12-31T23:30:00Z",
+      "sessions": {
+        "sydney": { "open": true, "next": "close", "next_utc": "2026-01-01T05:00:00Z" },
+        "tokyo": { "open": false, "next": "open", "next_utc": "2026-01-01T00:00:00Z" },
+        "london": { "open": false, "next": "open", "next_utc": "2026-01-01T08:00:00Z" },
+        "new_york": { "open": false, "next": "open", "next_utc": "2026-01-01T13:00:00Z" }
+      },
+      "overlap": { "open": false, "next_start": "2026-01-01T13:00:00Z", "next_end": "2026-01-01T17:00:00Z" }
+    },
+    {
+      "name": "tokyo_has_no_dst",
+      "utc": "2025-07-01T00:00:00Z",
+      "sessions": {
+        "sydney": { "open": true, "next": "close", "next_utc": "2025-07-01T06:00:00Z" },
+        "tokyo": { "open": true, "next": "close", "next_utc": "2025-07-01T09:00:00Z" },
+        "london": { "open": false, "next": "open", "next_utc": "2025-07-01T07:00:00Z" },
+        "new_york": { "open": false, "next": "open", "next_utc": "2025-07-01T12:00:00Z" }
+      },
+      "overlap": { "open": false, "next_start": "2025-07-01T12:00:00Z", "next_end": "2025-07-01T16:00:00Z" }
+    },
+    {
+      "name": "leap_day",
+      "utc": "2024-02-29T13:30:00Z",
+      "sessions": {
+        "sydney": { "open": false, "next": "open", "next_utc": "2024-02-29T20:00:00Z" },
+        "tokyo": { "open": false, "next": "open", "next_utc": "2024-03-01T00:00:00Z" },
+        "london": { "open": true, "next": "close", "next_utc": "2024-02-29T17:00:00Z" },
+        "new_york": { "open": true, "next": "close", "next_utc": "2024-02-29T22:00:00Z" }
+      },
+      "overlap": { "open": true, "current_start": "2024-02-29T13:00:00Z", "current_end": "2024-02-29T17:00:00Z" }
+    },
+    {
+      "name": "london_at_exact_close",
+      "utc": "2025-01-15T17:00:00Z",
+      "sessions": {
+        "sydney": { "open": false, "next": "open", "next_utc": "2025-01-15T20:00:00Z" },
+        "tokyo": { "open": false, "next": "open", "next_utc": "2025-01-16T00:00:00Z" },
+        "london": { "open": false, "next": "open", "next_utc": "2025-01-16T08:00:00Z" },
+        "new_york": { "open": true, "next": "close", "next_utc": "2025-01-15T22:00:00Z" }
+      },
+      "overlap": { "open": false, "next_start": "2025-01-16T13:00:00Z", "next_end": "2025-01-16T17:00:00Z" }
+    },
+    {
+      "name": "tokyo_at_exact_close",
+      "utc": "2025-01-15T09:00:00Z",
+      "sessions": {
+        "sydney": { "open": false, "next": "open", "next_utc": "2025-01-15T20:00:00Z" },
+        "tokyo": { "open": false, "next": "open", "next_utc": "2025-01-16T00:00:00Z" },
+        "london": { "open": true, "next": "close", "next_utc": "2025-01-15T17:00:00Z" },
+        "new_york": { "open": false, "next": "open", "next_utc": "2025-01-15T13:00:00Z" }
+      },
+      "overlap": { "open": false, "next_start": "2025-01-15T13:00:00Z", "next_end": "2025-01-15T17:00:00Z" }
+    }
+  ],
+  "broker_cases": [
+    {
+      "name": "fixed_plus_two_weekday_reopen",
+      "utc": "2025-01-15T12:00:00Z",
+      "rule": {
+        "verified": true,
+        "winter_offset_minutes": 120,
+        "summer_offset_minutes": 120,
+        "seasonal": "fixed",
+        "reopen_local": "00:00",
+        "reopen_days": [1, 2, 3, 4, 5]
+      },
+      "server_utc": "2025-01-15T14:00:00Z",
+      "offset_minutes": 120,
+      "next_reopen": "2025-01-15T22:00:00Z"
+    },
+    {
+      "name": "fixed_plus_two_friday_to_monday",
+      "utc": "2025-01-17T21:00:00Z",
+      "rule": {
+        "verified": true,
+        "winter_offset_minutes": 120,
+        "summer_offset_minutes": 120,
+        "seasonal": "fixed",
+        "reopen_local": "00:00",
+        "reopen_days": [1, 2, 3, 4, 5]
+      },
+      "server_utc": "2025-01-17T23:00:00Z",
+      "offset_minutes": 120,
+      "next_reopen": "2025-01-19T22:00:00Z"
+    },
+    {
+      "name": "us_dst_summer_offset",
+      "utc": "2025-03-12T12:00:00Z",
+      "rule": {
+        "verified": true,
+        "winter_offset_minutes": 120,
+        "summer_offset_minutes": 180,
+        "seasonal": "us_dst",
+        "reopen_local": "00:00",
+        "reopen_days": [1, 2, 3, 4, 5]
+      },
+      "server_utc": "2025-03-12T15:00:00Z",
+      "offset_minutes": 180,
+      "next_reopen": "2025-03-12T21:00:00Z"
+    },
+    {
+      "name": "us_dst_winter_offset_again",
+      "utc": "2025-11-05T12:00:00Z",
+      "rule": {
+        "verified": true,
+        "winter_offset_minutes": 120,
+        "summer_offset_minutes": 180,
+        "seasonal": "us_dst",
+        "reopen_local": "00:00",
+        "reopen_days": [1, 2, 3, 4, 5]
+      },
+      "server_utc": "2025-11-05T14:00:00Z",
+      "offset_minutes": 120,
+      "next_reopen": "2025-11-05T22:00:00Z"
+    }
+  ]
+}

@@ -1,8 +1,8 @@
 [package]
 name = "mh_ticker"
-version = "1.2.3"
+version = "1.3.0"
 edition = "2021"
-description = "MH Ticker: a price strip docked in the Windows taskbar that opens into a centred panel. Public CNBC quotes, no login, no server."
+description = "MH Ticker: a price strip docked in the Windows taskbar that opens into a centred panel, with world session timers. Public CNBC quotes, no login, no server."
 license = "Apache-2.0"
 repository = "https://github.com/mariyaholic/mh-ticker"
 authors = ["mariyaholic"]
@@ -11,19 +11,30 @@ authors = ["mariyaholic"]
 name = "MH_Ticker"
 path = "src/main.rs"
 
+[workspace]
+members = ["crates/session-engine", "crates/specgen"]
+# The root package is Windows-only (Win32/GDI). On Linux, plain `cargo test` and
+# `cargo test --workspace` target the portable members; build the app with
+# `cargo build --release -p mh_ticker` on Windows.
+default-members = ["crates/session-engine", "crates/specgen"]
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # HTTPS through Windows' own TLS (SChannel) via native-tls: no bundled certificate store.
 ureq = { version = "2.12", default-features = false, features = ["json", "native-tls"] }
 native-tls = "0.2"
+chrono = { version = "=0.4.45", default-features = false, features = ["clock", "std"] }
+mh-session = { path = "crates/session-engine", package = "mh-session" }
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
+    "Win32_Globalization",
     "Win32_UI_Accessibility",
     "Win32_Graphics_Gdi",
     "Win32_Security",
     "Win32_Graphics_Dwm",
     "Win32_System_LibraryLoader",
+    "Win32_System_Time",
     "Win32_System_Threading",
     "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",

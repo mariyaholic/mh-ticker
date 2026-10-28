@@ -1,0 +1,69 @@
+{
+  "spdx": "Apache-2.0",
+  "spec_version": "1.0.0",
+  "tzdb_version": "2025b",
+  "effective_from": "2024-01-01T00:00:00Z",
+  "effective_to": "2036-01-01T00:00:00Z",
+  "interval": "half-open",
+  "ambiguous_local": "earliest",
+  "nonexistent_local": "shift_forward_1h",
+  "sessions": [
+    {
+      "id": "sydney",
+      "label": "Sydney",
+      "iana": "Australia/Sydney",
+      "open": "07:00",
+      "close": "16:00",
+      "days": [1, 2, 3, 4, 5],
+      "overnight": false,
+      "provenance": "Common FX-session convention; hours and weekdays require owner approval before a public release."
+    },
+    {
+      "id": "tokyo",
+      "label": "Tokyo",
+      "iana": "Asia/Tokyo",
+      "open": "09:00",
+      "close": "18:00",
+      "days": [1, 2, 3, 4, 5],
+      "overnight": false,
+      "provenance": "Common FX-session convention; hours and weekdays require owner approval before a public release."
+    },
+    {
+      "id": "london",
+      "label": "London",
+      "iana": "Europe/London",
+      "open": "08:00",
+      "close": "17:00",
+      "days": [1, 2, 3, 4, 5],
+      "overnight": false,
+      "provenance": "Common FX-session convention; hours and weekdays require owner approval before a public release."
+    },
+    {
+      "id": "new_york",
+      "label": "New York",
+      "iana": "America/New_York",
+      "open": "08:00",
+      "close": "17:00",
+      "days": [1, 2, 3, 4, 5],
+      "overnight": false,
+      "provenance": "Common FX-session convention; hours and weekdays require owner approval before a public release."
+    }
+  ],
+  "overlap": ["london", "new_york"],
+  "holidays": {
+    "policy": "none",
+    "provenance": "No holiday or exceptional-closure calendar is approved for v1; weekdays only."
+  },
+  "broker": {
+    "id": "exness_default",
+    "label": "Broker",
+    "verified": false,
+    "provenance": "Internal default preset: Exness. Reported observation only: UTC+0 server year-round, daily reopen around 22:00/23:00 server depending on US DST. Not independently confirmed; the next verified reopen is hidden until the owner approves a rule.",
+    "winter_offset_minutes": 0,
+    "summer_offset_minutes": 0,
+    "seasonal": "fixed",
+    "reopen_local": "22:00",
+    "reopen_days": [7],
+    "reopen_note": "Weekly reopen estimate only; daily maintenance reopens are not modelled."
+  }
+}
