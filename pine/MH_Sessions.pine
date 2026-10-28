@@ -80,9 +80,6 @@ bool showTable = input.bool(defval = true, title = "Show the sessions table")
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-f_state(string session, string zone) =>
-    not na(time(timeframe.period, session, zone)) ? "open" : "closed"
-
 f_duration(int ms) =>
     int mins = int(math.floor((ms < 0 ? 0 : ms) / 60000))
     int d = int(mins / 1440)
@@ -111,10 +108,10 @@ f_next_weekly(int now, int minuteOfDay, int pineDay) =>
 var table t = table.new(position.top_right, 4, 10, frame_color = color.new(color.gray, 60), frame_width = 1, border_color = color.new(color.gray, 80), border_width = 1)
 
 if showTable and barstate.islast
-    string sydney = f_state(MH_SESSION_SYDNEY, MH_ZONE_SYDNEY)
-    string tokyo = f_state(MH_SESSION_TOKYO, MH_ZONE_TOKYO)
-    string london = f_state(MH_SESSION_LONDON, MH_ZONE_LONDON)
-    string newYork = f_state(MH_SESSION_NEW_YORK, MH_ZONE_NEW_YORK)
+    string sydney = not na(time(timeframe.period, MH_SESSION_SYDNEY, MH_ZONE_SYDNEY)) ? "open" : "closed"
+    string tokyo = not na(time(timeframe.period, MH_SESSION_TOKYO, MH_ZONE_TOKYO)) ? "open" : "closed"
+    string london = not na(time(timeframe.period, MH_SESSION_LONDON, MH_ZONE_LONDON)) ? "open" : "closed"
+    string newYork = not na(time(timeframe.period, MH_SESSION_NEW_YORK, MH_ZONE_NEW_YORK)) ? "open" : "closed"
     bool overlapOpen = london == "open" and newYork == "open"
 
     int reopenAt = f_next_weekly(timenow, MH_BROKER_REOPEN_MIN, MH_BROKER_REOPEN_DAY)
