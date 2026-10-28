@@ -12,6 +12,7 @@ use crate::config::{Config, Row};
 use crate::model::{resolve, Board, Link, Quote};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::io::Read;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -26,16 +27,25 @@ const ROWS_CHECK: Duration = Duration::from_millis(250);
 const HOUR_S: f64 = 3600.0;
 
 pub fn now_s() -> f64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
 }
 
 /// "4,155.24" / "+1.22%" / 4155.24 -> 4155.24
 fn number(v: &Value) -> Option<f64> {
     match v {
         Value::Number(n) => n.as_f64(),
-        Value::String(s) => s.trim().trim_end_matches('%').replace([',', '+'], "").parse().ok(),
+        Value::String(s) => s
+            .trim()
+            .trim_end_matches('%')
+            .replace([',', '+'], "")
+            .parse()
+            .ok(),
         _ => None,
     }
+    .filter(|n: &f64| n.is_finite())
 }
 
 fn flag(v: Option<&Value>) -> bool {
@@ -78,7 +88,9 @@ pub fn parse_time(s: &str) -> Option<f64> {
 
 /// `restQuote` body -> quotes.
 pub fn parse_quotes(v: &Value) -> Vec<Quote> {
-    let rows = v.pointer("/FormattedQuoteResult/FormattedQuote").and_then(Value::as_array);
+    let rows = v
+        .pointer("/FormattedQuoteResult/FormattedQuote")
+        .and_then(Value::as_array);
     rows.map(|rows| {
         rows.iter()
             .filter_map(|r| {
@@ -86,11 +98,18 @@ pub fn parse_quotes(v: &Value) -> Vec<Quote> {
                 let price = r.get("last").and_then(number).filter(|p| *p > 0.0)?;
                 Some(Quote {
                     symbol,
-                    name: r.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
+                    name: r
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
                     price,
                     change_pct: r.get("change_pct").and_then(number),
                     prev_close: r.get("previous_day_closing").and_then(number),
-                    ts: r.get("last_time").and_then(Value::as_str).and_then(parse_time),
+                    ts: r
+                        .get("last_time")
+                        .and_then(Value::as_str)
+                        .and_then(parse_time),
                     realtime: flag(r.get("realTime")),
                 })
             })
@@ -118,7 +137,9 @@ pub fn parse_chart(v: &Value, now: f64) -> Vec<(f64, f64)> {
 fn encode(s: &str) -> String {
     s.bytes()
         .map(|b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
             _ => format!("%{b:02X}"),
         })
         .collect()
@@ -141,7 +162,18 @@ impl Client {
 
     fn get(&self, url: &str) -> Result<Value, String> {
         match self.agent.get(url).call() {
-            Ok(resp) => resp.into_json::<Value>().map_err(|e| e.to_string()),
+            Ok(resp) => {
+                const MAX_RESPONSE: u64 = 8 * 1024 * 1024;
+                let mut bytes = Vec::new();
+                resp.into_reader()
+                    .take(MAX_RESPONSE + 1)
+                    .read_to_end(&mut bytes)
+                    .map_err(|e| e.to_string())?;
+                if bytes.len() as u64 > MAX_RESPONSE {
+                    return Err("response too large".into());
+                }
+                serde_json::from_slice(&bytes).map_err(|e| e.to_string())
+            }
             Err(ureq::Error::Status(code, _)) => Err(format!("HTTP {code}")),
             Err(e) => Err(e.to_string()),
         }
@@ -161,7 +193,10 @@ impl Client {
     }
 
     pub fn chart(&self, symbol: &str) -> Result<Vec<(f64, f64)>, String> {
-        Ok(parse_chart(&self.get(&format!("{CHART_URL}?symbol={}", encode(symbol)))?, now_s()))
+        Ok(parse_chart(
+            &self.get(&format!("{CHART_URL}?symbol={}", encode(symbol)))?,
+            now_s(),
+        ))
     }
 }
 
@@ -200,7 +235,13 @@ impl Feed {
             if b.rows_gen != self.rows_gen {
                 return;
             }
-            b.cells = resolve(&self.rows, &self.quotes, now_s(), self.cfg.stale_after_s, self.cfg.delayed_grace_s);
+            b.cells = resolve(
+                &self.rows,
+                &self.quotes,
+                now_s(),
+                self.cfg.stale_after_s,
+                self.cfg.delayed_grace_s,
+            );
             b.link = link;
             b.note = note;
             if b.backfill_gen != self.backfill_gen {
@@ -217,7 +258,12 @@ impl Feed {
         let until = Instant::now() + d;
         while Instant::now() < until {
             thread::sleep(ROWS_CHECK.min(until.saturating_duration_since(Instant::now())));
-            if self.shared.lock().map(|b| b.rows_gen != self.rows_gen).unwrap_or(false) {
+            if self
+                .shared
+                .lock()
+                .map(|b| b.rows_gen != self.rows_gen)
+                .unwrap_or(false)
+            {
                 return;
             }
         }
@@ -228,7 +274,11 @@ impl Feed {
         if Instant::now() < self.bars_next {
             return false;
         }
-        let got: Vec<Vec<(f64, f64)>> = self.rows.iter().map(|r| self.client.chart(&r.symbol).unwrap_or_default()).collect();
+        let got: Vec<Vec<(f64, f64)>> = self
+            .rows
+            .iter()
+            .map(|r| self.client.chart(&r.symbol).unwrap_or_default())
+            .collect();
         if got.iter().any(|p| !p.is_empty()) {
             self.backfill = got;
             self.backfill_gen += 1;
@@ -249,13 +299,25 @@ impl Feed {
                     for q in qs {
                         self.quotes.insert(q.symbol.clone(), q);
                     }
-                    let cells =
-                        resolve(&self.rows, &self.quotes, now_s(), self.cfg.stale_after_s, self.cfg.delayed_grace_s);
-                    let lagging: Vec<&str> = cells.iter().filter(|c| c.stale).map(|c| c.label.as_str()).collect();
+                    let cells = resolve(
+                        &self.rows,
+                        &self.quotes,
+                        now_s(),
+                        self.cfg.stale_after_s,
+                        self.cfg.delayed_grace_s,
+                    );
+                    let lagging: Vec<&str> = cells
+                        .iter()
+                        .filter(|c| c.stale)
+                        .map(|c| c.label.as_str())
+                        .collect();
                     if lagging.is_empty() {
                         (Link::Live, String::new())
                     } else {
-                        (Link::Partial, format!("no fresh price: {} (market closed?)", lagging.join(", ")))
+                        (
+                            Link::Partial,
+                            format!("no fresh price: {} (market closed?)", lagging.join(", ")),
+                        )
                     }
                 }
                 Err(e) => {
@@ -290,7 +352,10 @@ pub fn spawn(cfg: Config, shared: Arc<Mutex<Board>>, notify: Box<dyn Fn() + Send
             return;
         }
     };
-    let (rows, rows_gen) = shared.lock().map(|b| (b.rows.clone(), b.rows_gen)).unwrap_or_else(|_| (cfg.rows.clone(), 0));
+    let (rows, rows_gen) = shared
+        .lock()
+        .map(|b| (b.rows.clone(), b.rows_gen))
+        .unwrap_or_else(|_| (cfg.rows.clone(), 0));
     let feed = Feed {
         cfg,
         rows,
@@ -304,7 +369,10 @@ pub fn spawn(cfg: Config, shared: Arc<Mutex<Board>>, notify: Box<dyn Fn() + Send
         bars_next: Instant::now(),
         fails: 0,
     };
-    thread::Builder::new().name("feed".into()).spawn(move || feed.run()).expect("spawn feed thread");
+    thread::Builder::new()
+        .name("feed".into())
+        .spawn(move || feed.run())
+        .expect("spawn feed thread");
 }
 
 /// `MH_Ticker --probe`: one pass over the quotes and the hour of bars, printed, then exit.
@@ -323,11 +391,14 @@ pub fn probe(cfg: &Config) {
                         "{:<5} {:>12} {:>8}  {}{}{} age={}",
                         c.label,
                         crate::model::fmt_price(q.price, c.digits),
-                        q.change_pct.map(crate::model::fmt_change).unwrap_or_default(),
+                        q.change_pct
+                            .map(crate::model::fmt_change)
+                            .unwrap_or_default(),
                         q.name,
                         if q.realtime { "" } else { " DELAYED" },
                         if c.stale { " STALE" } else { "" },
-                        q.ts.map(|t| format!("{:.0}s", now - t)).unwrap_or_else(|| "?".into()),
+                        q.ts.map(|t| format!("{:.0}s", now - t))
+                            .unwrap_or_else(|| "?".into()),
                     ),
                     None => println!("{:<5} {:>12}  no quote", c.label, "-"),
                 }
@@ -355,6 +426,12 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rejects_non_finite_prices() {
+        assert_eq!(number(&serde_json::json!("NaN")), None);
+        assert_eq!(number(&serde_json::json!("inf")), None);
+    }
+
+    #[test]
     fn parses_cnbc_times_to_utc() {
         // 2026-10-15T08:29:41.313Z
         let utc = parse_time("2026-10-15T04:29:41.313-0400").unwrap();
@@ -376,8 +453,19 @@ mod tests {
         .unwrap();
         let qs = parse_quotes(&v);
         assert_eq!(qs.len(), 2);
-        assert_eq!((qs[0].price, qs[0].change_pct, qs[0].prev_close, qs[0].realtime), (4155.24, Some(1.22), Some(4105.122), true));
-        assert_eq!((qs[1].price, qs[1].change_pct, qs[1].realtime), (52078.0, Some(-0.42), false));
+        assert_eq!(
+            (
+                qs[0].price,
+                qs[0].change_pct,
+                qs[0].prev_close,
+                qs[0].realtime
+            ),
+            (4155.24, Some(1.22), Some(4105.122), true)
+        );
+        assert_eq!(
+            (qs[1].price, qs[1].change_pct, qs[1].realtime),
+            (52078.0, Some(-0.42), false)
+        );
     }
 
     #[test]
@@ -389,7 +477,10 @@ mod tests {
               {"close":"3.0","tradeTimeinMills":10060000}]}}"#,
         )
         .unwrap();
-        assert_eq!(parse_chart(&v, 10_100.0), vec![(10_060.0, 2.0), (10_100.0, 3.0)]);
+        assert_eq!(
+            parse_chart(&v, 10_100.0),
+            vec![(10_060.0, 2.0), (10_100.0, 3.0)]
+        );
     }
 
     #[test]

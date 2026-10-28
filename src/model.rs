@@ -53,7 +53,12 @@ pub struct Board {
 }
 
 fn empty_cell(r: &Row) -> Cell {
-    Cell { label: r.label.clone(), digits: r.digits, quote: None, stale: true }
+    Cell {
+        label: r.label.clone(),
+        digits: r.digits,
+        quote: None,
+        stale: true,
+    }
 }
 
 impl Board {
@@ -78,7 +83,10 @@ impl Board {
                 self.cells
                     .iter()
                     .find(|c| c.label == r.label)
-                    .map(|c| Cell { digits: r.digits, ..c.clone() })
+                    .map(|c| Cell {
+                        digits: r.digits,
+                        ..c.clone()
+                    })
                     .unwrap_or_else(|| empty_cell(r))
             })
             .collect();
@@ -93,19 +101,33 @@ pub fn is_stale(q: &Quote, now: f64, stale_after: f64, delayed_grace: f64) -> bo
 }
 
 /// One cell per configured row, from the latest quotes keyed by symbol.
-pub fn resolve(rows: &[Row], quotes: &HashMap<String, Quote>, now: f64, stale_after: f64, delayed_grace: f64) -> Vec<Cell> {
+pub fn resolve(
+    rows: &[Row],
+    quotes: &HashMap<String, Quote>,
+    now: f64,
+    stale_after: f64,
+    delayed_grace: f64,
+) -> Vec<Cell> {
     rows.iter()
         .map(|r| {
             let quote = quotes.get(&r.symbol).cloned();
-            let stale = quote.as_ref().map(|q| is_stale(q, now, stale_after, delayed_grace)).unwrap_or(true);
-            Cell { label: r.label.clone(), digits: r.digits, quote, stale }
+            let stale = quote
+                .as_ref()
+                .map(|q| is_stale(q, now, stale_after, delayed_grace))
+                .unwrap_or(true);
+            Cell {
+                label: r.label.clone(),
+                digits: r.digits,
+                quote,
+                stale,
+            }
         })
         .collect()
 }
 
 /// `81176.4, 0` -> "81,176"; `4154.456, 2` -> "4,154.46".
 pub fn fmt_price(v: f64, digits: u32) -> String {
-    let s = format!("{:.*}", digits as usize, v.abs());
+    let s = format!("{:.*}", digits.min(12) as usize, v.abs());
     let (int, frac) = match s.split_once('.') {
         Some((i, f)) => (i.to_string(), Some(f.to_string())),
         None => (s.clone(), None),
@@ -133,7 +155,20 @@ mod tests {
     use super::*;
 
     fn q(sym: &str, ts: Option<f64>, realtime: bool) -> Quote {
-        Quote { symbol: sym.into(), name: String::new(), price: 1.0, change_pct: None, prev_close: None, ts, realtime }
+        Quote {
+            symbol: sym.into(),
+            name: String::new(),
+            price: 1.0,
+            change_pct: None,
+            prev_close: None,
+            ts,
+            realtime,
+        }
+    }
+
+    #[test]
+    fn excessive_configured_precision_is_bounded() {
+        assert_eq!(fmt_price(1.0, u32::MAX), "1.000000000000");
     }
 
     #[test]
@@ -148,10 +183,22 @@ mod tests {
     #[test]
     fn resolve_keeps_row_order_and_marks_missing() {
         let rows = vec![
-            Row { label: "XAU".into(), symbol: "XAU=".into(), digits: 2, name: String::new() },
-            Row { label: "DOW".into(), symbol: "@DJ.1".into(), digits: 0, name: String::new() },
+            Row {
+                label: "XAU".into(),
+                symbol: "XAU=".into(),
+                digits: 2,
+                name: String::new(),
+            },
+            Row {
+                label: "DOW".into(),
+                symbol: "@DJ.1".into(),
+                digits: 0,
+                name: String::new(),
+            },
         ];
-        let quotes: HashMap<_, _> = [("XAU=".to_string(), q("XAU=", Some(100.0), true))].into_iter().collect();
+        let quotes: HashMap<_, _> = [("XAU=".to_string(), q("XAU=", Some(100.0), true))]
+            .into_iter()
+            .collect();
         let cells = resolve(&rows, &quotes, 110.0, 90.0, 900.0);
         assert_eq!(cells[0].label, "XAU");
         assert!(!cells[0].stale);
