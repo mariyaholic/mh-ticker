@@ -13,15 +13,55 @@ fn main() {
         return;
     }
     let out = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR")).join("app_res.o");
-    let windres = env::var("WINDRES").unwrap_or_else(|_| "windres".into());
-    let status = Command::new(&windres)
-        .current_dir(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"))
-        .args(["--include-dir", "assets", "--input", "assets/app.rc", "--output-format=coff", "--output"])
-        .arg(&out)
-        .status();
-    match status {
-        Ok(s) if s.success() => println!("cargo:rustc-link-arg-bins={}", out.display()),
-        Ok(s) => println!("cargo:warning={windres} failed ({s}); building without the app icon"),
-        Err(e) => println!("cargo:warning={windres} not found ({e}); building without the app icon"),
+    let override_tool = env::var("WINDRES").ok();
+    let host = env::var("HOST").unwrap_or_default();
+    let target = env::var("TARGET").unwrap_or_default();
+    let prefix = if target.starts_with("x86_64-") {
+        Some("x86_64")
+    } else if target.starts_with("i686-") {
+        Some("i686")
+    } else if target.starts_with("aarch64-") {
+        Some("aarch64")
+    } else {
+        None
+    };
+    let mut tools = Vec::new();
+    if let Some(tool) = override_tool {
+        tools.push(tool);
+    } else {
+        if !host.contains("windows") {
+            if let Some(arch) = prefix {
+                tools.push(format!("{arch}-w64-mingw32-windres"));
+            }
+        }
+        tools.push("windres".into());
     }
+    for windres in tools {
+        let status = Command::new(&windres)
+            .current_dir(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"))
+            .args([
+                "--include-dir",
+                "assets",
+                "--input",
+                "assets/app.rc",
+                "--output-format=coff",
+                "--output",
+            ])
+            .arg(&out)
+            .status();
+        match status {
+            Ok(s) if s.success() => {
+                println!("cargo:rustc-link-arg-bins={}", out.display());
+                return;
+            }
+            Ok(s) => {
+                println!("cargo:warning={windres} failed ({s}); building without the app icon")
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                println!("cargo:warning={windres} failed ({e}); building without the app icon")
+            }
+        }
+    }
+    println!("cargo:warning=windres unavailable or failed; building without the app icon");
 }
