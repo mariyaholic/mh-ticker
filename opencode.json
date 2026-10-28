@@ -26,6 +26,11 @@
       "action": "codesearch",
       "resource": "*",
       "effect": "deny"
+    },
+    {
+      "action": "execute",
+      "resource": "*",
+      "effect": "deny"
     }
   ],
   "policies": [
@@ -42,6 +47,11 @@
     {
       "action": "tool.use",
       "resource": "codesearch:*",
+      "effect": "deny"
+    },
+    {
+      "action": "tool.use",
+      "resource": "execute:*",
       "effect": "deny"
     },
     {
