@@ -1,5 +1,5 @@
 {
-  "spdx": "Apache-2.0",
+  "spdx": "MIT",
   "spec_version": "1.0.0",
   "tzdb_version": "2025b",
   "note": "Shared UTC golden vectors. Rust tests assert them; the Pine/MQL5 harnesses use the same instants and generated rules.",

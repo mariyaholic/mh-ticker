@@ -1,5 +1,14 @@
 # Changelog — MH Ticker
 
+## 2026-10-28 — 1.3.0 licence follow-up   [agent]
+
+- Licence stays **MIT** (Manager ruling 2026-10-28): restored the original `LICENSE`, removed the Apache-2.0
+  `NOTICE`, restored the original README credit and License section, and switched SPDX headers, crate
+  metadata and the About text to MIT / "made with love by maria". The Pine and MQL5 boilerplates live in
+  this repository, so they are MIT too.
+- Added the Unicode License v3 text for the bundled CLDR `windowsZones` subset (approved 2026-10-28).
+- Session hours and the default broker preset are recorded as owner-approved (2026-10-28).
+
 ## 2026-10-28 — 1.3.0: session timers, plus Pine v6 and MQL5 boilerplates   [agent]
 
 **Files:** `spec/sessions.json`, `spec/golden/vectors.json`, `crates/session-engine/**`, `crates/specgen/**`,
@@ -11,7 +20,7 @@
   open/closed, next-transition countdown), the highlighted London–New York overlap, the broker server clock
   and next reopen, and **exactly one** Windows device-zone clock. Rows never reorder or disappear; a failed
   zone mapping shows the device row as unavailable. New *Session timers* menu toggle and an *About MH Ticker*
-  item with "Made by Maria".
+  item with "made with love by maria".
 - **Engine:** a platform-independent `mh-session` workspace crate with half-open intervals, `earliest`
   ambiguous-local handling, forward-shift for nonexistent local times, DST/weekend/overlap logic, and a
   broker rule with an explicit verified/unverified state. It builds and tests on Linux with `cargo test`.

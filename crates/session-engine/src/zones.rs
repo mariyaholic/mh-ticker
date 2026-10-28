@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 //! Pinned Windows dynamic-time-zone key -> IANA mapping.
 //!
 //! This is a deliberately small, reviewable subset of CLDR `windowsZones`

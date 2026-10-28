@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 //! Platform-independent core for MH Ticker's session timers.
 //!
 //! The generated rules in [`SESSION_RULES`] come from `spec/sessions.json`; see

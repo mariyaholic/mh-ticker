@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 //! Windows device-zone adapter.
 //!
 //! Reads the current dynamic time-zone key and the user's territory, then maps

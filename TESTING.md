@@ -1,4 +1,4 @@
-<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!-- SPDX-License-Identifier: MIT -->
 # Testing and verification status
 
 Made by Maria. This file records what was run on the build box and what still needs real Windows, MT5 or
@@ -54,7 +54,7 @@ The engine tests cover:
   when quotes are offline.
 - **Panel layout:** six session columns plus the overlap/caveat line with 1, 2, 6 and 12 cards; check the
   footer and the session block do not clip at the narrowest width. Toggle *Session timers* while the panel is
-  open; confirm it resizes in place. Check *About MH Ticker* shows "Made by Maria".
+  open; confirm it resizes in place. Check *About MH Ticker* shows "made with love by maria" and "MIT licensed".
 - **Config migration:** open a real pre-1.3 `%LOCALAPPDATA%\MH_Ticker\config.json` (with symbols, placement,
   dock and x/y) and confirm quotes/settings are unchanged while `sessions` defaults are added. Change
   `broker_rule_verified`, `broker_offset_min`, `broker_reopen_min` and `device_zone` by hand, restart, and

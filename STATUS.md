@@ -1,4 +1,4 @@
-<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!-- SPDX-License-Identifier: MIT -->
 # Status — session timers (v1)
 
 Made by Maria. Branch `feature/session-timers`, based on `main` at `f8cc026`. No remotes, pushes, uploads or
@@ -7,7 +7,7 @@ publishing were used.
 ## Built
 
 - **Shared spec:** `spec/sessions.json` (spec 1.0.0, tzdb 2025b, coverage 2024–2036) with four ordered
-  sessions, the London–New York overlap pair, no-holiday policy and the unverified broker preset.
+  sessions, the London–New York overlap pair, no-holiday policy and the broker preset (both approved by the Manager on 2026-10-28).
   `spec/golden/vectors.json` holds shared UTC vectors.
 - **Portable engine:** `crates/session-engine` (`mh-session`). Half-open intervals, earliest ambiguous-local
   handling, forward-shift for nonexistent local times, DST/weekend/overlap logic, broker offset/reopen
@@ -23,7 +23,8 @@ publishing were used.
   `syminfo.timezone`); MQL5 display-only, strictly read-only boilerplate with generated bounded IANA tables,
   measured/overridden broker offset, device clock and visible unknown/coverage states.
 - **Docs/licensing:** `docs/SESSIONS.md`, `TESTING.md`, `THIRD_PARTY.md`, README/CHANGELOG updates; LICENSE
-  and NOTICE unchanged; Apache-2.0 SPDX headers on new files.
+  unchanged from `main` (MIT, as the Manager ruled on 2026-10-28; the earlier Apache-2.0 relicense and NOTICE
+  were reverted); MIT SPDX headers on new files.
 
 Commits:
 
@@ -82,14 +83,15 @@ See `TESTING.md` for the full list. Summary:
 
 ## Open issues
 
-1. **Session hours/weekdays are not owner-approved.** They are common FX conventions; the spec records that
-   approval is required before a public release. No holiday/exception calendar exists in v1.
-2. **Broker rule is unverified.** The default Exness-style preset shows the server clock but deliberately
+1. **Session hours/weekdays: approved by the Manager (2026-10-28).** They are common FX conventions; no
+   holiday/exception calendar exists in v1.
+2. **Broker preset: approved by the Manager (2026-10-28) as the default; still not verified against a live
+   server.** The default Exness-style preset shows the server clock but deliberately
    reports the next verified reopen as unknown. Daily reopens are not modelled; seasonal mapping, exceptions
    and broker changes need independent confirmation. `broker_rule_verified` is a user assertion, not proof.
-3. **CLDR licence review.** The Windows-to-IANA table is a pinned subset of CLDR `windowsZones` 48. CLDR's
-   Unicode License v3 is not on the approved dependency licence list; the mapping is hand-maintained and
-   unknown keys fail visibly, but the Manager should approve or replace the data source.
+3. **CLDR data: approved by the Manager (2026-10-28).** The Windows-to-IANA table is a pinned subset of CLDR
+   `windowsZones` 48 under the Unicode License v3; the licence text ships next to the data in
+   `crates/session-engine/data/LICENSE-UNICODE-CLDR.txt` and is credited in `THIRD_PARTY.md`.
 4. **Windows mapping is a subset**, not the full CLDR table. Unlisted keys show unavailable rather than a
    guessed zone.
 5. **No Windows build or Windows tests** on this box; no clippy/rustfmt. The Linux type-check is not a

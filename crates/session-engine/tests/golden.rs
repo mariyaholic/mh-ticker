@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 //! Shared UTC golden vectors: the same JSON is shipped beside the indicators.
 
 use chrono::{DateTime, TimeZone, Utc};

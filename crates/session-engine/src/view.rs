@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 //! Presentation-neutral rows for the ticker panel and (where useful) the
 //! indicator boilerplates. This module is deliberately pure: it takes a UTC
 //! instant and already-detected device-zone information, so it is fully

@@ -1,7 +1,7 @@
-<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!-- SPDX-License-Identifier: MIT -->
 # Session timers — rules, generated files and limits
 
-Made by Maria. Apache-2.0. Not financial advice. Not affiliated with TradingView. Not affiliated with
+made with love by maria. MIT. Not financial advice. Not affiliated with TradingView. Not affiliated with
 MetaQuotes; MT5 is a MetaQuotes trademark.
 
 ## One source
@@ -39,8 +39,8 @@ common FX-session conventions:
 | `london` | `Europe/London` | 08:00–17:00 | Mon–Fri |
 | `new_york` | `America/New_York` | 08:00–17:00 | Mon–Fri |
 
-**Approval status: not approved.** These are conventions, not guaranteed exchange hours. The spec records
-that the hours/weekdays require the owner's approval before a public release. No holiday or exceptional
+**Approval status: approved by the owner on 2026-10-28.** These are conventions, not guaranteed exchange
+hours. No holiday or exceptional
 closure calendar is applied in v1; a holiday can invalidate a countdown. Tokyo has no DST.
 
 Interval and DST policies:
@@ -56,7 +56,8 @@ The engine is `crates/session-engine` (crate `mh-session`). It is platform indep
 ## Broker server time
 
 A broker rule has a winter/summer UTC offset, an optional US-DST seasonal switch, a local reopen time,
-eligible reopen days and provenance. The default preset is **Exness-style and unverified**: UTC+0 year-round,
+eligible reopen days and provenance. The default preset is **Exness-style, approved by the owner on 2026-10-28 as the default, and still not
+verified against a live server**: UTC+0 year-round,
 weekly reopen estimated at Sunday 22:00 server. The reported observation includes 22:00/23:00 depending on US
 DST; that has not been independently confirmed and daily maintenance reopens are not modelled.
 

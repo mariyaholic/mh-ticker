@@ -1,10 +1,10 @@
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: MIT
 [package]
 name = "mh-session"
 version = "1.0.0"
 edition = "2021"
 description = "Platform-independent FX session engine and shared generated rules for MH Ticker, Pine and MQL5."
-license = "Apache-2.0"
+license = "MIT"
 repository = "https://github.com/mariyaholic/mh-ticker"
 authors = ["mariyaholic"]
 

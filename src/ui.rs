@@ -1014,7 +1014,7 @@ fn menu(hwnd: HWND) {
         }
         CMD_ABOUT => unsafe {
             let text = wide(
-                "MH Ticker 1.3.0\n\nMade by Maria\nApache-2.0 licensed.\n\nSession times are conventions, not guaranteed exchange hours.\nNot financial advice.\n\nNot affiliated with TradingView or MetaQuotes; MT5 is a MetaQuotes trademark.",
+                "MH Ticker 1.3.0\n\nmade with love by maria\nMIT licensed.\n\nSession times are conventions, not guaranteed exchange hours.\nNot financial advice.\n\nNot affiliated with TradingView or MetaQuotes; MT5 is a MetaQuotes trademark.",
             );
             let title = wide("About MH Ticker");
             MessageBoxW(hwnd, text.as_ptr(), title.as_ptr(), MB_OK | MB_ICONINFORMATION);

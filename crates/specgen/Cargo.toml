@@ -1,10 +1,10 @@
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: MIT
 [package]
 name = "mh-specgen"
 version = "1.0.0"
 edition = "2021"
 description = "Generator for MH Ticker session rules, Pine v6 and MQL5 artifacts."
-license = "Apache-2.0"
+license = "MIT"
 repository = "https://github.com/mariyaholic/mh-ticker"
 authors = ["mariyaholic"]
 

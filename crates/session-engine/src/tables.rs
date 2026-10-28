@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 //! Generated, bounded IANA offset tables used by the indicator boilerplates.
 //!
 //! The session engine itself asks `chrono-tz` (the full compiled database). The

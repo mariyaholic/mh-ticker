@@ -1,5 +1,5 @@
 {
-  "spdx": "Apache-2.0",
+  "spdx": "MIT",
   "spec_version": "1.0.0",
   "tzdb_version": "2025b",
   "effective_from": "2024-01-01T00:00:00Z",
@@ -16,7 +16,7 @@
       "close": "16:00",
       "days": [1, 2, 3, 4, 5],
       "overnight": false,
-      "provenance": "Common FX-session convention; hours and weekdays require owner approval before a public release."
+      "provenance": "Common FX-session convention; hours and weekdays approved by the owner on 2026-10-28."
     },
     {
       "id": "tokyo",
@@ -26,7 +26,7 @@
       "close": "18:00",
       "days": [1, 2, 3, 4, 5],
       "overnight": false,
-      "provenance": "Common FX-session convention; hours and weekdays require owner approval before a public release."
+      "provenance": "Common FX-session convention; hours and weekdays approved by the owner on 2026-10-28."
     },
     {
       "id": "london",
@@ -36,7 +36,7 @@
       "close": "17:00",
       "days": [1, 2, 3, 4, 5],
       "overnight": false,
-      "provenance": "Common FX-session convention; hours and weekdays require owner approval before a public release."
+      "provenance": "Common FX-session convention; hours and weekdays approved by the owner on 2026-10-28."
     },
     {
       "id": "new_york",
@@ -46,7 +46,7 @@
       "close": "17:00",
       "days": [1, 2, 3, 4, 5],
       "overnight": false,
-      "provenance": "Common FX-session convention; hours and weekdays require owner approval before a public release."
+      "provenance": "Common FX-session convention; hours and weekdays approved by the owner on 2026-10-28."
     }
   ],
   "overlap": ["london", "new_york"],
@@ -58,7 +58,7 @@
     "id": "exness_default",
     "label": "Broker",
     "verified": false,
-    "provenance": "Internal default preset: Exness. Reported observation only: UTC+0 server year-round, daily reopen around 22:00/23:00 server depending on US DST. Not independently confirmed; the next verified reopen is hidden until the owner approves a rule.",
+    "provenance": "Default preset approved by the owner on 2026-10-28 (not verified against a live server). Internal default preset: Exness. Reported observation only: UTC+0 server year-round, daily reopen around 22:00/23:00 server depending on US DST. Not independently confirmed; the next verified reopen is hidden until the owner approves a rule.",
     "winter_offset_minutes": 0,
     "summer_offset_minutes": 0,
     "seasonal": "fixed",

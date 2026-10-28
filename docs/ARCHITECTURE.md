@@ -29,16 +29,11 @@
 
 ## Licensing
 
-[measured] The Manager requires Apache-2.0 for every project ([Amendment 10a](/workspace/qol-portfolio/BRIEF-v5.md:40)). Include the full Apache-2.0 text in `LICENSE`, use `SPDX-License-Identifier: Apache-2.0` on project source where practical, and open every README with “Made by Maria”. Each UI app includes an About screen with “Made by Maria”. Store copy, where applicable: “free and open source (Apache-2.0)”. The root `NOTICE` is exactly:
+[measured] Exception to the portfolio's Apache-2.0 rule: MH Ticker stays **MIT** (Manager ruling, 2026-10-28). Keep the original `LICENSE` (MIT, © 2026 mariyaholic) and the original README credit line “made with love by maria” and License section; there is no Apache-2.0 relicense and no root `NOTICE`. Use `SPDX-License-Identifier: MIT` on new source files. The About screen shows “made with love by maria”. The Pine and MQL5 boilerplates live inside this repository, so they are MIT as well; if either is later split into its own repository, it follows the portfolio default (Apache-2.0 with `NOTICE`).
 
-```text
-MH Ticker
-Copyright 2026 Maria (https://github.com/mariyaholic)
+[measured] Session hours/weekdays and the default broker preset were approved by the Manager on 2026-10-28. The bundled CLDR `windowsZones` subset (Unicode License v3) was approved on 2026-10-28; ship the Unicode licence text next to the data and credit it in `THIRD_PARTY`.
 
-Made by Maria. This product includes software developed by Maria.
-```
-
-[inferred] MIT, BSD, ISC, Apache-2.0 and Zlib dependencies are compatible subject to their terms; retain required third-party notices in `THIRD_PARTY` so the required root template stays exact. Audit all code, transitive dependencies and assets; do not reuse GPL code such as mukunku/ParquetViewer. Rights and obligations still require review.
+[inferred] MIT, BSD, ISC, Apache-2.0 and Zlib dependencies are compatible subject to their terms; retain required third-party notices in `THIRD_PARTY`. Audit all code, transitive dependencies and assets; do not reuse GPL code such as mukunku/ParquetViewer. Rights and obligations still require review.
 
 [measured] The [SignPath application draft](/workspace/qol-portfolio/SIGNPATH_APPLICATION_DRAFT.md:1) is draft only; a public repository and an existing public release are prerequisites and the Manager decides publication/application. Apache-2.0 preserves eligibility; no application or publishing is authorized by this architecture.
 
