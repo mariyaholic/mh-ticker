@@ -26,7 +26,7 @@ use crate::dock;
 use crate::model::{fmt_change, fmt_price, Board, Cell, Link};
 use crate::panel;
 use mh_session::view::{build_view, DeviceInfo, SessionView, ViewOptions};
-use std::cell::RefCell;
+use std::cell::{Cell as Slot, RefCell};
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -38,7 +38,7 @@ use windows_sys::Win32::Graphics::Dwm::{
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::CreateMutexW;
-use windows_sys::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
+use windows_sys::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows_sys::Win32::UI::HiDpi::{
     GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
@@ -186,6 +186,7 @@ struct Ui {
 
 thread_local! {
     static UI: RefCell<Option<Ui>> = const { RefCell::new(None) };
+    static FOREGROUND_HOOK: Slot<HWINEVENTHOOK> = const { Slot::new(null_mut()) };
 }
 
 fn with_ui<R>(f: impl FnOnce(&mut Ui) -> R) -> Option<R> {
@@ -910,6 +911,21 @@ fn heal(hwnd: HWND) {
             relayout_and_place(hwnd);
         }
     }
+}
+
+fn take_foreground_hook(slot: &Slot<HWINEVENTHOOK>, unhook: impl FnOnce(HWINEVENTHOOK)) {
+    let hook = slot.replace(null_mut());
+    if !hook.is_null() {
+        unhook(hook);
+    }
+}
+
+fn unhook_foreground() {
+    FOREGROUND_HOOK.with(|slot| {
+        take_foreground_hook(slot, |hook| unsafe {
+            UnhookWinEvent(hook);
+        })
+    });
 }
 
 unsafe extern "system" fn on_win_event(
@@ -1691,6 +1707,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_DESTROY => {
             STRIP.store(0, Ordering::Relaxed);
+            unhook_foreground();
             tray_delete(hwnd);
             with_ui(|u| config::save(&u.cfg));
             PostQuitMessage(0);
@@ -1809,7 +1826,7 @@ pub fn run(cfg: Config, board: Arc<Mutex<Board>>) {
         tray(hwnd, NIM_ADD, icon, &tip);
         apply_visibility(hwnd);
 
-        SetWinEventHook(
+        let hook = SetWinEventHook(
             EVENT_SYSTEM_FOREGROUND,
             EVENT_SYSTEM_FOREGROUND,
             null_mut(),
@@ -1818,6 +1835,7 @@ pub fn run(cfg: Config, board: Arc<Mutex<Board>>) {
             0,
             WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
         );
+        FOREGROUND_HOOK.with(|slot| slot.set(hook));
         SetTimer(hwnd, TIMER_DOCK, 500, None);
 
         let target = hwnd as isize;
@@ -1837,5 +1855,25 @@ pub fn run(cfg: Config, board: Arc<Mutex<Board>>) {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
+        unhook_foreground();
+    }
+}
+
+#[cfg(test)]
+mod hook_tests {
+    use super::*;
+
+    #[test]
+    fn cleanup_removes_the_handle_once() {
+        let slot = Slot::new(1_usize as HWINEVENTHOOK);
+        let calls = Slot::new(0);
+        for _ in 0..2 {
+            take_foreground_hook(&slot, |hook| {
+                assert_eq!(hook as usize, 1);
+                calls.set(calls.get() + 1);
+            });
+        }
+        assert_eq!(calls.get(), 1);
+        assert!(slot.get().is_null());
     }
 }
