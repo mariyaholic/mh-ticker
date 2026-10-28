@@ -33,6 +33,7 @@ e3019c9 feat(ticker): show session timers and map the Windows device zone
 fa21eba docs: session rules, generated artifacts, testing and licences
 3a2f2e3 docs: add STATUS for the session timers v1 work
 abc2944 fix(pine): convert the broker reopen day to Pine's Sunday-first numbering
+c107986 fix(pine): call time() with the generated const session strings directly
 ```
 
 ## Commands and results
