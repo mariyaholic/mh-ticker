@@ -34,6 +34,7 @@ fa21eba docs: session rules, generated artifacts, testing and licences
 3a2f2e3 docs: add STATUS for the session timers v1 work
 abc2944 fix(pine): convert the broker reopen day to Pine's Sunday-first numbering
 c107986 fix(pine): call time() with the generated const session strings directly
+d9577a2 fix: keep the unavailable-device test portable and shorten the broker detail
 ```
 
 ## Commands and results
