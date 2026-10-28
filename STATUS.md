@@ -31,6 +31,8 @@ Commits:
 0460b91 feat(sessions): shared spec, portable engine and generated indicators
 e3019c9 feat(ticker): show session timers and map the Windows device zone
 fa21eba docs: session rules, generated artifacts, testing and licences
+3a2f2e3 docs: add STATUS for the session timers v1 work
+abc2944 fix(pine): convert the broker reopen day to Pine's Sunday-first numbering
 ```
 
 ## Commands and results
@@ -50,9 +52,9 @@ would include the Win32-only app and cannot run here.
 
 From `git diff --numstat main...HEAD` before this status file:
 
-- **4,817 added / 46 deleted** across 36 files.
-- Rust: **2,298 added / 16 deleted** (engine, generator, app and generated Rust tables).
-- Other: **2,519 added / 30 deleted** (spec/vectors, Pine 178, MQL5 437, docs, README).
+- **4,821 added / 46 deleted** across 37 files.
+- Rust: **2,300 added / 16 deleted** (engine, generator, app and generated Rust tables).
+- Other: **2,521 added / 30 deleted** (spec/vectors, Pine 178, MQL5 437, docs, README).
 - Excludes this `STATUS.md`.
 
 ## Tests needing real Windows
