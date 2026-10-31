@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>MH Ticker — theme catalogue</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; padding: 28px 32px 60px; background: #14161a; color: #e6e9ee;
+         font: 13px/1.5 "Segoe UI", system-ui, sans-serif; }
+  h1 { font-size: 18px; font-weight: 600; margin: 0 0 4px; }
+  p.sub { margin: 0 0 28px; color: #8b93a1; }
+  h2 { font-size: 13px; letter-spacing: .12em; text-transform: uppercase; color: #8b93a1;
+       margin: 34px 0 12px; font-weight: 600; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(362px, 1fr)); gap: 18px; }
+  figure { margin: 0; }
+  img { width: 100%; height: auto; display: block; border-radius: 8px;
+        box-shadow: 0 6px 24px rgba(0,0,0,.45); }
+  figcaption { margin-top: 6px; color: #8b93a1; font-size: 12px; }
+  figcaption b { color: #e6e9ee; font-weight: 600; }
+</style>
+</head>
+<body>
+<h1>MH Ticker — theme catalogue</h1>
+<p class="sub">Rendered by <code>panel::draw</code> at 96 dpi, 724 × 394. Animated themes are shown as three frames a third of a cycle apart.</p>
+
+<h2>Basic — one solid fill</h2>
+<div class="grid">
+  <figure><img src="midnight.png" alt="midnight"><figcaption><b>midnight</b> — the original, Segoe UI</figcaption></figure>
+  <figure><img src="ink.png" alt="ink"><figcaption><b>ink</b> — near-black navy</figcaption></figure>
+  <figure><img src="slate.png" alt="slate"><figcaption><b>slate</b> — cool grey</figcaption></figure>
+  <figure><img src="moss.png" alt="moss"><figcaption><b>moss</b> — deep green</figcaption></figure>
+  <figure><img src="oxblood.png" alt="oxblood"><figcaption><b>oxblood</b> — Georgia</figcaption></figure>
+  <figure><img src="taupe.png" alt="taupe"><figcaption><b>taupe</b> — Tahoma</figcaption></figure>
+  <figure><img src="paper.png" alt="paper"><figcaption><b>paper</b> — light</figcaption></figure>
+  <figure><img src="sand.png" alt="sand"><figcaption><b>sand</b> — Verdana</figcaption></figure>
+  <figure><img src="mono.png" alt="mono"><figcaption><b>mono</b> — Consolas</figcaption></figure>
+</div>
+
+<h2>Gradients — a two-colour ramp</h2>
+<div class="grid">
+  <figure><img src="graphite.png" alt="graphite"><figcaption><b>graphite</b></figcaption></figure>
+  <figure><img src="aurora.png" alt="aurora"><figcaption><b>aurora</b> — the icon's ramp</figcaption></figure>
+  <figure><img src="dusk.png" alt="dusk"><figcaption><b>dusk</b> — Constantia</figcaption></figure>
+  <figure><img src="ocean.png" alt="ocean"><figcaption><b>ocean</b></figcaption></figure>
+  <figure><img src="ember.png" alt="ember"><figcaption><b>ember</b> — Tahoma</figcaption></figure>
+  <figure><img src="glass.png" alt="glass"><figcaption><b>glass</b> — light</figcaption></figure>
+</div>
+
+<h2>Animated — the ramp drifts</h2>
+<div class="grid">
+  <figure><img src="drift.png" alt="drift"><figcaption><b>drift</b> frame 1</figcaption></figure>
+  <figure><img src="drift-2.png" alt="drift frame 2"><figcaption><b>drift</b> frame 2</figcaption></figure>
+  <figure><img src="drift-3.png" alt="drift frame 3"><figcaption><b>drift</b> frame 3</figcaption></figure>
+  <figure><img src="pulse.png" alt="pulse"><figcaption><b>pulse</b></figcaption></figure>
+  <figure><img src="vaporwave.png" alt="vaporwave"><figcaption><b>vaporwave</b> — Consolas</figcaption></figure>
+  <figure><img src="aurora-live.png" alt="aurora-live"><figcaption><b>aurora-live</b></figcaption></figure>
+  <figure><img src="sunset.png" alt="sunset"><figcaption><b>sunset</b> — Tahoma</figcaption></figure>
+</div>
+
+<h2>Retro — chunky, dithered, bitmap faces</h2>
+<div class="grid">
+  <figure><img src="ega.png" alt="ega"><figcaption><b>ega</b> — Terminal</figcaption></figure>
+  <figure><img src="amber-crt.png" alt="amber-crt"><figcaption><b>amber-crt</b> — Terminal</figcaption></figure>
+  <figure><img src="phosphor.png" alt="phosphor"><figcaption><b>phosphor</b> — Terminal</figcaption></figure>
+  <figure><img src="gameboy.png" alt="gameboy"><figcaption><b>gameboy</b> — Fixedsys</figcaption></figure>
+  <figure><img src="c64.png" alt="c64"><figcaption><b>c64</b> — Consolas</figcaption></figure>
+  <figure><img src="pc98.png" alt="pc98"><figcaption><b>pc98</b> — MS Gothic, gold accent</figcaption></figure>
+</div>
+<script>
+// Bust the browser cache: this page is regenerated alongside the PNGs, and a stale image in a
+// theme gallery is the one thing it must never show.
+for (const img of document.images) img.src = img.src.split('?')[0] + '?v=' + Date.now();
+</script>
+</body>
+</html>

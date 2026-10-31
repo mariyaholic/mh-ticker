@@ -38,6 +38,13 @@ fn number(v: &Value) -> Option<f64> {
     }
 }
 
+/// A number that only counts when it is above zero. CNBC sends `0.00` for a value a symbol does
+/// not have (`high`/`low` on spot silver and platinum, `yrloprice` on six of the catalogue), and a
+/// zero drawn on the card would read as a real price.
+fn positive(v: Option<&Value>) -> Option<f64> {
+    v.and_then(number).filter(|n| *n > 0.0)
+}
+
 fn flag(v: Option<&Value>) -> bool {
     match v {
         Some(Value::Bool(b)) => *b,
@@ -92,6 +99,14 @@ pub fn parse_quotes(v: &Value) -> Vec<Quote> {
                     prev_close: r.get("previous_day_closing").and_then(number),
                     ts: r.get("last_time").and_then(Value::as_str).and_then(parse_time),
                     realtime: flag(r.get("realTime")),
+                    open: positive(r.get("open")),
+                    high: positive(r.get("high")),
+                    low: positive(r.get("low")),
+                    volume: positive(r.get("volume")),
+                    yr_hi: positive(r.get("yrhiprice")),
+                    yr_lo: positive(r.get("yrloprice")),
+                    yr_hi_date: r.get("yrhidate").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string),
+                    currency: r.get("currencyCode").and_then(Value::as_str).unwrap_or("").to_string(),
                 })
             })
             .collect()
@@ -113,6 +128,25 @@ pub fn parse_chart(v: &Value, now: f64) -> Vec<(f64, f64)> {
             .collect()
     })
     .unwrap_or_default()
+}
+
+/// One outbound POST, for alerts. Deliberately a free function: alert traffic is rare, so it gets
+/// its own short-lived agent instead of sharing the quote feed's connection pool.
+///
+/// Errors are reduced to "HTTP <code>" or "network" on purpose: `ureq`'s own message can echo the
+/// URL, and for a webhook the URL *is* the credential.
+pub fn post(url: &str, body: &str, content_type: &str, timeout_s: u64) -> Result<(), String> {
+    let tls = native_tls::TlsConnector::new().map_err(|_| "tls".to_string())?;
+    let agent = ureq::AgentBuilder::new()
+        .tls_connector(Arc::new(tls))
+        .user_agent(UA)
+        .timeout(Duration::from_secs(timeout_s))
+        .build();
+    match agent.post(url).set("Content-Type", content_type).send_string(body) {
+        Ok(_) => Ok(()),
+        Err(ureq::Error::Status(code, _)) => Err(format!("HTTP {code}")),
+        Err(_) => Err("network".into()),
+    }
 }
 
 fn encode(s: &str) -> String {
@@ -211,6 +245,12 @@ impl Feed {
         (self.notify)();
     }
 
+    /// The cadence in force. Read from the board rather than `cfg`, so the Poll-interval menu item
+    /// applies on the next tick instead of needing a restart.
+    fn cadence(&self) -> f64 {
+        self.shared.lock().map(|b| b.poll_s).unwrap_or(self.cfg.poll_s).clamp(1.0, 60.0)
+    }
+
     /// Sleep until the next poll, waking early when the Symbols menu changes the rows so a new
     /// symbol shows up within a fraction of a second.
     fn wait(&self, d: Duration) {
@@ -268,10 +308,11 @@ impl Feed {
             if self.maybe_bars() {
                 self.publish(link, note);
             }
+            let cadence = self.cadence();
             let wait = if self.fails == 0 {
-                self.cfg.poll_s.max(1.0)
+                cadence
             } else {
-                (self.cfg.poll_s.max(1.0) * 2f64.powi(self.fails.min(6) as i32)).min(60.0)
+                (cadence * 2f64.powi(self.fails.min(6) as i32)).min(60.0)
             };
             self.wait(Duration::from_secs_f64(wait));
         }
@@ -368,9 +409,13 @@ mod tests {
         let v: Value = serde_json::from_str(
             r#"{"FormattedQuoteResult":{"FormattedQuote":[
               {"symbol":"XAU=","name":"Gold / US Dollar Spot","last":"4,155.24","change_pct":"+1.22%",
-               "previous_day_closing":"4,105.122","last_time":"2026-10-15T04:29:41.313-0400","realTime":"true"},
+               "previous_day_closing":"4,105.122","last_time":"2026-10-15T04:29:41.313-0400","realTime":"true",
+               "open":"4,110.00","high":"4,190.00","low":"4,102.50","volume":"128400",
+               "yrhiprice":"4,381.00","yrloprice":"3,940.00","yrhidate":"2026-09-22","currencyCode":"USD"},
               {"symbol":"@DJ.1","name":"Dow Jones Fut (Dec'26)","last":"52,078.00","change_pct":"-0.42%",
-               "last_time":"2026-10-15T04:19:40.000-0400","realTime":"false"},
+               "last_time":"2026-10-15T04:19:40.000-0400","realTime":"false",
+               "open":"0.00","high":"0.00","low":"0.00","volume":"0","yrhiprice":"0.00","yrloprice":"0.00",
+               "currencyCode":""},
               {"symbol":"BAD","last":"UNCH"}]}}"#,
         )
         .unwrap();
@@ -378,6 +423,15 @@ mod tests {
         assert_eq!(qs.len(), 2);
         assert_eq!((qs[0].price, qs[0].change_pct, qs[0].prev_close, qs[0].realtime), (4155.24, Some(1.22), Some(4105.122), true));
         assert_eq!((qs[1].price, qs[1].change_pct, qs[1].realtime), (52078.0, Some(-0.42), false));
+        // The fields that were always there and used to be parsed away.
+        assert_eq!((qs[0].open, qs[0].high, qs[0].low), (Some(4110.0), Some(4190.0), Some(4102.5)));
+        assert_eq!(qs[0].volume, Some(128_400.0));
+        assert_eq!((qs[0].yr_hi, qs[0].yr_lo), (Some(4381.0), Some(3940.0)));
+        assert_eq!(qs[0].yr_hi_date.as_deref(), Some("2026-09-22"));
+        assert_eq!(qs[0].currency, "USD");
+        // `0.00` is how CNBC says "this symbol has no such value"; it must not draw as a price.
+        assert_eq!((qs[1].high, qs[1].yr_lo, qs[1].volume), (None, None, None));
+        assert_eq!(qs[1].currency, "");
     }
 
     #[test]

@@ -1,6 +1,11 @@
 //! The strip (borderless, layered, always-on-top popup drawn with GDI) and the tray icon.
 //! Plain Win32: no GUI toolkit, no GPU context, which is what keeps the process to a few MB.
 //!
+//! This module is the whole engine: both builds link it. What differs between them is data, not
+//! code paths — `Ui::profile` decides the config file, the mutex and the window title, and
+//! `Ui::theme` decides the palette. The classic build has one theme and no picker, so its menus
+//! simply have fewer entries and its panel draws no dead buttons.
+//!
 //! Click the docked strip (double-click when free) and it morphs into a centred panel with a card
 //! per symbol (`panel.rs`); the minimise button or Esc morphs it back. The morph stretches and
 //! crossfades snapshots of both states while the window glides, paced by `DwmFlush` (vsync).
@@ -20,9 +25,11 @@
 //! Re-entrancy: TrackPopupMenu, SetWindowPos and ShowWindow pump or send messages back into
 //! `wndproc`, so the `UI` RefCell is never borrowed across those calls.
 
-use crate::config::{self, Config, Placement};
+use crate::alerts;
+use crate::config::{self, Config, Placement, Profile};
 use crate::dock;
 use crate::panel;
+use crate::theme::{self, Gradient, Theme};
 use crate::model::{fmt_change, fmt_price, Board, Cell, Link};
 use std::cell::RefCell;
 use std::ptr::{null, null_mut};
@@ -30,6 +37,8 @@ use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use windows_sys::Win32::Foundation::*;
+use windows_sys::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData};
+use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 use windows_sys::Win32::Graphics::Dwm::{DwmFlush, DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND};
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -46,8 +55,14 @@ const WM_TRAY: u32 = WM_APP + 2;
 const WM_DOCK: u32 = WM_APP + 3;
 /// The foreground window changed (WinEvent hook).
 const WM_FGCHANGE: u32 = WM_APP + 4;
+/// A webhook post finished off-thread (`wparam` 1 = failed). Kept as a message because the posting
+/// thread cannot touch `Ui` (it is thread-local).
+const WM_ALERT: u32 = WM_APP + 5;
 const TRAY_ID: u32 = 1;
 const TIMER_DOCK: usize = 1;
+/// Repaint pace for an animated background, only while the panel is open. 12 fps is enough for a
+/// slow drift and keeps the cost of a moving background in the same class as a hover repaint.
+const TIMER_ANIM: usize = 2;
 /// One-shot re-check soon after a foreground change: a taskbar click raises the taskbar a moment
 /// after the foreground event, so the immediate check can miss it.
 const TIMER_RECHECK: usize = 3;
@@ -63,6 +78,27 @@ const CMD_SYM: usize = 2000;
 /// Position submenu: CMD_POS + index into `Placement::ALL`, CMD_MON + index into `dock::monitors()`.
 const CMD_POS: usize = 4000;
 const CMD_MON: usize = 4100;
+/// Poll interval: CMD_POLL + index into `POLL_CHOICES`.
+const CMD_POLL: usize = 5000;
+/// Theme: CMD_THEME + index into `theme::ALL` (Ultra only).
+const CMD_THEME: usize = 5100;
+/// Font: CMD_FONT + index into `theme::FACES` (Ultra only).
+const CMD_FONT: usize = 5150;
+/// The card under the right-click: copy its price, or open it on CNBC. The index is the card's, so
+/// the two ranges must not overlap (`MAX_ROWS` apart).
+const CMD_COPY: usize = 5600;
+const CMD_OPEN: usize = 5700;
+/// The Ultra symbol picker open/closed toggle.
+const CMD_PICK: usize = 5800;
+/// Alerts: CMD_ALERT + row*4 + step, CMD_ALERT_CLEAR + row (Ultra only).
+const CMD_ALERT: usize = 5200;
+const CMD_ALERT_CLEAR: usize = 5400;
+/// Offsets offered by the Alerts submenu, in percent from the current price. Arbitrary levels are
+/// a config edit for now; these are the ones a glance-at-the-strip user actually reaches for.
+const ALERT_STEPS: [(f64, bool); 4] = [(1.0, true), (2.0, true), (1.0, false), (2.0, false)];
+
+/// Poll intervals offered in the menu, in seconds. 1 s is aggressive; 60 s is a working-day glance.
+const POLL_CHOICES: [f64; 7] = [1.0, 2.0, 3.0, 5.0, 10.0, 30.0, 60.0];
 /// Auto takes a taskbar gap at least this wide (96-dpi px); a forced side needs `MIN_FORCED_GAP`.
 const MIN_GAP: i32 = 140;
 const MIN_FORCED_GAP: i32 = 60;
@@ -70,6 +106,9 @@ const MIN_FORCED_GAP: i32 = 60;
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const EXPAND_MS: f64 = 230.0;
 const COLLAPSE_MS: f64 = 190.0;
+/// How long one loop of an animated background takes, and how often it is advanced.
+const ANIM_CYCLE_S: f64 = 9.0;
+const ANIM_MS: u32 = 100;
 const TIP_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
 /// A second tray click inside this window (a double-click) is ignored.
 const TRAY_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(600);
@@ -77,34 +116,11 @@ const TRAY_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(600)
 const fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
     r as u32 | (g as u32) << 8 | (b as u32) << 16
 }
-pub(crate) const BG: COLORREF = rgb(18, 20, 24);
-pub(crate) const LABEL: COLORREF = rgb(140, 148, 160);
-pub(crate) const PRICE: COLORREF = rgb(235, 238, 242);
-pub(crate) const DIM: COLORREF = rgb(105, 110, 118);
-pub(crate) const UP: COLORREF = rgb(80, 200, 120);
-pub(crate) const DOWN: COLORREF = rgb(235, 90, 90);
-pub(crate) const AMBER: COLORREF = rgb(240, 180, 60);
 
 static STRIP: AtomicIsize = AtomicIsize::new(0);
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
-pub(crate) fn link_color(link: Link) -> COLORREF {
-    match link {
-        Link::Live => UP,
-        Link::Partial => AMBER,
-        Link::Down => DOWN,
-    }
-}
-
-pub(crate) fn link_name(link: Link) -> &'static str {
-    match link {
-        Link::Live => "CNBC live",
-        Link::Partial => "CNBC, some prices not fresh",
-        Link::Down => "offline",
-    }
 }
 
 struct Run {
@@ -141,8 +157,16 @@ struct Morph {
 
 struct Ui {
     hwnd: HWND,
+    profile: Profile,
     font: HFONT,
     bg: HBRUSH,
+    /// The palette in force. `grad` and `bg` are derived from it and rebuilt together, so a theme
+    /// change can never leave a stale brush or gradient behind.
+    theme: &'static Theme,
+    /// The face actually in force (`cfg.theme_font` when it names a known face, else the theme's).
+    /// The panel fonts are rebuilt when either this or the theme changes.
+    face: &'static str,
+    grad: Gradient,
     icon: HICON,
     icon_link: Option<Link>,
     dpi: u32,
@@ -164,12 +188,62 @@ struct Ui {
     hist: panel::History,
     /// The minimise button is hovered.
     hover: bool,
+    /// The symbol-picker toggle is hovered.
+    pick_hover: bool,
+    /// The picker strip is open (Ultra only).
+    pick_open: bool,
+    /// Pointer position on a chart, `None` when it is off every sparkline.
+    hover_at: Option<panel::Hover>,
+    /// Last alert outcome, shown in the footer so a swallowed balloon is not silent.
+    alert_note: Option<String>,
     tracking: bool,
     /// Foreground window before the panel opened; it gets focus back on collapse.
     prev_fg: HWND,
     /// Last tray tooltip refresh.
     tip_at: Option<Instant>,
     tray_click_at: Option<Instant>,
+    /// The cached back buffer, rebuilt only when the window changes size.
+    back: Option<Back>,
+    /// When the current animated background started, so its phase is continuous across repaints.
+    anim: Option<Instant>,
+}
+
+/// The panel's back buffer, kept between frames.
+///
+/// `paint` used to allocate a window-sized bitmap per repaint. That was survivable while repaints
+/// were rare (a poll every 3 s, a hover move), but an animated background repaints ten times a
+/// second, and a fresh ~1 MB `CreateCompatibleBitmap` each time is pure GDI churn for a surface that
+/// never changes size. One buffer, reused until the window resizes.
+struct Back {
+    dc: HDC,
+    bmp: HBITMAP,
+    /// What the DC held before `bmp` was selected into it, restored before the bitmap is freed: a
+    /// bitmap that is still selected into a DC cannot be deleted.
+    old: HGDIOBJ,
+    size: (i32, i32),
+}
+
+impl Back {
+    fn new(w: i32, h: i32) -> Self {
+        unsafe {
+            let screen = GetDC(null_mut());
+            let dc = CreateCompatibleDC(screen);
+            let bmp = CreateCompatibleBitmap(screen, w.max(1), h.max(1));
+            ReleaseDC(null_mut(), screen);
+            let old = SelectObject(dc, bmp);
+            Self { dc, bmp, old, size: (w, h) }
+        }
+    }
+}
+
+impl Drop for Back {
+    fn drop(&mut self) {
+        unsafe {
+            SelectObject(self.dc, self.old);
+            DeleteObject(self.bmp);
+            DeleteDC(self.dc);
+        }
+    }
 }
 
 thread_local! {
@@ -180,9 +254,39 @@ fn with_ui<R>(f: impl FnOnce(&mut Ui) -> R) -> Option<R> {
     UI.with(|cell| cell.try_borrow_mut().ok().and_then(|mut g| g.as_mut().map(f)))
 }
 
-/// False when another MH Ticker already runs (one strip, one tray icon).
+/// How many catalogue entries the picker would draw. The classic build never draws it, so the
+/// count only has to be right when the picker exists.
+fn catalog_len(u: &Ui) -> usize {
+    if u.profile.ultra { config::menu_list(&u.cfg).len() } else { 0 }
+}
+
+fn picker_open(u: &Ui) -> bool {
+    u.profile.ultra && u.pick_open
+}
+
+/// The panel face for this build. The classic build ignores `theme_font` for the same reason it
+/// ignores `theme`: one look, enforced here rather than by convention.
+fn face_for(u: &Ui) -> &'static str {
+    let over = if u.profile.ultra { u.cfg.theme_font.as_deref() } else { None };
+    theme::font_of(u.theme, over)
+}
+
+/// The panel's geometry, from one place. `draw` and every hit test call this, so a click lands
+/// where the pixels are even while the picker is opening or the symbols change.
+fn panel_geo(u: &Ui) -> panel::Geo {
+    panel::geometry(u.view.cells.len(), catalog_len(u), u.dpi, picker_open(u))
+}
+
+/// Snap a crosshair time to 5 s buckets. A 1 px mouse move would otherwise change the readout on
+/// every event; over an hour-wide plot 5 s is well under a pixel, so nothing visible is lost.
+fn snap(h: panel::Hover) -> panel::Hover {
+    panel::Hover { row: h.row, t: (h.t / 5.0).round() * 5.0 }
+}
+
+/// False when another instance of *this* build already runs (one strip, one tray icon per
+/// profile). The two profiles get different mutexes so they can run side by side.
 pub fn single_instance() -> bool {
-    let name = wide("Local\\MH_Ticker_single_instance");
+    let name = wide(&format!("Local\\{}-single_instance", config::profile().id));
     unsafe {
         let h = CreateMutexW(null(), 0, name.as_ptr());
         !h.is_null() && GetLastError() != ERROR_ALREADY_EXISTS
@@ -242,17 +346,17 @@ fn make_icon(color: COLORREF) -> HICON {
 }
 
 /// (label, price, price colour, change + colour) for one row of the board.
-fn cell_texts(c: &Cell) -> (String, String, COLORREF, Option<(String, COLORREF)>) {
+fn cell_texts(c: &Cell, t: &Theme) -> (String, String, COLORREF, Option<(String, COLORREF)>) {
     let label = c.label.clone();
     match &c.quote {
         Some(q) => {
             let change = q.change_pct.map(|p| {
-                let col = if c.stale { DIM } else if p >= 0.0 { UP } else { DOWN };
+                let col = if c.stale { t.dim } else if p >= 0.0 { t.up } else { t.down };
                 (fmt_change(p), col)
             });
-            (label, fmt_price(q.price, c.digits), if c.stale { DIM } else { PRICE }, change)
+            (label, fmt_price(q.price, c.digits), if c.stale { t.dim } else { t.price }, change)
         }
-        None => (label, "--".into(), DIM, None),
+        None => (label, "--".into(), t.dim, None),
     }
 }
 
@@ -268,23 +372,23 @@ fn text_run(x: i32, y: i32, s: &str, color: COLORREF) -> Run {
 }
 
 /// Free mode: everything on one row.
-fn layout_row(dc: HDC, cells: &[Cell], dpi: u32) -> Frame {
+fn layout_row(dc: HDC, cells: &[Cell], dpi: u32, t: &Theme) -> Frame {
     let s = |v: i32| v * dpi as i32 / 96;
     let (px, py) = (s(10), s(5));
     let (_, line_h) = text_size(dc, "Xg");
     let mut f = Frame::default();
     let mut x = px;
     for (i, c) in cells.iter().enumerate() {
-        let (label, price, pc, change) = cell_texts(c);
+        let (label, price, pc, change) = cell_texts(c, t);
         let mut push = |t: String, col: COLORREF| {
             let (w, _) = text_size(dc, &t);
             f.runs.push(text_run(x, py, &t, col));
             x += w;
         };
         if i > 0 {
-            push("    ".into(), LABEL);
+            push("    ".into(), t.label);
         }
-        push(format!("{label} "), LABEL);
+        push(format!("{label} "), t.label);
         push(price, pc);
         if let Some((t, col)) = change {
             push(format!(" {t}"), col);
@@ -299,7 +403,7 @@ fn layout_row(dc: HDC, cells: &[Cell], dpi: u32) -> Frame {
 
 /// Dock mode: the first `k` rows of the board as a column-major grid with `rows` lines,
 /// label | right-aligned price | right-aligned change.
-fn layout_grid(dc: HDC, cells: &[Cell], dpi: u32, rows: usize, show_change: bool) -> Frame {
+fn layout_grid(dc: HDC, cells: &[Cell], dpi: u32, rows: usize, show_change: bool, t: &Theme) -> Frame {
     let s = |v: i32| v * dpi as i32 / 96;
     let (px, py, gap_s, gap_l) = (s(7), s(3), s(5), s(12));
     let (_, line_h) = text_size(dc, "Xg");
@@ -310,7 +414,7 @@ fn layout_grid(dc: HDC, cells: &[Cell], dpi: u32, rows: usize, show_change: bool
         if ci > 0 {
             x += gap_l;
         }
-        let texts: Vec<_> = col.iter().map(cell_texts).collect();
+        let texts: Vec<_> = col.iter().map(|c| cell_texts(c, t)).collect();
         let lw = texts.iter().map(|t| text_size(dc, &t.0).0).max().unwrap_or(0);
         let pw = texts.iter().map(|t| text_size(dc, &t.1).0).max().unwrap_or(0);
         let cw = if show_change {
@@ -321,11 +425,11 @@ fn layout_grid(dc: HDC, cells: &[Cell], dpi: u32, rows: usize, show_change: bool
         let col_w = lw + gap_s + pw + if cw > 0 { gap_s + cw } else { 0 };
         for (r, (label, price, pc, change)) in texts.iter().enumerate() {
             let y = py + r as i32 * line_h;
-            f.runs.push(text_run(x, y, label, LABEL));
+            f.runs.push(text_run(x, y, label, t.label));
             let w = text_size(dc, price).0;
             // Without the change column the price itself carries the day's direction.
             let pc = match change {
-                Some((_, col)) if cw == 0 && *pc == PRICE => *col,
+                Some((_, col)) if cw == 0 && *pc == t.price => *col,
                 _ => *pc,
             };
             f.runs.push(text_run(x + lw + gap_s + pw - w, y, price, pc));
@@ -350,21 +454,22 @@ fn layout(u: &Ui, avail: Option<i32>) -> Frame {
         let dc = GetDC(u.hwnd);
         let old = SelectObject(dc, u.font);
         let cells = &u.view.cells;
+        let t = u.theme;
         let frame = match avail {
-            None => layout_row(dc, cells, u.dpi),
+            None => layout_row(dc, cells, u.dpi, t),
             Some(avail) => {
                 let rows = u.cfg.dock_rows.max(1) as usize;
                 let mut pick = None;
                 'fit: for k in (1..=cells.len()).rev() {
                     for show_change in [true, false] {
-                        let f = layout_grid(dc, &cells[..k], u.dpi, rows, show_change);
+                        let f = layout_grid(dc, &cells[..k], u.dpi, rows, show_change, t);
                         if f.w <= avail {
                             pick = Some(f);
                             break 'fit;
                         }
                     }
                 }
-                pick.unwrap_or_else(|| layout_grid(dc, &cells[..cells.len().min(1)], u.dpi, rows, false))
+                pick.unwrap_or_else(|| layout_grid(dc, &cells[..cells.len().min(1)], u.dpi, rows, false, t))
             }
         };
         SelectObject(dc, old);
@@ -385,7 +490,7 @@ fn draw_strip(u: &Ui, dc: HDC) {
             TextOutW(dc, r.x, r.y, r.text.as_ptr(), r.text.len() as i32);
         }
         let (dx, dy, d) = u.frame.dot;
-        let brush = CreateSolidBrush(link_color(u.view.link));
+        let brush = CreateSolidBrush(theme::link_color(u.theme, u.view.link));
         let old_brush = SelectObject(dc, brush);
         let old_pen = SelectObject(dc, GetStockObject(NULL_PEN));
         Ellipse(dc, dx, dy, dx + d, dy + d);
@@ -396,10 +501,36 @@ fn draw_strip(u: &Ui, dc: HDC) {
     }
 }
 
-fn draw_panel(u: &Ui, dc: HDC, w: i32, h: i32) {
-    if let Some(f) = &u.fonts {
-        panel::draw(dc, w, h, &u.view, &u.hist, f, u.dpi, u.hover, crate::source::now_s());
-    }
+fn draw_panel(u: &mut Ui, dc: HDC, w: i32, h: i32) {
+    let Some(f) = &u.fonts else { return };
+    let list = config::menu_list(&u.cfg);
+    let shown: Vec<bool> = list.iter().map(|r| config::is_shown(&u.cfg, &r.symbol)).collect();
+    // An animated theme's loop position. The clock only exists while this build can animate, and it
+    // is read from the panel being open, so a collapsed strip never carries a moving timer.
+    let phase = if u.theme.animated() {
+        let start = *u.anim.get_or_insert_with(Instant::now);
+        (start.elapsed().as_secs_f64() / ANIM_CYCLE_S) % 1.0
+    } else {
+        0.0
+    };
+    let scene = panel::Scene {
+        title: u.profile.title(),
+        board: &u.view,
+        hist: &u.hist,
+        fonts: f,
+        theme: u.theme,
+        grad: &u.grad,
+        dpi: u.dpi,
+        now: crate::source::now_s(),
+        btn_hover: u.hover,
+        pick_hover: u.pick_hover,
+        hover: u.hover_at,
+        picker: picker_open(u).then(|| panel::Picker { list: &list, shown: &shown }),
+        picker_btn: u.profile.ultra,
+        alert: u.alert_note.as_deref(),
+        phase,
+    };
+    panel::draw(dc, w, h, &scene);
 }
 
 /// Render into a fresh w x h bitmap compatible with the window.
@@ -435,30 +566,32 @@ fn draw_morph(m: &Morph, dc: HDC, w: i32, h: i32) {
     }
 }
 
-fn paint(u: &Ui) {
+fn paint(u: &mut Ui) {
     unsafe {
         let mut ps: PAINTSTRUCT = std::mem::zeroed();
         let hdc = BeginPaint(u.hwnd, &mut ps);
         let mut rc: RECT = std::mem::zeroed();
         GetClientRect(u.hwnd, &mut rc);
         let (w, h) = (rc.right.max(1), rc.bottom.max(1));
-        let bmp = snapshot(u.hwnd, w, h, |dc| match (u.mode, &u.morph) {
-            (Mode::Morph, Some(m)) => draw_morph(m, dc, w, h),
-            (Mode::Panel, _) => draw_panel(u, dc, w, h),
-            _ => draw_strip(u, dc),
-        });
-        let mem = CreateCompatibleDC(hdc);
-        let old = SelectObject(mem, bmp);
-        BitBlt(hdc, 0, 0, w, h, mem, 0, 0, SRCCOPY);
-        SelectObject(mem, old);
-        DeleteObject(bmp);
-        DeleteDC(mem);
+        if !matches!(&u.back, Some(b) if b.size == (w, h)) {
+            u.back = Some(Back::new(w, h));
+        }
+        // Take the buffer out of `u` so the painter can borrow `u` immutably while drawing into it.
+        if let Some(back) = u.back.take() {
+            match (u.mode, &u.morph) {
+                (Mode::Morph, Some(m)) => draw_morph(m, back.dc, w, h),
+                (Mode::Panel, _) => draw_panel(u, back.dc, w, h),
+                _ => draw_strip(u, back.dc),
+            }
+            BitBlt(hdc, 0, 0, w, h, back.dc, 0, 0, SRCCOPY);
+            u.back = Some(back);
+        }
         EndPaint(u.hwnd, &ps);
     }
 }
 
 fn tooltip(view: &Board) -> String {
-    let mut s = format!("MH Ticker - {}", link_name(view.link));
+    let mut s = format!("{} - {}", config::profile().title(), theme::link_name(view.link));
     for c in &view.cells {
         if let Some(q) = &c.quote {
             s.push_str(&format!("\n{} {}", c.label, fmt_price(q.price, c.digits)));
@@ -604,14 +737,27 @@ fn relayout_and_place(hwnd: HWND) {
 /// Explorer round trip) refreshes at most every 5 s unless the link colour changed, and a hidden
 /// strip is not re-measured.
 fn on_feed(hwnd: HWND) {
-    let Some(tray_update) = with_ui(|u| {
+    let Some((tray_update, fired, hook)) = with_ui(|u| {
         if let Ok(b) = u.board.lock() {
             u.view = b.clone();
         }
-        u.hist.record(&u.view, crate::source::now_s());
+        let now = crate::source::now_s();
+        u.hist.record(&u.view, now);
+        // Alerts run after the view is current, so a balloon names the price the strip is showing.
+        // The checker drops stale quotes itself: a closed market frozen at a level must not
+        // retrigger on every cooldown.
+        let fired = if u.profile.ultra && !u.cfg.alerts.is_empty() {
+            let f = alerts::check(&mut u.cfg, &u.view, now);
+            if !f.is_empty() {
+                config::save(&u.cfg);
+            }
+            f
+        } else {
+            Vec::new()
+        };
         let relinked = u.icon_link != Some(u.view.link);
         if relinked {
-            let fresh = make_icon(link_color(u.view.link));
+            let fresh = make_icon(theme::link_color(u.theme, u.view.link));
             if !u.icon.is_null() {
                 unsafe { DestroyIcon(u.icon) };
             }
@@ -619,15 +765,28 @@ fn on_feed(hwnd: HWND) {
             u.icon_link = Some(u.view.link);
         }
         let due = relinked || u.tip_at.is_none_or(|t| t.elapsed() >= TIP_EVERY);
-        due.then(|| {
+        let tray_update = due.then(|| {
             u.tip_at = Some(Instant::now());
             (u.icon, tooltip(&u.view))
-        })
+        });
+        (tray_update, fired, u.cfg.webhook.clone())
     }) else {
         return;
     };
     if let Some((icon, tip)) = tray_update {
         tray(hwnd, NIM_MODIFY, icon, &tip);
+    }
+    for f in fired {
+        alerts::balloon(hwnd, TRAY_ID, &f.title, &f.body);
+        with_ui(|u| u.alert_note = Some(format!("alert: {}", f.title)));
+        if let Some(url) = hook.clone() {
+            let target = hwnd as isize;
+            // The posting thread reports back by message: `Ui` is thread-local, so it cannot
+            // touch it directly.
+            alerts::spawn_post(url, f.title.clone(), f.body.clone(), Box::new(move |err| unsafe {
+                PostMessageW(target as HWND, WM_ALERT, err.is_some() as usize, 0);
+            }));
+        }
     }
     match with_ui(|u| u.mode) {
         Some(Mode::Strip) if unsafe { IsWindowVisible(hwnd) } != 0 => relayout_and_place(hwnd),
@@ -812,12 +971,16 @@ fn expand(hwnd: HWND) {
             return None;
         }
         if u.fonts.is_none() {
-            u.fonts = Some(panel::Fonts::new(&u.cfg.font, u.dpi));
+            u.fonts = Some(panel::Fonts::new(u.face, u.dpi, u.theme.is_pixel()));
         }
+        // Every expand starts the drift from the top of its loop.
+        u.anim = None;
         u.hover = false;
+        u.pick_hover = false;
+        u.hover_at = None;
         u.prev_fg = unsafe { GetForegroundWindow() };
         let a = u.strip_rect;
-        let g = panel::geometry(u.view.cells.len(), u.dpi);
+        let g = panel_geo(u);
         let b = panel_rect(&a, g.w, g.h);
         let fsz = (u.frame.w.max(1), u.frame.h.max(1));
         let from = snapshot(hwnd, fsz.0, fsz.1, |dc| draw_strip(u, dc));
@@ -836,6 +999,7 @@ fn expand(hwnd: HWND) {
     }
     run_morph(hwnd, a, b, from, to, (op, 255), EXPAND_MS, ease_out);
     with_ui(|u| u.mode = Mode::Panel);
+    sync_anim(hwnd);
     unsafe {
         SetWindowPos(hwnd, null_mut(), b.left, b.top, b.right - b.left, b.bottom - b.top, SWP_NOZORDER | SWP_NOACTIVATE);
         InvalidateRect(hwnd, null(), 0);
@@ -864,6 +1028,7 @@ fn collapse(hwnd: HWND) {
     };
     run_morph(hwnd, a, b, from, to, (255, op), COLLAPSE_MS, ease_in_out);
     with_ui(|u| u.mode = Mode::Strip);
+    sync_anim(hwnd);
     unsafe {
         SetWindowPos(hwnd, null_mut(), b.left, b.top, b.right - b.left, b.bottom - b.top, SWP_NOZORDER | SWP_NOACTIVATE);
         InvalidateRect(hwnd, null(), 0);
@@ -875,12 +1040,36 @@ fn collapse(hwnd: HWND) {
     dock_check(hwnd);
 }
 
-fn menu(hwnd: HWND) {
-    let Some((visible, top, docked, status, open, list, shown)) = with_ui(|u| {
+/// The context menu. `at` is the client-space click that opened it, when there was one: a
+/// right-click on a card acts on that card, everywhere else it is the window's own menu.
+fn menu(hwnd: HWND, at: Option<(i32, i32)>) {
+    #[allow(clippy::type_complexity)]
+    let Some((visible, top, docked, status, open, list, shown, theme_name, theme_font, poll_s, ultra, picked, alerted)) = with_ui(|u| {
         let list = config::menu_list(&u.cfg);
         let shown: Vec<bool> = list.iter().map(|r| config::is_shown(&u.cfg, &r.symbol)).collect();
-        let note = if u.view.note.is_empty() { link_name(u.view.link).to_string() } else { u.view.note.clone() };
-        (u.cfg.strip_visible, u.cfg.topmost, u.cfg.placement().on_taskbar(), note, u.mode != Mode::Strip, list, shown)
+        let note = if u.view.note.is_empty() { theme::link_name(u.view.link).to_string() } else { u.view.note.clone() };
+        let alerted: Vec<String> = u
+            .cfg
+            .alerts
+            .iter()
+            .filter(|a| a.above.is_some() || a.below.is_some())
+            .map(|a| a.label.clone())
+            .collect();
+        (
+            u.cfg.strip_visible,
+            u.cfg.topmost,
+            u.cfg.placement().on_taskbar(),
+            note,
+            u.mode != Mode::Strip,
+            list,
+            shown,
+            u.cfg.theme.clone(),
+            u.cfg.theme_font.clone(),
+            u.cfg.poll_s,
+            u.profile.ultra,
+            u.pick_open,
+            alerted,
+        )
     }) else {
         return;
     };
@@ -893,6 +1082,24 @@ fn menu(hwnd: HWND) {
             AppendMenuW(menu, flags, id, t.as_ptr());
         };
         let item = |flags: u32, id: usize, text: &str| add(m, flags, id, text);
+        // A card under the pointer: the two things a card is for, first in the menu.
+        let card = at.and_then(|(x, y)| {
+            with_ui(|u| {
+                if u.mode != Mode::Panel {
+                    return None;
+                }
+                let i = panel::card_at(&panel_geo(u), u.view.cells.len(), x, y)?;
+                let c = u.view.cells.get(i)?;
+                let price = fmt_price(c.quote.as_ref()?.price, c.digits);
+                Some((i, c.label.clone(), price))
+            })
+            .flatten()
+        });
+        if let Some((i, label, price)) = &card {
+            add(m, MF_STRING, CMD_COPY + i, &format!("Copy {label} {price}"));
+            add(m, MF_STRING, CMD_OPEN + i, &format!("Open {label} on CNBC"));
+            AppendMenuW(m, MF_SEPARATOR, 0, null());
+        }
         // Symbols: tick to show, untick to hide. The last one cannot go; at most MAX_ROWS show.
         let n_shown = shown.iter().filter(|s| **s).count();
         let full = n_shown >= config::MAX_ROWS;
@@ -909,6 +1116,75 @@ fn menu(hwnd: HWND) {
         item(MF_STRING, CMD_PANEL, if open { "Back to taskbar" } else { "Expand view" });
         SetMenuDefaultItem(m, CMD_PANEL as u32, 0);
         add(m, MF_POPUP, syms as usize, &format!("Symbols ({n_shown})"));
+        // Poll interval: `poll_s` has always been in the config; nothing exposed it until now.
+        let poll = CreatePopupMenu();
+        for (i, secs) in POLL_CHOICES.iter().enumerate() {
+            add(poll, MF_STRING, CMD_POLL + i, &format!("{secs} s"));
+        }
+        let cur_poll = POLL_CHOICES.iter().position(|secs| (secs - poll_s).abs() < 0.01).unwrap_or(2);
+        CheckMenuRadioItem(
+            poll,
+            CMD_POLL as u32,
+            (CMD_POLL + POLL_CHOICES.len() - 1) as u32,
+            (CMD_POLL + cur_poll) as u32,
+            MF_BYCOMMAND,
+        );
+        add(m, MF_POPUP, poll as usize, &format!("Poll every {poll_s} s"));
+        if ultra {
+            // Theme: four tier submenus, because 25 entries in one popup is a wall. The tier is a
+            // rendering rule (`theme::Kind`), so the menu cannot disagree with the painter.
+            let th = CreatePopupMenu();
+            let cur = theme::index_of(&theme_name);
+            for kind in theme::Kind::ALL {
+                let sub = CreatePopupMenu();
+                // The tier explains itself, so "Animated" and "Retro" do not need a README.
+                add(sub, MF_STRING | MF_GRAYED, 0, kind.note());
+                AppendMenuW(sub, MF_SEPARATOR, 0, null());
+                for i in theme::tier(kind) {
+                    let t = &theme::ALL[i];
+                    let flags = MF_STRING | if i == cur { MF_CHECKED } else { 0 };
+                    add(sub, flags, CMD_THEME + i, &format!("{}\t{}", t.name, t.note));
+                }
+                add(th, MF_POPUP, sub as usize, kind.label());
+            }
+            add(m, MF_POPUP, th as usize, &format!("Theme \u{b7} {}", theme::ALL[cur].name));
+            // Font: the same idea one axis over — grouped by family, not one list of 13 names.
+            let face = theme::font_of(&theme::ALL[cur], theme_font.as_deref());
+            let ft = CreatePopupMenu();
+            for group in theme::FACE_GROUPS {
+                let sub = CreatePopupMenu();
+                for (i, f) in theme::FACES.iter().enumerate().filter(|(_, f)| f.group == group) {
+                    let flags = MF_STRING | if f.name == face { MF_CHECKED } else { 0 };
+                    add(sub, flags, CMD_FONT + i, &format!("{}\t{}", f.name, f.note));
+                }
+                add(ft, MF_POPUP, sub as usize, group);
+            }
+            add(m, MF_POPUP, ft as usize, &format!("Font \u{b7} {face}"));
+            item(MF_STRING | if picked { MF_CHECKED } else { 0 }, CMD_PICK, "Symbol picker");
+            // Alerts at a move from the current price. Arbitrary levels are a config edit for now.
+            let al = CreatePopupMenu();
+            let mut any = false;
+            for (i, r) in list.iter().enumerate() {
+                if !shown[i] {
+                    continue;
+                }
+                any = true;
+                let sub = CreatePopupMenu();
+                for (k, (pct, up)) in ALERT_STEPS.iter().enumerate() {
+                    let text = format!("{} {pct:.0} %", if *up { "above" } else { "below" });
+                    add(sub, MF_STRING, CMD_ALERT + i * 4 + k, &text);
+                }
+                if alerted.contains(&r.label) {
+                    AppendMenuW(sub, MF_SEPARATOR, 0, null());
+                    add(sub, MF_STRING, CMD_ALERT_CLEAR + i, "Clear this symbol's alerts");
+                }
+                add(al, MF_POPUP, sub as usize, &r.label);
+            }
+            if !any {
+                add(al, MF_GRAYED, 0, "(no symbols shown)");
+            }
+            add(m, MF_POPUP, al as usize, &format!("Alerts ({})", alerted.len()));
+        }
         AppendMenuW(m, MF_SEPARATOR, 0, null());
         item(MF_STRING | if visible { MF_CHECKED } else { 0 }, CMD_STRIP, "Show strip");
         // Position: where the strip sits (and on which display, when there are several).
@@ -999,6 +1275,80 @@ fn menu(hwnd: HWND) {
             with_ui(|u| u.cfg.rows = config::default_rows());
             apply_rows(hwnd);
         }
+        c if (CMD_POLL..CMD_POLL + POLL_CHOICES.len()).contains(&c) => {
+            let secs = POLL_CHOICES[c - CMD_POLL];
+            with_ui(|u| {
+                u.cfg.poll_s = secs;
+                config::save(&u.cfg);
+                // The feed reads the cadence from the board, so this applies on the next tick.
+                if let Ok(mut b) = u.board.lock() {
+                    b.poll_s = secs;
+                }
+            });
+        }
+        c if ultra && (CMD_THEME..CMD_THEME + theme::ALL.len()).contains(&c) => {
+            with_ui(|u| u.cfg.theme = theme::ALL[c - CMD_THEME].name.to_string());
+            apply_theme(hwnd);
+        }
+        c if ultra && (CMD_FONT..CMD_FONT + theme::FACES.len()).contains(&c) => {
+            with_ui(|u| u.cfg.theme_font = Some(theme::FACES[c - CMD_FONT].name.to_string()));
+            apply_theme(hwnd);
+        }
+        c if (CMD_COPY..CMD_COPY + config::MAX_ROWS).contains(&c) => {
+            let text = with_ui(|u| {
+                let c = u.view.cells.get(c - CMD_COPY)?;
+                Some(format!("{} {}", c.label, fmt_price(c.quote.as_ref()?.price, c.digits)))
+            })
+            .flatten();
+            if let Some(text) = text {
+                copy_text(&text);
+            }
+        }
+        c if (CMD_OPEN..CMD_OPEN + config::MAX_ROWS).contains(&c) => {
+            let sym = with_ui(|u| {
+                let cell = u.view.cells.get(c - CMD_OPEN)?;
+                u.cfg.rows.iter().find(|r| r.label == cell.label).map(|r| r.symbol.clone())
+            })
+            .flatten();
+            if let Some(sym) = sym {
+                open_cnbc(hwnd, &sym);
+            }
+        }
+        CMD_PICK if ultra => apply_picker(hwnd, !picked),
+        c if ultra && (CMD_ALERT..CMD_ALERT + list.len() * 4).contains(&c) => {
+            let (i, step) = ((c - CMD_ALERT) / 4, (c - CMD_ALERT) % 4);
+            let label = list.get(i).map(|r| r.label.clone());
+            let price = with_ui(|u| {
+                u.view.cells.iter().find(|c| Some(&c.label) == label.as_ref()).and_then(|c| c.quote.as_ref().map(|q| q.price))
+            })
+            .flatten();
+            if let (Some(label), Some(price)) = (label, price) {
+                let (pct, up) = ALERT_STEPS[step];
+                let level = price * (1.0 + if up { pct } else { -pct } / 100.0);
+                with_ui(|u| {
+                    if !u.cfg.alerts.iter().any(|a| a.label == label) {
+                        u.cfg.alerts.push(config::Alert { label: label.clone(), ..Default::default() });
+                    }
+                    if let Some(a) = u.cfg.alerts.iter_mut().find(|a| a.label == label) {
+                        if up {
+                            a.above = Some(level);
+                        } else {
+                            a.below = Some(level);
+                        }
+                        // A fresh level may already be met: let it fire on the next poll.
+                        a.last = 0.0;
+                    }
+                    config::save(&u.cfg);
+                });
+            }
+        }
+        c if ultra && (CMD_ALERT_CLEAR..CMD_ALERT_CLEAR + list.len()).contains(&c) => {
+            let label = list[c - CMD_ALERT_CLEAR].label.clone();
+            with_ui(|u| {
+                u.cfg.alerts.retain(|a| a.label != label);
+                config::save(&u.cfg);
+            });
+        }
         _ => {}
     }
 }
@@ -1032,7 +1382,7 @@ fn apply_rows(hwnd: HWND) {
         }
         u.hist.record(&u.view, crate::source::now_s());
         (u.mode == Mode::Panel).then(|| {
-            let g = panel::geometry(u.view.cells.len(), u.dpi);
+            let g = panel_geo(u);
             let mut cur: RECT = unsafe { std::mem::zeroed() };
             unsafe { GetWindowRect(hwnd, &mut cur) };
             panel_rect(&cur, g.w, g.h)
@@ -1048,6 +1398,115 @@ fn apply_rows(hwnd: HWND) {
         None => relayout_and_place(hwnd),
     }
     unsafe { PostMessageW(hwnd, WM_FEED, 0, 0) };
+}
+
+/// Open or close the symbol picker: the panel grows or shrinks in place, staying centred.
+fn apply_picker(hwnd: HWND, open: bool) {
+    let Some(r) = with_ui(|u| {
+        u.pick_open = open;
+        u.hover_at = None;
+        (u.mode == Mode::Panel).then(|| {
+            let g = panel_geo(u);
+            let mut cur: RECT = unsafe { std::mem::zeroed() };
+            unsafe { GetWindowRect(hwnd, &mut cur) };
+            panel_rect(&cur, g.w, g.h)
+        })
+    })
+    .flatten()
+    else {
+        return;
+    };
+    unsafe {
+        SetWindowPos(hwnd, null_mut(), r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
+        InvalidateRect(hwnd, null(), 0);
+    }
+}
+
+/// Switch palette or face. Every GDI object derived from either is rebuilt here, in one place, so
+/// no repaint can be left using the previous palette's brush or font.
+fn apply_theme(hwnd: HWND) {
+    let Some((icon, tip)) = with_ui(|u| {
+        let t = theme::pick(u.profile.ultra, &u.cfg.theme);
+        let face = face_for(u);
+        if std::ptr::eq(u.theme, t) && face == u.face {
+            return None;
+        }
+        unsafe {
+            DeleteObject(u.bg);
+            DeleteObject(u.font);
+        }
+        u.theme = t;
+        u.face = face;
+        // A theme change restarts an animated background at the top of its loop.
+        u.anim = None;
+        u.bg = unsafe { CreateSolidBrush(t.bg) };
+        u.font = make_font(&u.cfg, u.dpi);
+        u.grad = Gradient::new(t);
+        u.fonts = u.fonts.take().map(|_| panel::Fonts::new(face, u.dpi, t.is_pixel()));
+        let fresh = make_icon(theme::link_color(t, u.view.link));
+        if !u.icon.is_null() {
+            unsafe { DestroyIcon(u.icon) };
+        }
+        u.icon = fresh;
+        u.icon_link = Some(u.view.link);
+        config::save(&u.cfg);
+        Some((u.icon, tooltip(&u.view)))
+    })
+    .flatten()
+    else {
+        return;
+    };
+    tray(hwnd, NIM_MODIFY, icon, &tip);
+    sync_anim(hwnd);
+    unsafe { InvalidateRect(hwnd, null(), 0) };
+}
+
+/// Start or stop the animation timer to match what is on screen: only an open panel running an
+/// animated theme needs one, so the strip and every static theme pay nothing for it.
+fn sync_anim(hwnd: HWND) {
+    let on = with_ui(|u| u.mode == Mode::Panel && u.theme.animated()).unwrap_or(false);
+    unsafe {
+        if on {
+            SetTimer(hwnd, TIMER_ANIM, ANIM_MS, None);
+        } else {
+            KillTimer(hwnd, TIMER_ANIM);
+        }
+    }
+}
+
+/// The text on the clipboard, as UTF-16. Fails silently: a clipboard held open by another app is a
+/// lost convenience, not an error worth interrupting anyone over.
+fn copy_text(s: &str) {
+    /// CF_UNICODETEXT. The windows-sys constant lives behind a feature nothing else here needs.
+    const CF_UNICODETEXT: u32 = 13;
+    unsafe {
+        if OpenClipboard(null_mut()) == 0 {
+            return;
+        }
+        EmptyClipboard();
+        let w: Vec<u16> = s.encode_utf16().chain(std::iter::once(0)).collect();
+        let h = GlobalAlloc(GMEM_MOVEABLE, w.len() * 2);
+        if !h.is_null() {
+            let p = GlobalLock(h) as *mut u16;
+            if !p.is_null() {
+                std::ptr::copy_nonoverlapping(w.as_ptr(), p, w.len());
+                GlobalUnlock(h);
+            }
+            // The clipboard takes ownership of the handle on success. A failed set would leak the
+            // block; `GlobalFree` is not exported by the memory module in this windows-sys
+            // version, and a clipboard failure is a one-handle leak in a process that lives for
+            // hours, so the leak is the cheaper of the two options.
+            SetClipboardData(CF_UNICODETEXT, h);
+        }
+        CloseClipboard();
+    }
+}
+
+/// Open a symbol's page on CNBC. The canonical symbol (`XAU=`, `@DJ.1`) is what the quote URL wants.
+fn open_cnbc(hwnd: HWND, symbol: &str) {
+    let url = wide(&format!("https://www.cnbc.com/quotes/{symbol}"));
+    let op = wide("open");
+    unsafe { ShellExecuteW(hwnd, op.as_ptr(), url.as_ptr(), null(), null(), SW_SHOWNORMAL) };
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -1070,6 +1529,23 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             SetTimer(hwnd, TIMER_RECHECK, 150, None);
             0
         }
+        WM_ALERT => {
+            let failed = wp != 0;
+            with_ui(|u| {
+                u.alert_note = Some(if failed { "alert kept here: webhook failed" } else { "alert: webhook sent" }.into())
+            });
+            if with_ui(|u| u.mode == Mode::Panel).unwrap_or(false) {
+                InvalidateRect(hwnd, null(), 0);
+            }
+            0
+        }
+        WM_TIMER if wp == TIMER_ANIM => {
+            // The clock keeps running while the strip is collapsed; only the panel draws it.
+            if with_ui(|u| u.mode == Mode::Panel).unwrap_or(false) {
+                InvalidateRect(hwnd, null(), 0);
+            }
+            0
+        }
         WM_TIMER if wp == TIMER_RECHECK => {
             KillTimer(hwnd, TIMER_RECHECK);
             dock_check(hwnd);
@@ -1090,7 +1566,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_PAINT => {
-            if with_ui(|u| paint(u)).is_none() {
+            if with_ui(paint).is_none() {
                 return DefWindowProcW(hwnd, msg, wp, lp);
             }
             0
@@ -1099,9 +1575,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         // Floating strip: the whole strip is a drag handle. Any other placement: fixed, a click opens the panel.
         // Panel: the header (minus the button) drags it.
         WM_NCHITTEST => {
-            let Some((mode, dock, header, btn)) = with_ui(|u| {
-                let g = panel::geometry(u.view.cells.len(), u.dpi);
-                (u.mode, u.cfg.placement() != Placement::Floating, g.header, g.btn)
+            let Some((mode, dock, header, btn, pick_btn)) = with_ui(|u| {
+                let g = panel_geo(u);
+                (u.mode, u.cfg.placement() != Placement::Floating, g.header, g.btn, g.pick_btn)
             }) else {
                 return HTCLIENT as LRESULT;
             };
@@ -1110,7 +1586,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 Mode::Panel => {
                     let mut pt = POINT { x: (lp & 0xffff) as i16 as i32, y: ((lp >> 16) & 0xffff) as i16 as i32 };
                     ScreenToClient(hwnd, &mut pt);
-                    if pt.y < header && !panel::in_rect(&btn, pt.x, pt.y) {
+                    let on_button = panel::in_rect(&btn, pt.x, pt.y) || panel::in_rect(&pick_btn, pt.x, pt.y);
+                    if pt.y < header && !on_button {
                         HTCAPTION as LRESULT
                     } else {
                         HTCLIENT as LRESULT
@@ -1129,7 +1606,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_SETCURSOR => {
             let fixed = |u: &Ui| u.cfg.placement() != Placement::Floating;
-            let hand = with_ui(|u| (u.mode == Mode::Strip && fixed(u)) || (u.mode == Mode::Panel && u.hover)).unwrap_or(false);
+            // The whole open panel is clickable now (a card opens CNBC, the chips toggle symbols),
+            // so the hand cursor covers it. The header stays a drag handle via WM_NCHITTEST, which
+            // reports HTCAPTION there and never reaches this branch.
+            let hand = with_ui(|u| (u.mode == Mode::Strip && fixed(u)) || u.mode == Mode::Panel).unwrap_or(false);
             if hand && (lp & 0xffff) as u32 == HTCLIENT {
                 SetCursor(LoadCursorW(null_mut(), IDC_HAND));
                 return 1;
@@ -1138,29 +1618,76 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_LBUTTONUP => {
             let (x, y) = ((lp & 0xffff) as i16 as i32, ((lp >> 16) & 0xffff) as i16 as i32);
+            // One click can mean four things; decide which from the same `Geo` the painter used.
+            enum Act {
+                Expand,
+                Collapse,
+                TogglePicker,
+                Symbol(String),
+                /// Open this symbol's CNBC page.
+                Open(String),
+                Nothing,
+            }
             let what = with_ui(|u| {
-                let g = panel::geometry(u.view.cells.len(), u.dpi);
-                (u.mode, u.cfg.placement() != Placement::Floating, panel::in_rect(&g.btn, x, y))
+                let g = panel_geo(u);
+                match u.mode {
+                    Mode::Strip if u.cfg.placement() != Placement::Floating => Act::Expand,
+                    Mode::Panel if panel::in_rect(&g.btn, x, y) => Act::Collapse,
+                    Mode::Panel if u.profile.ultra && panel::in_rect(&g.pick_btn, x, y) => Act::TogglePicker,
+                    // A chip, when the picker is open and the pointer is on one.
+                    Mode::Panel if picker_open(u) && panel::pick_hit(&g, x, y).is_some() => {
+                        let list = config::menu_list(&u.cfg);
+                        match panel::pick_hit(&g, x, y).and_then(|i| list.get(i)) {
+                            Some(r) => Act::Symbol(r.symbol.clone()),
+                            None => Act::Nothing,
+                        }
+                    }
+                    // Otherwise the card under the pointer is the target: click opens it on CNBC.
+                    Mode::Panel => match panel::card_at(&g, u.view.cells.len(), x, y) {
+                        Some(i) => match u.view.cells.get(i).and_then(|c| u.cfg.rows.iter().find(|r| r.label == c.label)) {
+                            Some(r) => Act::Open(r.symbol.clone()),
+                            None => Act::Nothing,
+                        },
+                        None => Act::Nothing,
+                    },
+                    _ => Act::Nothing,
+                }
             });
             match what {
-                Some((Mode::Strip, true, _)) => expand(hwnd),
-                Some((Mode::Panel, _, true)) => collapse(hwnd),
+                Some(Act::Expand) => expand(hwnd),
+                Some(Act::Collapse) => collapse(hwnd),
+                Some(Act::TogglePicker) => {
+                    let open = !with_ui(|u| u.pick_open).unwrap_or(false);
+                    apply_picker(hwnd, open);
+                }
+                Some(Act::Symbol(sym)) if with_ui(|u| config::toggle(&mut u.cfg, &sym)).unwrap_or(false) => {
+                    apply_rows(hwnd)
+                }
+                Some(Act::Open(sym)) => open_cnbc(hwnd, &sym),
                 _ => {}
             }
             0
         }
         WM_MOUSEMOVE => {
             let (x, y) = ((lp & 0xffff) as i16 as i32, ((lp >> 16) & 0xffff) as i16 as i32);
+            let now = crate::source::now_s();
+            // `Hover { row: usize::MAX }` stands in for "off every chart" so one comparison covers
+            // all three hover targets and a repaint only happens when something visual moved.
+            let away = panel::Hover { row: usize::MAX, t: 0.0 };
             let state = with_ui(|u| {
                 if u.mode != Mode::Panel {
                     return (false, false);
                 }
-                let g = panel::geometry(u.view.cells.len(), u.dpi);
-                let over = panel::in_rect(&g.btn, x, y);
+                let g = panel_geo(u);
+                let at = panel::hit(&g, u.view.cells.len(), u.dpi, x, y, now).map(snap).unwrap_or(away);
+                let btn = panel::in_rect(&g.btn, x, y);
+                let pick = u.profile.ultra && panel::in_rect(&g.pick_btn, x, y);
                 let track = !u.tracking;
                 u.tracking = true;
-                let changed = over != u.hover;
-                u.hover = over;
+                let changed = btn != u.hover || pick != u.pick_hover || at != u.hover_at.unwrap_or(away);
+                u.hover = btn;
+                u.pick_hover = pick;
+                u.hover_at = (at.row != usize::MAX).then_some(at);
                 (changed, track)
             });
             if let Some((changed, track)) = state {
@@ -1177,7 +1704,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_MOUSELEAVE => {
             let was = with_ui(|u| {
                 u.tracking = false;
-                std::mem::replace(&mut u.hover, false)
+                let was = u.hover || u.pick_hover || u.hover_at.is_some();
+                u.hover = false;
+                u.pick_hover = false;
+                u.hover_at = None;
+                was
             });
             if was == Some(true) {
                 InvalidateRect(hwnd, null(), 0);
@@ -1193,7 +1724,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_NCRBUTTONUP | WM_CONTEXTMENU => {
-            menu(hwnd);
+            // lParam is screen coordinates (client ones for WM_CONTEXTMENU from a menu key are
+            // not sent), and -1 means the keyboard opened it, with no card to act on.
+            let at = if lp == -1 {
+                None
+            } else {
+                let mut pt = POINT { x: (lp & 0xffff) as i16 as i32, y: ((lp >> 16) & 0xffff) as i16 as i32 };
+                ScreenToClient(hwnd, &mut pt);
+                Some((pt.x, pt.y))
+            };
+            menu(hwnd, at);
             0
         }
         WM_EXITSIZEMOVE => {
@@ -1215,8 +1755,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 unsafe { DeleteObject(u.font) };
                 u.dpi = dpi;
                 u.font = make_font(&u.cfg, dpi);
-                u.fonts = u.fonts.take().map(|_| panel::Fonts::new(&u.cfg.font, dpi));
-                (u.mode == Mode::Panel).then(|| panel::geometry(u.view.cells.len(), dpi))
+                u.fonts = u.fonts.take().map(|_| panel::Fonts::new(u.face, dpi, u.theme.is_pixel()));
+                (u.mode == Mode::Panel).then(|| panel_geo(u))
             })
             .flatten();
             match open {
@@ -1245,7 +1785,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         _ => {}
                     }
                 }
-                WM_RBUTTONUP => menu(hwnd),
+                // The tray has no cards, so there is nothing for a contextual entry to point at.
+                WM_RBUTTONUP => menu(hwnd, None),
                 _ => {}
             }
             0
@@ -1276,7 +1817,8 @@ pub fn run(cfg: Config, board: Arc<Mutex<Board>>) {
     unsafe {
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let inst = GetModuleHandleW(null());
-        let class = wide("MH_Ticker_Strip");
+        let profile = config::profile();
+        let class = wide(&format!("{}_Strip", profile.id));
         let wc = WNDCLASSW {
             style: 0,
             lpfnWndProc: Some(wndproc),
@@ -1291,7 +1833,7 @@ pub fn run(cfg: Config, board: Arc<Mutex<Board>>) {
             lpszClassName: class.as_ptr(),
         };
         RegisterClassW(&wc);
-        let title = wide("MH Ticker");
+        let title = wide(profile.title());
         let ex = WS_EX_TOOLWINDOW | WS_EX_LAYERED | if cfg.topmost || cfg.placement().on_taskbar() { WS_EX_TOPMOST } else { 0 };
         let hwnd = CreateWindowExW(ex, class.as_ptr(), title.as_ptr(), WS_POPUP, 0, 0, 10, 10, null_mut(), null_mut(), inst, null());
         if hwnd.is_null() {
@@ -1304,12 +1846,21 @@ pub fn run(cfg: Config, board: Arc<Mutex<Board>>) {
 
         let dpi = GetDpiForWindow(hwnd).max(96);
         let tc_name = wide("TaskbarCreated");
+        // The UI owns the poll cadence: the feed reads it from the board each pass.
+        if let Ok(mut b) = board.lock() {
+            b.poll_s = cfg.poll_s;
+        }
         let view = board.lock().map(|b| b.clone()).unwrap_or_else(|_| Board::new(&cfg.rows));
+        let theme = theme::pick(profile.ultra, &cfg.theme);
         let ui = Ui {
             hwnd,
+            profile,
             font: make_font(&cfg, dpi),
-            bg: CreateSolidBrush(BG),
-            icon: make_icon(link_color(Link::Down)),
+            bg: CreateSolidBrush(theme.bg),
+            theme,
+            face: theme::font_of(theme, if profile.ultra { cfg.theme_font.as_deref() } else { None }),
+            grad: Gradient::new(theme),
+            icon: make_icon(theme::link_color(theme, Link::Down)),
             icon_link: Some(Link::Down),
             dpi,
             cfg: cfg.clone(),
@@ -1325,10 +1876,16 @@ pub fn run(cfg: Config, board: Arc<Mutex<Board>>) {
             fonts: None,
             hist: panel::History::new(),
             hover: false,
+            pick_hover: false,
+            pick_open: false,
+            hover_at: None,
+            alert_note: None,
             tracking: false,
             prev_fg: null_mut(),
             tip_at: None,
             tray_click_at: None,
+            back: None,
+            anim: None,
         };
         let (icon, tip) = (ui.icon, tooltip(&ui.view));
         UI.with(|c| *c.borrow_mut() = Some(ui));

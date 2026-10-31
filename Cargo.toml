@@ -1,21 +1,46 @@
 [package]
 name = "mh_ticker"
-version = "1.2.3"
+version = "1.4.0"
 edition = "2021"
-description = "MH Ticker: a price strip docked in the Windows taskbar that opens into a centred panel. Public CNBC quotes, no login, no server."
+description = "MH Ticker: a price strip docked in the Windows taskbar that opens into a centred panel. Public CNBC quotes, no login, no server. Two builds from one source: MH_Ticker (one theme, lean) and MH_Ticker_Ultra (themes, alerts, symbol picker)."
 license = "MIT"
 repository = "https://github.com/mariyaholic/mh-ticker"
 authors = ["mariyaholic"]
 
+# One library, two products. `src/` is the shared engine; `src/bin/` holds the two entries.
+# MH_Ticker keeps its name and its look; MH_Ticker_Ultra is where the aesthetics live.
+# Both get every correctness and network fix, because both link the same engine.
+[lib]
+name = "mh_ticker"
+path = "src/lib.rs"
+
 [[bin]]
 name = "MH_Ticker"
-path = "src/main.rs"
+path = "src/bin/classic.rs"
+
+[[bin]]
+name = "MH_Ticker_Ultra"
+path = "src/bin/ultra.rs"
+
+# The screenshot renderer, and only it, needs a PNG encoder. It is a feature, not a dependency of
+# the product: neither binary links `png` because neither enables `shots`. Run it with
+#     cargo run --release --example shots --features shots -- shots/
+[[example]]
+name = "shots"
+path = "examples/shots.rs"
+required-features = ["shots"]
+
+[features]
+shots = ["dep:png"]
 
 [dependencies]
+png = { version = "0.17", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # HTTPS through Windows' own TLS (SChannel) via native-tls: no bundled certificate store.
-ureq = { version = "2.12", default-features = false, features = ["json", "native-tls"] }
+# `gzip` is not optional: without it CNBC's chart JSON (the bulk of the traffic) comes down
+# uncompressed, ~6x the bytes for no benefit.
+ureq = { version = "2.12", default-features = false, features = ["json", "native-tls", "gzip"] }
 native-tls = "0.2"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
@@ -23,7 +48,9 @@ windows-sys = { version = "0.59", features = [
     "Win32_Graphics_Gdi",
     "Win32_Security",
     "Win32_Graphics_Dwm",
+    "Win32_System_DataExchange",
     "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
     "Win32_System_Threading",
     "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",
