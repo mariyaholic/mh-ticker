@@ -1,14 +1,15 @@
 # Changelog — MH Ticker
 
-## [Unreleased]
+## [Unreleased] (1.3.0 is not released yet)
 
 - Validate quote timestamps and balance COM initialization and foreground hook cleanup.
 - Audit locked dependency licences and clarify unverified release and platform checks.
+- Session timers, the portable session engine and the generated Pine and MQL5 indicators are the
+  1.3.0 feature set, detailed in the two dated draft entries below; they move to a dated 1.3.0
+  heading at the actual release (02-L5: they previously appeared both here *and* under dated
+  1.3.0 headings while the version was still unreleased).
 
-- Add session timers, a portable session engine, and generated Pine and MQL5 indicators.
-- Review Windows cross-builds, resource compilation, documentation, and release preparation.
-
-## 2026-10-28 — 1.3.0 licence follow-up   [agent]
+## Unreleased — 2026-10-28: licence follow-up   [draft, 1.3.0]
 
 - Licence stays **MIT** (Manager ruling 2026-10-28): restored the original `LICENSE`, removed the Apache-2.0
   `NOTICE`, restored the original README credit and License section, and switched SPDX headers, crate
@@ -17,7 +18,7 @@
 - Added the Unicode License v3 text for the bundled CLDR `windowsZones` subset (approved 2026-10-28).
 - Session hours and the default broker preset are recorded as owner-approved (2026-10-28).
 
-## 2026-10-28 — 1.3.0: session timers, plus Pine v6 and MQL5 boilerplates   [agent]
+## Unreleased — 2026-10-28: session timers, plus Pine v6 and MQL5 boilerplates   [draft, 1.3.0]
 
 **Files:** `spec/sessions.json`, `spec/golden/vectors.json`, `crates/session-engine/**`, `crates/specgen/**`,
 `pine/MH_Sessions.pine`, `mql5/MH_Sessions.mq5`, `src/{config,device,panel,ui,dock,main}.rs`, `Cargo.toml`,

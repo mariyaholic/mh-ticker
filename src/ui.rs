@@ -298,6 +298,19 @@ fn make_icon(color: COLORREF) -> HICON {
     }
 }
 
+/// 02-L5: the About text, versioned from the crate metadata like the About
+/// screen should be — the "1.3.0" hard-code drifted from `Cargo.toml` by
+/// construction here and had already drifted once from the 1.2.3 binary.
+pub fn about_text() -> &'static str {
+    concat!(
+        "MH Ticker ",
+        env!("CARGO_PKG_VERSION"),
+        "\n\nmade with love by maria\nMIT licensed.\n\nSession times are conventions, not guaranteed",
+        " exchange hours.\nNot financial advice.\n\nNot affiliated with TradingView or MetaQuotes;",
+        " MT5 is a MetaQuotes trademark."
+    )
+}
+
 /// (label, price, price colour, change + colour) for one row of the board.
 fn cell_texts(c: &Cell) -> (String, String, COLORREF, Option<(String, COLORREF)>) {
     let label = c.label.clone();
@@ -1349,9 +1362,7 @@ fn menu(hwnd: HWND) {
             apply_sessions(hwnd);
         }
         CMD_ABOUT => unsafe {
-            let text = wide(
-                "MH Ticker 1.3.0\n\nmade with love by maria\nMIT licensed.\n\nSession times are conventions, not guaranteed exchange hours.\nNot financial advice.\n\nNot affiliated with TradingView or MetaQuotes; MT5 is a MetaQuotes trademark.",
-            );
+            let text = wide(about_text());
             let title = wide("About MH Ticker");
             MessageBoxW(
                 hwnd,
@@ -1873,6 +1884,17 @@ mod icon_tests {
     // (they were still selected into the DC when deleted). This test counts
     // the real GDI handle inventory, so a leak is arithmetic, not vibes.
     use super::*;
+
+    #[test]
+    fn about_text_is_versioned_from_the_crate_not_hard_coded() {
+        // 02-L5: mu old build got the "1.3.0" from a literal, so About and
+        // Cargo.toml could drift apart silently. concat! of the metadata
+        // keeps them pinned together.
+        let text = about_text();
+        assert!(text.contains(concat!("MH Ticker ", env!("CARGO_PKG_VERSION"))));
+        assert!(text.contains("made with love by maria"));
+        assert!(text.contains("MIT licensed"));
+    }
 
     #[test]
     fn icon_creation_leaks_no_gdi_objects() {
