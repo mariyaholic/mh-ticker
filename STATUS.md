@@ -32,7 +32,10 @@ the tree was 63 green tests before the run. Rust sources count and LOC are uncha
 commit).
 
 Gates run locally on this Windows box (toolchain `x86_64-pc-windows-gnu`, rustc 1.98.1; CI uses
-1.99.1):
+1.99.1). **The first CI run ever (run 41384548804) is green**: windows job (fmt, strict clippy,
+build, the full 77-test run incl. the GDI counting test) plus the deny job — moved to
+ubuntu-latest after the first attempt failed (`cargo-deny-action` is container-based, Linux only;
+`58a1fa8`); the deny.toml graph already covers both target triples, so coverage did not shrink:
 
 ```text
 cargo fmt --all --check                                   # exit 0
@@ -73,9 +76,9 @@ Explorer restarts, the hook/COM lifecycle matrix, DST-off device comparison with
 and the session-panel visual with the new minimum width (M4). MQL5 (MT5 tester or a real terminal):
 compile and compare countdowns against the vectors (H1), the override/measured reopen clock (M2),
 the seasonal reopen (L4). TradingView: paste `MH_Sessions.pine`, confirm compile, toggle the
-exchange-zone input (H2), compare plate rendering. The branch CI (`fix/opus-review-02`) runs the
-Windows job; this is the first CI run of `.github/workflows/ci.yml` ever, and the runner GDI calls
-(see L1 test) are the CI-only unknown.
+exchange-zone input (H2), compare table rendering. The branch CI (`fix/opus-review-02`) is green
+(see the gates section); watch items there are cosmetic — the ubuntu-latest → Ubuntu 26 image
+migration note and the Node 20 → 24 deprecation warning on the pinned checkout.
 
 Open issues: a tag/release job is not in scope of L7 (the 07A-13-style release model can be ported
 from the sister repos, the Manager's call); the broker identity must stay verified offline in the
