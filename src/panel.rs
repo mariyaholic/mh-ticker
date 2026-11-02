@@ -205,11 +205,19 @@ pub struct Geo {
     pub chips: Vec<RECT>,
 }
 
+/// The panel at its content size: the width its cards ask for. Screenshots and the strip's "expand"
+/// both want this, and it must never drift — `shots/*.png` pins it.
 pub fn geometry(n: usize, catalog: usize, dpi: u32, picker: bool) -> Geo {
+    geometry_in(workspace::grid(n, dpi as i32).w, n, catalog, dpi, picker)
+}
+
+/// The panel in a window `w` wide. Columns come from the width, so a dragged edge reflows the grid
+/// instead of clipping it; everything below the header is derived from those columns.
+pub fn geometry_in(w: i32, n: usize, catalog: usize, dpi: u32, picker: bool) -> Geo {
     let s = |v: i32| v * dpi as i32 / 96;
-    // The card grid's size and column count are `workspace`'s business now: the panel is one pane,
-    // and the pane model has to own the numbers before it can own the window.
-    let g = workspace::grid(n, dpi as i32);
+    // The card grid's size and column count are `workspace`'s business: the panel is one pane, and
+    // the pane model has to own the numbers before it can own the window.
+    let g = workspace::grid_in(w, n, dpi as i32);
     let cols = g.cols;
     let (pad, gap, card_w, card_h, header) = (
         s(workspace::PAD),
@@ -689,7 +697,9 @@ pub fn draw(dc: HDC, w: i32, h: i32, sc: &Scene) {
     let t = sc.theme;
     let s = |v: i32| v * sc.dpi as i32 / 96;
     let radius = |v: i32| if t.is_pixel() { 0 } else { s(v) };
-    let g = geometry(sc.board.cells.len(), sc.picker.as_ref().map(|p| p.list.len()).unwrap_or(0), sc.dpi, sc.picker.is_some());
+    // Columns come from the width we were asked to draw in, so the frame and its content agree:
+    // the window is the composition, and a dragged edge reflows the grid instead of leaving a gutter.
+    let g = geometry_in(w, sc.board.cells.len(), sc.picker.as_ref().map(|p| p.list.len()).unwrap_or(0), sc.dpi, sc.picker.is_some());
     unsafe {
         SetBkMode(dc, TRANSPARENT as _);
     }
