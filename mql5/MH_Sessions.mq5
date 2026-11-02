@@ -213,6 +213,9 @@ long MhNextBoundary(string zone, int openMin, int closeMin, int days, bool overn
    datetime localNow = (datetime)(utc + offset);
    MqlDateTime dt;
    TimeToStruct(localNow, dt);
+   dt.hour = 0;
+   dt.min = 0;
+   dt.sec = 0;
    datetime midnight = StructToTime(dt);
    long best = 0;
    for(int d = -1; d <= 10; d++)
@@ -252,6 +255,9 @@ long MhBrokerNextReopen(long utc)
    datetime localNow = (datetime)(utc + offset * 60);
    MqlDateTime dt;
    TimeToStruct(localNow, dt);
+   dt.hour = 0;
+   dt.min = 0;
+   dt.sec = 0;
    datetime midnight = StructToTime(dt);
    long best = 0;
    for(int d = -1; d <= 10; d++)
