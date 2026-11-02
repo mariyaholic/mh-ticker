@@ -31,6 +31,7 @@ pub(crate) mod panel;
 pub(crate) mod source;
 pub(crate) mod theme;
 pub(crate) mod ui;
+pub(crate) mod workspace;
 
 use std::sync::{Arc, Mutex};
 
