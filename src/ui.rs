@@ -287,8 +287,23 @@ fn face_for(u: &Ui) -> &'static str {
 
 /// The panel's geometry, from one place. `draw` and every hit test call this, so a click lands
 /// where the pixels are even while the picker is opening or the symbols change.
+/// The panel's geometry. Content-sized unless it is open: an open panel takes its columns from the
+/// window's width, so a dragged edge reflows the cards instead of clipping them, and its height from
+/// the window's height, so the footer sits at the bottom of the frame.
 fn panel_geo(u: &Ui) -> panel::Geo {
-    panel::geometry(u.view.cells.len(), catalog_len(u), u.dpi, picker_open(u))
+    let n = u.view.cells.len();
+    let natural = panel::geometry(n, catalog_len(u), u.dpi, picker_open(u));
+    if u.mode != Mode::Panel {
+        return natural;
+    }
+    let mut rc: RECT = unsafe { std::mem::zeroed() };
+    unsafe { GetClientRect(u.hwnd, &mut rc) };
+    if rc.right <= 0 || rc.bottom <= 0 {
+        return natural;
+    }
+    let mut g = panel::geometry_in(rc.right, n, catalog_len(u), u.dpi, picker_open(u));
+    g.h = rc.bottom;
+    g
 }
 
 /// Snap a crosshair time to 5 s buckets. A 1 px mouse move would otherwise change the readout on
@@ -979,6 +994,25 @@ fn panel_rect(near: &RECT, w: i32, h: i32) -> RECT {
     }
 }
 
+/// A saved panel rect, kept inside the work area of the monitor it lands on. A rect whose header
+/// would sit off the desktop — the monitor was unplugged, or the resolution dropped — is pulled back
+/// in rather than left unreachable, and a frame larger than the screen is trimmed to it.
+fn fit_panel(r: RECT) -> RECT {
+    unsafe {
+        let mut mi: MONITORINFO = std::mem::zeroed();
+        mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(MonitorFromRect(&r, MONITOR_DEFAULTTONEAREST), &mut mi) == 0 {
+            return r;
+        }
+        let wa = mi.rcWork;
+        let w = (r.right - r.left).min(wa.right - wa.left);
+        let h = (r.bottom - r.top).min(wa.bottom - wa.top);
+        let x = r.left.clamp(wa.left, (wa.right - w).max(wa.left));
+        let y = r.top.clamp(wa.top, (wa.bottom - h).max(wa.top));
+        RECT { left: x, top: y, right: x + w, bottom: y + h }
+    }
+}
+
 /// Strip -> panel.
 fn expand(hwnd: HWND) {
     let Some((a, b, from, to, op)) = with_ui(|u| {
@@ -995,12 +1029,20 @@ fn expand(hwnd: HWND) {
         u.hover_at = None;
         u.prev_fg = unsafe { GetForegroundWindow() };
         let a = u.strip_rect;
-        let g = panel_geo(u);
-        let b = panel_rect(&a, g.w, g.h);
+        let natural = panel_geo(u);
+        // A frame the user dragged last time comes back the way they left it; anything that no longer
+        // fits the monitor (unplugged, resolution changed) is fitted again rather than lost.
+        let b = match u.cfg.panel {
+            Some(p) => fit_panel(RECT { left: p[0], top: p[1], right: p[0] + p[2], bottom: p[1] + p[3] }),
+            None => panel_rect(&a, natural.w, natural.h),
+        };
+        // The content is laid out for the frame it is about to be drawn in, not for the one it would
+        // have had if the window were still content-sized.
+        let (pw, ph) = (b.right - b.left, b.bottom - b.top);
         let fsz = (u.frame.w.max(1), u.frame.h.max(1));
         let from = snapshot(hwnd, fsz.0, fsz.1, |dc| draw_strip(u, dc));
-        let to = snapshot(hwnd, g.w, g.h, |dc| draw_panel(u, dc, g.w, g.h));
-        Some((a, b, (from, fsz), (to, (g.w, g.h)), u.cfg.opacity))
+        let to = snapshot(hwnd, pw, ph, |dc| draw_panel(u, dc, pw, ph));
+        Some((a, b, (from, fsz), (to, (pw, ph)), u.cfg.opacity))
     })
     .flatten() else {
         return;
@@ -1609,6 +1651,39 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             0
         }
+        // The client area is the whole window: no caption, no border, no offset for the hit tests.
+        WM_NCCALCSIZE => 0,
+        // Only the panel is resizable, so only the panel advertises a size range: the strip is a bar,
+        // and clamping it to the panel's minimum would stop it being a bar.
+        WM_GETMINMAXINFO => {
+            let Some((mode, natural)) = with_ui(|u| {
+                (u.mode, panel::geometry(u.view.cells.len(), catalog_len(u), u.dpi, picker_open(u)))
+            }) else {
+                return 0;
+            };
+            if mode == Mode::Panel {
+                unsafe {
+                    let info = lp as *mut MINMAXINFO;
+                    // Smallest: the content size, so the cards never fold below their columns.
+                    (*info).ptMinTrackSize = POINT { x: natural.w, y: natural.h };
+                    // Largest: the monitor's work area, so maximise cannot hide under the taskbar.
+                    let mut mi: MONITORINFO = std::mem::zeroed();
+                    mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+                    let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+                    if GetMonitorInfoW(mon, &mut mi) != 0 {
+                        (*info).ptMaxTrackSize = POINT { x: mi.rcWork.right - mi.rcWork.left, y: mi.rcWork.bottom - mi.rcWork.top };
+                    }
+                }
+            }
+            0
+        }
+        // A dragged edge changes the width; the panel reflows its columns from it.
+        WM_SIZE => {
+            if with_ui(|u| u.mode == Mode::Panel).unwrap_or(false) {
+                InvalidateRect(hwnd, null(), 0);
+            }
+            0
+        }
         WM_PAINT => {
             if with_ui(paint).is_none() {
                 return DefWindowProcW(hwnd, msg, wp, lp);
@@ -1619,6 +1694,30 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         // Floating strip: the whole strip is a drag handle. Any other placement: fixed, a click opens the panel.
         // Panel: the header (minus the button) drags it.
         WM_NCHITTEST => {
+            // The panel's edges resize it. The strip stays a drag handle with nothing to grab: it is
+            // a bar, and a bar that can be stretched into a rectangle is a bug with a cursor.
+            if with_ui(|u| u.mode == Mode::Panel).unwrap_or(false) {
+                let mut pt = POINT { x: (lp & 0xffff) as i16 as i32, y: ((lp >> 16) & 0xffff) as i16 as i32 };
+                ScreenToClient(hwnd, &mut pt);
+                let mut rc: RECT = std::mem::zeroed();
+                GetClientRect(hwnd, &mut rc);
+                let b = 6 * with_ui(|u| u.dpi as i32).unwrap_or(96) / 96;
+                let (l, r, t, bo) = (pt.x < b, pt.x >= rc.right - b, pt.y < b, pt.y >= rc.bottom - b);
+                let edge = match (l, r, t, bo) {
+                    (true, _, true, _) => Some(HTTOPLEFT),
+                    (_, true, true, _) => Some(HTTOPRIGHT),
+                    (true, _, _, true) => Some(HTBOTTOMLEFT),
+                    (_, true, _, true) => Some(HTBOTTOMRIGHT),
+                    (true, _, _, _) => Some(HTLEFT),
+                    (_, true, _, _) => Some(HTRIGHT),
+                    (_, _, true, _) => Some(HTTOP),
+                    (_, _, _, true) => Some(HTBOTTOM),
+                    _ => None,
+                };
+                if let Some(h) = edge {
+                    return h as LRESULT;
+                }
+            }
             let Some((mode, dock, header, btn, pick_btn)) = with_ui(|u| {
                 let g = panel_geo(u);
                 (u.mode, u.cfg.placement() != Placement::Floating, g.header, g.btn, g.pick_btn)
@@ -1783,13 +1882,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_EXITSIZEMOVE => {
             let mut r: RECT = std::mem::zeroed();
             GetWindowRect(hwnd, &mut r);
-            with_ui(|u| {
-                if u.cfg.placement() == Placement::Floating && u.mode == Mode::Strip {
+            with_ui(|u| match u.mode {
+                Mode::Panel => {
+                    // The frame is the user's now: remember it, and only write when it changed.
+                    let frame = [r.left, r.top, r.right - r.left, r.bottom - r.top];
+                    if u.cfg.panel != Some(frame) {
+                        u.cfg.panel = Some(frame);
+                        config::save(&u.cfg);
+                    }
+                }
+                Mode::Strip if u.cfg.placement() == Placement::Floating => {
                     u.strip_rect = r;
                     u.cfg.x = Some(r.left);
                     u.cfg.y = Some(r.top);
                     config::save(&u.cfg);
                 }
+                _ => {}
             });
             0
         }
@@ -1879,7 +1987,11 @@ pub fn run(cfg: Config, board: Arc<Mutex<Board>>) {
         RegisterClassW(&wc);
         let title = wide(profile.title());
         let ex = WS_EX_TOOLWINDOW | WS_EX_LAYERED | if cfg.topmost || cfg.placement().on_taskbar() { WS_EX_TOPMOST } else { 0 };
-        let hwnd = CreateWindowExW(ex, class.as_ptr(), title.as_ptr(), WS_POPUP, 0, 0, 10, 10, null_mut(), null_mut(), inst, null());
+        // WS_THICKFRAME is what makes the panel resizable (and what lets Windows run its own sizing
+        // loop on wm_nchittest's HTLEFT/HTRIGHT/... edges). WM_NCCALCSIZE then returns 0, so the
+        // frame costs no visible border and no client-area offset: the look is still ours.
+        let style = WS_POPUP | WS_THICKFRAME | WS_MAXIMIZEBOX;
+        let hwnd = CreateWindowExW(ex, class.as_ptr(), title.as_ptr(), style, 0, 0, 10, 10, null_mut(), null_mut(), inst, null());
         if hwnd.is_null() {
             return;
         }
