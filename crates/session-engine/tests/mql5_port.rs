@@ -7,6 +7,7 @@
 //! guarded structurally: it must zero the clock fields before `StructToTime`.
 
 use chrono::{DateTime, Offset, TimeZone, Utc};
+use chrono_tz::OffsetComponents;
 use serde_json::Value;
 
 /// `MhOffsetByZone` equivalent: seconds east of UTC for the rule zone at `utc`.
@@ -88,16 +89,40 @@ fn mql5_boundary_port_matches_the_golden_vectors() {
     }
 }
 
-/// Port of `MhBrokerNextReopen` with the 02-H1 + 02-M2 fix: midnight-anchored
-/// and driven by the *effective* offset the indicator displays.
-fn next_reopen(offset_min: i32, reopen_min: i32, days_monfirst: u32, utc_secs: i64) -> i64 {
+/// Port of `MhBrokerNextReopen` with the 02-H1 + 02-M2 + 02-L4 fix: midnight-
+/// anchored, driven by the *effective* offset the indicator displays, and
+/// switching the reopen clock with the server-side US-DST season when the
+/// generated summer differs.
+fn next_reopen(
+    offset_min: i32,
+    winter_reopen_min: i32,
+    summer_reopen_min: i32,
+    days_monfirst: u32,
+    utc_secs: i64,
+) -> i64 {
     let effective = offset_min;
     let server_now = utc_secs + (effective as i64) * 60;
     let midnight = server_now - server_now.rem_euclid(86_400);
-    let reopen_min = reopen_min as i64;
+    let winter = winter_reopen_min as i64;
+    let summer = summer_reopen_min as i64;
     let mut best = 0i64;
     for d in -1..=10 {
-        let local_reopen = midnight + d * 86_400 + reopen_min * 60;
+        let mut local_reopen = midnight + d * 86_400 + winter * 60;
+        if summer != winter {
+            // NY EDT probe on the candidate instant, like the template.
+            let probe = Utc
+                .timestamp_opt(local_reopen - (effective as i64) * 60, 0)
+                .single()
+                .expect("valid candidate");
+            let edt = probe
+                .with_timezone(&chrono_tz::America::New_York)
+                .offset()
+                .dst_offset()
+                != chrono::Duration::zero();
+            if edt {
+                local_reopen = midnight + d * 86_400 + summer * 60;
+            }
+        }
         let day_bits = local_reopen.div_euclid(86_400);
         if days_monfirst >> ((day_bits + 3).rem_euclid(7)) & 1 == 0 {
             continue;
@@ -118,28 +143,34 @@ fn mql5_reopen_port_matches_the_broker_vectors() {
     let mut checked = 0;
     for case in v["broker_cases"].as_array().unwrap() {
         let name = case["name"].as_str().unwrap();
-        // Only the cases the MQL5 can model: verified, fixed offset override.
-        if case["rule"]["seasonal"].as_str() != Some("fixed") {
+        // The cases the MQL5 can model: verified rules with a fixed override,
+        // and (since 02-L4) the seasonal reopen. A live measured offset is
+        // Windows-runtime data, kept to the manual checks.
+        let r = &case["rule"];
+        let offset = r["winter_offset_minutes"].as_i64().unwrap() as i32;
+        if r["summer_offset_minutes"].as_i64().unwrap() != offset as i64 {
             continue;
         }
-        let offset = case["rule"]["winter_offset_minutes"].as_i64().unwrap() as i32;
-        let (h, m) = case["rule"]["reopen_local"]
+        let hms_pair = |s: &str| -> i64 {
+            let (h, m) = s.split_once(':').unwrap();
+            h.parse::<i64>().unwrap() * 60 + m.parse::<i64>().unwrap()
+        };
+        let winter = hms_pair(r["reopen_local"].as_str().unwrap()) as i32;
+        let summer = r["reopen_summer_local"]
             .as_str()
-            .unwrap()
-            .split_once(':')
-            .unwrap();
-        let reopen_min = h.parse::<i64>().unwrap() * 60 + m.parse::<i64>().unwrap();
+            .map(hms_pair)
+            .unwrap_or(winter as i64) as i32;
         let mut days = 0u32;
-        for d in case["rule"]["reopen_days"].as_array().unwrap() {
+        for d in r["reopen_days"].as_array().unwrap() {
             days |= 1 << (d.as_u64().unwrap() as u32 - 1);
         }
         let now = epoch_rfc3339(case["utc"].as_str().unwrap());
         let want = epoch_rfc3339(case["next_reopen"].as_str().unwrap());
-        let got = next_reopen(offset, reopen_min as i32, days, now);
+        let got = next_reopen(offset, winter, summer, days, now);
         assert_eq!(got, want, "{name} reopen");
         checked += 1;
     }
-    assert!(checked >= 2, "{checked} broker vectors exercised");
+    assert!(checked >= 4, "{checked} broker vectors exercised");
 }
 
 const MQL5: &str = include_str!("../../../mql5/MH_Sessions.mq5");

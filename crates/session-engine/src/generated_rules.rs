@@ -62,6 +62,7 @@ pub static BROKER_DEFAULT: BrokerRule = BrokerRule {
     summer_offset_min: 0,
     seasonal_us_dst: false,
     reopen_min: 1320,
+    summer_reopen_min: Some(1380),
     reopen_days: [false, false, false, false, false, false, true],
-    reopen_note: "Weekly reopen estimate only; daily maintenance reopens are not modelled.",
+    reopen_note: "Weekly reopen estimate only; daily maintenance reopens are not modelled. The reopen clock follows the US-DST season (22:00 winter / 23:00 summer server), modelled in the engine and both indicator boilerplates under the 02-L4 ruling (2026-11-02) from the reported observation.",
 };

@@ -61,6 +61,7 @@ const int MH_BROKER_WINTER_OFFSET = 0;
 const int MH_BROKER_SUMMER_OFFSET = 0;
 const bool MH_BROKER_US_DST = false;
 const int MH_BROKER_REOPEN = 1320;
+const int MH_BROKER_REOPEN_SUMMER = 1380;
 const int MH_BROKER_DAYS = 64;
 
 // America/New_York
@@ -268,7 +269,19 @@ long MhBrokerNextReopen(long utc, int brokerOffset)
    long best = 0;
    for(int d = -1; d <= 10; d++)
    {
+      // 02-L4: the reopen clock follows the server-side US-DST season when
+      // the summer clock differs (generated equal for fixed rules and user
+      // overrides). Probe the candidate with the winter clock, then rebuild
+      // it with the summer clock when New York is on EDT (== -14400 s).
       datetime localReopen = midnight + d * 86400 + MH_BROKER_REOPEN * 60;
+      int reopenMin = MH_BROKER_REOPEN;
+      if(MH_BROKER_REOPEN_SUMMER != MH_BROKER_REOPEN)
+      {
+         datetime probe = (datetime)(localReopen - offset * 60);
+         if(MhOffsetByZone("America/New_York", probe) == -14400)
+            reopenMin = MH_BROKER_REOPEN_SUMMER;
+      }
+      localReopen = midnight + d * 86400 + reopenMin * 60;
       MqlDateTime rdt;
       TimeToStruct(localReopen, rdt);
       int idx = (rdt.day_of_week + 6) % 7;

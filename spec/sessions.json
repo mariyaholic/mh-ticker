@@ -63,7 +63,8 @@
     "summer_offset_minutes": 0,
     "seasonal": "fixed",
     "reopen_local": "22:00",
+    "reopen_local_summer": "23:00",
     "reopen_days": [7],
-    "reopen_note": "Weekly reopen estimate only; daily maintenance reopens are not modelled."
+    "reopen_note": "Weekly reopen estimate only; daily maintenance reopens are not modelled. The reopen clock follows the US-DST season (22:00 winter / 23:00 summer server), modelled in the engine and both indicator boilerplates under the 02-L4 ruling (2026-11-02) from the reported observation."
   }
 }

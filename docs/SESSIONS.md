@@ -59,7 +59,11 @@ A broker rule has a winter/summer UTC offset, an optional US-DST seasonal switch
 eligible reopen days and provenance. The default preset is **Exness-style, approved by the owner on 2026-10-28 as the default, and still not
 verified against a live server**: UTC+0 year-round,
 weekly reopen estimated at Sunday 22:00 server. The reported observation includes 22:00/23:00 depending on US
-DST; that has not been independently confirmed and daily maintenance reopens are not modelled.
+DST; that has not been independently confirmed and daily maintenance reopens are not modelled. Since the
+02-L4 ruling (2026-11-02) the reopen clock itself is modelled seasonally — 22:00 winter / 23:00 summer,
+switched by the server-side US-DST season — in the engine and both indicator boilerplates; an explicit
+`broker_reopen_min` override keeps one clock for both seasons. The "estimate / not independently confirmed"
+labelling still holds.
 
 Because the rule is unverified, the engine **does not present a verified next reopen**. The panel shows the
 server clock and "reopen unknown · est …". Config overrides:
