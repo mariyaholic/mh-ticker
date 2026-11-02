@@ -36,7 +36,7 @@ Build `MH_Ticker.exe` using the instructions in [Testing](docs/TESTING.md). The 
   overlap, the broker server clock, and exactly one device-zone clock detected from Windows. Right click →
   *Session timers* hides or shows the block. The times are common FX-session conventions, not guaranteed
   exchange hours; there is no holiday calendar in v1. See [docs/SESSIONS.md](docs/SESSIONS.md).
-- **Broker clock:** the default preset is a reported, *unverified* Exness-style rule, so the panel shows the
+- **Broker clock:** the default preset is a reported, *unverified* broker rule (publisher anonymised in the public build), so the panel shows the
   server time but marks the next reopen unknown until u confirm the rule in config. Set
   `sessions.broker_offset_min`, `sessions.broker_reopen_min` and `sessions.broker_rule_verified` in
   `config.json` if u have checked them against ur own server. A configured offset is an estimate, not a live

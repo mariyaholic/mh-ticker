@@ -54,10 +54,10 @@ pub static SESSION_RULES: [SessionRule; 4] = [
 pub static OVERLAP_PAIR: [&str; 2] = ["london", "new_york"];
 
 pub static BROKER_DEFAULT: BrokerRule = BrokerRule {
-    id: "exness_default",
+    id: "broker_default",
     label: "Broker",
     verified: false,
-    provenance: "Default preset approved by the owner on 2026-10-28 (not verified against a live server). Internal default preset: Exness. Reported observation only: UTC+0 server year-round, daily reopen around 22:00/23:00 server depending on US DST. Not independently confirmed; the next verified reopen is hidden until the owner approves a rule.",
+    provenance: "Default preset approved by the owner on 2026-10-28 (not verified against a live server). The broker is anonymised in the public build (02-L6 ruling, 2026-11-02). Reported observation only: UTC+0 server year-round, daily reopen around 22:00/23:00 server depending on US DST. Not independently confirmed; the next verified reopen is hidden until the owner approves a rule.",
     winter_offset_min: 0,
     summer_offset_min: 0,
     seasonal_us_dst: false,

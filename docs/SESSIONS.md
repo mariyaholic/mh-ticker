@@ -56,8 +56,8 @@ The engine is `crates/session-engine` (crate `mh-session`). It is platform indep
 ## Broker server time
 
 A broker rule has a winter/summer UTC offset, an optional US-DST seasonal switch, a local reopen time,
-eligible reopen days and provenance. The default preset is **Exness-style, approved by the owner on 2026-10-28 as the default, and still not
-verified against a live server**: UTC+0 year-round,
+eligible reopen days and provenance. The default preset is **broker-anonymised for the public build (approved by the owner on
+2026-10-28 as the default, and still not verified against a live server)**: UTC+0 year-round,
 weekly reopen estimated at Sunday 22:00 server. The reported observation includes 22:00/23:00 depending on US
 DST; that has not been independently confirmed and daily maintenance reopens are not modelled. Since the
 02-L4 ruling (2026-11-02) the reopen clock itself is modelled seasonally — 22:00 winter / 23:00 summer,
