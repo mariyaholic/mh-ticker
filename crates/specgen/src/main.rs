@@ -692,7 +692,12 @@ mod tests {
             pine.contains("MH_BROKER_REOPEN_DAY = 1"),
             "spec day 7 (Sunday) is Pine day 1"
         );
-        assert!(pine.contains("syminfo.timezone"));
+        assert!(pine.contains("defval = \"UTC\""));
+        assert!(pine.contains("extraUseExchange ? syminfo.timezone : manualExtra"));
+        assert!(
+            !pine.contains("defval = syminfo"),
+            "input defaults must stay const (02-H2)"
+        );
         assert!(pine.contains("not auto-detected"));
         assert!(mq5.contains("NOT AFFILIATED WITH METAMOQUOTES"));
     }

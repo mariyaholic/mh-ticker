@@ -107,6 +107,26 @@ mod tests {
         };
         let d = current(&cfg);
         assert_ne!(d.source, DeviceSource::Configured);
-        assert!(d.iana.as_deref().is_none_or(is_valid_iana));
+        // 02-M3: the weak `is_none_or(is_valid_iana)` assertion held for every
+        // possible result — and the earlier is_none_or checked the logic. What
+        // must hold: this Windows box maps its real dynamic time-zone key, or
+        // the row is unavailable; never a valid-but-unmapped guess.
+        if let Some(iana) = d.iana.as_deref() {
+            assert_eq!(d.source, DeviceSource::Auto);
+            assert!(is_valid_iana(iana), "{iana} must be a real IANA zone");
+        } else {
+            assert_eq!(d.source, DeviceSource::Unavailable);
+        }
+    }
+
+    #[test]
+    fn the_mapping_function_is_the_real_adapters_core() {
+        // 02-M3: pins the table through adapter code with a known pair, rather
+        // than asserting any string is either absent or valid.
+        assert_eq!(
+            map_windows_zone("W. Europe Standard Time", Some("DE")),
+            Some("Europe/Berlin")
+        );
+        assert_eq!(map_windows_zone("Not/ARealKey", None), None);
     }
 }
