@@ -88,7 +88,76 @@ fn mql5_boundary_port_matches_the_golden_vectors() {
     }
 }
 
+/// Port of `MhBrokerNextReopen` with the 02-H1 + 02-M2 fix: midnight-anchored
+/// and driven by the *effective* offset the indicator displays.
+fn next_reopen(offset_min: i32, reopen_min: i32, days_monfirst: u32, utc_secs: i64) -> i64 {
+    let effective = offset_min;
+    let server_now = utc_secs + (effective as i64) * 60;
+    let midnight = server_now - server_now.rem_euclid(86_400);
+    let reopen_min = reopen_min as i64;
+    let mut best = 0i64;
+    for d in -1..=10 {
+        let local_reopen = midnight + d * 86_400 + reopen_min * 60;
+        let day_bits = local_reopen.div_euclid(86_400);
+        if days_monfirst >> ((day_bits + 3).rem_euclid(7)) & 1 == 0 {
+            continue;
+        }
+        let guess = local_reopen - (effective as i64) * 60;
+        if guess > utc_secs && (best == 0 || guess < best) {
+            best = guess;
+        }
+    }
+    best
+}
+
+const BROKER_VECTORS: &str = include_str!("../../../spec/golden/vectors.json");
+
+#[test]
+fn mql5_reopen_port_matches_the_broker_vectors() {
+    let v: Value = serde_json::from_str(BROKER_VECTORS).unwrap();
+    let mut checked = 0;
+    for case in v["broker_cases"].as_array().unwrap() {
+        let name = case["name"].as_str().unwrap();
+        // Only the cases the MQL5 can model: verified, fixed offset override.
+        if case["rule"]["seasonal"].as_str() != Some("fixed") {
+            continue;
+        }
+        let offset = case["rule"]["winter_offset_minutes"].as_i64().unwrap() as i32;
+        let (h, m) = case["rule"]["reopen_local"]
+            .as_str()
+            .unwrap()
+            .split_once(':')
+            .unwrap();
+        let reopen_min = h.parse::<i64>().unwrap() * 60 + m.parse::<i64>().unwrap();
+        let mut days = 0u32;
+        for d in case["rule"]["reopen_days"].as_array().unwrap() {
+            days |= 1 << (d.as_u64().unwrap() as u32 - 1);
+        }
+        let now = epoch_rfc3339(case["utc"].as_str().unwrap());
+        let want = epoch_rfc3339(case["next_reopen"].as_str().unwrap());
+        let got = next_reopen(offset, reopen_min as i32, days, now);
+        assert_eq!(got, want, "{name} reopen");
+        checked += 1;
+    }
+    assert!(checked >= 2, "{checked} broker vectors exercised");
+}
+
 const MQL5: &str = include_str!("../../../mql5/MH_Sessions.mq5");
+
+#[test]
+fn generated_mql5_reopen_uses_the_effective_offset() {
+    // 02-M2: the signature takes the displayed offset, the caller passes it,
+    // and the candidate conversion uses the same offset instead of re-deriving
+    // the seasonal default per iteration.
+    let text = MQL5.replace("\r\n", "\n");
+    for needle in [
+        "long MhBrokerNextReopen(long utc, int brokerOffset)",
+        "MhBrokerNextReopen(utc, brokerOffset)",
+        "long guess = (long)localReopen - offset * 60;",
+    ] {
+        assert!(text.contains(needle), "missing: {needle}");
+    }
+}
 
 #[test]
 fn generated_mql5_zeroes_the_midnight_fields() {
