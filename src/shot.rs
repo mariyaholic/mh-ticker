@@ -191,7 +191,10 @@ pub fn write_all(dir: &Path) -> Result<usize, String> {
     hist.record(&b, now);
     let mut n = 0;
     for t in &theme::ALL {
-        let phases: &[f64] = if t.animated() { &[0.0, 0.34, 0.67] } else { &[0.0] };
+        // Every palette moves now, but only the animated tier is *about* the motion, so only it
+        // gets the three frames: a screenshot set that tripled in size would stop being a
+        // catalogue and start being a film strip.
+        let phases: &[f64] = if t.kind == theme::Kind::Animated { &[0.0, 0.34, 0.67] } else { &[0.0] };
         for (i, &phase) in phases.iter().enumerate() {
             let name = if i == 0 { format!("{}.png", t.name) } else { format!("{}-{}.png", t.name, i + 1) };
             let path = dir.join(name);
