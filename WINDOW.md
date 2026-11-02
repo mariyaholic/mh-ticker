@@ -67,7 +67,12 @@ what looks nice on a design canvas.
 | `Compact` | 760×394 | 3 cols × 2 | — | — | — |
 | `Working` | 900×600 | 3 cols, scrolls | Chart 1× | Rail folded | — |
 | `Wide` | 1160×700 | 3–4 cols | Chart 1× | Rail 340 | Timeline 96 |
+| `Wall-lite` | 1160×780 | 1 col ticker | Wall grid 2×2 | — | — |
 | `Wall` | 1500×860 | 1 col ticker | Wall grid 2×3 | Rail 340 | Timeline 96 |
+
+`Wall-lite` exists because of the table below: at 125 % on a 1080p laptop there is no 1500 px to
+have, but there is 1536×816 — enough for a watchlist column and four charts if the rail and the
+timeline get out of the way. It is not a compromise on type; it is the same panes with two fewer.
 
 `Compact` is today's strip and panel, byte for byte. That is an acceptance test, not an aspiration:
 the existing `shots/*.png` must come out identical, because they are the only pixels anyone has
@@ -77,19 +82,20 @@ agreed on.
 sample, and it says 1920×1080 at ~50 %, 2560×1440 at ~22–27 %, 4K ~5 %. Converted to DIPs after the
 taskbar and Windows scaling:
 
-| Screen | Scaling | Work area (DIP) | Compact | Working | Wide | Wall |
-|---|---|---|---|---|---|---|
-| 1920×1080 | 100 % | 1920×1032 | ✓ | ✓ | ✓ | ✓ |
-| 1920×1080 | 125 % | 1536×816 | ✓ | ✓ | ✓ | ✗ |
-| 1920×1080 | 150 % | 1280×672 | ✓ | ✓ | ✗ | ✗ |
-| 2560×1440 | 100 % | 2560×1392 | ✓ | ✓ | ✓ | ✓ |
-| 2560×1440 | 125 % | 2048×1104 | ✓ | ✓ | ✓ | ✓ |
-| 2560×1440 | 150 % | 1707×912 | ✓ | ✓ | ✓ | ✓ |
-| 3840×2160 | 200 % | 1920×1032 | ✓ | ✓ | ✓ | ✓ |
+| Screen | Scaling | Work area (DIP) | Compact | Working | Wide | Wall-lite | Wall |
+|---|---|---|---|---|---|---|---|
+| 1920×1080 | 100 % | 1920×1032 | ✓ | ✓ | ✓ | ✓ | ✓ |
+| 1920×1080 | 125 % | 1536×816 | ✓ | ✓ | ✓ | ✓ | ✗ |
+| 1920×1080 | 150 % | 1280×672 | ✓ | ✓ | ✗ | ✗ | ✗ |
+| 2560×1440 | 100 % | 2560×1392 | ✓ | ✓ | ✓ | ✓ | ✓ |
+| 2560×1440 | 125 % | 2048×1104 | ✓ | ✓ | ✓ | ✓ | ✓ |
+| 2560×1440 | 150 % | 1707×912 | ✓ | ✓ | ✓ | ✓ | ✓ |
+| 3840×2160 | 200 % | 1920×1032 | ✓ | ✓ | ✓ | ✓ | ✓ |
 
 Work area = screen ÷ scaling, minus a 48 DIP taskbar. That table is the requirement, in full:
-**every composition except Wall must fit a 1080p laptop at 125 %**, Wall is for 1080p at 100 % or anything 1440p and up, and nothing may fall through the floor
-below Compact. If a composition does not fit, it folds — it does not scale the type down.
+**every composition except the full Wall must fit a 1080p laptop at 125 %**; Wall itself is for
+1080p at 100 % or anything 1440p and up; and nothing may fall through the floor below Compact. If a
+composition does not fit, it folds — it does not scale the type down.
 
 ## 4. The scaling law: layout scales, type does not
 
@@ -105,7 +111,8 @@ Therefore:
   which means `panel::COLS`, today a `const 3`, becomes a parameter of the same name. At 1600 wide
   that is 6 columns; at 900 it is 3.
 - **Panes fold.** `Rail` collapses to a 44 px icon strip below 1160 wide, and to nothing below 900.
-  `Timeline` hides below 700 tall. `Wall` becomes a single `Chart` below 1500 wide.
+  `Timeline` hides below 700 tall. `Wall` folds to `Wall-lite` below 1500 wide, and `Wall-lite`
+  folds to a single `Chart` below 1160.
 - **Splitters are draggable** where they exist, and the dragged ratio persists per composition.
 
 The one place type does change is the **wall ticker column**, which is deliberately one card wide and
@@ -194,10 +201,20 @@ Each pane owns its rectangle, its hit test and its paint call. The window owns p
 
 - **Watchlist** — today's card grid. `min 3×2 cards`. Grows by columns, then scrolls. Click, hover,
   crosshair, picker chips unchanged.
-- **Chart** — candles or a line from the bars the app already downloads. `source.rs:125` keeps only
-  `close` and the timestamp; if `priceBars` carries `open/high/low` — **to verify against a live
-  payload**, the fixture does not — keeping them as `f32` is +12 B per bar, ~4 KB per symbol per
-  hour. A line chart needs nothing new. `min 380×260`. Crosshair reads `History::sample`, which exists. Timeframe (1 h / 1 d)
+- **Chart** — **candles** (decided 2026-11-02), drawn from bars the app is *already downloading and
+  throwing away*. Verified against the live endpoint on 2026-11-02: `1D.json` for `@SP.1` returns
+  **1,367 bars**, each with `open/high/low/close/volume`; `parse_chart` keeps only the last hour
+  (`t >= now − 3600`) and only `close` (`source.rs:119-131`). So candles cost **zero extra bytes** —
+  it is a parser change plus a painter. `min 380×260`.
+
+  Three facts from that payload worth designing around:
+  1. **The 1-day view is also already downloaded.** Keeping all 1,367 bars as `(t, o, h, l, c)` `f32`
+     is ~33 KB per symbol — 200 KB for six — and gives a 1D timeframe with no new request.
+  2. **Spot bars are often flat.** `XAU=` returns `open == high == low == close` for most minutes
+     (volume 0). A degenerate candle must still read: draw the body at 1 px and the wick as a line,
+     never nothing.
+  3. **Volume exists but is uneven.** Non-zero for `@SP.1`, zero for `XAU=`. Volume bars are a later
+     pane option, not part of this one. Crosshair reads `History::sample`, which exists. Timeframe (1 h / 1 d)
   switches which series it reads, not which request it makes.
 - **Rail** — alerts and portfolio on tabs, `min 300×240`, folds to icons at 44 px. Alerts already
   exist (`alerts.rs`); portfolio is config plus arithmetic over existing quotes.
@@ -221,9 +238,9 @@ Splitter drags are a three-message protocol (`WM_LBUTTONDOWN` on `HTCLIENT` over
 | P0 | `workspace.rs` + `solve()`, `geometry()` reimplemented on top | **existing `shots/*.png` byte-identical**; solver tests for every composition |
 | P1 | frame, resize, min/max, DPI, persistence, splitter drag | window resizes from 760×394 to work area; Compact identical; morph re-shot |
 | P2 | banded paint, no full-window buffer | peak private RAM < 5 MB at 1600×1000; no flicker on resize or hover |
-| P3 | Chart pane | candles from existing bars; crosshair; timeframe switch |
+| P3 | Chart pane | candles from existing bars (no new traffic); 1 h and 1 D from the same payload; crosshair; flattish bars still legible |
 | P4 | Rail + Timeline | folds at the documented widths |
-| P5 | Wall composition | 2×3 charts live at 1600×1000 with 6 symbols |
+| P5 | Wall + Wall-lite | 2×3 at 1600×1000 and 2×2 at 1200×780, six symbols live in both |
 
 P0 and P1 are worth doing even if nothing else lands: they make the window behave like a window.
 
@@ -239,13 +256,13 @@ P0 and P1 are worth doing even if nothing else lands: they make the window behav
 The estate's 5 MB rule survives all of this **only** because the buffer stops being window-sized.
 That is the load-bearing decision in this document.
 
-## 11. Open questions for Maria
+## 11. Decisions, and what is still open
 
-1. **Wall on 1080p**: at 125 % scaling it does not fit (1536×816 vs 1500×860). Do we ship Wall only
-   where it fits and fold to `Wide` elsewhere — my recommendation — or add a compressed Wall that
-   drops the rail and timeline to reach 860 tall?
-2. **Chart default**: candles or a line? Candles need `o/h/l/c` kept per bar (+16 B/bar); the line
-   needs nothing new.
-3. **Rail order**: alerts first or portfolio first? It decides the tab that opens.
-4. **Frame switch**: acceptable to make the system frame the default in P1, with `frame: "popup"` as
-   the escape hatch, or must the strip stay a popup and only the workspace be framed?
+Taken 2026-11-02: **`Wall-lite` ships** (§3), so 1080p at 125 % gets four charts instead of folding
+to a single one; and the chart is **candles** (§7), from bars the app already downloads.
+
+Still open:
+
+1. **Rail order** — alerts first or portfolio first? It decides which tab opens.
+2. **Frame switch** — may the system frame be the default in P1, with `frame: "popup"` as the escape
+   hatch, or must the strip stay a popup and only the workspace be framed?
