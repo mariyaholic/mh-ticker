@@ -266,34 +266,70 @@ pub fn path() -> PathBuf {
 }
 
 pub fn load() -> Config {
-    let p = path();
-    match std::fs::read_to_string(&p) {
-        Ok(text) => {
-            let cfg: Config = serde_json::from_str(&text).unwrap_or_default();
-            // A config from before the Symbols menu has no catalog: write the default one in.
-            // A config from before session timers gets the new `sessions` block too.
-            if !text.contains("\"catalog\"") || !text.contains("\"sessions\"") {
-                save(&cfg);
+    load_at(&path())
+}
+
+fn load_at(p: &std::path::Path) -> Config {
+    match std::fs::read_to_string(p) {
+        Ok(text) => match serde_json::from_str::<Config>(&text) {
+            Ok(cfg) => {
+                // A config from before the Symbols menu has no catalog: write the default one in.
+                // A config from before session timers gets the new `sessions` block too.
+                // Migrate only after a successful parse: a broken file must never be
+                // overwritten with defaults (02-M1).
+                if !text.contains("\"catalog\"") || !text.contains("\"sessions\"") {
+                    save_at(p, &cfg);
+                }
+                cfg
             }
-            cfg
-        }
+            Err(e) => {
+                // 02-M1: keep the user's file. Rename it aside with a timestamp so a
+                // later save (for example at exit) cannot replace it with defaults.
+                let bad = bad_backup_path(p);
+                if std::fs::rename(p, &bad).is_ok() {
+                    eprintln!(
+                        "MH_Ticker: {:?} could not be parsed ({e}); kept as {:?}. Defaults loaded.",
+                        p, bad
+                    );
+                } else {
+                    eprintln!(
+                        "MH_Ticker: {:?} could not be parsed ({e}) and could not be moved aside; defaults loaded.",
+                        p
+                    );
+                }
+                Config::default()
+            }
+        },
         Err(_) => {
             let cfg = Config::default();
-            save(&cfg);
+            save_at(p, &cfg);
             cfg
         }
     }
 }
 
+fn bad_backup_path(p: &std::path::Path) -> std::path::PathBuf {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let mut name = p.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".bad-{ms}"));
+    p.with_file_name(name)
+}
+
 pub fn save(cfg: &Config) {
-    let p = path();
+    save_at(&path(), cfg)
+}
+
+fn save_at(p: &std::path::Path, cfg: &Config) {
     if let Some(dir) = p.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
     if let Ok(text) = serde_json::to_string_pretty(cfg) {
         let tmp = p.with_extension("json.tmp");
         if std::fs::write(&tmp, text).is_ok() {
-            let _ = std::fs::rename(&tmp, &p);
+            let _ = std::fs::rename(&tmp, p);
         }
     }
 }
@@ -383,5 +419,94 @@ mod tests {
         assert_eq!(back.sessions, c.sessions);
         assert_eq!(back.rows, c.rows);
         assert_eq!(back.poll_s, c.poll_s);
+    }
+
+    #[test]
+    fn malformed_config_is_kept_aside_not_overwritten() {
+        std::fs::remove_dir_all(
+            &std::env::temp_dir().join(format!("mhticker-test-{}-1", std::process::id())),
+        )
+        .ok();
+        // 02-M1: a parse error used to become defaults in memory *and* went to
+        // disk on the next save — the user's rows were unrecoverable.
+        let dir = std::env::temp_dir().join(format!("mhticker-test-{}-1", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("config.json");
+        let broken = "{\"rows\":[{";
+        std::fs::write(&p, broken).unwrap();
+        let cfg = load_at(&p);
+        assert_eq!(cfg.rows, Config::default().rows);
+        // The original bytes survive under a timestamped sidecar, and the live
+        // path does not silently carry generated defaults.
+        let sidecar: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|q| {
+                q.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("config.json.bad-"))
+            })
+            .collect();
+        assert_eq!(
+            sidecar.len(),
+            1,
+            "exactly one .bad- sidecar, found {sidecar:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&sidecar[0]).unwrap(), broken);
+        assert!(!p.exists(), "the malformed file was renamed, not rewritten");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn migration_write_still_happens_for_a_valid_old_config() {
+        std::fs::remove_dir_all(
+            &std::env::temp_dir().join(format!("mhticker-test-{}-2", std::process::id())),
+        )
+        .ok();
+        let dir = std::env::temp_dir().join(format!("mhticker-test-{}-2", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("config.json");
+        std::fs::write(
+            &p,
+            r#"{"rows":[{"label":"XAU","symbol":"XAU=","digits":2}]}"#,
+        )
+        .unwrap();
+        let cfg = load_at(&p);
+        assert_eq!(cfg.catalog, default_catalog());
+        let after = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            after.contains("\"sessions\"") && after.contains("\"catalog\""),
+            "the migration save ran: {after}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unnamed_configs_use_defaults() {
+        // A hard type error lands in the same .bad path as a syntax error.
+        std::fs::remove_dir_all(
+            &std::env::temp_dir().join(format!("mhticker-test-{}-3", std::process::id())),
+        )
+        .ok();
+        let dir = std::env::temp_dir().join(format!("mhticker-test-{}-3", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("config.json");
+        let broken = r#"{"poll_s":"seven","rows":[]}"#;
+        std::fs::write(&p, broken).unwrap();
+        let cfg = load_at(&p);
+        assert_eq!(cfg.poll_s, Config::default().poll_s);
+        let sidecar = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .find(|q| {
+                q.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("config.json.bad-"))
+            })
+            .expect("sidecar exists");
+        assert_eq!(std::fs::read_to_string(&sidecar).unwrap(), broken);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
