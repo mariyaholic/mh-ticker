@@ -92,7 +92,7 @@ indicator files from it; `--check` fails if anything drifted. The shared UTC gol
   and weekend reopen.
 - **Pine v6:** [`pine/MH_Sessions.pine`](pine/MH_Sessions.pine) is a display-only boilerplate. Pine cannot
   read the chart or device time zone, so its one extra clock is a manual `input.string` IANA dropdown
-  (default `syminfo.timezone`, the exchange zone) and is never auto-detected. It updates on bar events, so it
+  (default `UTC`, with an opt-in exchange-zone toggle) and is never auto-detected. It updates on bar events, so it
   shows the last update and has no session countdowns.
 - **MQL5:** [`mql5/MH_Sessions.mq5`](mql5/MH_Sessions.mq5) is display-only, strictly read-only, with no
   trading functions. It embeds bounded IANA transition tables and fails visibly outside their coverage. The

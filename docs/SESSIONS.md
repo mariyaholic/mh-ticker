@@ -129,8 +129,9 @@ MT5 terminal, so their runtime behaviour is **not verified here** (see [TESTING.
 
 - Pine scripts **cannot read the chart time zone or the device time zone**. `syminfo.timezone` is the
   symbol's exchange zone, not the chart or device zone. The one extra clock is therefore a manual
-  `input.string` IANA dropdown, defaulting to `syminfo.timezone`, explicitly labelled "set to your
-  chart/device zone" and "not auto-detected".
+  `input.string` IANA dropdown (defaulting to `UTC`, because Pine input defaults must be const) with an
+  opt-in "use the exchange zone" toggle, explicitly labelled "set to your chart/device zone" and
+  "not auto-detected".
 - Session membership uses `time(timeframe.period, generated_session_string, IANA_zone)`. The chart timeframe
   affects the granularity, and the table updates on bar events, not on a wall clock.
 - The table shows the last bar time. Historical bars are not re-rendered into a live clock.

@@ -24,6 +24,13 @@ manual zone input, bar-event updates and historical/realtime behavior. Compare s
 both platforms before claiming parity. Pine cannot detect the chart or device zone. MT5 is a
 MetaQuotes trademark; the project is not affiliated with MetaQuotes or TradingView.
 
+Pine has no offline compiler here, so **a compile check in the TradingView Pine editor is a release
+gate** for `pine/MH_Sessions.pine` (paste, confirm no errors, then toggle the extra-clock inputs:
+"Use the symbol's exchange zone" off takes the manual dropdown (default `UTC`), on takes
+`syminfo.timezone`). Two failures this gate would have caught: a non-const `input.*`
+default (`syminfo.timezone`, rejected by the Pine qualifier rules) and a `defval` outside the
+dropdown `options` list (02-H2, fixed 2026-11-02).
+
 ## Review follow-up
 
 Offline checks use `cargo test --offline`, `cargo fmt --all --check`, `cargo clippy --offline
