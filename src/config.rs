@@ -148,6 +148,9 @@ pub struct Config {
     /// Last strip position in screen pixels when undocked; None = top-right of the work area.
     pub x: Option<i32>,
     pub y: Option<i32>,
+    /// The panel's last frame, `[x, y, w, h]`. None = size it to its content and centre it, which
+    /// is what every config written before a panel became resizable gets.
+    pub panel: Option<[i32; 4]>,
 
     // --- Ultra only. `serde(default)` keeps a classic config parsing unchanged. ---
     /// Theme name (`theme::ALL`). Ignored by the classic build, which has exactly one.
@@ -242,6 +245,7 @@ impl Default for Config {
             dock_rows: 2,
             x: None,
             y: None,
+            panel: None,
             theme: "midnight".into(),
             theme_font: None,
             alerts: Vec::new(),

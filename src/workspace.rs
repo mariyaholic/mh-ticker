@@ -23,9 +23,12 @@ pub const CARD_W: i32 = 236;
 pub const CARD_H: i32 = 150;
 pub const HEADER: i32 = 48;
 
-/// The widest the card grid gets before it adds a row instead of a column. Becomes a parameter once
-/// a window can be wider than three columns (WINDOW.md §4).
+/// The widest the card grid gets before it adds a row instead of a column. `grid` (content-sized)
+/// stops here; `grid_in` (window-sized) goes up to [`MAX_COLS`] when the window has the width.
 pub const COLS: usize = 3;
+/// Six columns is 1,514 DIP wide: a 1080p desktop at 100 %, or any 1440p. Wider than that and the
+/// cards stop being scannable, so the window just gets gutters (WINDOW.md §4).
+pub const MAX_COLS: usize = 6;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Size {
@@ -103,6 +106,26 @@ pub fn grid(n: usize, dpi: i32) -> Grid {
     let rows = n.div_ceil(COLS).max(1) as i32;
     Grid {
         w: 2 * s(PAD, dpi) + cols as i32 * s(CARD_W, dpi) + (cols as i32 - 1) * s(GAP, dpi),
+        h: s(HEADER, dpi) + rows * s(CARD_H, dpi) + (rows - 1) * s(GAP, dpi),
+        cols,
+    }
+}
+
+/// How many cards fit across `w`, at the fixed card size. Never fewer than one.
+pub fn cols_for(w: i32, dpi: i32) -> usize {
+    let usable = w - 2 * s(PAD, dpi) + s(GAP, dpi);
+    let step = (s(CARD_W, dpi) + s(GAP, dpi)).max(1);
+    (usable.max(0) / step).clamp(1, MAX_COLS as i32) as usize
+}
+
+/// The card grid for `n` cards in a window `w` wide: columns come from the width, rows from the
+/// count. `w` is kept as given — the caller asked for a window this wide, and gutters are the honest
+/// answer when the cards do not divide it evenly.
+pub fn grid_in(w: i32, n: usize, dpi: i32) -> Grid {
+    let cols = cols_for(w, dpi);
+    let rows = n.div_ceil(cols).max(1) as i32;
+    Grid {
+        w,
         h: s(HEADER, dpi) + rows * s(CARD_H, dpi) + (rows - 1) * s(GAP, dpi),
         cols,
     }
@@ -266,6 +289,38 @@ mod tests {
         }
         let tight = solve(&c, Rect { x: 0, y: 0, w: 300, h: 200 }, 96);
         assert!(tight.iter().all(|(_, r)| r.w == 100), "a tight window keeps every minimum");
+    }
+
+    #[test]
+    fn six_cards_reflow_between_one_and_six_columns() {
+        // One column: 268 wide. Three: 760 - the shipped panel. Six: 1,514.
+        assert_eq!(cols_for(268, 96), 1);
+        assert_eq!(cols_for(760, 96), 3);
+        assert_eq!(cols_for(1_514, 96), 6);
+        // Between breakpoints the count floors, so cards never clip at the edge.
+        assert_eq!(cols_for(1_000, 96), 3);
+        assert_eq!(cols_for(1_200, 96), 4);
+        // And it never runs away on a very wide monitor.
+        assert_eq!(cols_for(3_840, 96), MAX_COLS);
+    }
+
+    #[test]
+    fn a_window_sized_grid_fills_the_width_it_was_given() {
+        let g = grid_in(1_200, 12, 96);
+        assert_eq!((g.w, g.cols), (1_200, 4));
+        assert_eq!(g.h, 48 + 3 * 150 + 2 * 10, "12 cards at 4 across is three rows");
+        // The same width at 192 dpi fits half the columns, because the cards double.
+        assert_eq!(cols_for(1_200, 192), 2);
+        assert_eq!(grid_in(1_200, 12, 192).cols, 2);
+    }
+
+    #[test]
+    fn a_content_sized_grid_still_uses_three_columns() {
+        // `grid` must not drift with `grid_in`: the shipped panel is 760 wide for any n >= 3.
+        for n in [3, 4, 6, 12] {
+            assert_eq!(grid(n, 96).w, 760, "n = {n}");
+            assert_eq!(grid(n, 96).cols, 3);
+        }
     }
 
     #[test]
