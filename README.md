@@ -23,7 +23,7 @@ effort went:
 
 | | `MH_Ticker.exe` | `MH_Ticker_Ultra.exe` |
 |---|---|---|
-| Look | one theme, exactly as it always was | **26 palettes in 4 tiers** plus 13 fonts — see [THEMES.md](THEMES.md) |
+| Look | one theme, exactly as it always was | **26 palettes in 4 tiers**, every one of them moving, plus 22 fonts — see [THEMES.md](THEMES.md) |
 | Symbols | the *Symbols* menu | that **plus a picker strip inside the panel** |
 | Alerts | — | price alerts, tray balloon, optional **Discord/Slack/ntfy webhook** |
 | Memory after a minute | ~5.7 MB | ~5.8 MB |
@@ -76,9 +76,10 @@ Double click it. If prompted, simply select Run anyway.
   vaporwave, aurora-live, sunset) and only animate while the panel is open, so a collapsed strip costs nothing.
   **Retro** ones are chunky, scanlined and drawn in a bitmap face (ega, amber-crt, phosphor, gameboy, c64, pc98 -
   the PC-98 palette with the gold accent). it changes immediately, no restart
-- **Fonts (Ultra):** right click → *Font*. thirteen faces in 4 groups (system, mono, serif, bitmap), applied to the
-  panel only - the strip keeps its own size so it still fits a taskbar gap. the retro themes pick a bitmap face
-  themselves, and an unknown name in the config is refused rather than silently replaced
+- **Fonts (Ultra):** right click → *Font*. twenty-two faces in 4 groups (system, mono, serif, bitmap), applied to the
+  the panel only - the strip keeps its own size so it still fits a taskbar gap. the retro themes pick a bitmap face
+  themselves; an unknown name in the config is refused, and a face this machine does not have is greyed in the menu
+  rather than silently substituted
 - **Symbol picker (Ultra):** the button left of the minimize cross opens a strip of chips inside the panel - click
   one to add it, click again to drop it. same as the Symbols menu but u dont have to hunt through a submenu, and u
   see the whole list at once

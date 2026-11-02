@@ -10,7 +10,7 @@ owns what, which direction data flows, and why the boundaries sit where they do.
 |---|---|---|
 | `src/ui.rs` | **1,907** | windows, message pump, strip layout + paint, **the cached back buffer**, morph animation, tray icon + tooltip, positioning, docking heal, mode transitions, the tiered Theme/Font menus, clipboard and card clicks, config application, hit-testing, hover tracking |
 | `src/panel.rs` | 930 | panel geometry (`Geo`, shared by paint *and* hit tests), **`History` (price series state)**, `Scene`, GDI paint, `Fonts`, crosshair, symbol picker, the day-range bar and the 52-week badge |
-| `src/theme.rs` | 640 | **26 palettes in four tiers**, gradient / animated-ring / scanline paint, the face catalogue |
+| `src/theme.rs` | 720 | **26 palettes in four tiers**, motion as a per-palette `cycle` (breath / ring / pixel ring), gradient + scanline paint, the face catalogue and its availability query |
 | `src/dock.rs` | 522 | taskbar geometry, UI Automation lookup of the Start button, monitor enumeration |
 | `src/source.rs` | 453 | ureq client, `restQuote` + chart parsers, the `Feed` thread, one-shot `post` for alerts, `--probe` |
 | `src/config.rs` | 384 | `Config`, `Row`, `Alert`, `Profile`, load/save, catalogue, menu list, placements |
@@ -30,10 +30,11 @@ been deferred twice, and it is the next real piece of work.
 - **`theme.rs` became a catalogue, and the tier became a rendering rule.** `Kind::{Flat, Gradient,
 Animated, Pixel}` is read by the painter *and* by the menu builder, so the menu cannot describe a
 theme differently from the way it is drawn. Adding a palette is one array entry.
-- **Animated backgrounds allocate nothing per frame.** `Gradient` pre-builds a 96-band ring whose last
-colour equals its first, so the wrap is seamless; a frame changes only the starting index.
-`sync_anim` owns the `WM_TIMER` and exists only while the panel is open on an animated theme — the
-strip and every static theme pay nothing.
+- **Moving backgrounds allocate nothing per frame.** `Gradient` pre-builds the ring its surface needs —
+96 bands for a ramp, 16 for retro, 48 shown as one band for a breath — and the last colour equals the
+first, so the wrap is seamless; a frame changes only the starting index. `sync_anim` owns the
+`WM_TIMER` and exists only while the panel is open and Windows allows animation — the strip pays
+nothing, and so does every machine with "Show animations" switched off.
 - **`paint` reuses one back buffer.** When a repaint was a poll every 3 s and a hover move, a fresh
 1.2 MB `CreateCompatibleBitmap` per frame was survivable. At 10 fps it is not. `Back` owns the DC and
 the bitmap, restores the DC's original object before freeing, and is rebuilt only on resize. Only the

@@ -1,5 +1,42 @@
 # Changelog — MH Ticker
 
+## 2026-11-02 — 1.5.0: every palette moves, and a face the machine lacks is greyed   [hermes.impl]
+
+**Files:** `src/theme.rs` (motion as a field, all 26 palettes rewritten, 22 faces, the availability
+query), `src/ui.rs` (per-palette cycle, `allow_motion`, face fallback, greyed Font entries),
+`src/shot.rs` (three frames for the animated tier only), `Cargo.toml` (1.5.0), `THEMES.md`,
+`README.md`, `FEATURES.md`, `ARCHITECTURE.md`, `shots/` (generated).
+
+**What.** Maria asked for animated versions of all 26 palettes plus font alternatives, approved the
+proposal, and asked for it as a branch and a PR.
+
+- **Motion is a field, not a tier.** `Theme` carries `cycle: Option<f64>`; `animated()` is now
+  `cycle.is_some()`. `Kind` stays the rendering rule, so a palette keeps its surface and still
+  moves. Three modes, none of them new machinery: a flat palette **breathes** (48-step ring of the
+  three stops, drawn as one flat fill), a ramp becomes a **96-band ring**, retro keeps its **16
+  chunky bands** and rolls its scanlines a cell per cycle.
+- **Every palette got a real three-stop cycle and its own pace** (6–22 s), and `bg_mid` is no longer
+  a copy of `bg_to` — that duplicate is why a ring on a gradient used to have a dead segment.
+  Values are in `THEMES.md`.
+- **Faces: 13 → 22** — Segoe UI Variable, Bahnschrift, Candara, Corbel, Franklin Gothic Medium,
+  Sitka Text, Cambria, Cascadia Code, Lucida Console — one proposed face per palette.
+- **A missing face is refused instead of substituted.** `face_available` enumerates the machine's
+  families once (`EnumFontFamiliesExW`) and the Font menu greys what it cannot draw, because GDI's
+  silent substitution looks like a theme bug. An empty enumeration is read as "unknown" and greys
+  nothing.
+- **Reduced motion is honoured.** `SPI_GETCLIENTAREAANIMATION` off holds every cycle at phase 0.
+- **The classic build is untouched**: it never runs a clock, so midnight still draws `rgb(18,20,24)`
+  as one flat fill, byte for byte.
+
+**Why.** A palette that can only move if it is filed under "Animated" is a catalogue arranged around
+an implementation detail. Motion belongs to the palette; the surface decides what moving looks like.
+The 22nd face only makes the substitution problem worse, so the availability query ships with it.
+
+**Checked.** 40 tests pass under Wine against `x86_64-pc-windows-gnu` (palette stops, cycle range,
+brush counts per mode, tier contiguity, pixel faces fixed-pitch, font resolution). `shots/`
+regenerated from `panel::draw` at this commit. Motion itself is not unit-testable — the frames were
+inspected as GIFs before the patch landed.
+
 ## 2026-10-22 — 1.4.0: a theme catalogue, and the nine card features in both builds   [freebuff.impl]
 
 **Files:** `src/theme.rs` (rewritten: 26 palettes, 4 tiers, 13 faces), `src/panel.rs` (card layout,
