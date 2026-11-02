@@ -18,12 +18,12 @@
 use crate::config::Row;
 use crate::model::{fmt_change, fmt_price, Board, Cell};
 use crate::theme::{Gradient, Theme};
+use crate::workspace;
 
 use std::collections::VecDeque;
 use windows_sys::Win32::Foundation::{COLORREF, POINT, RECT, SIZE};
 use windows_sys::Win32::Graphics::Gdi::*;
 
-const COLS: usize = 3;
 /// The sparkline window, and a hard cap on points per row (an hour of 1 s samples).
 const WINDOW_S: f64 = 3600.0;
 const HIST_CAP: usize = 3600;
@@ -207,14 +207,18 @@ pub struct Geo {
 
 pub fn geometry(n: usize, catalog: usize, dpi: u32, picker: bool) -> Geo {
     let s = |v: i32| v * dpi as i32 / 96;
-    let cols = n.clamp(1, COLS);
-    let rows = n.div_ceil(COLS).max(1) as i32;
-    // 150 tall, not 132: the day-range bar and the lo/hi + 52-week line need the extra strip, and
-    // squeezing them into 132 would overlap the last hour's line. 236 wide, not 224: the range, the
-    // 52-week badge and its date are three numbers on one 9 pt line.
-    let (pad, gap, card_w, card_h, header) = (s(16), s(10), s(236), s(150), s(48));
-    let w = 2 * pad + cols as i32 * card_w + (cols as i32 - 1) * gap;
-    let cards_h = header + rows * card_h + (rows - 1) * gap;
+    // The card grid's size and column count are `workspace`'s business now: the panel is one pane,
+    // and the pane model has to own the numbers before it can own the window.
+    let g = workspace::grid(n, dpi as i32);
+    let cols = g.cols;
+    let (pad, gap, card_w, card_h, header) = (
+        s(workspace::PAD),
+        s(workspace::GAP),
+        s(workspace::CARD_W),
+        s(workspace::CARD_H),
+        s(workspace::HEADER),
+    );
+    let (w, cards_h) = (g.w, g.h);
     let (chip_h, chip_gap) = (s(26), s(6));
     let chip_rows = if picker { catalog.div_ceil(CHIP_COLS).max(1) as i32 } else { 0 };
     let pick_h = if picker { s(22) + chip_rows * (chip_h + chip_gap) } else { 0 };
