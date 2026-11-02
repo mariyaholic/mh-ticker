@@ -106,7 +106,8 @@ const MIN_FORCED_GAP: i32 = 60;
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const EXPAND_MS: f64 = 230.0;
 const COLLAPSE_MS: f64 = 190.0;
-/// How long one loop of an animated background takes, and how often it is advanced.
+/// The fallback cycle length, and how often a moving background is advanced. Each palette names its
+/// own cycle in `theme::ALL`; this only covers a theme that somehow has none.
 const ANIM_CYCLE_S: f64 = 9.0;
 const ANIM_MS: u32 = 100;
 const TIP_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
@@ -204,8 +205,10 @@ struct Ui {
     tray_click_at: Option<Instant>,
     /// The cached back buffer, rebuilt only when the window changes size.
     back: Option<Back>,
-    /// When the current animated background started, so its phase is continuous across repaints.
+    /// When the current background cycle started, so its phase is continuous across repaints.
     anim: Option<Instant>,
+    /// False when Windows asks for no animation; every palette then holds phase 0.
+    motion: bool,
 }
 
 /// The panel's back buffer, kept between frames.
@@ -264,11 +267,22 @@ fn picker_open(u: &Ui) -> bool {
     u.profile.ultra && u.pick_open
 }
 
-/// The panel face for this build. The classic build ignores `theme_font` for the same reason it
-/// ignores `theme`: one look, enforced here rather than by convention.
+/// The panel face for a palette. The classic build ignores `theme_font` for the same reason it
+/// ignores `theme`: one look, enforced here rather than by convention. A face this machine lacks is
+/// refused here too — GDI would otherwise substitute one silently at paint time, which looks like a
+/// theme bug rather than a missing font.
+fn face_of(theme: &Theme, cfg: &Config, ultra: bool) -> &'static str {
+    let over = if ultra { cfg.theme_font.as_deref() } else { None };
+    let face = theme::font_of(theme, over);
+    if theme::face_available(face) {
+        face
+    } else {
+        theme::font_of(theme, None)
+    }
+}
+
 fn face_for(u: &Ui) -> &'static str {
-    let over = if u.profile.ultra { u.cfg.theme_font.as_deref() } else { None };
-    theme::font_of(u.theme, over)
+    face_of(u.theme, &u.cfg, u.profile.ultra)
 }
 
 /// The panel's geometry, from one place. `draw` and every hit test call this, so a click lands
@@ -505,11 +519,12 @@ fn draw_panel(u: &mut Ui, dc: HDC, w: i32, h: i32) {
     let Some(f) = &u.fonts else { return };
     let list = config::menu_list(&u.cfg);
     let shown: Vec<bool> = list.iter().map(|r| config::is_shown(&u.cfg, &r.symbol)).collect();
-    // An animated theme's loop position. The clock only exists while this build can animate, and it
-    // is read from the panel being open, so a collapsed strip never carries a moving timer.
-    let phase = if u.theme.animated() {
+    // The background's loop position. Each palette carries its own cycle length, and the clock only
+    // runs in Ultra: the classic build keeps the one look it shipped with, so it holds phase 0. It is
+    // also read from the panel being open, so a collapsed strip never carries a moving timer.
+    let phase = if clock_runs(u.profile.ultra, u.motion, u.theme) {
         let start = *u.anim.get_or_insert_with(Instant::now);
-        (start.elapsed().as_secs_f64() / ANIM_CYCLE_S) % 1.0
+        (start.elapsed().as_secs_f64() / u.theme.cycle.unwrap_or(ANIM_CYCLE_S)) % 1.0
     } else {
         0.0
     };
@@ -1154,7 +1169,13 @@ fn menu(hwnd: HWND, at: Option<(i32, i32)>) {
             for group in theme::FACE_GROUPS {
                 let sub = CreatePopupMenu();
                 for (i, f) in theme::FACES.iter().enumerate().filter(|(_, f)| f.group == group) {
-                    let flags = MF_STRING | if f.name == face { MF_CHECKED } else { 0 };
+                    // A face this machine cannot draw is greyed rather than hidden: the menu is a
+                    // catalogue of what the app can do, and "installed on other machines" is
+                    // information, not noise.
+                    let missing = !theme::face_available(f.name);
+                    let flags = MF_STRING
+                        | if f.name == face { MF_CHECKED } else { 0 }
+                        | if missing { MF_GRAYED } else { 0 };
                     add(sub, flags, CMD_FONT + i, &format!("{}\t{}", f.name, f.note));
                 }
                 add(ft, MF_POPUP, sub as usize, group);
@@ -1461,10 +1482,33 @@ fn apply_theme(hwnd: HWND) {
     unsafe { InvalidateRect(hwnd, null(), 0) };
 }
 
+/// Whether the background clock runs at all. Three things can stop it, and each one is a promise:
+/// the classic build keeps the one look it shipped with, Windows' "Show animations" can be off, and
+/// a palette with `cycle: None` is still. Kept as one function so the painter and the timer cannot
+/// disagree about whether the panel is moving.
+fn clock_runs(ultra: bool, motion: bool, t: &Theme) -> bool {
+    ultra && motion && t.animated()
+}
+
+/// Whether Windows allows animation. "Show animations in Windows" is a preference a person sets
+/// once; a panel that ignores it is the kind of thing that gets an app switched off rather than
+/// configured, so an explicit off holds every cycle at phase 0.
+fn allow_motion() -> bool {
+    /// Not exported by windows-sys 0.59's WindowsAndMessaging.
+    const SPI_GETCLIENTAREAANIMATION: u32 = 0x1042;
+    let mut on: BOOL = 1;
+    let ok = unsafe {
+        SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &mut on as *mut _ as _, 0)
+    };
+    // A query that fails must not freeze the background; only a real "off" does.
+    ok == 0 || on != 0
+}
+
 /// Start or stop the animation timer to match what is on screen: only an open panel running an
-/// animated theme needs one, so the strip and every static theme pay nothing for it.
+/// animated theme needs one, so the strip and every still theme pay nothing for it.
 fn sync_anim(hwnd: HWND) {
-    let on = with_ui(|u| u.mode == Mode::Panel && u.theme.animated()).unwrap_or(false);
+    let on = with_ui(|u| u.mode == Mode::Panel && clock_runs(u.profile.ultra, u.motion, u.theme))
+        .unwrap_or(false);
     unsafe {
         if on {
             SetTimer(hwnd, TIMER_ANIM, ANIM_MS, None);
@@ -1858,7 +1902,7 @@ pub fn run(cfg: Config, board: Arc<Mutex<Board>>) {
             font: make_font(&cfg, dpi),
             bg: CreateSolidBrush(theme.bg),
             theme,
-            face: theme::font_of(theme, if profile.ultra { cfg.theme_font.as_deref() } else { None }),
+            face: face_of(theme, &cfg, profile.ultra),
             grad: Gradient::new(theme),
             icon: make_icon(theme::link_color(theme, Link::Down)),
             icon_link: Some(Link::Down),
@@ -1886,6 +1930,7 @@ pub fn run(cfg: Config, board: Arc<Mutex<Board>>) {
             tray_click_at: None,
             back: None,
             anim: None,
+            motion: allow_motion(),
         };
         let (icon, tip) = (ui.icon, tooltip(&ui.view));
         UI.with(|c| *c.borrow_mut() = Some(ui));
@@ -1910,5 +1955,25 @@ pub fn run(cfg: Config, board: Arc<Mutex<Board>>) {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_classic_build_never_runs_a_clock() {
+        let t = theme::classic();
+        assert!(!clock_runs(false, true, t), "the classic build keeps its one still look");
+        assert!(clock_runs(true, true, t), "Ultra lets midnight breathe");
+    }
+
+    #[test]
+    fn windows_and_a_still_palette_can_both_stop_the_clock() {
+        let t = theme::resolve("drift");
+        assert!(!clock_runs(true, false, t), "Show animations is off");
+        let still = Theme { cycle: None, ..*t };
+        assert!(!clock_runs(true, true, &still), "a still palette holds phase 0");
     }
 }
