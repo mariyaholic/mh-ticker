@@ -56,10 +56,14 @@ The engine is `crates/session-engine` (crate `mh-session`). It is platform indep
 ## Broker server time
 
 A broker rule has a winter/summer UTC offset, an optional US-DST seasonal switch, a local reopen time,
-eligible reopen days and provenance. The default preset is **Exness-style, approved by the owner on 2026-10-28 as the default, and still not
-verified against a live server**: UTC+0 year-round,
+eligible reopen days and provenance. The default preset is **broker-anonymised for the public build (approved by the owner on
+2026-10-28 as the default, and still not verified against a live server)**: UTC+0 year-round,
 weekly reopen estimated at Sunday 22:00 server. The reported observation includes 22:00/23:00 depending on US
-DST; that has not been independently confirmed and daily maintenance reopens are not modelled.
+DST; that has not been independently confirmed and daily maintenance reopens are not modelled. Since the
+02-L4 ruling (2026-11-02) the reopen clock itself is modelled seasonally — 22:00 winter / 23:00 summer,
+switched by the server-side US-DST season — in the engine and both indicator boilerplates; an explicit
+`broker_reopen_min` override keeps one clock for both seasons. The "estimate / not independently confirmed"
+labelling still holds.
 
 Because the rule is unverified, the engine **does not present a verified next reopen**. The panel shows the
 server clock and "reopen unknown · est …". Config overrides:
@@ -129,8 +133,9 @@ MT5 terminal, so their runtime behaviour is **not verified here** (see [TESTING.
 
 - Pine scripts **cannot read the chart time zone or the device time zone**. `syminfo.timezone` is the
   symbol's exchange zone, not the chart or device zone. The one extra clock is therefore a manual
-  `input.string` IANA dropdown, defaulting to `syminfo.timezone`, explicitly labelled "set to your
-  chart/device zone" and "not auto-detected".
+  `input.string` IANA dropdown (defaulting to `UTC`, because Pine input defaults must be const) with an
+  opt-in "use the exchange zone" toggle, explicitly labelled "set to your chart/device zone" and
+  "not auto-detected".
 - Session membership uses `time(timeframe.period, generated_session_string, IANA_zone)`. The chart timeframe
   affects the granularity, and the table updates on bar events, not on a wall clock.
 - The table shows the last bar time. Historical bars are not re-rendered into a live clock.

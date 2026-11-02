@@ -45,6 +45,7 @@ const string MH_WINDOW_NEW_YORK = "08:00-17:00"
 const bool MH_BROKER_VERIFIED = false
 const int MH_BROKER_OFFSET_MIN = 0
 const int MH_BROKER_REOPEN_MIN = 1320
+const int MH_BROKER_REOPEN_SUMMER_MIN = 1380
 const int MH_BROKER_REOPEN_DAY = 1
 const string MH_SPEC_VERSION = "1.0.0"
 const string MH_TZDB_VERSION = "2025b"
@@ -52,10 +53,11 @@ const string MH_TZDB_VERSION = "2025b"
 // ---------------------------------------------------------------------------
 // Inputs
 // ---------------------------------------------------------------------------
-// The manual extra clock. Default syminfo.timezone is only a starting point:
-// it is the exchange zone, not your chart or device zone. Pick your own zone.
-string extraZone = input.string(
-     defval = syminfo.timezone,
+// The manual extra clock. Pine `input.*` defaults must be const, so the
+// picker starts at UTC; tick the toggle to take syminfo.timezone instead —
+// the exchange zone, not your chart or device zone. Not auto-detected either way.
+string manualExtra = input.string(
+     defval = "UTC",
      title = "Extra clock: set to your chart/device zone (manual IANA, not auto-detected)",
      options = [
          "UTC", "Etc/UTC", "America/New_York", "America/Chicago", "America/Denver",
@@ -70,6 +72,10 @@ string extraZone = input.string(
          "Australia/Perth", "Australia/Adelaide", "Australia/Brisbane",
          "Australia/Sydney", "Australia/Hobart", "Pacific/Auckland"
      ])
+bool extraUseExchange = input.bool(
+     defval = false,
+     title = "Use the symbol's exchange zone (syminfo.timezone) for the extra clock")
+string extraZone = extraUseExchange ? syminfo.timezone : manualExtra
 int brokerOffset = input.int(
      defval = MH_BROKER_OFFSET_MIN,
      title = "Broker UTC offset (minutes, estimate — not a live feed)",
@@ -102,6 +108,18 @@ f_next_weekly(int now, int minuteOfDay, int pineDay) =>
     int candidate = base + addDays * 86400000 + minuteOfDay * 60000
     candidate <= now ? candidate + 7 * 86400000 : candidate
 
+// 02-L4: US-DST season for a UTC instant. EDT starts on the 2nd Sunday of March
+// (08:00 UTC ≈ 02:00 EDT) and EST resumes on the 1st Sunday of November
+// (07:00 UTC ≈ 02:00 EST). Approximation for the "est" label; the evening
+// reopen times (22:00/23:00 server) never land inside the one-hour boundary
+// window, so the switch is exact for the times this spec models.
+f_season_reopen_min(int t) =>
+    int y = year(t, "UTC")
+    int mar2 = 8 + (8 - dayofweek(timestamp("UTC", y, 3, 1))) % 7
+    int nov1 = 1 + (8 - dayofweek(timestamp("UTC", y, 11, 1))) % 7
+    bool edt = t >= timestamp("UTC", y, 3, mar2, 8, 0, 0) and t < timestamp("UTC", y, 11, nov1, 7, 0, 0)
+    edt ? MH_BROKER_REOPEN_SUMMER_MIN : MH_BROKER_REOPEN_MIN
+
 // ---------------------------------------------------------------------------
 // Table
 // ---------------------------------------------------------------------------
@@ -114,7 +132,16 @@ if showTable and barstate.islast
     string newYork = not na(time(timeframe.period, MH_SESSION_NEW_YORK, MH_ZONE_NEW_YORK)) ? "open" : "closed"
     bool overlapOpen = london == "open" and newYork == "open"
 
-    int reopenAt = f_next_weekly(timenow, MH_BROKER_REOPEN_MIN, MH_BROKER_REOPEN_DAY)
+    // 02-L4 (+02-M2 for Pine): the estimate lives on the server-side clock —
+    // convert into the server coordinate, pick the seasonal reopen clock at
+    // the candidate, then convert back. The candidate day is rebuilt once when
+    // the season moves the reopen time.
+    int serverNow = timenow - brokerOffset * 60000
+    int cand = f_next_weekly(serverNow, MH_BROKER_REOPEN_MIN, MH_BROKER_REOPEN_DAY)
+    int reopenAt = 0
+    if f_season_reopen_min(cand) != MH_BROKER_REOPEN_MIN
+        cand := f_next_weekly(serverNow, f_season_reopen_min(cand), MH_BROKER_REOPEN_DAY)
+    reopenAt := cand + brokerOffset * 60000
     string brokerClock = str.format_time(timenow + brokerOffset * 60000, "HH:mm", "UTC")
     string brokerDetail = MH_BROKER_VERIFIED ? "reopen in " + f_duration(reopenAt - timenow) : "unknown (unverified rule) · est " + str.format_time(reopenAt, "EEE HH:mm", "UTC")
     string extraClock = str.format_time(timenow, "HH:mm", extraZone)

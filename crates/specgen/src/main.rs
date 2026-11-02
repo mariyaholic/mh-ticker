@@ -56,6 +56,7 @@ struct BrokerSpec {
     summer_offset_minutes: i32,
     seasonal: String,
     reopen_local: String,
+    reopen_local_summer: Option<String>,
     reopen_days: Vec<u8>,
     reopen_note: String,
 }
@@ -216,6 +217,9 @@ fn validate(spec: &Spec) -> Result<(), String> {
     }
     let broker = &spec.broker;
     parse_hm(&broker.reopen_local)?;
+    if let Some(summer) = &broker.reopen_local_summer {
+        parse_hm(summer)?;
+    }
     if !matches!(broker.seasonal.as_str(), "fixed" | "us_dst") {
         return Err("broker.seasonal must be 'fixed' or 'us_dst'".into());
     }
@@ -347,6 +351,16 @@ fn rust_rules(spec: &Spec, from: DateTime<Utc>, to: DateTime<Utc>) -> Result<Str
     )
     .unwrap();
     writeln!(out, "    reopen_min: {},", minutes(&b.reopen_local)?).unwrap();
+    // 02-L4: the seasonal reopen is *declared* — `None` when the spec gives
+    // no summer clock, so inheriting callers cannot silently become seasonal.
+    match &b.reopen_local_summer {
+        Some(summer) => {
+            writeln!(out, "    summer_reopen_min: Some({}),", minutes(summer)?).unwrap();
+        }
+        None => {
+            writeln!(out, "    summer_reopen_min: None,").unwrap();
+        }
+    }
     writeln!(out, "    reopen_days: [{}],", bd.join(", ")).unwrap();
     writeln!(out, "    reopen_note: {},", rust_str(&b.reopen_note)).unwrap();
     writeln!(out, "}};").unwrap();
@@ -498,10 +512,11 @@ fn fill(
         broker.reopen_days[0] + 1
     };
     let pine_broker = format!(
-        "const bool MH_BROKER_VERIFIED = {}\nconst int MH_BROKER_OFFSET_MIN = {}\nconst int MH_BROKER_REOPEN_MIN = {}\nconst int MH_BROKER_REOPEN_DAY = {}",
+        "const bool MH_BROKER_VERIFIED = {}\nconst int MH_BROKER_OFFSET_MIN = {}\nconst int MH_BROKER_REOPEN_MIN = {}\nconst int MH_BROKER_REOPEN_SUMMER_MIN = {}\nconst int MH_BROKER_REOPEN_DAY = {}",
         rust_bool(broker.verified),
         broker.winter_offset_minutes,
         minutes(&broker.reopen_local)?,
+        minutes(broker.reopen_local_summer.as_deref().unwrap_or(&broker.reopen_local))?,
         pine_reopen_day
     );
     let mut mq5_constants = String::new();
@@ -533,6 +548,17 @@ fn fill(
         mq5_constants,
         "const int MH_BROKER_REOPEN = {};",
         minutes(&broker.reopen_local)?
+    )
+    .unwrap();
+    writeln!(
+        mq5_constants,
+        "const int MH_BROKER_REOPEN_SUMMER = {};",
+        minutes(
+            broker
+                .reopen_local_summer
+                .as_deref()
+                .unwrap_or(&broker.reopen_local)
+        )?
     )
     .unwrap();
     writeln!(
@@ -672,6 +698,37 @@ mod tests {
     }
 
     #[test]
+    fn ci_actions_are_sha_pinned() {
+        // XR-1/02-L7 acceptance gate: no `uses:` line may reference a moving
+        // ref (no branch name, tag, or unversioned ref); each pin must be a
+        // 40-hex commit SHA with an inline version comment.
+        let ci = std::fs::read_to_string("../../.github/workflows/ci.yml").unwrap();
+        for line in ci.lines().filter(|l| l.trim_start().starts_with("uses:")) {
+            let body = line.trim_start()["uses:".len()..].trim();
+            let Some((at, comment)) = body.split_once(" ") else {
+                panic!("missing version comment: {line}");
+            };
+            assert!(comment.starts_with("# "), "pin + version comment: {line}");
+            assert!(
+                !at.contains("@main")
+                    && !at.contains("@master")
+                    && !at.contains("@stable")
+                    && !at.contains("@v4")
+                    && !at.contains("@v5"),
+                "unpinned action: {line}"
+            );
+            assert!(at.contains("@"), "pin + version comment: {line}");
+            let sha = at.rsplit('@').next().unwrap();
+            assert_eq!(sha.len(), 40, "40-hex SHA expected: {line}");
+            assert!(
+                sha.chars().all(|c| c.is_ascii_hexdigit()),
+                "hex SHA expected: {line}"
+            );
+        }
+        assert!(ci.lines().filter(|l| l.contains("uses:")).count() >= 2);
+    }
+
+    #[test]
     fn generated_indicators_have_no_template_leftovers_or_empty_mql5_arrays() {
         let pine = std::fs::read_to_string("../../pine/MH_Sessions.pine").unwrap();
         let mq5 = std::fs::read_to_string("../../mql5/MH_Sessions.mq5").unwrap();
@@ -692,7 +749,12 @@ mod tests {
             pine.contains("MH_BROKER_REOPEN_DAY = 1"),
             "spec day 7 (Sunday) is Pine day 1"
         );
-        assert!(pine.contains("syminfo.timezone"));
+        assert!(pine.contains("defval = \"UTC\""));
+        assert!(pine.contains("extraUseExchange ? syminfo.timezone : manualExtra"));
+        assert!(
+            !pine.contains("defval = syminfo"),
+            "input defaults must stay const (02-H2)"
+        );
         assert!(pine.contains("not auto-detected"));
         assert!(mq5.contains("NOT AFFILIATED WITH METAMOQUOTES"));
     }

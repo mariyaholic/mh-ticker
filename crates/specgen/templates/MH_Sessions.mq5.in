@@ -146,6 +146,9 @@ long MhNextBoundary(string zone, int openMin, int closeMin, int days, bool overn
    datetime localNow = (datetime)(utc + offset);
    MqlDateTime dt;
    TimeToStruct(localNow, dt);
+   dt.hour = 0;
+   dt.min = 0;
+   dt.sec = 0;
    datetime midnight = StructToTime(dt);
    long best = 0;
    for(int d = -1; d <= 10; d++)
@@ -177,27 +180,46 @@ int MhBrokerOffsetAt(long utc)
    return (ny == -14400 ? MH_BROKER_SUMMER_OFFSET : MH_BROKER_WINTER_OFFSET);
 }
 
-long MhBrokerNextReopen(long utc)
+long MhBrokerNextReopen(long utc, int brokerOffset)
 {
    if(!InpBrokerRuleVerified)
       return 0;
-   int offset = MhBrokerOffsetAt(utc);
+   // 02-M2: the reopen lives on the effective broker clock (the override or
+   // the measured value the indicator displays), not on the generated
+   // seasonal default. The same offset drives the local anchor and the
+   // candidate conversion; MhBrokerOffsetAt only when nothing else is known.
+   int offset = brokerOffset;
+   if(offset == MH_UNKNOWN)
+      offset = MhBrokerOffsetAt(utc);
    datetime localNow = (datetime)(utc + offset * 60);
    MqlDateTime dt;
    TimeToStruct(localNow, dt);
+   dt.hour = 0;
+   dt.min = 0;
+   dt.sec = 0;
    datetime midnight = StructToTime(dt);
    long best = 0;
    for(int d = -1; d <= 10; d++)
    {
+      // 02-L4: the reopen clock follows the server-side US-DST season when
+      // the summer clock differs (generated equal for fixed rules and user
+      // overrides). Probe the candidate with the winter clock, then rebuild
+      // it with the summer clock when New York is on EDT (== -14400 s).
       datetime localReopen = midnight + d * 86400 + MH_BROKER_REOPEN * 60;
+      int reopenMin = MH_BROKER_REOPEN;
+      if(MH_BROKER_REOPEN_SUMMER != MH_BROKER_REOPEN)
+      {
+         datetime probe = (datetime)(localReopen - offset * 60);
+         if(MhOffsetByZone("America/New_York", probe) == -14400)
+            reopenMin = MH_BROKER_REOPEN_SUMMER;
+      }
+      localReopen = midnight + d * 86400 + reopenMin * 60;
       MqlDateTime rdt;
       TimeToStruct(localReopen, rdt);
       int idx = (rdt.day_of_week + 6) % 7;
       if(((MH_BROKER_DAYS >> idx) & 1) == 0)
          continue;
-      long guess = (long)localReopen;
-      for(int i = 0; i < 3; i++)
-         guess = (long)localReopen - (long)MhBrokerOffsetAt(guess) * 60;
+      long guess = (long)localReopen - offset * 60;
       if(guess > utc && (best == 0 || guess < best))
          best = guess;
    }
@@ -286,7 +308,7 @@ void MhUpdate()
    {
       brokerClock = TimeToString((datetime)(utc + brokerOffset * 60), TIME_MINUTES);
       brokerState = MhOffLabel(brokerOffset) + (measured ? " est" : " set");
-      long reopen = MhBrokerNextReopen(utc);
+      long reopen = MhBrokerNextReopen(utc, brokerOffset);
       if(!InpBrokerRuleVerified)
          brokerDetail = "reopen unknown (rule unverified)";
       else if(reopen == 0)

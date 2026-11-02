@@ -8,3 +8,8 @@ dist/
 
 # Local scratch output
 /scratch/
+
+# Agent workspace files (XR-1 ruling: local-only everywhere; the harness still
+# reads the working-tree copies, which stay untracked)
+/AGENTS.md
+/opencode.json
