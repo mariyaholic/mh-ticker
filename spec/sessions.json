@@ -55,15 +55,16 @@
     "provenance": "No holiday or exceptional-closure calendar is approved for v1; weekdays only."
   },
   "broker": {
-    "id": "exness_default",
+    "id": "broker_default",
     "label": "Broker",
     "verified": false,
-    "provenance": "Default preset approved by the owner on 2026-10-28 (not verified against a live server). Internal default preset: Exness. Reported observation only: UTC+0 server year-round, daily reopen around 22:00/23:00 server depending on US DST. Not independently confirmed; the next verified reopen is hidden until the owner approves a rule.",
+    "provenance": "Default preset approved by the owner on 2026-10-28 (not verified against a live server). The broker is anonymised in the public build (02-L6 ruling, 2026-11-02). Reported observation only: UTC+0 server year-round, daily reopen around 22:00/23:00 server depending on US DST. Not independently confirmed; the next verified reopen is hidden until the owner approves a rule.",
     "winter_offset_minutes": 0,
     "summer_offset_minutes": 0,
     "seasonal": "fixed",
     "reopen_local": "22:00",
+    "reopen_local_summer": "23:00",
     "reopen_days": [7],
-    "reopen_note": "Weekly reopen estimate only; daily maintenance reopens are not modelled."
+    "reopen_note": "Weekly reopen estimate only; daily maintenance reopens are not modelled. The reopen clock follows the US-DST season (22:00 winter / 23:00 summer server), modelled in the engine and both indicator boilerplates under the 02-L4 ruling (2026-11-02) from the reported observation."
   }
 }

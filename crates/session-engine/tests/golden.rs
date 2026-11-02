@@ -106,12 +106,20 @@ fn broker_vectors() {
             days[(d.as_u64().unwrap() - 1) as usize] = true;
         }
         let (h, m) = text(r, "reopen_local").split_once(':').unwrap();
+        let reopen_min = h.parse::<u16>().unwrap() * 60 + m.parse::<u16>().unwrap();
+        let summer_reopen_min = r["reopen_summer_local"]
+            .as_str()
+            .and_then(|s| s.split_once(':'))
+            .map(|(h, m)| h.parse::<u16>().unwrap() * 60 + m.parse::<u16>().unwrap());
         let rule = BrokerRule {
             verified: r["verified"].as_bool().unwrap(),
             winter_offset_min: r["winter_offset_minutes"].as_i64().unwrap() as i32,
             summer_offset_min: r["summer_offset_minutes"].as_i64().unwrap() as i32,
             seasonal_us_dst: text(r, "seasonal") == "us_dst",
-            reopen_min: h.parse::<u16>().unwrap() * 60 + m.parse::<u16>().unwrap(),
+            reopen_min,
+            // 02-L4: only the vectors that declare a summer reopen are
+            // seasonal; the absent field is None, not "inherit".
+            summer_reopen_min,
             reopen_days: days,
             ..BROKER_DEFAULT
         };

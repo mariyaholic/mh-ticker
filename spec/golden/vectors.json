@@ -188,6 +188,7 @@
         "summer_offset_minutes": 180,
         "seasonal": "us_dst",
         "reopen_local": "00:00",
+        "reopen_summer_local": "00:00",
         "reopen_days": [1, 2, 3, 4, 5]
       },
       "server_utc": "2025-03-12T15:00:00Z",
@@ -203,11 +204,44 @@
         "summer_offset_minutes": 180,
         "seasonal": "us_dst",
         "reopen_local": "00:00",
+        "reopen_summer_local": "00:00",
         "reopen_days": [1, 2, 3, 4, 5]
       },
       "server_utc": "2025-11-05T14:00:00Z",
       "offset_minutes": 120,
       "next_reopen": "2025-11-05T22:00:00Z"
+    },
+    {
+      "name": "seasonal_reopen_winter_sunday",
+      "utc": "2025-01-15T12:00:00Z",
+      "rule": {
+        "verified": true,
+        "winter_offset_minutes": 0,
+        "summer_offset_minutes": 0,
+        "seasonal": "us_dst",
+        "reopen_local": "22:00",
+        "reopen_summer_local": "23:00",
+        "reopen_days": [7]
+      },
+      "server_utc": "2025-01-15T12:00:00Z",
+      "offset_minutes": 0,
+      "next_reopen": "2025-01-19T22:00:00Z"
+    },
+    {
+      "name": "seasonal_reopen_summer_sunday",
+      "utc": "2025-03-12T12:00:00Z",
+      "rule": {
+        "verified": true,
+        "winter_offset_minutes": 0,
+        "summer_offset_minutes": 0,
+        "seasonal": "us_dst",
+        "reopen_local": "22:00",
+        "reopen_summer_local": "23:00",
+        "reopen_days": [7]
+      },
+      "server_utc": "2025-03-12T12:00:00Z",
+      "offset_minutes": 0,
+      "next_reopen": "2025-03-16T23:00:00Z"
     }
   ]
 }

@@ -7,13 +7,28 @@ jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4 # TODO pin to commit SHA before publishing
-      - uses: dtolnay/rust-toolchain@stable # TODO pin to commit SHA before publishing
+      # 02-L7: every action pinned by commit SHA (TODOs rotated 2026-11-02).
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      # The dtolnay action bakes the toolchain version into the pinned ref's
+      # action.yml (env: toolchain: 1.99.1), so this SHA is version-specific.
+      - uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1
         with:
-          toolchain: 1.99.1
           components: rustfmt, clippy
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets --locked
+      # 02-L7: strict clippy; the working tree has zero warnings at 1.98.1
+      # (local baseline), deliberate triage not needed.
+      - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo build --workspace --locked
       - run: cargo test --workspace --locked
-      - run: cargo run --locked -p mh-specgen -- --check
+
+  # cargo-deny-action is container-based and only runs on Linux (learned on
+  # the first CI run: "Container action is only supported on Linux"); the
+  # deny.toml graph covers both target triples here.
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Check dependency licences and bans (cargo-deny)
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check licenses bans

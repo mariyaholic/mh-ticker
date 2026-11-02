@@ -266,6 +266,19 @@ struct Feed {
     fails: u32,
 }
 
+/// 02-L2: the poll wait in seconds, clamped on both ends. `poll_s` and the
+/// failure count come straight from the user's config, so the result stays a
+/// finite 1..=3600 s even for `f64::MAX`, infinity and NaN (`f64::max`
+/// already turns a NaN base into the 1 s floor).
+pub(crate) fn wait_seconds(poll_s: f64, fails: i32) -> f64 {
+    let base = poll_s.max(1.0).clamp(1.0, 3600.0);
+    if fails == 0 {
+        base
+    } else {
+        (base * 2f64.powi(fails.min(6) as i32)).min(60.0)
+    }
+}
+
 impl Feed {
     /// Adopt the UI's row list if the Symbols menu changed it; the hour of bars is refetched.
     fn sync_rows(&mut self) {
@@ -381,11 +394,11 @@ impl Feed {
             if self.maybe_bars() {
                 self.publish(link, note);
             }
-            let wait = if self.fails == 0 {
-                self.cfg.poll_s.max(1.0)
-            } else {
-                (self.cfg.poll_s.max(1.0) * 2f64.powi(self.fails.min(6) as i32)).min(60.0)
-            };
+            // 02-L2: the success path had no upper clamp, so a huge poll_s
+            // fed `Duration::from_secs_f64` past 1.79e19 and panicked; with
+            // `panic = "abort"` the release build dies. One hour is the cap;
+            // backoff still governs the failure path.
+            let wait = wait_seconds(self.cfg.poll_s, self.fails as i32);
             self.wait(Duration::from_secs_f64(wait));
         }
     }
@@ -475,6 +488,27 @@ pub fn probe(cfg: &Config) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_huge_poll_s_yields_a_finite_wait_not_an_abort() {
+        // 02-L2: `Duration::from_secs_f64` panics above ~1.79e19 s and the
+        // release profile has panic = abort — a config value used to be able
+        // to kill the app.
+        for poll in [f64::MAX, f64::INFINITY, f64::NAN, 1e300, -5.0, 0.0] {
+            let wait = wait_seconds(poll, 0);
+            assert!((1.0..=3600.0).contains(&wait), "poll {poll} -> {wait}");
+            let _ = Duration::from_secs_f64(wait); // must not panic
+        }
+    }
+
+    #[test]
+    fn backoff_and_typical_polls_are_unchanged() {
+        assert_eq!(wait_seconds(3.0, 0), 3.0);
+        assert_eq!(wait_seconds(5.0, 3), 40.0);
+        assert_eq!(wait_seconds(5.0, 9), 60.0);
+        assert_eq!(wait_seconds(0.5, 0), 1.0);
+        assert_eq!(wait_seconds(1e300, 5), 60.0);
+    }
 
     #[test]
     fn rejects_non_finite_prices() {

@@ -46,6 +46,11 @@ pub struct BrokerRule {
     pub summer_offset_min: i32,
     pub seasonal_us_dst: bool,
     pub reopen_min: u16,
+    /// The reopen clock in the US-summer season, declared only when the spec
+    /// says the reopen differs ("23:00" for the default preset). `None` (and
+    /// equal values, as user overrides produce) means the winter clock rules
+    /// in both seasons (02-L4).
+    pub summer_reopen_min: Option<u16>,
     pub reopen_days: [bool; 7],
     pub reopen_note: &'static str,
 }
@@ -90,7 +95,10 @@ impl BrokerRule {
             r.seasonal_us_dst = false;
         }
         if let Some(m) = reopen_min {
+            // An explicit reopen override is a fixed clock, mirroring the
+            // offset override: it holds for both seasons (02-L4).
             r.reopen_min = m;
+            r.summer_reopen_min = Some(m);
         }
         if verified {
             r.verified = true;

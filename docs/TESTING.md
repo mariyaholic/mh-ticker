@@ -14,7 +14,10 @@ Check tray, strip and panel at multiple DPI settings and monitor/taskbar layouts
 sleep/resume, manual clock and zone changes, and offline quotes. Confirm device-zone mapping and
 unavailable fallback on different Windows zones and territories. Check panel clipping and toggle,
 About credit, pre-1.3 config migration and broker/device overrides. Check a clean Windows machine
-without external zoneinfo. Installer and uninstaller are not supplied by this repository.
+without external zoneinfo. Installer and uninstaller are not supplied by this repository. With
+"Adjust for daylight saving time automatically" off, the device row must show unavailable (02-L3
+ruling: the auto-detected clock would disagree with the taskbar clock for half the year) — turn the
+switch off in a DST zone and compare with the taskbar clock.
 
 ## MT5 and TradingView checks
 
@@ -23,6 +26,13 @@ strategy tester clocks, server offset, DST and table coverage edges. Check Pine 
 manual zone input, bar-event updates and historical/realtime behavior. Compare shared vectors across
 both platforms before claiming parity. Pine cannot detect the chart or device zone. MT5 is a
 MetaQuotes trademark; the project is not affiliated with MetaQuotes or TradingView.
+
+Pine has no offline compiler here, so **a compile check in the TradingView Pine editor is a release
+gate** for `pine/MH_Sessions.pine` (paste, confirm no errors, then toggle the extra-clock inputs:
+"Use the symbol's exchange zone" off takes the manual dropdown (default `UTC`), on takes
+`syminfo.timezone`). Two failures this gate would have caught: a non-const `input.*`
+default (`syminfo.timezone`, rejected by the Pine qualifier rules) and a `defval` outside the
+dropdown `options` list (02-H2, fixed 2026-11-02).
 
 ## Review follow-up
 

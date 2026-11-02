@@ -95,33 +95,80 @@ mod tests {
     #[test]
     fn generated_mql5_embeds_the_same_transition_numbers() {
         let text = include_str!("../../../mql5/MH_Sessions.mq5");
+        let text = text.replace("\r\n", "\n");
         assert!(text.contains("MhOffsetByZone"));
         assert!(!text.contains("[] = {};"));
-        for table in ZONE_TABLES {
-            for tr in table.transitions {
-                assert!(
-                    text.contains(&tr.at.to_string()),
-                    "{} transition {} missing from MQL5",
-                    table.iana,
-                    tr.at
-                );
-                assert!(
-                    text.contains(&tr.offset_s.to_string()),
-                    "{} offset {} missing from MQL5",
-                    table.iana,
-                    tr.offset_s
-                );
-            }
+        for (idx, table) in ZONE_TABLES.iter().enumerate() {
+            // The whole generated arrays, not just "the numbers appear
+            // somewhere": at/offset columns must pair row-for-row and match the
+            // engine's transition list exactly (02-M3). A table without
+            // transitions (Tokyo) is emitted as the `{0}` sentinel with the
+            // base offset, which the binary search resolves to that base.
+            let (at, off) = if table.transitions.is_empty() {
+                ("0".to_string(), table.base_offset_s.to_string())
+            } else {
+                (
+                    table
+                        .transitions
+                        .iter()
+                        .map(|t| t.at.to_string())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    table
+                        .transitions
+                        .iter()
+                        .map(|t| t.offset_s.to_string())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                )
+            };
+            assert!(
+                text.contains(&format!("long MH_AT_{idx}[] = {{{at}}};")),
+                "{}: MH_AT_{idx} does not match the engine table",
+                table.iana
+            );
+            assert!(
+                text.contains(&format!("int MH_OFF_{idx}[] = {{{off}}};")),
+                "{}: MH_OFF_{idx} does not match the engine table",
+                table.iana
+            );
+            assert!(
+                text.contains(&format!(
+                    "const int MH_BASE_{idx} = {};",
+                    table.base_offset_s
+                )),
+                "{}: base offset mismatch",
+                table.iana
+            );
+            assert!(
+                text.contains(&format!(
+                    "if(iana == \"{}\") return MhOffsetByZone(utc, MH_AT_{idx}, MH_OFF_{idx}, MH_BASE_{idx});",
+                    table.iana
+                )) || text.contains(&format!(
+                    "if(iana == \"{}\") return MhOffsetAt(utc, MH_AT_{idx}, MH_OFF_{idx}, MH_BASE_{idx});",
+                    table.iana
+                )),
+                "{}: lookup route missing",
+                table.iana
+            );
         }
     }
 
     #[test]
     fn generated_pine_uses_the_shared_session_strings_and_a_manual_zone_input() {
         let text = include_str!("../../../pine/MH_Sessions.pine");
+        let text = text.replace("\r\n", "\n");
         assert!(text.contains("indicator("));
         assert!(text.contains("MH_SESSION_SYDNEY = \"0700-1600:23456\""));
+        // 02-M3 (with 02-H2): the input must be const-defaulted; the exchange
+        // zone arrives through the toggle, and "not auto-detected" stays put.
+        assert!(text.contains("defval = \"UTC\""));
+        assert!(text.contains("extraUseExchange ? syminfo.timezone : manualExtra"));
+        assert!(
+            !text.contains("defval = syminfo"),
+            "input defaults must stay const"
+        );
         assert!(text.contains("input.string"));
-        assert!(text.contains("syminfo.timezone"));
         assert!(text.contains("not auto-detected"));
         assert!(!text.contains("chart.timezone"));
     }

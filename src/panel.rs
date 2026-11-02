@@ -187,6 +187,16 @@ pub fn geometry(n: usize, dpi: u32, sessions: bool) -> Geo {
     let rows = n.div_ceil(COLS).max(1) as i32;
     let (pad, gap, card_w, card_h, header) = (s(16), s(10), s(224), s(132), s(48));
     let w = 2 * pad + cols as i32 * card_w + (cols as i32 - 1) * gap;
+    // 02-M4: the block always lays out six fixed columns (four sessions +
+    // broker + device). With one symbol the old width left ~27 px per column
+    // and truncated every clock; a sessions panel is at least six readable
+    // columns wide (review's formula: s(6 * 112) + 2 * pad + 24 = the block's
+    // own ix/rx inset plus the two pads).
+    let w = if sessions {
+        w.max(s(6 * 112) + 2 * pad + 24)
+    } else {
+        w
+    };
     let block = if sessions {
         s(SESSIONS_GAP) + s(SESSIONS_H)
     } else {
@@ -747,7 +757,30 @@ mod tests {
         let without = geometry(6, 96, false);
         let with = geometry(6, 96, true);
         assert_eq!(with.h - without.h, SESSIONS_GAP + SESSIONS_H);
-        assert_eq!(with.w, without.w);
+        // 02-M4: sessions panels are at least six readable columns, so the
+        // six-card width (724) is topped to the block minimum (728).
+        assert!(with.w >= without.w);
+        assert!(with.w >= 6 * 112 + 2 * 16 + 24);
+    }
+
+    #[test]
+    fn sessions_panel_never_narrows_six_columns_unreadable() {
+        // 02-M4: one shown symbol used to give a 256 px panel whose session
+        // block split into ~27 px columns and truncated every clock. The
+        // review's minimum: s(6 * 112) + 2 * pad + 24, six readable columns.
+        let one = geometry(1, 96, true);
+        assert_eq!(one.w, 6 * 112 + 2 * 16 + 24);
+        assert_eq!(one.cols, 1);
+        // 150% DPI keeps the same physical proportions.
+        let s150 = |v: i32| v * 144 / 96;
+        let one_150 = geometry(1, 144, true);
+        assert_eq!(one_150.w, s150(6 * 112) + 2 * s150(16) + 24);
+        // Widths still count every card for abundant symbols.
+        let six = geometry(6, 144, true);
+        assert_eq!(six.w, 2 * s150(16) + 3 * s150(224) + 2 * s150(10));
+        // A panel without session timers stays compact (the strip does not
+        // grow for it).
+        assert_eq!(geometry(1, 96, false).w, 2 * 16 + 224);
     }
 
     #[test]

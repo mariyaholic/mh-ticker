@@ -2,7 +2,7 @@
 //! Session intervals, statuses, the London/New York overlap and broker reopen.
 
 use chrono::{DateTime, Datelike, Duration, LocalResult, NaiveDate, TimeZone, Utc, Weekday};
-use chrono_tz::Tz;
+use chrono_tz::{OffsetComponents, Tz};
 
 use crate::{
     coverage_contains, BrokerRule, SessionRule, BROKER_DEFAULT, COVERAGE_FROM, COVERAGE_TO,
@@ -242,9 +242,31 @@ impl BrokerRule {
             if !self.reopen_days[date.weekday().num_days_from_monday() as usize] {
                 continue;
             }
-            let Some(naive) =
-                date.and_hms_opt(self.reopen_min as u32 / 60, self.reopen_min as u32 % 60, 0)
-            else {
+            let at_min = |reopen_min: u16| {
+                date.and_hms_opt((reopen_min / 60) as u32, (reopen_min % 60) as u32, 0)
+            };
+            // 02-L4: when the rule models a seasonal reopen — the spec
+            // declares a summer clock that differs (user overrides keep both
+            // equal) — the clock follows the server-side season of the
+            // candidate instant (US DST, read from New York like
+            // `offset_at`). Resolve once with the winter clock, then refine.
+            let mut reopen_min = self.reopen_min;
+            if self.summer_reopen_min.is_some_and(|s| s != self.reopen_min) {
+                if let Some(naive) = at_min(self.reopen_min) {
+                    let probe = Utc.from_utc_datetime(&naive) - Duration::minutes(guess as i64);
+                    let summer = probe
+                        .with_timezone(&chrono_tz::America::New_York)
+                        .offset()
+                        .dst_offset()
+                        != Duration::zero();
+                    if summer {
+                        reopen_min = self
+                            .summer_reopen_min
+                            .expect("seasonal branch implies a declared summer clock");
+                    }
+                }
+            }
+            let Some(naive) = at_min(reopen_min) else {
                 continue;
             };
             let naive_utc = Utc.from_utc_datetime(&naive);
@@ -465,7 +487,10 @@ mod tests {
             winter_offset_min: 120,
             summer_offset_min: 180,
             seasonal_us_dst: true,
+            // 02-L4: this rule pins one reopen clock for both seasons (the
+            // preset's seasonal one is not inherited by inference).
             reopen_min: 0,
+            summer_reopen_min: Some(0),
             reopen_days: [true, true, true, true, true, false, false],
             verified: true,
             ..BROKER_DEFAULT

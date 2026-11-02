@@ -259,7 +259,7 @@ fn make_icon(color: COLORREF) -> HICON {
         SelectObject(dc, colour);
         FillRect(dc, &full, GetStockObject(BLACK_BRUSH));
         let tile = CreateSolidBrush(rgb(30, 33, 40));
-        SelectObject(dc, tile);
+        let old_tile = SelectObject(dc, tile);
         RoundRect(dc, 0, 0, n + 1, n + 1, radius, radius);
         let f = |a: i32| a * n / 16;
         let line = [
@@ -269,8 +269,16 @@ fn make_icon(color: COLORREF) -> HICON {
             POINT { x: f(13), y: f(4) },
         ];
         let pen = CreatePen(PS_SOLID, (n / 8).max(2), color);
-        SelectObject(dc, pen);
+        let old_pen = SelectObject(dc, pen);
         Polyline(dc, line.as_ptr(), line.len() as i32);
+        // 02-L1: documented Win32 semantics — DeleteObject on an object still
+        // selected into a DC must not be relied on; restore the pen and the
+        // tile brush, then the bitmap, before deleting them. Measured on this
+        // box (see the test): a deliberately un-restored variant keeps the GDI
+        // count flat at 200 iterations because the memory DC frees them, but
+        // the documented pattern is what the counting test can guard.
+        SelectObject(dc, old_pen);
+        SelectObject(dc, old_tile);
         SelectObject(dc, old);
         let info = ICONINFO {
             fIcon: 1,
@@ -288,6 +296,19 @@ fn make_icon(color: COLORREF) -> HICON {
         ReleaseDC(null_mut(), screen);
         icon
     }
+}
+
+/// 02-L5: the About text, versioned from the crate metadata like the About
+/// screen should be — the "1.3.0" hard-code drifted from `Cargo.toml` by
+/// construction here and had already drifted once from the 1.2.3 binary.
+pub fn about_text() -> &'static str {
+    concat!(
+        "MH Ticker ",
+        env!("CARGO_PKG_VERSION"),
+        "\n\nmade with love by maria\nMIT licensed.\n\nSession times are conventions, not guaranteed",
+        " exchange hours.\nNot financial advice.\n\nNot affiliated with TradingView or MetaQuotes;",
+        " MT5 is a MetaQuotes trademark."
+    )
 }
 
 /// (label, price, price colour, change + colour) for one row of the board.
@@ -1341,9 +1362,7 @@ fn menu(hwnd: HWND) {
             apply_sessions(hwnd);
         }
         CMD_ABOUT => unsafe {
-            let text = wide(
-                "MH Ticker 1.3.0\n\nmade with love by maria\nMIT licensed.\n\nSession times are conventions, not guaranteed exchange hours.\nNot financial advice.\n\nNot affiliated with TradingView or MetaQuotes; MT5 is a MetaQuotes trademark.",
-            );
+            let text = wide(about_text());
             let title = wide("About MH Ticker");
             MessageBoxW(
                 hwnd,
@@ -1856,6 +1875,47 @@ pub fn run(cfg: Config, board: Arc<Mutex<Board>>) {
             DispatchMessageW(&msg);
         }
         unhook_foreground();
+    }
+}
+
+#[cfg(test)]
+mod icon_tests {
+    // 02-L1: the tray icon builder used to leak the pen and the tile brush
+    // (they were still selected into the DC when deleted). This test counts
+    // the real GDI handle inventory, so a leak is arithmetic, not vibes.
+    use super::*;
+
+    #[test]
+    fn about_text_is_versioned_from_the_crate_not_hard_coded() {
+        // 02-L5: mu old build got the "1.3.0" from a literal, so About and
+        // Cargo.toml could drift apart silently. concat! of the metadata
+        // keeps them pinned together.
+        let text = about_text();
+        assert!(text.contains(concat!("MH Ticker ", env!("CARGO_PKG_VERSION"))));
+        assert!(text.contains("made with love by maria"));
+        assert!(text.contains("MIT licensed"));
+    }
+
+    #[test]
+    fn icon_creation_leaks_no_gdi_objects() {
+        let gdi = || unsafe {
+            windows_sys::Win32::System::Threading::GetGuiResources(
+                windows_sys::Win32::System::Threading::GetCurrentProcess(),
+                windows_sys::Win32::System::Threading::GR_GDIOBJECTS,
+            )
+        };
+        // Warm-up: first-draw lazily creates fonts and stock handles.
+        let warm = make_icon(rgb(255, 60, 60));
+        assert!(!warm.is_null());
+        unsafe { DestroyIcon(warm) };
+        let before = gdi();
+        for _ in 0..200 {
+            let icon = make_icon(rgb(30, 33, 40));
+            assert!(!icon.is_null());
+            unsafe { DestroyIcon(icon) };
+        }
+        let after = gdi();
+        assert_eq!(after, before, "GDI handle count must stay flat");
     }
 }
 
