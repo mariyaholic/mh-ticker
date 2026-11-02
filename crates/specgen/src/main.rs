@@ -698,6 +698,37 @@ mod tests {
     }
 
     #[test]
+    fn ci_actions_are_sha_pinned() {
+        // XR-1/02-L7 acceptance gate: no `uses:` line may reference a moving
+        // ref (no branch name, tag, or unversioned ref); each pin must be a
+        // 40-hex commit SHA with an inline version comment.
+        let ci = std::fs::read_to_string("../../.github/workflows/ci.yml").unwrap();
+        for line in ci.lines().filter(|l| l.trim_start().starts_with("uses:")) {
+            let body = line.trim_start()["uses:".len()..].trim();
+            let Some((at, comment)) = body.split_once(" ") else {
+                panic!("missing version comment: {line}");
+            };
+            assert!(comment.starts_with("# "), "pin + version comment: {line}");
+            assert!(
+                !at.contains("@main")
+                    && !at.contains("@master")
+                    && !at.contains("@stable")
+                    && !at.contains("@v4")
+                    && !at.contains("@v5"),
+                "unpinned action: {line}"
+            );
+            assert!(at.contains("@"), "pin + version comment: {line}");
+            let sha = at.rsplit('@').next().unwrap();
+            assert_eq!(sha.len(), 40, "40-hex SHA expected: {line}");
+            assert!(
+                sha.chars().all(|c| c.is_ascii_hexdigit()),
+                "hex SHA expected: {line}"
+            );
+        }
+        assert!(ci.lines().filter(|l| l.contains("uses:")).count() >= 2);
+    }
+
+    #[test]
     fn generated_indicators_have_no_template_leftovers_or_empty_mql5_arrays() {
         let pine = std::fs::read_to_string("../../pine/MH_Sessions.pine").unwrap();
         let mq5 = std::fs::read_to_string("../../mql5/MH_Sessions.mq5").unwrap();
