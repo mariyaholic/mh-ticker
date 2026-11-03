@@ -1,5 +1,50 @@
 # Changelog — MH Ticker
 
+## 2026-11-03 — 1.6.0: a window that resizes, and a candle pane that reads   [hermes.impl]
+
+**Files:** `src/workspace.rs` (width-aware grid), `src/panel.rs` (`geometry_in`, `minimum`, the
+candle pane and its bucket ladder), `src/ui.rs` (resize edges, minimum/maximum track sizes, panel
+persistence, the chart toggle and its pointer tracking), `src/config.rs` (`panel`), `src/model.rs`
+(`Bar`, the board's bars), `src/source.rs` (the day's OHLC kept, a longer timeout for it),
+`src/shot.rs` + `examples/chart.rs` (the pane rendered from a fixture), `README.md`, `Cargo.toml`.
+
+**What.** Two PRs, one release: the panel stops being one fixed size, and the space it gains is used
+by a chart. `#6` made the window resizable; this one puts candles in it.
+
+- **The window resizes like a window.** `WS_THICKFRAME | WS_MAXIMIZEBOX` with `WM_NCCALCSIZE`
+  returning 0, so the frame costs no border and no client-area offset, and `WM_NCHITTEST` returns
+  the eight edge codes on the panel only — the strip stays a drag handle. The floor is the content
+  size, the ceiling the monitor's work area.
+- **Width is columns, never zoom.** A dragged edge reflows the card grid (1–6 columns) and the
+  painter lays out from the width it is asked to draw in. Cards stay `236×150` and type never
+  shrinks; `shots/*.png` are still byte-identical, which is the proof.
+- **The panel remembers its frame.** `panel: [x, y, w, h]` in the config, fitted to the work area of
+  the monitor it lands on, so an unplugged display or a resolution drop cannot strand it.
+- **Candles from data that was already arriving.** `1D.json` has always sent `open/high/low/close`
+  per minute; `parse_chart` used to keep the last hour and the close only. It now keeps the day
+  (~1,450 bars) and the sparkline is a slice of the same series, so the two can never disagree.
+  No extra request, no extra byte.
+- **A candle has to be readable to be a candle.** Below four pixels a body is a scratch between two
+  wicks, so the pane folds the day into 5-, 15-, 30- or 60-minute buckets until each candle has its
+  pixels: 5 m at 96 dpi on a 720 px pane, 1 m when there is room. Buckets are cut on the clock, so a
+  break in the session stays a gap. The header names the bucket and the zone (`S&P · 5 m UTC`).
+- **The pane follows the pointer**, and the toggle raises the window's minimum to two whole panes, so
+  opening the chart never folds the card grid. The picker and the chart take turns: both want the
+  space under the cards.
+- **The chart request gets its own patience.** A day of bars is ~220 KB; the 10 s that serves a
+  quote can truncate it on a slow link, and a truncated body parses as a JSON error at 128 KB.
+
+**Why.** A ticker that only shows six cards has nothing to put in a bigger window. The pane model
+from `#5` gave the geometry a shape; this is the first pane that is worth the width, and it is built
+on the feed that already ran — the only new machinery is a bucket ladder and a fold.
+
+**Checked.** 59 tests pass under Wine against `x86_64-pc-windows-gnu` (grid sizing, the pane split,
+the window floor, the bucket ladder, clock-cut folding, the parser's OHLC). `shots/*.png` regenerate
+byte-identically (`diff -rq` empty). The pane was inspected at 96 and 192 dpi in midnight, paper and
+pc98, and driven live: toggle opens it, the window widens to 1,490, hovering another card recharts,
+and the empty state names its symbol instead of drawing a bare rectangle. Live bars are slow under
+Wine's TLS (two of six symbols answered in the probe run); the fixture path is what the images use.
+
 ## 2026-11-02 — 1.5.0: every palette moves, and a face the machine lacks is greyed   [hermes.impl]
 
 **Files:** `src/theme.rs` (motion as a field, all 26 palettes rewritten, 22 faces, the availability

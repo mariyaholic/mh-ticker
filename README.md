@@ -83,6 +83,14 @@ Double click it. If prompted, simply select Run anyway.
 - **Symbol picker (Ultra):** the button left of the minimize cross opens a strip of chips inside the panel - click
   one to add it, click again to drop it. same as the Symbols menu but u dont have to hunt through a submenu, and u
   see the whole list at once
+- **Resize it (Ultra):** drag any edge or corner. the window is the layout: a wider frame adds card columns
+  (up to six) instead of stretching the cards, and it remembers the size it was left at, so expanding it again
+  comes back where u left it. no native border - the frame is still drawn by the app
+- **Candles (Ultra):** the button left of the picker opens a candle pane down the right side. it charts whatever
+  card is under the pointer, so pointing at a price changes the chart and clicking still opens CNBC. one-minute
+  bars from the same CNBC request the sparklines already use, folded to 5/15/30/60 minutes on a narrow pane so a
+  candle is never a one-pixel scratch. the header names the resolution and the axis is UTC. opening it on a narrow
+  window widens the frame to fit both, and the picker and the chart take turns (they want the same space)
 - **Alerts (Ultra):** right click → *Alerts* → pick a symbol → *above 1 %* / *above 2 %* / *below 1 %* / *below 2 %*
   (of whatever it is right now). u get a tray balloon and, if u set a `webhook`, a message in Discord/Slack/ntfy.
   it fires once per cooldown and **never on a stale price** (a market closed at a level would otherwise ping u
@@ -113,6 +121,8 @@ whats in there:
 - `dock_rows`, `dock_font_pt`: the grid when its in the taskbar
 - `font`, `font_pt`, `opacity`, `topmost`
 - `x`/`y`: where it was left in Floating
+- `panel`: the panel's last frame as `[x, y, w, h]` (Ultra). leave it out and the panel sizes itself to its cards
+  and centres - which is what every config written before the panel could be resized does
 - `theme` (Ultra): any name from [THEMES.md](THEMES.md) - `midnight`, `aurora`, `vaporwave`, `pc98`, …
 - `theme_font` (Ultra): a panel face from `theme::FACES`, e.g. `Georgia` or `Terminal`. empty = the theme's own
 - `alerts` (Ultra): `{ label, above, below, cooldown_s, last }` each. `label` is the row label, `above`/`below`
@@ -121,7 +131,7 @@ whats in there:
 - `webhook` (Ultra): a URL to also POST alerts to. **this is a secret** - the URL is the password for that
   channel, so dont paste it anywhere public. the app never prints it (menus and `--probe` show the host at most)
 
-`MH_Ticker --probe` does one pass over the prices and the last hour of bars, prints it and exits - handy for
+`MH_Ticker --probe` does one pass over the prices and the day's bars, prints it and exits - handy for
 checking a new symbol actually works before u add it
 
 ## Building it Yourself
