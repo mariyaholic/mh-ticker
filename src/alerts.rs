@@ -42,7 +42,7 @@ pub fn check(cfg: &mut Config, board: &Board, now: f64) -> Vec<Fired> {
     let mut out = Vec::new();
     for cell in &board.cells {
         let Some(q) = cell.quote.as_ref() else { continue };
-        if cell.stale {
+        if cell.stale || crate::model::is_stale(q, now, cfg.stale_after_s, cfg.delayed_grace_s) {
             continue;
         }
         for a in cfg.alerts.iter_mut().filter(|a| a.label == cell.label) {
@@ -136,7 +136,7 @@ mod tests {
 
     #[test]
     fn fires_once_across_the_level_then_respects_the_cooldown() {
-        let mut cfg = Config { alerts: vec![alert(Some(4100.0), None)], ..Config::default() };
+        let mut cfg = Config { alerts: vec![alert(Some(4100.0), None)], stale_after_s: 1_000_000.0, ..Config::default() };
         assert_eq!(check(&mut cfg, &board(4200.0, false), 10_000.0).len(), 1);
         // still above, but inside the cooldown
         assert!(check(&mut cfg, &board(4200.0, false), 10_100.0).is_empty());
@@ -149,14 +149,22 @@ mod tests {
 
     #[test]
     fn a_stale_quote_never_fires() {
-        let mut cfg = Config { alerts: vec![alert(Some(4100.0), None)], ..Config::default() };
+        let mut cfg = Config { alerts: vec![alert(Some(4100.0), None)], stale_after_s: 1_000_000.0, ..Config::default() };
         assert!(check(&mut cfg, &board(4200.0, true), 10_000.0).is_empty());
         assert_eq!(cfg.alerts[0].last, 0.0, "a stale quote must not burn the cooldown");
     }
 
     #[test]
+    fn quote_that_aged_stale_since_publication_never_fires() {
+        let mut cfg = Config { alerts: vec![alert(Some(4100.0), None)], stale_after_s: 90.0, ..Config::default() };
+        let b = board(4200.0, false); // timestamp 100; the snapshot was fresh when published
+        assert!(check(&mut cfg, &b, 10_000.0).is_empty());
+        assert_eq!(cfg.alerts[0].last, 0.0);
+    }
+
+    #[test]
     fn below_alerts_and_a_minimum_cooldown() {
-        let mut cfg = Config { alerts: vec![alert(None, Some(4000.0))], ..Config::default() };
+        let mut cfg = Config { alerts: vec![alert(None, Some(4000.0))], stale_after_s: 1_000_000.0, ..Config::default() };
         assert_eq!(check(&mut cfg, &board(3900.0, false), 10_000.0).len(), 1);
         // the cooldown was configured as 900, but the floor keeps a 10 s repeat out
         assert!(check(&mut cfg, &board(3900.0, false), 10_010.0).is_empty());

@@ -7,7 +7,7 @@
 //! strip keeps catalog order. Any other CNBC symbol can be added to `catalog` (or `rows`) by hand.
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 /// The strip, dock grid and panel stay readable up to this many symbols.
@@ -303,34 +303,48 @@ pub fn path() -> PathBuf {
     p.folder().join(p.config_file)
 }
 
-pub fn load() -> Config {
-    let p = path();
-    match std::fs::read_to_string(&p) {
+fn parse_settings(text: &str) -> Result<Config, serde_json::Error> {
+    serde_json::from_str(text)
+}
+
+pub fn load() -> Result<Config, String> {
+    load_from(&path())
+}
+
+fn load_from(p: &Path) -> Result<Config, String> {
+    match std::fs::read_to_string(p) {
         Ok(text) => {
-            let cfg: Config = serde_json::from_str(&text).unwrap_or_default();
-            // A config from before the Symbols menu has no catalog: write the default one in.
+            // Never replace an unreadable configuration with defaults: it may contain the user's
+            // symbols, alert thresholds and webhook. Stop before any save can overwrite it.
+            let cfg = parse_settings(&text).map_err(|e| {
+                format!("Invalid settings at {} (line {}, column {})", p.display(), e.line(), e.column())
+            })?;
             if !text.contains("\"catalog\"") {
-                save(&cfg);
+                save_to(p, &cfg);
             }
-            cfg
+            Ok(cfg)
         }
-        Err(_) => {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let cfg = Config::default();
-            save(&cfg);
-            cfg
+            save_to(p, &cfg);
+            Ok(cfg)
         }
+        Err(e) => Err(format!("Could not read settings at {}: {e}", p.display())),
     }
 }
 
 pub fn save(cfg: &Config) {
-    let p = path();
+    save_to(&path(), cfg);
+}
+
+fn save_to(p: &Path, cfg: &Config) {
     if let Some(dir) = p.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
     if let Ok(text) = serde_json::to_string_pretty(cfg) {
         let tmp = p.with_extension("json.tmp");
         if std::fs::write(&tmp, text).is_ok() {
-            let _ = std::fs::rename(&tmp, &p);
+            let _ = std::fs::rename(&tmp, p);
         }
     }
 }
@@ -341,6 +355,24 @@ mod tests {
 
     fn symbols(rows: &[Row]) -> Vec<&str> {
         rows.iter().map(|r| r.symbol.as_str()).collect()
+    }
+
+    #[test]
+    fn malformed_settings_are_not_accepted_as_defaults() {
+        assert!(parse_settings("{invalid json").is_err());
+        assert!(parse_settings(r#"{"placement":"not-a-placement"}"#).is_err());
+        assert!(parse_settings("{}").is_ok());
+    }
+
+    #[test]
+    fn invalid_config_file_is_not_replaced_or_migrated() {
+        let root = std::env::var_os("TICKER_TEST_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+        let path = root.join(format!("mh-ticker-invalid-{}.json", std::process::id()));
+        let text = r#"{"placement":"bad-value","rows":[]}"#;
+        std::fs::write(&path, text).unwrap();
+        assert!(load_from(&path).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

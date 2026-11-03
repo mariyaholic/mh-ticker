@@ -235,7 +235,7 @@ struct Feed {
     rows: Vec<Row>,
     rows_gen: u64,
     shared: Arc<Mutex<Board>>,
-    notify: Box<dyn Fn() + Send>,
+    notify: Arc<dyn Fn() + Send + Sync>,
     client: Client,
     quotes: HashMap<String, Quote>,
     /// (t0, bars) per row: the candles, and the hour of closes the sparklines are seeded from.
@@ -243,6 +243,7 @@ struct Feed {
     backfill: Vec<Vec<(f64, f64)>>,
     backfill_gen: u64,
     bars_next: Instant,
+    bars_due: Vec<Instant>,
     fails: u32,
 }
 
@@ -250,8 +251,8 @@ struct Feed {
 ///
 /// A day of bars is a quarter of a megabyte over SChannel: on a slow link a pass is a few wins and
 /// a few losses, and replacing the set wholesale would make the chart flap between drawn and empty.
-/// The rows are stable between passes — a change clears `chart` in `sync_rows` — so an empty result
-/// for row `i` means the fetch failed, not that the symbol has no bars.
+/// Rows are stable between passes; `sync_rows` remaps the cache by identity when they change.
+/// An empty result for row `i` is treated as a failed fetch, retaining its prior bars if present.
 fn merge_bars(prev: &[(f64, Vec<Bar>)], got: Vec<(f64, Vec<Bar>)>) -> Vec<(f64, Vec<Bar>)> {
     let mut got = got;
     if got.len() == prev.len() {
@@ -273,11 +274,35 @@ impl Feed {
     fn sync_rows(&mut self) {
         if let Ok(b) = self.shared.lock() {
             if b.rows_gen != self.rows_gen {
+                let now = Instant::now();
+                let due: Vec<Instant> = b.rows.iter().enumerate().map(|(new_i, r)| {
+                    let Some(old_i) = self.rows.iter().position(|old| old.label == r.label && old.symbol == r.symbol) else { return now; };
+                    // A row can be removed and re-added between syncs, or a successful fetch can
+                    // be rejected between its generation check and publish. In either case the
+                    // private cache differs from the board, so the success deadline is not valid.
+                    let private = self.chart.get(old_i);
+                    let published = b.bars.get(new_i).map(|v| v.as_ref()).unwrap_or(&[]);
+                    if let Some((t0, bars)) = private {
+                        if !bars.is_empty() && (bars.as_slice() != published || b.bars_t0.get(new_i).copied() != Some(*t0)) {
+                            return now;
+                        }
+                    }
+                    self.bars_due.get(old_i).copied().unwrap_or(now)
+                }).collect();
                 self.rows = b.rows.clone();
                 self.rows_gen = b.rows_gen;
-                self.chart.clear();
-                self.backfill.clear();
-                self.bars_next = Instant::now();
+                // Board::set_rows has already remapped these vectors by identity. Reuse that
+                // cache so a failed fetch after the change cannot wipe a surviving symbol's bars.
+                self.chart = self.rows.iter().enumerate().map(|(i, _)| {
+                    (b.bars_t0.get(i).copied().unwrap_or_default(),
+                     b.bars.get(i).map(|v| v.to_vec()).unwrap_or_default())
+                }).collect();
+                self.backfill = b.backfill.clone();
+                // A rejected in-flight fetch may have advanced our private counter. Adopt the
+                // published generation before sending quotes, or stale cache state wipes retained rows.
+                self.backfill_gen = b.backfill_gen;
+                self.bars_next = due.iter().copied().min().unwrap_or(now + BARS_REFRESH);
+                self.bars_due = due;
             }
         }
     }
@@ -292,6 +317,13 @@ impl Feed {
             b.cells = resolve(&self.rows, &self.quotes, now_s(), self.cfg.stale_after_s, self.cfg.delayed_grace_s);
             b.link = link;
             b.note = note;
+        }
+        (self.notify)();
+    }
+
+    fn publish_bars(&self) {
+        if let Ok(mut b) = self.shared.lock() {
+            if b.rows_gen != self.rows_gen { return; }
             if b.backfill_gen != self.backfill_gen {
                 b.backfill = self.backfill.clone();
                 b.backfill_gen = self.backfill_gen;
@@ -323,10 +355,40 @@ impl Feed {
 
     /// Fetch the hour of 1-minute bars when due; true when a fresh set arrived.
     fn maybe_bars(&mut self) -> bool {
+        let client = Client { agent: self.client.agent.clone() };
+        self.maybe_bars_with(|symbol| client.chart(symbol).unwrap_or_default())
+    }
+
+    fn maybe_bars_with(&mut self, mut fetch: impl FnMut(&str) -> (f64, Vec<Bar>)) -> bool {
         if Instant::now() < self.bars_next {
             return false;
         }
-        let got: Vec<(f64, Vec<Bar>)> = self.rows.iter().map(|r| self.client.chart(&r.symbol).unwrap_or_default()).collect();
+        if self.bars_due.len() != self.rows.len() {
+            self.bars_due = vec![Instant::now(); self.rows.len()];
+        }
+        let Some((i, _)) = self.bars_due.iter().enumerate().min_by_key(|(_, due)| *due) else {
+            self.bars_next = Instant::now() + BARS_REFRESH;
+            return false;
+        };
+        let result = fetch(&self.rows[i].symbol);
+        // A row change invalidates even a successful response from the previous generation.
+        if self.shared.lock().map(|b| b.rows_gen != self.rows_gen).unwrap_or(true) {
+            return false;
+        }
+        let fresh = !result.1.is_empty();
+        self.bars_due[i] = Instant::now() + if fresh { BARS_REFRESH } else { BARS_RETRY };
+        let changed = if fresh {
+            let mut got = self.chart.clone();
+            got.resize_with(self.rows.len(), Default::default);
+            got[i] = result;
+            self.accept_bars(got)
+        } else { false };
+        self.bars_next = self.bars_due.iter().copied().min().unwrap_or_else(|| Instant::now() + BARS_REFRESH);
+        changed
+    }
+
+    fn accept_bars(&mut self, got: Vec<(f64, Vec<Bar>)>) -> bool {
+        let retry = got.iter().any(|(_, bars)| bars.is_empty());
         let got = merge_bars(&self.chart, got);
         if got.iter().any(|(_, bars)| !bars.is_empty()) {
             // The sparkline is the last hour of the same bars, so the two never disagree.
@@ -342,7 +404,7 @@ impl Feed {
                 .collect();
             self.chart = got;
             self.backfill_gen += 1;
-            self.bars_next = Instant::now() + BARS_REFRESH;
+            self.bars_next = Instant::now() + if retry { BARS_RETRY } else { BARS_REFRESH };
             true
         } else {
             self.bars_next = Instant::now() + BARS_RETRY;
@@ -374,10 +436,6 @@ impl Feed {
                 }
             };
             self.publish(link, note.clone());
-            // Bars after the quotes, so a symbol just ticked in the menu shows its price at once.
-            if self.maybe_bars() {
-                self.publish(link, note);
-            }
             let cadence = self.cadence();
             let wait = if self.fails == 0 {
                 cadence
@@ -389,7 +447,7 @@ impl Feed {
     }
 }
 
-pub fn spawn(cfg: Config, shared: Arc<Mutex<Board>>, notify: Box<dyn Fn() + Send>) {
+pub fn spawn(cfg: Config, shared: Arc<Mutex<Board>>, notify: Box<dyn Fn() + Send + Sync>) {
     let client = match Client::new() {
         Ok(c) => c,
         Err(e) => {
@@ -402,6 +460,19 @@ pub fn spawn(cfg: Config, shared: Arc<Mutex<Board>>, notify: Box<dyn Fn() + Send
         }
     };
     let (rows, rows_gen) = shared.lock().map(|b| (b.rows.clone(), b.rows_gen)).unwrap_or_else(|_| (cfg.rows.clone(), 0));
+    let notify: Arc<dyn Fn() + Send + Sync> = Arc::from(notify);
+    let chart_client = Client { agent: client.agent.clone() };
+    let mut chart_feed = Feed {
+        cfg: cfg.clone(), rows: rows.clone(), rows_gen, shared: shared.clone(),
+        notify: notify.clone(), client: chart_client, quotes: HashMap::new(), chart: Vec::new(),
+        backfill: Vec::new(), backfill_gen: 0, bars_next: Instant::now(), bars_due: Vec::new(), fails: 0,
+    };
+    thread::Builder::new().name("chart".into()).spawn(move || loop {
+        chart_feed.sync_rows();
+        if chart_feed.maybe_bars() { chart_feed.publish_bars(); }
+        let wait = chart_feed.bars_next.saturating_duration_since(Instant::now());
+        chart_feed.wait(wait);
+    }).expect("spawn chart thread");
     let feed = Feed {
         cfg,
         rows,
@@ -414,6 +485,7 @@ pub fn spawn(cfg: Config, shared: Arc<Mutex<Board>>, notify: Box<dyn Fn() + Send
         backfill: Vec::new(),
         backfill_gen: 0,
         bars_next: Instant::now(),
+        bars_due: Vec::new(),
         fails: 0,
     };
     thread::Builder::new().name("feed".into()).spawn(move || feed.run()).expect("spawn feed thread");
@@ -543,6 +615,227 @@ mod tests {
         assert_eq!(bars[2].dt, 90_660.0, "offsets, not absolute times");
         // A flat bar survives as a degenerate candle rather than vanishing.
         assert_eq!((bars[2].o, bars[2].h, bars[2].l, bars[2].c), (7_584.0, 7_584.0, 7_584.0, 7_584.0));
+    }
+
+    #[test]
+    fn obsolete_chart_fetch_does_not_erase_remapped_board_bars() {
+        let cfg = Config::default();
+        let rows = cfg.rows[..2].to_vec();
+        let mut board = Board::new(&rows);
+        let bar = |c| Bar { dt: 0.0, o: c, h: c, l: c, c };
+        board.bars = vec![vec![bar(1.0)].into(), vec![bar(2.0)].into()];
+        board.bars_t0 = vec![100.0, 200.0];
+        board.backfill = vec![vec![(100.0, 1.0)], vec![(200.0, 2.0)]];
+        board.backfill_gen = 1;
+        let shared = Arc::new(Mutex::new(board));
+        let mut feed = Feed {
+            cfg, rows: rows.clone(), rows_gen: 0, shared: shared.clone(), notify: Arc::new(|| {}),
+            client: Client::new().unwrap(), quotes: HashMap::new(), chart: Vec::new(),
+            backfill: Vec::new(), backfill_gen: 1, bars_next: Instant::now(), bars_due: Vec::new(), fails: 0,
+        };
+        // A row change races a fetch. Its publication is rejected as stale.
+        shared.lock().unwrap().set_rows(&rows[1..]);
+        feed.accept_bars(vec![(100.0, vec![bar(3.0)]), (200.0, vec![bar(4.0)])]);
+        feed.publish_bars();
+        feed.sync_rows();
+        feed.publish_bars();
+        let board = shared.lock().unwrap();
+        assert_eq!(board.bars[0][0].c, 2.0, "obsolete result must not clear retained candles");
+        assert_eq!(board.bars_t0[0], 200.0);
+        assert_eq!(board.backfill[0][0].1, 2.0);
+    }
+
+    #[test]
+    fn row_change_then_partial_failure_keeps_remapped_cached_bars() {
+        let cfg = Config::default();
+        let rows = cfg.rows[..2].to_vec();
+        let mut board = Board::new(&rows);
+        let bar = |c| Bar { dt: 0.0, o: c, h: c, l: c, c };
+        board.bars = vec![vec![bar(1.0)].into(), vec![bar(2.0)].into()];
+        board.bars_t0 = vec![100.0, 200.0];
+        board.backfill_gen = 1;
+        let shared = Arc::new(Mutex::new(board));
+        let mut feed = Feed {
+            cfg, rows: rows.clone(), rows_gen: 0, shared: shared.clone(), notify: Arc::new(|| {}),
+            client: Client::new().unwrap(), quotes: HashMap::new(), chart: Vec::new(),
+            backfill: Vec::new(), backfill_gen: 1, bars_next: Instant::now(), bars_due: Vec::new(), fails: 0,
+        };
+        shared.lock().unwrap().set_rows(&[rows[1].clone(), rows[0].clone()]);
+        feed.sync_rows();
+        feed.accept_bars(vec![(0.0, vec![]), (300.0, vec![bar(3.0)])]);
+        feed.publish_bars();
+        let board = shared.lock().unwrap();
+        assert_eq!(board.bars[0][0].c, 2.0, "failed symbol retains its own remapped cache");
+        assert_eq!(board.bars[1][0].c, 3.0);
+    }
+
+    #[test]
+    fn failed_first_fetch_after_row_change_still_retries_promptly() {
+        let cfg = Config::default();
+        let rows = cfg.rows[..2].to_vec();
+        let mut board = Board::new(&rows[..1]);
+        let bar = Bar { dt: 0.0, o: 1.0, h: 1.0, l: 1.0, c: 1.0 };
+        board.bars = vec![vec![bar].into()];
+        board.bars_t0 = vec![100.0];
+        board.backfill_gen = 1;
+        let shared = Arc::new(Mutex::new(board));
+        let mut feed = Feed {
+            cfg, rows: rows[..1].to_vec(), rows_gen: 0, shared: shared.clone(), notify: Arc::new(|| {}),
+            client: Client::new().unwrap(), quotes: HashMap::new(), chart: Vec::new(),
+            backfill: Vec::new(), backfill_gen: 1, bars_next: Instant::now(), bars_due: Vec::new(), fails: 0,
+        };
+        shared.lock().unwrap().set_rows(&rows);
+        feed.sync_rows();
+        let start = Instant::now();
+        feed.accept_bars(vec![(0.0, vec![]), (0.0, vec![])]);
+        assert!(feed.bars_next >= start + BARS_RETRY);
+        assert!(feed.bars_next <= Instant::now() + BARS_RETRY);
+        assert_eq!(feed.chart[0].1[0].c, 1.0);
+        assert!(feed.chart[1].1.is_empty());
+        let next = Instant::now();
+        feed.accept_bars(vec![(0.0, vec![]), (0.0, vec![])]);
+        assert!(feed.bars_next >= next + BARS_RETRY);
+        assert!(feed.bars_next <= Instant::now() + BARS_RETRY);
+        feed.accept_bars(vec![(0.0, vec![]), (300.0, vec![bar])]);
+        let next = Instant::now();
+        feed.accept_bars(vec![(0.0, vec![]), (0.0, vec![])]);
+        assert!(feed.bars_next >= next + BARS_RETRY);
+        assert!(feed.bars_next <= Instant::now() + BARS_RETRY);
+    }
+
+    #[test]
+    fn blocked_chart_does_not_block_quotes_or_apply_obsolete_rows() {
+        use std::sync::mpsc;
+        let cfg = Config::default();
+        let rows = cfg.rows[..2].to_vec();
+        let shared = Arc::new(Mutex::new(Board::new(&rows)));
+        let make_feed = || Feed {
+            cfg: cfg.clone(), rows: rows.clone(), rows_gen: 0, shared: shared.clone(),
+            notify: Arc::new(|| {}), client: Client::new().unwrap(), quotes: HashMap::new(),
+            chart: Vec::new(), backfill: Vec::new(), backfill_gen: 0,
+            bars_next: Instant::now(), bars_due: Vec::new(), fails: 0,
+        };
+        let mut chart_feed = make_feed();
+        let quote_feed = make_feed();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            chart_feed.maybe_bars_with(|_| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                (100.0, vec![Bar { dt: 0.0, o: 1.0, h: 1.0, l: 1.0, c: 1.0 }])
+            })
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        quote_feed.publish(Link::Live, String::new());
+        assert_eq!(shared.lock().unwrap().link, Link::Live);
+        shared.lock().unwrap().set_rows(&rows[1..]);
+        release_tx.send(()).unwrap();
+        assert!(!thread.join().unwrap(), "obsolete result must be discarded");
+        assert!(shared.lock().unwrap().bars[0].is_empty());
+    }
+
+    #[test]
+    fn remove_then_readd_before_sync_retries_the_lost_chart() {
+        let cfg = Config::default();
+        let rows = cfg.rows[..2].to_vec();
+        let mut board = Board::new(&rows);
+        let bar = Bar { dt: 0.0, o: 1.0, h: 1.0, l: 1.0, c: 1.0 };
+        board.bars = vec![vec![bar].into(), vec![bar].into()];
+        board.bars_t0 = vec![100.0, 100.0];
+        let shared = Arc::new(Mutex::new(board));
+        let now = Instant::now();
+        let mut feed = Feed { cfg, rows: rows.clone(), rows_gen: 0, shared: shared.clone(), notify: Arc::new(|| {}),
+            client: Client::new().unwrap(), quotes: HashMap::new(), chart: vec![(100.0, vec![bar]); 2],
+            backfill: Vec::new(), backfill_gen: 0, bars_next: now + BARS_REFRESH,
+            bars_due: vec![now + BARS_REFRESH; 2], fails: 0 };
+        shared.lock().unwrap().set_rows(&rows[1..]);
+        shared.lock().unwrap().set_rows(&rows);
+        feed.sync_rows();
+        assert!(feed.bars_due[0] <= Instant::now(), "re-added row lost its cached data");
+        assert_eq!(feed.bars_due[1], now + BARS_REFRESH);
+    }
+
+    #[test]
+    fn rejected_chart_publication_retries_after_resync() {
+        let cfg = Config::default();
+        let rows = cfg.rows[..2].to_vec();
+        let shared = Arc::new(Mutex::new(Board::new(&rows)));
+        let mut feed = Feed { cfg, rows: rows.clone(), rows_gen: 0, shared: shared.clone(), notify: Arc::new(|| {}),
+            client: Client::new().unwrap(), quotes: HashMap::new(), chart: Vec::new(),
+            backfill: Vec::new(), backfill_gen: 0, bars_next: Instant::now(), bars_due: Vec::new(), fails: 0 };
+        let bar = Bar { dt: 0.0, o: 1.0, h: 1.0, l: 1.0, c: 1.0 };
+        assert!(feed.maybe_bars_with(|_| (100.0, vec![bar])));
+        shared.lock().unwrap().set_rows(&[rows[1].clone(), rows[0].clone()]);
+        feed.publish_bars();
+        feed.sync_rows();
+        assert!(feed.bars_due[1] <= Instant::now(), "rejected success must not suppress a retry");
+    }
+
+    #[test]
+    fn row_changes_preserve_surviving_chart_deadlines() {
+        let cfg = Config::default();
+        let rows = cfg.rows[..3].to_vec();
+        let shared = Arc::new(Mutex::new(Board::new(&rows[..2])));
+        let now = Instant::now();
+        let mut feed = Feed {
+            cfg, rows: rows[..2].to_vec(), rows_gen: 0, shared: shared.clone(), notify: Arc::new(|| {}),
+            client: Client::new().unwrap(), quotes: HashMap::new(), chart: Vec::new(),
+            backfill: Vec::new(), backfill_gen: 0, bars_next: now + BARS_RETRY,
+            bars_due: vec![now + BARS_RETRY, now + BARS_REFRESH], fails: 0,
+        };
+        shared.lock().unwrap().set_rows(&[rows[1].clone(), rows[0].clone(), rows[2].clone()]);
+        feed.sync_rows();
+        assert_eq!(feed.bars_due[0], now + BARS_REFRESH);
+        assert_eq!(feed.bars_due[1], now + BARS_RETRY);
+        assert!(feed.bars_due[2] <= Instant::now());
+        let mut seen = String::new();
+        feed.maybe_bars_with(|s| { seen = s.to_string(); (0.0, Vec::new()) });
+        assert_eq!(seen, rows[2].symbol, "the newly added row goes before a backoff retry");
+    }
+
+    #[test]
+    fn chart_scheduler_retries_only_the_failed_row() {
+        let cfg = Config::default();
+        let rows = cfg.rows[..2].to_vec();
+        let shared = Arc::new(Mutex::new(Board::new(&rows)));
+        let mut feed = Feed {
+            cfg, rows: rows.clone(), rows_gen: 0, shared, notify: Arc::new(|| {}),
+            client: Client::new().unwrap(), quotes: HashMap::new(), chart: Vec::new(),
+            backfill: Vec::new(), backfill_gen: 0, bars_next: Instant::now(), bars_due: Vec::new(), fails: 0,
+        };
+        let bar = Bar { dt: 0.0, o: 1.0, h: 1.0, l: 1.0, c: 1.0 };
+        let mut seen = Vec::new();
+        assert!(feed.maybe_bars_with(|s| { seen.push(s.to_string()); (100.0, vec![bar]) }));
+        feed.publish_bars();
+        assert!(!feed.maybe_bars_with(|s| { seen.push(s.to_string()); (0.0, vec![]) }));
+        assert_eq!(seen, vec![rows[0].symbol.clone(), rows[1].symbol.clone()]);
+        assert!(feed.bars_due[1] < feed.bars_due[0]);
+        feed.bars_due[1] = Instant::now();
+        feed.bars_next = feed.bars_due[1];
+        assert!(feed.maybe_bars_with(|s| { seen.push(s.to_string()); (200.0, vec![bar]) }));
+        feed.publish_bars();
+        assert_eq!(seen[2], rows[1].symbol);
+        let board = feed.shared.lock().unwrap();
+        assert_eq!(board.bars_t0, vec![100.0, 200.0]);
+        assert_eq!(board.bars[0][0].c, 1.0);
+        assert_eq!(board.bars[1][0].c, 1.0);
+    }
+
+    #[test]
+    fn partial_failure_schedules_a_retry_despite_a_successful_row() {
+        let cfg = Config::default();
+        let rows = cfg.rows[..2].to_vec();
+        let shared = Arc::new(Mutex::new(Board::new(&rows)));
+        let mut feed = Feed {
+            cfg, rows, rows_gen: 0, shared, notify: Arc::new(|| {}),
+            client: Client::new().unwrap(), quotes: HashMap::new(), chart: Vec::new(),
+            backfill: Vec::new(), backfill_gen: 0, bars_next: Instant::now(), bars_due: Vec::new(), fails: 0,
+        };
+        let bar = Bar { dt: 0.0, o: 1.0, h: 1.0, l: 1.0, c: 1.0 };
+        let before = Instant::now();
+        feed.accept_bars(vec![(100.0, vec![bar]), (0.0, vec![])]);
+        assert!(feed.bars_next <= before + BARS_RETRY + Duration::from_secs(1), "the failed row must not wait ten minutes");
     }
 
     #[test]

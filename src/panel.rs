@@ -85,6 +85,7 @@ type Series = VecDeque<(f64, f64)>;
 /// removes others.
 pub struct History {
     labels: Vec<String>,
+    symbols: Vec<String>,
     rows: Vec<Series>,
     gen: u64,
     pub backfilled: bool,
@@ -113,21 +114,31 @@ impl Default for History {
 
 impl History {
     pub fn new() -> Self {
-        Self { labels: Vec::new(), rows: Vec::new(), gen: 0, backfilled: false }
+        Self { labels: Vec::new(), symbols: Vec::new(), rows: Vec::new(), gen: 0, backfilled: false }
     }
 
-    /// Re-key the series when the board's rows changed (by label; new rows start empty).
+    /// Re-key by label and symbol; a renamed/replaced instrument starts with no old prices.
     fn align(&mut self, board: &Board) {
-        if self.labels.len() == board.cells.len() && self.labels.iter().zip(&board.cells).all(|(l, c)| *l == c.label) {
+        let keys: Vec<_> = board.cells.iter().enumerate().map(|(i, c)| {
+            (c.label.clone(), board.rows.get(i).map(|r| r.symbol.clone()).unwrap_or_default())
+        }).collect();
+        if self.labels.len() == keys.len() && self.symbols.len() == keys.len()
+            && keys.iter().enumerate().all(|(i, (l, s))| self.labels[i] == *l && self.symbols[i] == *s) {
             return;
         }
-        let mut old: Vec<(String, Series)> = self.labels.drain(..).zip(self.rows.drain(..)).collect();
-        for c in &board.cells {
-            let row = match old.iter().position(|(l, _)| *l == c.label) {
-                Some(i) => old.swap_remove(i).1,
+        let labels = std::mem::take(&mut self.labels);
+        let symbols = std::mem::take(&mut self.symbols);
+        let series = std::mem::take(&mut self.rows);
+        let mut old: Vec<_> = labels.into_iter().zip(series).enumerate().map(|(i, (l, row))| {
+            (l, symbols.get(i).cloned().unwrap_or_default(), row)
+        }).collect();
+        for (label, symbol) in keys {
+            let row = match old.iter().position(|(l, s, _)| *l == label && *s == symbol) {
+                Some(i) => old.swap_remove(i).2,
                 None => VecDeque::new(),
             };
-            self.labels.push(c.label.clone());
+            self.labels.push(label);
+            self.symbols.push(symbol);
             self.rows.push(row);
         }
     }
@@ -190,6 +201,9 @@ pub struct Geo {
     pub w: i32,
     pub h: i32,
     pub header: i32,
+    footer: i32,
+    scroll: i32,
+    pub scroll_max: i32,
     pub btn: RECT,
     /// The symbol-picker toggle, beside the minimise button.
     pub pick_btn: RECT,
@@ -260,7 +274,16 @@ pub fn geometry_in(w: i32, n: usize, catalog: usize, dpi: u32, picker: bool, cha
         }
     }
     let h = cards_h + pick_h + s(36);
-    Geo { w, h, header, btn, pick_btn, chart_btn, chart: chart_rect, cols, pad, gap, card_w, card_h, pick_top: cards_h, chips }
+    Geo { w, h, header, footer: s(36), scroll: 0, scroll_max: 0, btn, pick_btn, chart_btn, chart: chart_rect, cols, pad, gap, card_w, card_h, pick_top: cards_h, chips }
+}
+
+/// Clip and scroll the panel body while keeping header and footer fixed.
+pub fn viewport(g: &mut Geo, height: i32, offset: i32) {
+    g.scroll_max = (g.h - height).max(0);
+    g.scroll = offset.clamp(0, g.scroll_max);
+    g.pick_top -= g.scroll;
+    for chip in &mut g.chips { chip.top -= g.scroll; chip.bottom -= g.scroll; }
+    g.h = height;
 }
 
 /// The smallest frame this content can be drawn in: the cards' natural grid, plus a chart pane when
@@ -285,7 +308,7 @@ pub fn in_rect(r: &RECT, x: i32, y: i32) -> bool {
 pub fn card_rect(g: &Geo, i: usize) -> RECT {
     let (col, row) = ((i % g.cols) as i32, (i / g.cols) as i32);
     let x = g.pad + col * (g.card_w + g.gap);
-    let y = g.header + row * (g.card_h + g.gap);
+    let y = g.header + row * (g.card_h + g.gap) - g.scroll;
     RECT { left: x, top: y, right: x + g.card_w, bottom: y + g.card_h }
 }
 
@@ -298,6 +321,7 @@ fn spark_rect(card: RECT, dpi: u32) -> RECT {
 
 /// The card (and time) under a pointer, if it is over a sparkline.
 pub fn hit(g: &Geo, n: usize, dpi: u32, x: i32, y: i32, now: f64) -> Option<Hover> {
+    if y < g.header || y >= g.h - g.footer { return None; }
     (0..n).find_map(|i| {
         let r = spark_rect(card_rect(g, i), dpi);
         if !in_rect(&r, x, y) {
@@ -311,12 +335,14 @@ pub fn hit(g: &Geo, n: usize, dpi: u32, x: i32, y: i32, now: f64) -> Option<Hove
 
 /// Which catalogue entry a pointer is over, when the picker is open.
 pub fn pick_hit(g: &Geo, x: i32, y: i32) -> Option<usize> {
+    if y < g.header || y >= g.h - g.footer { return None; }
     g.chips.iter().position(|r| in_rect(r, x, y))
 }
 
 /// Which card a pointer is over. The card is the click target (it opens the symbol on CNBC), and
 /// the chips sit below the cards, so the two never overlap.
 pub fn card_at(g: &Geo, n: usize, x: i32, y: i32) -> Option<usize> {
+    if y < g.header || y >= g.h - g.footer { return None; }
     (0..n).find(|i| in_rect(&card_rect(g, *i), x, y))
 }
 
@@ -462,6 +488,7 @@ pub struct Scene<'a> {
     /// `Some` when the picker is open. `None` also hides the toggle: the classic build has no
     /// picker, so it must not draw a dead button.
     pub picker: Option<Picker<'a>>,
+    pub picker_scroll: i32,
     /// This build supports a picker at all.
     pub picker_btn: bool,
     /// The candle pane's data, when it is open. The bars are the row's whole day; the pane picks
@@ -741,7 +768,8 @@ pub fn draw(dc: HDC, w: i32, h: i32, sc: &Scene) {
     let radius = |v: i32| if t.is_pixel() { 0 } else { s(v) };
     // Columns come from the width we were asked to draw in, so the frame and its content agree:
     // the window is the composition, and a dragged edge reflows the grid instead of leaving a gutter.
-    let g = geometry_in(w, sc.board.cells.len(), sc.picker.as_ref().map(|p| p.list.len()).unwrap_or(0), sc.dpi, sc.picker.is_some(), sc.chart.is_some());
+    let mut g = geometry_in(w, sc.board.cells.len(), sc.picker.as_ref().map(|p| p.list.len()).unwrap_or(0), sc.dpi, sc.picker.is_some(), sc.chart.is_some());
+    viewport(&mut g, h, sc.picker_scroll);
     unsafe {
         SetBkMode(dc, TRANSPARENT as _);
     }
@@ -788,11 +816,18 @@ pub fn draw(dc: HDC, w: i32, h: i32, sc: &Scene) {
     let (bar, thick) = (s(12), s(2).max(2));
     fill_rect(dc, RECT { left: cx - bar / 2, top: cy - thick / 2, right: cx + bar / 2, bottom: cy - thick / 2 + thick }, if sc.btn_hover { t.price } else { t.label });
 
+    let clip = if sc.picker.is_some() || g.scroll_max > 0 {
+        unsafe { let saved = SaveDC(dc); IntersectClipRect(dc, 0, g.header, w, (h - g.footer).max(g.header)); saved }
+    } else { 0 };
     for (i, c) in sc.board.cells.iter().enumerate() {
         card(dc, sc, card_rect(&g, i), i, c);
     }
     if let Some(p) = &sc.picker {
         picker(dc, sc, &g, p);
+    }
+    if clip != 0 { unsafe { RestoreDC(dc, clip); } }
+    if g.scroll_max > 0 {
+        text_right(dc, sc.fonts.small, w - g.pad, h - s(27), "Wheel / PgUp / PgDn: scroll", t.label);
     }
     if let (Some(c), Some(mut r)) = (&sc.chart, g.chart) {
         // The pane grows with the frame: its bottom is the footer, not the last card row.
@@ -812,7 +847,7 @@ pub fn draw(dc: HDC, w: i32, h: i32, sc: &Scene) {
     };
     let left: String = left.chars().take(70).collect();
     text(dc, sc.fonts.small, g.pad + s(2), fy, &left, t.dim);
-    text_right(dc, sc.fonts.small, w - g.pad - s(2), fy, "click a card: CNBC \u{b7} Esc: dock", t.dim);
+    if g.scroll_max == 0 { text_right(dc, sc.fonts.small, w - g.pad - s(2), fy, "click a card: CNBC \u{b7} Esc: dock", t.dim); }
 }
 
 /// The candle pane.
@@ -1188,6 +1223,30 @@ mod tests {
     }
 
     #[test]
+    fn picker_hit_does_not_activate_a_chip_below_the_visible_frame() {
+        let mut g = geometry(6, 24, 96, true);
+        let chip = g.chips[0];
+        g.h = chip.top + 4;
+        assert_eq!(pick_hit(&g, chip.left + 2, chip.top + 5), None);
+    }
+
+    #[test]
+    fn scrolling_reaches_the_last_chip_without_changing_its_identity() {
+        for dpi in [96, 144, 192] {
+            let mut g = geometry(6, 24, dpi, true);
+            let height = 394 * dpi as i32 / 96;
+            viewport(&mut g, height, i32::MAX);
+            assert!(g.scroll_max > 0);
+            let last = g.chips[23];
+            let x = (last.left + last.right) / 2;
+            let y = (last.top + last.bottom) / 2;
+            assert!(y >= g.header && y < height - g.footer);
+            assert_eq!(pick_hit(&g, x, y), Some(23));
+            assert_eq!(pick_hit(&g, x, height - 1), None);
+        }
+    }
+
+    #[test]
     fn hit_testing_lands_on_the_card_and_chip_under_the_pointer() {
         let g = geometry(6, 8, 96, true);
         let spark = spark_rect(card_rect(&g, 4), 96);
@@ -1202,6 +1261,20 @@ mod tests {
         let chip = g.chips[3];
         assert_eq!(pick_hit(&g, (chip.left + chip.right) / 2, (chip.top + chip.bottom) / 2), Some(3));
         assert_eq!(pick_hit(&g, 40, 12), None);
+    }
+
+    #[test]
+    fn history_resets_when_symbol_changes_under_same_label() {
+        let old = crate::config::Row { label: "X".into(), symbol: "OLD".into(), digits: 2, name: String::new() };
+        let new = crate::config::Row { symbol: "NEW".into(), ..old.clone() };
+        let mut board = Board::new(&[old]);
+        board.cells[0].quote = Some(crate::model::Quote { symbol: "OLD".into(), price: 42.0, ..Default::default() });
+        board.cells[0].stale = false;
+        let mut history = History::new();
+        history.record(&board, 100.0);
+        board.set_rows(&[new]);
+        history.record(&board, 101.0);
+        assert!(history.row(0).unwrap().is_empty(), "old symbol's line must not survive");
     }
 
     #[test]
