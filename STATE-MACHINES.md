@@ -2,6 +2,14 @@
 
 Scope: both Classic and Ultra, at the `fix/state-transitions` branch based on main after PR #7. This is a source-level inventory and targeted regression audit, not a proof that every interleaving is safe. Win32 behavior still needs native Windows and multi-monitor testing.
 
+## Optional fallback policy
+
+Fallback is off by default in both profiles. Each enable requires confirmation; successful persistence precedes enabling. Disabling clears fallback quotes immediately even if saving fails (the UI reports that restart may restore the saved policy). A policy generation and row generation are captured before I/O and checked under the board lock at publication. Already-authorized operations may connect or finish after disabling, but cannot publish; this is standard cancellation, not a network kill switch. This contract was explicitly selected for the PR instead of maintaining a custom TCP transport.
+
+Three bounded, long-lived workers independently handle Gold API XAU/XAG and Kraken BTC. CNBC remains primary; unsupported instruments are never substituted. Rate-limit deadlines survive toggles. A separate expiry worker removes fallback values after 90 seconds from receipt even while HTTP workers block. Receipt time does not prove market freshness: fallback has unknown market age, no alert reference, and no CNBC chart/history overlay. Provider changes force tray refresh. Redirects are disabled and decoded alternate response bodies are capped at 32 KiB.
+
+Regression coverage includes 10,000 toggle cycles, blocked response release after off/on, already-authorized completion after disable, independent provider progress and CNBC recovery, receipt expiry, source identity, alert-reference rejection, oversized responses, redirects and persistence failure. These component tests are not 10,000 native GUI clicks. Live Wine checks used an isolated one-second stale threshold to exercise real provider fallback; native Windows acceptance remains outstanding.
+
 ## Machines and ownership
 
 - **Startup and profile** (`lib.rs`, `config.rs`, `ui.rs`): profile selection → settings load/migration → single-instance check → window, tray and workers → shutdown. Each profile has its own settings and mutex. Settings load errors must not become successful defaults that are later saved over the original. Existing `config` tests cover deserialization defaults for old settings, not migration writes; this audit adds malformed/invalid settings tests.

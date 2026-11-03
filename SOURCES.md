@@ -107,11 +107,18 @@ working). Keep CNBC as primary and treat Yahoo as an optional, failure-tolerant 
 | Kraken | `api.kraken.com/0/public/Ticker?pair=XBTUSD` | ≤ 720 OHLC entries, cannot go deep |
 | CoinGecko | `api.coingecko.com/api/v3/simple/price?ids=bitcoin` | free tier shared by IP, not for scheduled use |
 
-CNBC's `BTC.CB=` is already Coinbase, so this is mostly a **failover** path rather than a feature.
+CNBC's `BTC.CB=` is Coinbase; the opt-in Kraken fallback is a **different exchange**, not the same
+price. The app labels it Kraken and does not claim a market observation time. Kraken's
+[API notices](https://docs.kraken.com/api/docs/guides/global-intro) require prior permission for
+non-personal commercial use of public API data; enabling the toggle does not grant that permission.
 
 ### FX and metals — the honest gap
 
-There is no dependable **keyless, licensed, intraday** source for spot metals or broad FX.
+[Gold API](https://gold-api.com/faqs) (not the separate keyed GoldAPI.net) offers keyless USD spot
+XAU and XAG per troy ounce, and states commercial use is permitted. Its `updatedAt` is when it fetched
+its upstream, not a verified market-observation time; fallback quotes therefore show unknown age and
+never trigger alerts. The app checks the provider fetch time and rejects old responses. CNBC remains
+primary; the fallback is opt-in. Broad FX still has no verified equivalent fallback here.
 
 - **Frankfurter** (`api.frankfurter.dev/v2/rate/eur/usd`) is excellent and free, but it is a *daily
   reference* rate (ECB, ~16:00 CET) and carries no metals. Fine for a "rate" display, useless for an
@@ -147,8 +154,8 @@ app 6× its traffic for months.
 
 ## What I could not verify
 
-- Kraken's and Stooq's own docs pages did not extract in this pass; their limits are from secondary
-  reporting and should be re-checked before use.
+- Stooq's own documentation did not extract in the original research pass; its limits are from
+  secondary reporting and should be re-checked before use.
 - No source's response `Content-Encoding` was confirmed from inside this app — the byte figures in
   `FEATURES.md` come from `curl`, not from instrumented requests.
 - Webhook delivery was exercised against `payload()` and `redact()` in unit tests only, never against

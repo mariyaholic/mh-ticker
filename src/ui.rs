@@ -73,6 +73,7 @@ const CMD_FOLDER: usize = 1004;
 const CMD_EXIT: usize = 1005;
 const CMD_PANEL: usize = 1007;
 const CMD_RESET: usize = 1008;
+const CMD_FALLBACK: usize = 1009;
 /// Symbols submenu: CMD_SYM + index into `config::menu_list`.
 const CMD_SYM: usize = 2000;
 /// Position submenu: CMD_POS + index into `Placement::ALL`, CMD_MON + index into `dock::monitors()`.
@@ -392,7 +393,10 @@ fn make_icon(color: COLORREF) -> HICON {
 
 /// (label, price, price colour, change + colour) for one row of the board.
 fn cell_texts(c: &Cell, t: &Theme) -> (String, String, COLORREF, Option<(String, COLORREF)>) {
-    let label = c.label.clone();
+    let label = match &c.quote {
+        Some(q) if !q.source.is_empty() => format!("{} ({} ?)", c.label, q.source),
+        _ => c.label.clone(),
+    };
     match &c.quote {
         Some(q) => {
             let change = q.change_pct.map(|p| {
@@ -579,11 +583,13 @@ fn draw_panel(u: &mut Ui, dc: HDC, w: i32, h: i32) {
         // is read — point at the thing you want to see, without a click that would open a browser.
         chart: u.chart.then(|| {
             let row = u.chart_row.min(u.view.cells.len().saturating_sub(1));
+            let fallback = u.view.cells.get(row).and_then(|c| c.quote.as_ref()).is_some_and(|q| !q.source.is_empty());
             panel::Chart {
+                unavailable: fallback,
                 label: u.view.cells.get(row).map(|c| c.label.as_str()).unwrap_or(""),
                 digits: u.view.cells.get(row).map(|c| c.digits).unwrap_or(2),
                 t0: u.view.bars_t0.get(row).copied().unwrap_or(0.0),
-                bars: u.view.bars.get(row).map(|b| &b[..]).unwrap_or(&[]),
+                bars: if fallback { &[] } else { u.view.bars.get(row).map(|b| &b[..]).unwrap_or(&[]) },
                 last: u.view.cells.get(row).and_then(|c| c.quote.as_ref()).map(|q| q.price),
             }
         }),
@@ -655,9 +661,8 @@ fn tooltip(view: &Board) -> String {
     for c in &view.cells {
         if let Some(q) = &c.quote {
             s.push_str(&format!("\n{} {}", c.label, fmt_price(q.price, c.digits)));
-            if c.stale {
-                s.push_str(" (stale)");
-            }
+            if !q.source.is_empty() { s.push_str(&format!(" ({}; age unknown)", q.source)); }
+            else if c.stale { s.push_str(" (stale)"); }
         }
     }
     s
@@ -799,6 +804,10 @@ fn relayout_and_place(hwnd: HWND) {
 fn on_feed(hwnd: HWND) {
     let Some((tray_update, fired, hook)) = with_ui(|u| {
         if let Ok(b) = u.board.lock() {
+            let sources = |board: &Board| board.cells.iter()
+                .map(|c| c.quote.as_ref().map(|q| q.source).unwrap_or(""))
+                .collect::<Vec<_>>();
+            if sources(&u.view) != sources(&b) { u.tip_at = None; }
             u.view = b.clone();
         }
         let now = crate::source::now_s();
@@ -1258,6 +1267,10 @@ fn menu(hwnd: HWND, at: Option<(i32, i32)>) {
             MF_BYCOMMAND,
         );
         add(m, MF_POPUP, poll as usize, &format!("Poll every {poll_s} s"));
+        let sources = CreatePopupMenu();
+        let fallback = with_ui(|u| u.cfg.fallback_enabled).unwrap_or(false);
+        add(sources, MF_STRING | if fallback { MF_CHECKED } else { 0 }, CMD_FALLBACK, "Allow fallback sources");
+        add(m, MF_POPUP, sources as usize, "Data sources");
         if ultra {
             // Theme: four tier submenus, because 25 entries in one popup is a wall. The tier is a
             // rendering rule (`theme::Kind`), so the menu cannot disagree with the painter.
@@ -1304,9 +1317,11 @@ fn menu(hwnd: HWND, at: Option<(i32, i32)>) {
                 }
                 any = true;
                 let sub = CreatePopupMenu();
+                let can_base_alert = with_ui(|u| u.view.cells.iter().find(|c| c.label == r.label)
+                    .and_then(|c| alerts::reference_price(c, &u.cfg, crate::source::now_s())).is_some()).unwrap_or(false);
                 for (k, (pct, up)) in ALERT_STEPS.iter().enumerate() {
                     let text = format!("{} {pct:.0} %", if *up { "above" } else { "below" });
-                    add(sub, MF_STRING, CMD_ALERT + i * 4 + k, &text);
+                    add(sub, MF_STRING | if can_base_alert { 0 } else { MF_GRAYED }, CMD_ALERT + i * 4 + k, &text);
                 }
                 if alerted.contains(&r.label) {
                     AppendMenuW(sub, MF_SEPARATOR, 0, null());
@@ -1363,6 +1378,44 @@ fn menu(hwnd: HWND, at: Option<(i32, i32)>) {
                 collapse(hwnd)
             } else {
                 expand(hwnd)
+            }
+        }
+        CMD_FALLBACK => {
+            let Some(mut next) = with_ui(|u| u.cfg.clone()) else { return; };
+            let enabling = !next.fallback_enabled;
+            if enabling {
+                let message = wide("If CNBC is unavailable or a quote is stale, MH Ticker may request prices from Gold API or Kraken. Prices and update times can differ; Bitcoin may come from a different exchange. Some symbols have no fallback.\n\nYour device connects directly to these providers. Check the source and freshness shown before relying on a quote. Disabling stops new requests from being scheduled and clears fallback prices. Already-authorized requests may still connect or finish; their results are discarded. Kraken requires permission for non-personal commercial use of its data.\n\nAllow fallback sources?");
+                let title = wide("Allow fallback sources?");
+                let yes = unsafe { MessageBoxW(hwnd, message.as_ptr(), title.as_ptr(), MB_YESNO | MB_DEFBUTTON2 | MB_ICONWARNING) } == IDYES;
+                if !yes { return; }
+            }
+            next.fallback_enabled = enabling;
+            // Refuse enable on persistence failure. Disable in memory first even when saving fails.
+            if !enabling {
+                with_ui(|u| {
+                    u.cfg.fallback_enabled = false;
+                    u.tip_at = None; // Force an immediate Explorer tooltip refresh.
+                    if let Ok(mut b) = u.board.lock() { b.set_fallback(false); }
+                });
+                on_feed(hwnd);
+            }
+            match config::save_checked(&next) {
+                Ok(()) => {
+                    if enabling {
+                        with_ui(|u| {
+                            u.cfg.fallback_enabled = true;
+                            if let Ok(mut b) = u.board.lock() { b.set_fallback(true); }
+                        });
+                        on_feed(hwnd);
+                    }
+                }
+                Err(_) => {
+                    let msg = if enabling { "Fallback was not enabled because settings could not be saved." }
+                        else { "Fallback is off for this session, but settings could not be saved. It may be enabled again after restart." };
+                    let text = wide(msg);
+                    let title = wide("Could not save settings");
+                    unsafe { MessageBoxW(hwnd, text.as_ptr(), title.as_ptr(), MB_OK | MB_ICONERROR); }
+                }
             }
         }
         CMD_STRIP => {
@@ -1453,7 +1506,7 @@ fn menu(hwnd: HWND, at: Option<(i32, i32)>) {
             let (i, step) = ((c - CMD_ALERT) / 4, (c - CMD_ALERT) % 4);
             let label = list.get(i).map(|r| r.label.clone());
             let price = with_ui(|u| {
-                u.view.cells.iter().find(|c| Some(&c.label) == label.as_ref()).and_then(|c| c.quote.as_ref().map(|q| q.price))
+                u.view.cells.iter().find(|c| Some(&c.label) == label.as_ref()).and_then(|c| alerts::reference_price(c, &u.cfg, crate::source::now_s()))
             })
             .flatten();
             if let (Some(label), Some(price)) = (label, price) {
@@ -2130,6 +2183,7 @@ pub fn run(cfg: Config, board: Arc<Mutex<Board>>) {
         // The UI owns the poll cadence: the feed reads it from the board each pass.
         if let Ok(mut b) = board.lock() {
             b.poll_s = cfg.poll_s;
+            b.set_fallback(cfg.fallback_enabled);
         }
         let view = board.lock().map(|b| b.clone()).unwrap_or_else(|_| Board::new(&cfg.rows));
         let theme = theme::pick(profile.ultra, &cfg.theme);

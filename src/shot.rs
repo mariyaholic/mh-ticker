@@ -36,6 +36,8 @@ fn quote(row: &Row, spec: QuoteSpec<'_>, now: f64) -> Quote {
     let (price, pct, prev, high, low, vol, yr, date, realtime) = spec;
     Quote {
         symbol: row.symbol.clone(),
+        source: "",
+        received_at: None,
         name: row.name.clone(),
         price,
         change_pct: Some(pct),
@@ -257,7 +259,7 @@ pub fn write_chart_at(
         picker: None,
         picker_scroll: 0,
         picker_btn: true,
-        chart: Some(Chart { label: &label, digits, t0, bars: &charted, last }),
+        chart: Some(Chart { label: &label, digits, t0, bars: &charted, last, unavailable: false }),
         chart_btn: true,
         alert: None,
         phase: 0.0,

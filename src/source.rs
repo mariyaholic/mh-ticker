@@ -98,6 +98,8 @@ pub fn parse_quotes(v: &Value) -> Vec<Quote> {
                 let price = r.get("last").and_then(number).filter(|p| *p > 0.0)?;
                 Some(Quote {
                     symbol,
+                    source: "",
+                    received_at: None,
                     name: r.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
                     price,
                     change_pct: r.get("change_pct").and_then(number),
@@ -117,6 +119,25 @@ pub fn parse_quotes(v: &Value) -> Vec<Quote> {
             .collect()
     })
     .unwrap_or_default()
+}
+
+fn parse_alternate(symbol: &str, value: &Value) -> Option<Quote> {
+    let (source, price) = match symbol {
+        "XAU=" | "XAG=" => {
+            let want = if symbol == "XAU=" { "XAU" } else { "XAG" };
+            if value.get("symbol")?.as_str()? != want || value.get("currency")?.as_str()? != "USD" { return None; }
+            let updated = value.get("updatedAt")?.as_str()?;
+            parse_time(&updated.replace('Z', "+0000"))?;
+            ("Gold API", number(value.get("price")?)?)
+        }
+        "BTC.CB=" => {
+            if !value.get("error")?.as_array()?.is_empty() { return None; }
+            ("Kraken", number(value.pointer("/result/XXBTZUSD/c/0")?)?)
+        }
+        _ => return None,
+    };
+    if !price.is_finite() || price <= 0.0 { return None; }
+    Some(Quote { symbol: symbol.into(), source, price, currency: "USD".into(), ..Quote::default() })
 }
 
 /// 1-day chart body -> (t0, bars): the whole day of 1-minute OHLC bars, each stamped at its end
@@ -190,6 +211,24 @@ impl Client {
         Ok(Self { agent })
     }
 
+    fn new_fallback() -> Result<Self, String> {
+        let tls = native_tls::TlsConnector::new().map_err(|e| e.to_string())?;
+        let agent = ureq::AgentBuilder::new().tls_connector(Arc::new(tls)).user_agent(UA)
+            .timeout(Duration::from_secs(10)).redirects(0).build();
+        Ok(Self { agent })
+    }
+
+    fn get_fallback(&self, url: &str) -> Result<Value, String> {
+        use std::io::Read;
+        const LIMIT: usize = 32 * 1024;
+        let resp = self.agent.get(url).call().map_err(|_| "fallback request failed".to_string())?;
+        if !(200..300).contains(&resp.status()) { return Err("fallback HTTP status".into()); }
+        let mut body = Vec::new();
+        resp.into_reader().take((LIMIT + 1) as u64).read_to_end(&mut body).map_err(|_| "fallback read failed".to_string())?;
+        if body.len() > LIMIT { return Err("fallback response too large".into()); }
+        serde_json::from_slice(&body).map_err(|_| "invalid fallback JSON".into())
+    }
+
     fn get(&self, url: &str) -> Result<Value, String> {
         self.get_within(url, None)
     }
@@ -226,6 +265,63 @@ impl Client {
     pub fn chart(&self, symbol: &str) -> Result<(f64, Vec<Bar>), String> {
         let url = format!("{CHART_URL}?symbol={}", encode(symbol));
         Ok(parse_chart(&self.get_within(&url, Some(BARS_TIMEOUT))?, now_s()))
+    }
+}
+
+/// One alternate request, with the policy and row generation checked before and after I/O.
+fn fallback_attempt(
+    shared: &Arc<Mutex<Board>>, row: &Row,
+    fetch: impl FnOnce(&str) -> Option<Quote>,
+) -> bool {
+    let (policy, rows_gen) = match shared.lock() {
+        Ok(b) if b.fallback_enabled && b.note != "starting" => {
+            let Some(i) = b.rows.iter().position(|r| r.label == row.label && r.symbol == row.symbol) else { return false; };
+            if b.link != Link::Down && !b.cells[i].stale { return false; }
+            (b.fallback_gen, b.rows_gen)
+        }
+        _ => return false,
+    };
+    let Some(mut quote) = fetch(&row.symbol) else { return false; };
+    quote.received_at = Some(now_s());
+    shared.lock().map(|mut b| b.publish_fallback(policy, rows_gen, row, quote)).unwrap_or(false)
+}
+
+fn alternate_url(symbol: &str) -> Option<&'static str> {
+    match symbol {
+        "XAU=" => Some("https://api.gold-api.com/price/XAU"),
+        "XAG=" => Some("https://api.gold-api.com/price/XAG"),
+        "BTC.CB=" => Some("https://api.kraken.com/0/public/Ticker?pair=XBTUSD"),
+        _ => None,
+    }
+}
+
+fn fetch_alternate(client: &Client, symbol: &str) -> Option<Quote> {
+    let payload = client.get_fallback(alternate_url(symbol)?).ok()?;
+    if symbol == "XAU=" || symbol == "XAG=" {
+        // This is the provider's fetch time, not a verified trade timestamp.
+        let updated = payload.get("updatedAt")?.as_str()?.replace('Z', "+0000");
+        let age = now_s() - parse_time(&updated)?;
+        if !(-5.0..=90.0).contains(&age) { return None; }
+    }
+    parse_alternate(symbol, &payload)
+}
+
+fn fallback_worker(client: Client, shared: Arc<Mutex<Board>>, notify: Arc<dyn Fn() + Send + Sync>, symbol: &'static str) {
+    // Deadlines survive toggling so rapid opt-in cycles do not evade provider limits.
+    let mut due: HashMap<String, Instant> = HashMap::new();
+    loop {
+        let rows = shared.lock().map(|b| if b.fallback_enabled { b.rows.clone() } else { Vec::new() }).unwrap_or_default();
+        for row in rows {
+            if row.symbol != symbol || due.get(&row.symbol).is_some_and(|t| *t > Instant::now()) { continue; }
+            let attempted = std::cell::Cell::new(false);
+            let ok = fallback_attempt(&shared, &row, |symbol| {
+                attempted.set(true);
+                fetch_alternate(&client, symbol)
+            });
+            if attempted.get() { due.insert(row.symbol.clone(), Instant::now() + Duration::from_secs(30)); }
+            if ok { notify(); }
+        }
+        thread::sleep(ROWS_CHECK);
     }
 }
 
@@ -314,7 +410,21 @@ impl Feed {
             if b.rows_gen != self.rows_gen {
                 return;
             }
-            b.cells = resolve(&self.rows, &self.quotes, now_s(), self.cfg.stale_after_s, self.cfg.delayed_grace_s);
+            let now = now_s();
+            let mut cells = resolve(&self.rows, &self.quotes, now, self.cfg.stale_after_s, self.cfg.delayed_grace_s);
+            if link == Link::Down { for cell in &mut cells { cell.stale = true; } }
+            // Keep a recent fallback until CNBC supplies a fresh response; never turn receipt
+            // time into market freshness, and expire fallback if its refresh stops succeeding.
+            if b.fallback_enabled {
+                for (next, old) in cells.iter_mut().zip(&b.cells) {
+                    if (link == Link::Down || next.stale) && old.quote.as_ref().is_some_and(|q| {
+                        !q.source.is_empty() && q.received_at.is_some_and(|t| (0.0..=90.0).contains(&(now - t)))
+                    }) {
+                        *next = old.clone();
+                    }
+                }
+            }
+            b.cells = cells;
             b.link = link;
             b.note = note;
         }
@@ -418,6 +528,11 @@ impl Feed {
             let (link, note) = match self.client.quotes(&self.rows) {
                 Ok(qs) => {
                     self.fails = 0;
+                    // A partial batch is a per-row failure, not confirmation of a cached quote.
+                    let returned: std::collections::HashSet<_> = qs.iter().map(|q| q.symbol.as_str()).collect();
+                    for row in &self.rows {
+                        if !returned.contains(row.symbol.as_str()) { self.quotes.remove(&row.symbol); }
+                    }
                     for q in qs {
                         self.quotes.insert(q.symbol.clone(), q);
                     }
@@ -461,6 +576,29 @@ pub fn spawn(cfg: Config, shared: Arc<Mutex<Board>>, notify: Box<dyn Fn() + Send
     };
     let (rows, rows_gen) = shared.lock().map(|b| (b.rows.clone(), b.rows_gen)).unwrap_or_else(|_| (cfg.rows.clone(), 0));
     let notify: Arc<dyn Fn() + Send + Sync> = Arc::from(notify);
+    // Expiry must progress even when every HTTP worker is blocked.
+    {
+        let board = shared.clone();
+        let notify_expiry = notify.clone();
+        thread::Builder::new().name("fallback-expiry".into()).spawn(move || loop {
+            let changed = board.lock().map(|mut b| b.expire_fallback(now_s())).unwrap_or(false);
+            if changed { notify_expiry(); }
+            thread::sleep(ROWS_CHECK);
+        }).expect("spawn fallback expiry thread");
+    }
+    // A slow provider or symbol cannot stall another fallback or the CNBC workers.
+    // These three long-lived workers are bounded; toggling never creates new threads.
+    for symbol in ["XAU=", "XAG=", "BTC.CB="] {
+        let fallback_client = match Client::new_fallback() {
+            Ok(client) => client,
+            Err(_) => continue, // CNBC still works if an alternate client cannot initialize.
+        };
+        let fallback_board = shared.clone();
+        let fallback_notify = notify.clone();
+        thread::Builder::new().name(format!("fallback-{symbol}")).spawn(move || {
+            fallback_worker(fallback_client, fallback_board, fallback_notify, symbol)
+        }).expect("spawn fallback thread");
+    }
     let chart_client = Client { agent: client.agent.clone() };
     let mut chart_feed = Feed {
         cfg: cfg.clone(), rows: rows.clone(), rows_gen, shared: shared.clone(),
@@ -545,6 +683,174 @@ mod tests {
         assert!((utc - 1_792_052_981.313).abs() < 1e-3, "{utc}");
         assert_eq!(parse_time("2026-10-15T08:29:41.313+0000"), Some(utc));
         assert_eq!(parse_time("2026-10-14"), None);
+    }
+
+    #[test]
+    fn fallback_rejects_redirects_and_oversized_responses() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let target = TcpListener::bind("127.0.0.1:0").unwrap();
+        target.set_nonblocking(true).unwrap();
+        let target_addr = target.local_addr().unwrap();
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = server.local_addr().unwrap();
+        let redirect = thread::spawn(move || {
+            let (mut stream, _) = server.accept().unwrap();
+            let mut request = [0; 2048]; let _ = stream.read(&mut request);
+            write!(stream, "HTTP/1.1 302 Found\r\nLocation: http://{target_addr}/elsewhere\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+        });
+        let client = Client::new_fallback().unwrap();
+        assert!(client.get_fallback(&format!("http://{addr}/test")).is_err());
+        redirect.join().unwrap();
+        assert!(target.accept().is_err(), "redirect must not contact another host");
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = server.local_addr().unwrap();
+        let large = thread::spawn(move || {
+            let (mut stream, _) = server.accept().unwrap();
+            let mut request = [0; 2048]; let _ = stream.read(&mut request);
+            let body = vec![b'x'; 40 * 1024];
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+            let _ = stream.write_all(&body);
+        });
+        assert_eq!(client.get_fallback(&format!("http://{addr}/test")).unwrap_err(), "fallback response too large");
+        large.join().unwrap();
+    }
+
+    #[test]
+    fn alternate_survives_primary_outage_and_yields_to_fresh_cnbc() {
+        let cfg = Config::default();
+        let row = cfg.rows[0].clone();
+        let rows = vec![row.clone()];
+        let shared = Arc::new(Mutex::new(Board::new(&rows)));
+        let mut feed = Feed { cfg, rows, rows_gen: 0, shared: shared.clone(), notify: Arc::new(|| {}),
+            client: Client::new().unwrap(), quotes: HashMap::new(), chart: Vec::new(),
+            backfill: Vec::new(), backfill_gen: 0, bars_next: Instant::now(), bars_due: Vec::new(), fails: 0 };
+        shared.lock().unwrap().set_fallback(true);
+        feed.publish(Link::Down, "CNBC network error".into());
+        assert!(fallback_attempt(&shared, &row, |symbol| Some(Quote {
+            symbol: symbol.into(), source: "Gold API", price: 100.0, ..Quote::default()
+        })));
+        feed.publish(Link::Down, "still down".into());
+        assert_eq!(shared.lock().unwrap().cells[0].quote.as_ref().unwrap().source, "Gold API");
+        feed.quotes.insert(row.symbol.clone(), Quote { symbol: row.symbol.clone(), price: 101.0,
+            ts: Some(now_s()), realtime: true, ..Quote::default() });
+        feed.publish(Link::Live, String::new());
+        assert_eq!(shared.lock().unwrap().cells[0].quote.as_ref().unwrap().source, "");
+        let called = std::cell::Cell::new(false);
+        assert!(!fallback_attempt(&shared, &row, |_| { called.set(true); None }));
+        assert!(!called.get());
+    }
+
+    #[test]
+    fn blocked_gold_does_not_block_other_provider_or_cnbc_recovery() {
+        let gold = crate::config::default_rows()[0].clone();
+        let btc = crate::config::default_rows()[2].clone();
+        assert_eq!(btc.symbol, "BTC.CB=");
+        let rows = vec![gold.clone(), btc.clone()];
+        let shared = Arc::new(Mutex::new(Board::new(&rows)));
+        {
+            let mut b = shared.lock().unwrap();
+            b.note = "CNBC network error".into();
+            b.set_fallback(true);
+        }
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocked_board = shared.clone();
+        let blocked_gold = gold.clone();
+        let worker = thread::spawn(move || fallback_attempt(&blocked_board, &blocked_gold, |symbol| {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            Some(Quote { symbol: symbol.into(), source: "Gold API", price: 100.0, ..Quote::default() })
+        }));
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(fallback_attempt(&shared, &btc, |symbol| Some(Quote {
+            symbol: symbol.into(), source: "Kraken", price: 42.0, ..Quote::default()
+        })));
+        {
+            let mut b = shared.lock().unwrap();
+            b.link = Link::Live;
+            b.cells[0].stale = false;
+            b.cells[0].quote = Some(Quote { symbol: gold.symbol.clone(), price: 101.0,
+                ts: Some(now_s()), realtime: true, ..Quote::default() });
+        }
+        release_tx.send(()).unwrap();
+        assert!(!worker.join().unwrap());
+        let b = shared.lock().unwrap();
+        assert_eq!(b.cells[0].quote.as_ref().unwrap().source, "");
+        assert_eq!(b.cells[1].quote.as_ref().unwrap().source, "Kraken");
+    }
+
+    #[test]
+    fn authorized_request_may_finish_after_disable_but_cannot_publish() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let row = Config::default().rows[0].clone();
+        let shared = Arc::new(Mutex::new(Board::new(std::slice::from_ref(&row))));
+        { let mut b = shared.lock().unwrap(); b.note = "CNBC network error".into(); b.set_fallback(true); }
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let connected = Arc::new(AtomicBool::new(false));
+        let worker_connected = connected.clone();
+        let child_board = shared.clone();
+        let worker = thread::spawn(move || fallback_attempt(&child_board, &row, |_| {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            // This marks the point at which a provider connection would begin.
+            worker_connected.store(true, Ordering::SeqCst);
+            Some(Quote { symbol: row.symbol.clone(), source: "Gold API", price: 100.0, ..Quote::default() })
+        }));
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        shared.lock().unwrap().set_fallback(false);
+        release_tx.send(()).unwrap();
+        assert!(!worker.join().unwrap());
+        assert!(connected.load(Ordering::SeqCst), "already-authorized work may finish");
+        assert!(shared.lock().unwrap().cells[0].quote.is_none());
+    }
+
+    #[test]
+    fn blocked_alternate_result_is_rejected_after_rapid_toggle_stress() {
+        let row = Config::default().rows[0].clone();
+        let shared = Arc::new(Mutex::new(Board::new(std::slice::from_ref(&row))));
+        {
+            let mut b = shared.lock().unwrap();
+            b.note = "CNBC network error".into();
+            b.set_fallback(true);
+        }
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let child_board = shared.clone();
+        let child_row = row.clone();
+        let worker = thread::spawn(move || fallback_attempt(&child_board, &child_row, |symbol| {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            Some(Quote { symbol: symbol.into(), source: "Gold API", price: 1.0, ..Quote::default() })
+        }));
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        for _ in 0..10_000 {
+            let mut b = shared.lock().unwrap();
+            b.set_fallback(false);
+            b.set_fallback(true);
+        }
+        release_tx.send(()).unwrap();
+        assert!(!worker.join().unwrap());
+        assert!(shared.lock().unwrap().cells[0].quote.is_none());
+        shared.lock().unwrap().set_fallback(false);
+        let requested = std::cell::Cell::new(false);
+        assert!(!fallback_attempt(&shared, &row, |_| { requested.set(true); None }));
+        assert!(!requested.get());
+    }
+
+    #[test]
+    fn alternate_quotes_check_identity_and_never_claim_market_freshness() {
+        let gold = serde_json::json!({"symbol":"XAU", "currency":"USD", "price":1234.5, "updatedAt":"2026-11-03T21:17:57Z"});
+        let q = parse_alternate("XAU=", &gold).unwrap();
+        assert_eq!((q.symbol.as_str(), q.source, q.price, q.ts), ("XAU=", "Gold API", 1234.5, None));
+        assert!(parse_alternate("XAG=", &gold).is_none());
+        assert!(parse_alternate("XAU=", &serde_json::json!({"symbol":"XAU","currency":"USD","price":1234.5})).is_none());
+        let btc = serde_json::json!({"error":[],"result":{"XXBTZUSD":{"c":["12345.0","0.1"]}}});
+        let q = parse_alternate("BTC.CB=", &btc).unwrap();
+        assert_eq!((q.source, q.price, q.ts), ("Kraken", 12345.0, None));
+        assert!(parse_alternate("@DJ.1", &btc).is_none());
+        assert!(parse_alternate("BTC.CB=", &serde_json::json!({"error":["bad"],"result":{}})).is_none());
     }
 
     #[test]

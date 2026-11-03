@@ -6,6 +6,10 @@ use std::collections::HashMap;
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Quote {
     pub symbol: String,
+    /// Empty for CNBC; fallback provider name otherwise.
+    pub source: &'static str,
+    /// When a fallback response was received, not the market observation time.
+    pub received_at: Option<f64>,
     /// CNBC's name for it, e.g. "Dow Jones Fut (Dec'26)".
     pub name: String,
     pub price: f64,
@@ -71,6 +75,8 @@ impl Bar {
 
 #[derive(Clone, Debug)]
 pub struct Board {
+    pub fallback_enabled: bool,
+    pub fallback_gen: u64,
     /// The symbols shown. The UI changes them (Symbols menu) and bumps `rows_gen`; the feed
     /// thread picks the new list up on its next publish.
     pub rows: Vec<Row>,
@@ -101,6 +107,8 @@ fn empty_cell(r: &Row) -> Cell {
 impl Board {
     pub fn new(rows: &[Row]) -> Self {
         Self {
+            fallback_enabled: false,
+            fallback_gen: 0,
             rows: rows.to_vec(),
             rows_gen: 0,
             cells: rows.iter().map(empty_cell).collect(),
@@ -113,6 +121,42 @@ impl Board {
             bars_gen: 0,
             poll_s: 3.0,
         }
+    }
+
+    pub fn set_fallback(&mut self, enabled: bool) {
+        if self.fallback_enabled == enabled { return; }
+        self.fallback_enabled = enabled;
+        self.fallback_gen = self.fallback_gen.wrapping_add(1);
+        if !enabled {
+            for c in &mut self.cells {
+                if c.quote.as_ref().is_some_and(|q| !q.source.is_empty()) {
+                    c.quote = None;
+                    c.stale = true;
+                }
+            }
+        }
+    }
+
+    /// Expire fallback independently of either provider or CNBC request completion.
+    pub fn expire_fallback(&mut self, now: f64) -> bool {
+        let mut changed = false;
+        for cell in &mut self.cells {
+            let expired = cell.quote.as_ref().is_some_and(|q| !q.source.is_empty()
+                && q.received_at.is_none_or(|t| !(0.0..90.0).contains(&(now - t))));
+            if expired { cell.quote = None; cell.stale = true; changed = true; }
+        }
+        changed
+    }
+
+    pub fn publish_fallback(&mut self, generation: u64, rows_gen: u64, row: &Row, quote: Quote) -> bool {
+        if !self.fallback_enabled || self.fallback_gen != generation || self.rows_gen != rows_gen
+            || quote.symbol != row.symbol || quote.source.is_empty() { return false; }
+        let Some(i) = self.rows.iter().position(|r| r.label == row.label && r.symbol == row.symbol) else { return false; };
+        if !self.cells[i].stale && self.link != Link::Down { return false; }
+        self.cells[i].quote = Some(quote);
+        // No trustworthy market observation timestamp; never permit alert use.
+        self.cells[i].stale = true;
+        true
     }
 
     /// Swap in a new symbol list, keeping data only for the same label and symbol.
@@ -182,6 +226,52 @@ mod tests {
 
     fn q(sym: &str, ts: Option<f64>, realtime: bool) -> Quote {
         Quote { symbol: sym.into(), price: 1.0, ts, realtime, ..Quote::default() }
+    }
+
+    #[test]
+    fn fallback_expiry_does_not_need_network_completion() {
+        let rows = crate::config::default_rows();
+        let mut b = Board::new(&rows);
+        b.cells[0].quote = Some(Quote { symbol: rows[0].symbol.clone(), source: "Gold API", received_at: Some(100.0), price: 2.0, ..Quote::default() });
+        assert!(!b.expire_fallback(189.99));
+        assert!(b.expire_fallback(190.0));
+        assert!(b.cells[0].quote.is_none());
+        assert!(!b.expire_fallback(200.0));
+    }
+
+    #[test]
+    fn disabling_invalidates_inflight_fallback_and_clears_only_fallback() {
+        let rows = crate::config::default_rows();
+        let mut b = Board::new(&rows);
+        b.set_fallback(true);
+        let gen = b.fallback_gen;
+        let row = rows[0].clone();
+        let q = Quote { symbol: row.symbol.clone(), source: "Gold API", price: 5.0, ..Quote::default() };
+        assert!(b.publish_fallback(gen, b.rows_gen, &row, q.clone()));
+        assert_eq!(b.cells[0].quote.as_ref().unwrap().source, "Gold API");
+        b.set_fallback(false);
+        assert!(b.cells[0].quote.is_none());
+        b.set_fallback(true);
+        assert!(!b.publish_fallback(gen, b.rows_gen, &row, q));
+        assert!(b.cells[0].quote.is_none());
+    }
+
+    #[test]
+    fn stress_toggle_rejects_all_obsolete_inflight_results() {
+        let rows = crate::config::default_rows();
+        let row = rows[0].clone();
+        let mut b = Board::new(&rows);
+        for _ in 0..10_000 {
+            b.set_fallback(true);
+            let old = b.fallback_gen;
+            b.set_fallback(false);
+            b.set_fallback(true);
+            let q = Quote { symbol: row.symbol.clone(), source: "Gold API", price: 1.0, ..Quote::default() };
+            assert!(!b.publish_fallback(old, b.rows_gen, &row, q.clone()));
+            assert!(b.publish_fallback(b.fallback_gen, b.rows_gen, &row, q));
+            b.set_fallback(false);
+            assert!(b.cells[0].quote.is_none());
+        }
     }
 
     #[test]
