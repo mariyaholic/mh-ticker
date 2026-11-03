@@ -70,6 +70,17 @@ Double click it. If prompted, simply select Run anyway.
   - **Display 1 / 2 / ...** - Only shows up if u have more than one screen, picks which one (and so which taskbar)
 - **Poll faster or slower:** right click → *Poll every* (1 s to 60 s). it used to be a config edit only. at 1 s
   u get a genuinely live feel for about 3x the data; at 60 s it barely touches the network
+- **Optional fallback prices:** right click → *Data sources* → *Allow fallback sources*. CNBC stays
+  primary and fallback is **off by default**; enabling asks for confirmation every time. If CNBC fails or a
+  quote is stale, Gold API may supply USD gold/silver spot prices, and Kraken may supply BTC/USD from a
+  different exchange. Other symbols have no fallback. Your device connects directly to those providers.
+  Each alternate quote names its provider and shows `age unknown` (or `?` in the strip); without a reliable
+  observation timestamp it cannot trigger an alert. Alternate charts and day-change data are unavailable,
+  rather than mixed with CNBC's. Turning fallback off clears its prices and rejects in-flight results;
+  a request already queued at the toggle boundary may still connect or finish after disabling, but its
+  result is discarded. Recovery depends on network timeouts and polling.
+  Kraken requires prior permission for non-personal commercial use of its public API data; see
+  [Kraken API notices](https://docs.kraken.com/api/docs/guides/global-intro).
 - **Themes (Ultra):** right click → *Theme*, in four groups. **Basic** is one solid colour (midnight, ink, slate,
   moss, oxblood, taupe, paper, sand, mono). **Gradients** ramp top to bottom (graphite, aurora - the same violet-to-rose
   as the app icon, dusk, ocean, ember, glass). **Animated** ones drift on a 9-second loop (drift, pulse,
@@ -114,6 +125,7 @@ whats in there:
 - `rows`: the symbols that show, each with a `label`, the cnbc `symbol`, `digits` and an optional `name`
 - `catalog`: the list the Symbols menu shows, same fields. any symbol cnbc's quote pages have works, like
   `AUD=` for aud/usd or `@SI.1` for silver futures - add it here and then tick it in the menu
+- `fallback_enabled`: optional fallback consent, `false` by default; use the menu to change it
 - `poll_s`: seconds between price requests
 - `stale_after_s` and `delayed_grace_s`: when a price gets dimmed
 - `placement` (`auto`, `taskbar_left`, `taskbar_right`, `floating`, `top_right`, `bottom_right`, `top_left`,
