@@ -41,7 +41,18 @@ use std::sync::{Arc, Mutex};
 /// in both builds, which is what keeps "does it still fetch and parse" a one-command check.
 pub fn launch(profile: config::Profile) {
     config::init(profile);
-    let cfg = config::load();
+    let cfg = match config::load() {
+        Ok(cfg) => cfg,
+        Err(error) => {
+            if std::env::args().any(|a| a == "--probe") {
+                eprintln!("{error}");
+                std::process::exit(1);
+            } else {
+                ui::config_error(&error);
+            }
+            return;
+        }
+    };
     if std::env::args().any(|a| a == "--probe") {
         source::probe(&cfg);
         return;
