@@ -37,6 +37,15 @@ fn side(a: &Alert, price: f64) -> Option<(bool, f64)> {
     a.below.filter(|below| price <= *below).map(|below| (false, below))
 }
 
+/// Only a fresh CNBC price may establish a CNBC alert threshold.
+pub fn reference_price(cell: &crate::model::Cell, cfg: &Config, now: f64) -> Option<f64> {
+    let q = cell.quote.as_ref()?;
+    if cell.stale || !q.source.is_empty() || crate::model::is_stale(q, now, cfg.stale_after_s, cfg.delayed_grace_s) {
+        return None;
+    }
+    Some(q.price)
+}
+
 /// Check every alert and mark the ones that fire. The caller saves the config.
 pub fn check(cfg: &mut Config, board: &Board, now: f64) -> Vec<Fired> {
     let mut out = Vec::new();
@@ -145,6 +154,19 @@ mod tests {
         // crossed back up after the cooldown
         assert_eq!(check(&mut cfg, &board(4200.0, false), 30_000.0).len(), 1);
         assert_eq!(cfg.alerts[0].last, 30_000.0);
+    }
+
+    #[test]
+    fn fallback_or_stale_quote_never_sets_alert_reference() {
+        let cfg = Config::default();
+        let mut b = Board::new(&cfg.rows);
+        b.cells[0].stale = false;
+        b.cells[0].quote = Some(crate::model::Quote { source: "Gold API", price: 100.0, ts: Some(1000.0), realtime: true, ..Default::default() });
+        assert_eq!(reference_price(&b.cells[0], &cfg, 1000.0), None);
+        b.cells[0].quote.as_mut().unwrap().source = "";
+        assert_eq!(reference_price(&b.cells[0], &cfg, 1000.0), Some(100.0));
+        b.cells[0].stale = true;
+        assert_eq!(reference_price(&b.cells[0], &cfg, 1000.0), None);
     }
 
     #[test]
