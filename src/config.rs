@@ -122,6 +122,8 @@ pub struct Row {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    /// Opt-in to alternate quote providers when CNBC fails or is stale.
+    pub fallback_enabled: bool,
     /// Seconds between quote requests (one batched request covers every row).
     pub poll_s: f64,
     /// A real-time price older than this is drawn dimmed. Rows CNBC marks as delayed get
@@ -228,6 +230,7 @@ pub fn default_catalog() -> Vec<Row> {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            fallback_enabled: false,
             poll_s: 3.0,
             stale_after_s: 90.0,
             delayed_grace_s: 900.0,
@@ -337,16 +340,24 @@ pub fn save(cfg: &Config) {
     save_to(&path(), cfg);
 }
 
+pub fn save_checked(cfg: &Config) -> std::io::Result<()> {
+    save_checked_to(&path(), cfg)
+}
+
+fn save_checked_to(p: &Path, cfg: &Config) -> std::io::Result<()> {
+    if let Some(dir) = p.parent() { std::fs::create_dir_all(dir)?; }
+    let text = serde_json::to_string_pretty(cfg).map_err(std::io::Error::other)?;
+    let tmp = p.with_extension("json.tmp");
+    std::fs::write(&tmp, text)?;
+    if let Err(e) = std::fs::rename(&tmp, p) {
+        let _ = std::fs::remove_file(tmp);
+        return Err(e);
+    }
+    Ok(())
+}
+
 fn save_to(p: &Path, cfg: &Config) {
-    if let Some(dir) = p.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    if let Ok(text) = serde_json::to_string_pretty(cfg) {
-        let tmp = p.with_extension("json.tmp");
-        if std::fs::write(&tmp, text).is_ok() {
-            let _ = std::fs::rename(&tmp, p);
-        }
-    }
+    let _ = save_checked_to(p, cfg);
 }
 
 #[cfg(test)]
@@ -355,6 +366,27 @@ mod tests {
 
     fn symbols(rows: &[Row]) -> Vec<&str> {
         rows.iter().map(|r| r.symbol.as_str()).collect()
+    }
+
+    #[test]
+    fn fallback_policy_is_off_by_default_and_persists_explicit_consent() {
+        let old: Config = serde_json::from_str("{}").unwrap();
+        let saved = serde_json::to_value(&old).unwrap();
+        assert_eq!(saved.get("fallback_enabled"), Some(&serde_json::json!(false)));
+        let on: Config = serde_json::from_str(r#"{"fallback_enabled":true}"#).unwrap();
+        assert_eq!(serde_json::to_value(on).unwrap()["fallback_enabled"], true);
+    }
+
+    #[test]
+    fn save_reports_failure_instead_of_claiming_consent_persisted() {
+        let root = std::env::var_os("TICKER_TEST_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+        let dest = root.join(format!("mh-ticker-save-dir-{}", std::process::id()));
+        std::fs::create_dir_all(&dest).unwrap();
+        let result = save_checked_to(&dest, &Config::default());
+        assert!(result.is_err());
+        assert!(dest.is_dir());
+        let _ = std::fs::remove_file(dest.with_extension("json.tmp"));
+        std::fs::remove_dir(dest).unwrap();
     }
 
     #[test]

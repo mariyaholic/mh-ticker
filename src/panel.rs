@@ -120,7 +120,10 @@ impl History {
     /// Re-key by label and symbol; a renamed/replaced instrument starts with no old prices.
     fn align(&mut self, board: &Board) {
         let keys: Vec<_> = board.cells.iter().enumerate().map(|(i, c)| {
-            (c.label.clone(), board.rows.get(i).map(|r| r.symbol.clone()).unwrap_or_default())
+            let symbol = board.rows.get(i).map(|r| r.symbol.as_str()).unwrap_or("");
+            let provider = c.quote.as_ref().map(|q| q.source).unwrap_or("");
+            let key = if provider.is_empty() { symbol.to_string() } else { format!("{symbol}\0{provider}") };
+            (c.label.clone(), key)
         }).collect();
         if self.labels.len() == keys.len() && self.symbols.len() == keys.len()
             && keys.iter().enumerate().all(|(i, (l, s))| self.labels[i] == *l && self.symbols[i] == *s) {
@@ -149,7 +152,7 @@ impl History {
         self.gen = board.backfill_gen;
         for (i, c) in board.cells.iter().enumerate() {
             let row = &mut self.rows[i];
-            if reseed {
+            if reseed && c.quote.as_ref().is_none_or(|q| q.source.is_empty()) {
                 if let Some(bars) = board.backfill.get(i).filter(|b| !b.is_empty()) {
                     seed(row, bars);
                     self.backfilled = true;
@@ -466,6 +469,7 @@ pub struct Chart<'a> {
     pub t0: f64,
     pub bars: &'a [Bar],
     pub last: Option<f64>,
+    pub unavailable: bool,
 }
 
 /// What the panel needs to draw one frame. Bundled so `draw` has one argument that can grow
@@ -649,11 +653,11 @@ fn card(dc: HDC, sc: &Scene, r: RECT, i: usize, c: &Cell) {
             // Header: source, age, and volume when CNBC sends one and it still fits beside the
             // label. Volume is the first thing to go, because it is the least load-bearing number
             // on the card and "CNBC delayed" already uses the width.
-            let src = if q.realtime { "CNBC" } else { "CNBC delayed" };
-            let tag = match q.ts {
+            let src = if !q.source.is_empty() { q.source } else if q.realtime { "CNBC" } else { "CNBC delayed" };
+            let tag = if !q.source.is_empty() { format!("{src} \u{b7} age unknown") } else { match q.ts {
                 Some(ts) => format!("{src} \u{b7} {}", fmt_age(sc.now - ts)),
                 None => src.to_string(),
-            };
+            }};
             let room = rx - ix - text_width(dc, sc.fonts.mid, &c.label) - s(10);
             let tag = match q.volume {
                 Some(v) => {
@@ -730,7 +734,12 @@ fn card(dc: HDC, sc: &Scene, r: RECT, i: usize, c: &Cell) {
             }
         }
     }
-    spark(dc, sc, spark_rect(r, sc.dpi), i, sc.hist.row(i), day_baseline(c));
+    if c.quote.as_ref().is_some_and(|q| !q.source.is_empty()) {
+        let area = spark_rect(r, sc.dpi);
+        text(dc, sc.fonts.small, area.left, area.top + s(4), "chart unavailable", t.dim);
+    } else {
+        spark(dc, sc, spark_rect(r, sc.dpi), i, sc.hist.row(i), day_baseline(c));
+    }
 }
 
 /// The catalogue as clickable chips: ticked entries are on the strip, the rest are one click away.
@@ -867,7 +876,7 @@ fn candles(dc: HDC, sc: &Scene, r: RECT, c: &Chart) {
         // Named even when empty: a bare rectangle could be any pane, and the reason it is empty is
         // the one thing the reader wants to know.
         text(dc, sc.fonts.small, r.left + s(12), r.top + s(8), c.label, t.label);
-        text(dc, sc.fonts.small, r.left + s(12), r.top + s(28), "waiting for the day's bars", t.dim);
+        text(dc, sc.fonts.small, r.left + s(12), r.top + s(28), if c.unavailable { "chart unavailable for this source" } else { "waiting for the day's bars" }, t.dim);
         return;
     }
     if plot.right - plot.left < s(40) || plot.bottom - plot.top < s(30) {
