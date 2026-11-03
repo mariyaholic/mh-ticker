@@ -51,6 +51,24 @@ pub struct Cell {
     pub stale: bool,
 }
 
+/// One 1-minute bar, as CNBC sends it. The time is an offset from the row's `bars_t0` and the four
+/// prices are `f32`: 20 bytes a bar, ~27 KB per symbol for a day, and a 400 px chart cannot tell the
+/// difference.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Bar {
+    pub dt: f32,
+    pub o: f32,
+    pub h: f32,
+    pub l: f32,
+    pub c: f32,
+}
+
+impl Bar {
+    pub fn t(&self, t0: f64) -> f64 {
+        t0 + self.dt as f64
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Board {
     /// The symbols shown. The UI changes them (Symbols menu) and bumps `rows_gen`; the feed
@@ -65,6 +83,12 @@ pub struct Board {
     /// `backfill_gen` bumps each time a fresh set arrives.
     pub backfill: Vec<Vec<(f64, f64)>>,
     pub backfill_gen: u64,
+    /// The whole day's 1-minute bars per row, for the candle chart. `bars_gen` bumps with
+    /// `backfill_gen`.
+    pub bars: Vec<std::sync::Arc<[Bar]>>,
+    /// Each row's first bar's utc seconds; the bars themselves carry offsets from it.
+    pub bars_t0: Vec<f64>,
+    pub bars_gen: u64,
     /// Seconds between quote requests. The UI owns it (`Poll every` in the menu) and the feed
     /// thread reads it each pass, so a change takes effect on the next tick without a restart.
     pub poll_s: f64,
@@ -84,6 +108,9 @@ impl Board {
             note: "starting".into(),
             backfill: Vec::new(),
             backfill_gen: 0,
+            bars: Vec::new(),
+            bars_t0: Vec::new(),
+            bars_gen: 0,
             poll_s: 3.0,
         }
     }
