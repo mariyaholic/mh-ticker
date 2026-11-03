@@ -193,6 +193,11 @@ struct Ui {
     pick_hover: bool,
     /// The picker strip is open (Ultra only).
     pick_open: bool,
+    /// The candle pane is open (Ultra only). It shows the card under the pointer.
+    chart: bool,
+    /// The row the candle pane shows: the card last under the pointer, so pointing at a price
+    /// changes the chart without a click and without the pane ever going blank.
+    chart_row: usize,
     /// Pointer position on a chart, `None` when it is off every sparkline.
     hover_at: Option<panel::Hover>,
     /// Last alert outcome, shown in the footer so a swallowed balloon is not silent.
@@ -301,7 +306,7 @@ fn panel_geo(u: &Ui) -> panel::Geo {
     if rc.right <= 0 || rc.bottom <= 0 {
         return natural;
     }
-    let mut g = panel::geometry_in(rc.right, n, catalog_len(u), u.dpi, picker_open(u));
+    let mut g = panel::geometry_in(rc.right, n, catalog_len(u), u.dpi, picker_open(u), u.chart);
     g.h = rc.bottom;
     g
 }
@@ -557,6 +562,19 @@ fn draw_panel(u: &mut Ui, dc: HDC, w: i32, h: i32) {
         hover: u.hover_at,
         picker: picker_open(u).then(|| panel::Picker { list: &list, shown: &shown }),
         picker_btn: u.profile.ultra,
+        chart_btn: u.profile.ultra,
+        // The chart follows the pointer: hovering a card charts that symbol, which is how a ticker
+        // is read — point at the thing you want to see, without a click that would open a browser.
+        chart: u.chart.then(|| {
+            let row = u.chart_row.min(u.view.cells.len().saturating_sub(1));
+            panel::Chart {
+                label: u.view.cells.get(row).map(|c| c.label.as_str()).unwrap_or(""),
+                digits: u.view.cells.get(row).map(|c| c.digits).unwrap_or(2),
+                t0: u.view.bars_t0.get(row).copied().unwrap_or(0.0),
+                bars: u.view.bars.get(row).map(|b| &b[..]).unwrap_or(&[]),
+                last: u.view.cells.get(row).and_then(|c| c.quote.as_ref()).map(|q| q.price),
+            }
+        }),
         alert: u.alert_note.as_deref(),
         phase,
     };
@@ -991,6 +1009,55 @@ fn panel_rect(near: &RECT, w: i32, h: i32) -> RECT {
         let x = wa.left + (wa.right - wa.left - w) / 2;
         let y = wa.top + (wa.bottom - wa.top - h) / 2;
         RECT { left: x, top: y, right: x + w, bottom: y + h }
+    }
+}
+
+/// Opening the chart needs room for both pans. A frame that cannot hold them is widened to the
+/// two-pane minimum rather than squeezing the cards into a single column.
+fn grow_for_chart(hwnd: HWND) {
+    unsafe {
+        let mut rc: RECT = std::mem::zeroed();
+        GetWindowRect(hwnd, &mut rc);
+        let Some((natural, chart_max, gap)) = with_ui(|u| {
+            let s = |v: i32| v * u.dpi as i32 / 96;
+            (panel::geometry(u.view.cells.len(), catalog_len(u), u.dpi, false), s(720), s(10))
+        }) else {
+            return;
+        };
+        // Wide enough for the cards' natural grid plus a full chart pane; the pane takes what is
+        // left over, so this is the one width where both are whole.
+        let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
+        let want = natural.w + chart_max + gap;
+        if w >= want {
+            return;
+        }
+        let mut mi: MONITORINFO = std::mem::zeroed();
+        mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut mi) == 0 {
+            return;
+        }
+        let wa = mi.rcWork;
+        let new_w = want.min(wa.right - wa.left);
+        let x = rc.left.min((wa.right - new_w).max(wa.left));
+        SetWindowPos(hwnd, null_mut(), x, rc.top, new_w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+}
+
+/// Refit the frame's height to its content, keeping its width. Opening one pane closes the other,
+/// and a window left as tall as the chips it no longer shows is a hole under the cards.
+fn fit_height(hwnd: HWND) {
+    let mut rc: RECT = unsafe { std::mem::zeroed() };
+    unsafe { GetWindowRect(hwnd, &mut rc) };
+    let Some(h) = with_ui(|u| {
+        panel::geometry_in(rc.right - rc.left, u.view.cells.len(), catalog_len(u), u.dpi, picker_open(u), u.chart).h
+    }) else {
+        return;
+    };
+    if rc.bottom - rc.top == h {
+        return;
+    }
+    unsafe {
+        SetWindowPos(hwnd, null_mut(), rc.left, rc.top, rc.right - rc.left, h, SWP_NOZORDER | SWP_NOACTIVATE);
     }
 }
 
@@ -1656,8 +1723,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         // Only the panel is resizable, so only the panel advertises a size range: the strip is a bar,
         // and clamping it to the panel's minimum would stop it being a bar.
         WM_GETMINMAXINFO => {
-            let Some((mode, natural)) = with_ui(|u| {
-                (u.mode, panel::geometry(u.view.cells.len(), catalog_len(u), u.dpi, picker_open(u)))
+            // The floor is both panes when the chart is open: a narrower frame would have to fold
+            // the card grid, and a pane opened by hand must not reflow the thing it sits beside.
+            let Some((mode, min)) = with_ui(|u| {
+                let (w, h) = panel::minimum(u.view.cells.len(), catalog_len(u), u.dpi, picker_open(u), u.chart);
+                (u.mode, (w, h))
             }) else {
                 return 0;
             };
@@ -1665,7 +1735,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 unsafe {
                     let info = lp as *mut MINMAXINFO;
                     // Smallest: the content size, so the cards never fold below their columns.
-                    (*info).ptMinTrackSize = POINT { x: natural.w, y: natural.h };
+                    (*info).ptMinTrackSize = POINT { x: min.0, y: min.1 };
                     // Largest: the monitor's work area, so maximise cannot hide under the taskbar.
                     let mut mi: MONITORINFO = std::mem::zeroed();
                     mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
@@ -1718,9 +1788,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     return h as LRESULT;
                 }
             }
-            let Some((mode, dock, header, btn, pick_btn)) = with_ui(|u| {
+            let Some((mode, dock, header, btn, pick_btn, chart_btn)) = with_ui(|u| {
                 let g = panel_geo(u);
-                (u.mode, u.cfg.placement() != Placement::Floating, g.header, g.btn, g.pick_btn)
+                (u.mode, u.cfg.placement() != Placement::Floating, g.header, g.btn, g.pick_btn, g.chart_btn)
             }) else {
                 return HTCLIENT as LRESULT;
             };
@@ -1729,7 +1799,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 Mode::Panel => {
                     let mut pt = POINT { x: (lp & 0xffff) as i16 as i32, y: ((lp >> 16) & 0xffff) as i16 as i32 };
                     ScreenToClient(hwnd, &mut pt);
-                    let on_button = panel::in_rect(&btn, pt.x, pt.y) || panel::in_rect(&pick_btn, pt.x, pt.y);
+                    let on_button = panel::in_rect(&btn, pt.x, pt.y)
+                        || panel::in_rect(&pick_btn, pt.x, pt.y)
+                        || panel::in_rect(&chart_btn, pt.x, pt.y);
                     if pt.y < header && !on_button {
                         HTCAPTION as LRESULT
                     } else {
@@ -1766,6 +1838,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 Expand,
                 Collapse,
                 TogglePicker,
+                ToggleChart,
                 Symbol(String),
                 /// Open this symbol's CNBC page.
                 Open(String),
@@ -1777,6 +1850,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     Mode::Strip if u.cfg.placement() != Placement::Floating => Act::Expand,
                     Mode::Panel if panel::in_rect(&g.btn, x, y) => Act::Collapse,
                     Mode::Panel if u.profile.ultra && panel::in_rect(&g.pick_btn, x, y) => Act::TogglePicker,
+                    Mode::Panel if u.profile.ultra && panel::in_rect(&g.chart_btn, x, y) => Act::ToggleChart,
                     // A chip, when the picker is open and the pointer is on one.
                     Mode::Panel if picker_open(u) && panel::pick_hit(&g, x, y).is_some() => {
                         let list = config::menu_list(&u.cfg);
@@ -1801,7 +1875,31 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 Some(Act::Collapse) => collapse(hwnd),
                 Some(Act::TogglePicker) => {
                     let open = !with_ui(|u| u.pick_open).unwrap_or(false);
+                    // The chips and the candles both live under the cards, and a strip of chips
+                    // drawn over a chart is not a feature: opening one closes the other.
+                    if open {
+                        with_ui(|u| u.chart = false);
+                    }
                     apply_picker(hwnd, open);
+                }
+                Some(Act::ToggleChart) => {
+                    // The chart and the picker both want the space under the cards, and a chip strip
+                    // drawn over a chart is not a feature. Opening one closes the other.
+                    let on = with_ui(|u| {
+                        u.chart = !u.chart;
+                        if u.chart {
+                            u.pick_open = false;
+                        }
+                        u.chart
+                    })
+                    .unwrap_or(false);
+                    // A narrow frame has no room for both pans, so opening the chart on one widens
+                    // the window to the two-pane minimum instead of squeezing the cards to a column.
+                    if on {
+                        grow_for_chart(hwnd);
+                    }
+                    fit_height(hwnd);
+                    InvalidateRect(hwnd, null(), 0);
                 }
                 Some(Act::Symbol(sym)) if with_ui(|u| config::toggle(&mut u.cfg, &sym)).unwrap_or(false) => {
                     apply_rows(hwnd)
@@ -1827,7 +1925,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 let pick = u.profile.ultra && panel::in_rect(&g.pick_btn, x, y);
                 let track = !u.tracking;
                 u.tracking = true;
-                let changed = btn != u.hover || pick != u.pick_hover || at != u.hover_at.unwrap_or(away);
+                // The candle pane shows the card under the pointer, so a move across the grid is a
+                // pane's worth of pixels to repaint. Only an open pane needs the frame.
+                let over = panel::card_at(&g, u.view.cells.len(), x, y);
+                let row_moved = u.chart && over.is_some_and(|r| r != u.chart_row);
+                if let Some(r) = over {
+                    u.chart_row = r;
+                }
+                let changed = btn != u.hover
+                    || pick != u.pick_hover
+                    || at != u.hover_at.unwrap_or(away)
+                    || row_moved;
                 u.hover = btn;
                 u.pick_hover = pick;
                 u.hover_at = (at.row != usize::MAX).then_some(at);
@@ -2034,6 +2142,8 @@ pub fn run(cfg: Config, board: Arc<Mutex<Board>>) {
             hover: false,
             pick_hover: false,
             pick_open: false,
+            chart: false,
+            chart_row: 0,
             hover_at: None,
             alert_note: None,
             tracking: false,

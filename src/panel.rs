@@ -16,7 +16,7 @@
 //! text uses (`day_open`), so the number and the line can no longer disagree.
 
 use crate::config::Row;
-use crate::model::{fmt_change, fmt_price, Board, Cell};
+use crate::model::{fmt_change, fmt_price, Bar, Board, Cell};
 use crate::theme::{Gradient, Theme};
 use crate::workspace;
 
@@ -193,7 +193,14 @@ pub struct Geo {
     pub btn: RECT,
     /// The symbol-picker toggle, beside the minimise button.
     pub pick_btn: RECT,
-    cols: usize,
+    /// The chart toggle, beside the picker.
+    pub chart_btn: RECT,
+    /// The candle pane, when it is open. Its bottom is the caller's to set: the pane grows with a
+    /// resized window, and `geometry` does not know how tall the frame is yet.
+    pub chart: Option<RECT>,
+    /// How many card columns the current width holds. Public because the window asks before it
+    /// resizes: opening the chart must not cost the cards a column.
+    pub cols: usize,
     pad: i32,
     gap: i32,
     card_w: i32,
@@ -208,16 +215,22 @@ pub struct Geo {
 /// The panel at its content size: the width its cards ask for. Screenshots and the strip's "expand"
 /// both want this, and it must never drift — `shots/*.png` pins it.
 pub fn geometry(n: usize, catalog: usize, dpi: u32, picker: bool) -> Geo {
-    geometry_in(workspace::grid(n, dpi as i32).w, n, catalog, dpi, picker)
+    geometry_in(workspace::grid(n, dpi as i32).w, n, catalog, dpi, picker, false)
 }
 
 /// The panel in a window `w` wide. Columns come from the width, so a dragged edge reflows the grid
 /// instead of clipping it; everything below the header is derived from those columns.
-pub fn geometry_in(w: i32, n: usize, catalog: usize, dpi: u32, picker: bool) -> Geo {
+pub fn geometry_in(w: i32, n: usize, catalog: usize, dpi: u32, picker: bool, chart: bool) -> Geo {
     let s = |v: i32| v * dpi as i32 / 96;
+    // The cards come first: the chart takes the width left over once they can hold their natural
+    // grid, between 360 and 720. Deriving it from the frame instead left the cards a column short at
+    // 1,488 px — two pixels under a bucket edge — which is a reflow the user did not ask for.
+    let natural_w = workspace::grid(n, dpi as i32).w;
+    let chart_w = if chart { (w - natural_w - s(workspace::GAP)).clamp(s(360), s(720)) } else { 0 };
+    let cards_w = w - chart_w - if chart { s(workspace::GAP) } else { 0 };
     // The card grid's size and column count are `workspace`'s business: the panel is one pane, and
     // the pane model has to own the numbers before it can own the window.
-    let g = workspace::grid_in(w, n, dpi as i32);
+    let g = workspace::grid_in(cards_w, n, dpi as i32);
     let cols = g.cols;
     let (pad, gap, card_w, card_h, header) = (
         s(workspace::PAD),
@@ -226,7 +239,7 @@ pub fn geometry_in(w: i32, n: usize, catalog: usize, dpi: u32, picker: bool) -> 
         s(workspace::CARD_H),
         s(workspace::HEADER),
     );
-    let (w, cards_h) = (g.w, g.h);
+    let (w, cards_h) = (w.max(g.w), g.h);
     let (chip_h, chip_gap) = (s(26), s(6));
     let chip_rows = if picker { catalog.div_ceil(CHIP_COLS).max(1) as i32 } else { 0 };
     let pick_h = if picker { s(22) + chip_rows * (chip_h + chip_gap) } else { 0 };
@@ -234,6 +247,8 @@ pub fn geometry_in(w: i32, n: usize, catalog: usize, dpi: u32, picker: bool) -> 
     let (bw, bh, bx) = (s(30), s(30), w - s(12));
     let btn = RECT { left: bx - bw, top: s(10), right: bx, bottom: s(10) + bh };
     let pick_btn = RECT { left: btn.left - s(6) - bw, top: s(10), right: btn.left - s(6), bottom: s(10) + bh };
+    let chart_btn = RECT { left: pick_btn.left - s(6) - bw, top: s(10), right: pick_btn.left - s(6), bottom: s(10) + bh };
+    let chart_rect = chart.then(|| RECT { left: w - pad - chart_w, top: header, right: w - pad, bottom: cards_h });
     let mut chips = Vec::new();
     if picker {
         let chip_w = (w - 2 * pad - (CHIP_COLS as i32 - 1) * chip_gap) / CHIP_COLS as i32;
@@ -245,7 +260,20 @@ pub fn geometry_in(w: i32, n: usize, catalog: usize, dpi: u32, picker: bool) -> 
         }
     }
     let h = cards_h + pick_h + s(36);
-    Geo { w, h, header, btn, pick_btn, cols, pad, gap, card_w, card_h, pick_top: cards_h, chips }
+    Geo { w, h, header, btn, pick_btn, chart_btn, chart: chart_rect, cols, pad, gap, card_w, card_h, pick_top: cards_h, chips }
+}
+
+/// The smallest frame this content can be drawn in: the cards' natural grid, plus a chart pane when
+/// one is open. Below this the painter would have to fold a column, which is a reflow the user did
+/// not ask for, so the window's own minimum track size comes from here.
+pub fn minimum(n: usize, catalog: usize, dpi: u32, picker: bool, chart: bool) -> (i32, i32) {
+    let s = |v: i32| v * dpi as i32 / 96;
+    let g = geometry(n, catalog, dpi, picker);
+    if chart {
+        (g.w + s(360) + s(workspace::GAP), g.h)
+    } else {
+        (g.w, g.h)
+    }
 }
 
 pub fn in_rect(r: &RECT, x: i32, y: i32) -> bool {
@@ -405,6 +433,15 @@ pub fn day_baseline(c: &Cell) -> Option<f64> {
     }
 }
 
+/// What the candle pane draws. `bars` is the row's day in order, `t0` the time its first bar carries.
+pub struct Chart<'a> {
+    pub label: &'a str,
+    pub digits: u32,
+    pub t0: f64,
+    pub bars: &'a [Bar],
+    pub last: Option<f64>,
+}
+
 /// What the panel needs to draw one frame. Bundled so `draw` has one argument that can grow
 /// without every caller changing.
 pub struct Scene<'a> {
@@ -427,6 +464,11 @@ pub struct Scene<'a> {
     pub picker: Option<Picker<'a>>,
     /// This build supports a picker at all.
     pub picker_btn: bool,
+    /// The candle pane's data, when it is open. The bars are the row's whole day; the pane picks
+    /// what to show.
+    pub chart: Option<Chart<'a>>,
+    /// The chart toggle is drawn (Ultra only: the classic build has one window, one look).
+    pub chart_btn: bool,
     /// The last alert outcome. Replaces the footer hint, because Focus Assist can swallow the
     /// tray balloon and the panel is then the only place the alert is visible.
     pub alert: Option<&'a str>,
@@ -699,7 +741,7 @@ pub fn draw(dc: HDC, w: i32, h: i32, sc: &Scene) {
     let radius = |v: i32| if t.is_pixel() { 0 } else { s(v) };
     // Columns come from the width we were asked to draw in, so the frame and its content agree:
     // the window is the composition, and a dragged edge reflows the grid instead of leaving a gutter.
-    let g = geometry_in(w, sc.board.cells.len(), sc.picker.as_ref().map(|p| p.list.len()).unwrap_or(0), sc.dpi, sc.picker.is_some());
+    let g = geometry_in(w, sc.board.cells.len(), sc.picker.as_ref().map(|p| p.list.len()).unwrap_or(0), sc.dpi, sc.picker.is_some(), sc.chart.is_some());
     unsafe {
         SetBkMode(dc, TRANSPARENT as _);
     }
@@ -729,6 +771,19 @@ pub fn draw(dc: HDC, w: i32, h: i32, sc: &Scene) {
     if sc.btn_hover {
         fill_round(dc, g.btn, radius(8), t.btn);
     }
+    if sc.chart_btn {
+        let hot = sc.chart.is_some();
+        if hot {
+            fill_round(dc, g.chart_btn, radius(8), t.btn);
+        }
+        // Three candles, tallest in the middle: a chart, at 12 px.
+        let (px, py) = ((g.chart_btn.left + g.chart_btn.right) / 2, (g.chart_btn.top + g.chart_btn.bottom) / 2);
+        let col = if hot { t.price } else { t.label };
+        for (k, len) in [(-1, s(7)), (0, s(12)), (1, s(9))] {
+            let x = px + k * s(5);
+            fill_rect(dc, RECT { left: x, top: py - len / 2, right: x + s(2).max(2), bottom: py + len / 2 }, col);
+        }
+    }
     let (cx, cy) = ((g.btn.left + g.btn.right) / 2, (g.btn.top + g.btn.bottom) / 2);
     let (bar, thick) = (s(12), s(2).max(2));
     fill_rect(dc, RECT { left: cx - bar / 2, top: cy - thick / 2, right: cx + bar / 2, bottom: cy - thick / 2 + thick }, if sc.btn_hover { t.price } else { t.label });
@@ -738,6 +793,11 @@ pub fn draw(dc: HDC, w: i32, h: i32, sc: &Scene) {
     }
     if let Some(p) = &sc.picker {
         picker(dc, sc, &g, p);
+    }
+    if let (Some(c), Some(mut r)) = (&sc.chart, g.chart) {
+        // The pane grows with the frame: its bottom is the footer, not the last card row.
+        r.bottom = (h - s(34)).max(r.top + s(40));
+        candles(dc, sc, r, c);
     }
 
     let fy = h - s(27);
@@ -755,9 +815,234 @@ pub fn draw(dc: HDC, w: i32, h: i32, sc: &Scene) {
     text_right(dc, sc.fonts.small, w - g.pad - s(2), fy, "click a card: CNBC \u{b7} Esc: dock", t.dim);
 }
 
+/// The candle pane.
+///
+/// Bars arrive in time order, one minute each. The pane owns the price window, the bucket and the
+/// axes: a day of one-minute bars in 650 px is a comb, not a chart, so when a minute is narrower
+/// than a candle the same session is folded into 5-, 15-, 30- or 60-minute candles instead of being
+/// squeezed. Flat bars still draw a one-pixel body rather than being skipped — spot symbols return
+/// `open == high == low == close` for most minutes, and a chart with holes reads as missing data.
+fn candles(dc: HDC, sc: &Scene, r: RECT, c: &Chart) {
+    let t = sc.theme;
+    let s = |v: i32| v * sc.dpi as i32 / 96;
+    let radius = if t.is_pixel() { 0 } else { s(12) };
+    fill_round(dc, r, radius, t.card);
+    let plot = RECT { left: r.left + s(10), top: r.top + s(30), right: r.right - s(54), bottom: r.bottom - s(16) };
+    if c.bars.is_empty() {
+        // Named even when empty: a bare rectangle could be any pane, and the reason it is empty is
+        // the one thing the reader wants to know.
+        text(dc, sc.fonts.small, r.left + s(12), r.top + s(8), c.label, t.label);
+        text(dc, sc.fonts.small, r.left + s(12), r.top + s(28), "waiting for the day's bars", t.dim);
+        return;
+    }
+    if plot.right - plot.left < s(40) || plot.bottom - plot.top < s(30) {
+        return;
+    }
+    let (bars, bucket) = fitted(c.bars, plot.right - plot.left);
+    let span = match bucket as i64 {
+        60 => "1 m",
+        300 => "5 m",
+        900 => "15 m",
+        1_800 => "30 m",
+        _ => "1 h",
+    };
+    // What is being charted, at what resolution, in which time zone, and where it last traded.
+    text(dc, sc.fonts.small, r.left + s(12), r.top + s(8), &format!("{} \u{b7} {span} UTC", c.label), t.label);
+    if let Some(last) = c.last {
+        text_right(dc, sc.fonts.mid, r.right - s(12), r.top + s(6), &fmt_price(last, c.digits), t.price);
+    }
+    let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+    for b in &bars {
+        lo = lo.min(b.l);
+        hi = hi.max(b.h);
+    }
+    if hi <= lo {
+        // Every bar identical: give it a window anyway, or the division below is by zero. (A bar
+        // price is parsed from JSON, so it cannot be NaN; `<=` and `!(> )` mean the same here.)
+        let m = (hi.abs() * 0.001).max(0.5);
+        lo -= m;
+        hi += m;
+    }
+    let pad = (hi - lo) * 0.08;
+    let (lo, hi) = (lo - pad, hi + pad);
+    let span_px = (plot.bottom - plot.top) as f32;
+    let price_span = (hi - lo).max(f32::EPSILON);
+    let py = |v: f32| plot.bottom - (((v - lo) / price_span) * span_px).round() as i32;
+
+    for k in 1..=3 {
+        let v = lo + price_span * k as f32 / 4.0;
+        let y = py(v);
+        fill_rect(dc, RECT { left: plot.left, top: y, right: plot.right, bottom: y + 1 }, t.guide);
+        text_right(dc, sc.fonts.small, r.right - s(8), y - s(7), &fmt_price(v as f64, c.digits), t.label);
+    }
+
+    let n = bars.len() as f32;
+    let step = (plot.right - plot.left) as f32 / n;
+    let body = (step * 0.62).max(2.0);
+    for (i, b) in bars.iter().enumerate() {
+        let x = plot.left as f32 + (i as f32 + 0.5) * step;
+        let col = if (b.c - b.o).abs() <= f32::EPSILON {
+            t.dim
+        } else if b.c > b.o {
+            t.up
+        } else {
+            t.down
+        };
+        let (y0, y1) = (py(b.h), py(b.l));
+        fill_rect(dc, RECT { left: x as i32, top: y0.min(y1), right: x as i32 + 1, bottom: y1.max(y0 + 1) }, col);
+        let (b0, b1) = (py(b.o.max(b.c)), py(b.o.min(b.c)));
+        let left = (x - body / 2.0).round() as i32;
+        let right = ((x + body / 2.0).round() as i32).max(left + 1);
+        fill_rect(dc, RECT { left, top: b0.min(b1), right, bottom: b1.max(b0 + 1) }, col);
+    }
+
+    let first = bars[0].t(c.t0);
+    let last = bars[bars.len() - 1].t(c.t0);
+    text(dc, sc.fonts.small, plot.left, plot.bottom + s(2), &clock(first), t.label);
+    text_right(dc, sc.fonts.small, plot.right, plot.bottom + s(2), &clock(last), t.label);
+}
+
+/// The narrowest candle that still reads as one. Below four pixels a body is a scratch between two
+/// wicks, whatever the colour.
+const MIN_BAR: i32 = 4;
+
+/// The bars to draw and the bucket they are drawn at: the finest bucket on the ladder whose candles
+/// still have `MIN_BAR` pixels each.
+fn fitted(bars: &[Bar], plot_w: i32) -> (Vec<Bar>, f64) {
+    const LADDER: [f64; 5] = [60.0, 300.0, 900.0, 1_800.0, 3_600.0];
+    let (mut best, mut bucket) = (fold(bars, LADDER[0]), LADDER[0]);
+    // The finest bucket that fits wins; if none does, the coarsest is still better than a comb.
+    if best.len() as i32 * MIN_BAR > plot_w {
+        for b in &LADDER[1..] {
+            best = fold(bars, *b);
+            bucket = *b;
+            if best.len() as i32 * MIN_BAR <= plot_w {
+                break;
+            }
+        }
+    }
+    (best, bucket)
+}
+
+/// Fold one-minute bars into `bucket_s`-second candles: the open of the first bar in a bucket, the
+/// extreme high and low of all of them, the close of the last. Buckets are cut on the clock, not by
+/// counting bars, so a break in the session stays a gap instead of being papered over.
+fn fold(bars: &[Bar], bucket_s: f64) -> Vec<Bar> {
+    let mut out: Vec<Bar> = Vec::new();
+    let mut key: Option<f64> = None;
+    for b in bars {
+        let k = (b.dt as f64 / bucket_s).floor();
+        if key == Some(k) {
+            if let Some(last) = out.last_mut() {
+                last.h = last.h.max(b.h);
+                last.l = last.l.min(b.l);
+                last.c = b.c;
+                continue;
+            }
+        }
+        key = Some(k);
+        out.push(Bar { dt: (k * bucket_s) as f32, o: b.o, h: b.h, l: b.l, c: b.c });
+    }
+    out
+}
+
+/// HH:MM in UTC. The bars are utc seconds, and a local label would need a time-zone database for
+/// twenty-six market hours; the pane's header names the zone instead.
+fn clock(t: f64) -> String {
+    let m = (((t as i64) % 86_400) + 86_400) % 86_400 / 60;
+    format!("{:02}:{:02}", m / 60, m % 60)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_day_of_minutes_folds_into_candles_that_read() {
+        let bars: Vec<Bar> = (0..390)
+            .map(|i| {
+                let o = 100.0 + (i as f32 % 7.0);
+                Bar { dt: (i * 60) as f32, o, h: o + 1.0, l: o - 1.0, c: o + 0.5 }
+            })
+            .collect();
+        // 390 bars in 650 px is 1.6 px a bar: fold to five minutes, 78 of them at 8 px.
+        let (folded, bucket) = fitted(&bars, 650);
+        assert_eq!(bucket, 300.0);
+        assert_eq!(folded.len(), 78);
+        // Open from the first bar of the bucket, extremes across the bucket, close from the last.
+        assert_eq!(folded[0].o, bars[0].o);
+        assert_eq!(folded[0].c, bars[4].c);
+        assert_eq!(folded[0].h, bars[0..5].iter().fold(f32::MIN, |m, b| m.max(b.h)));
+        assert_eq!(folded[0].l, bars[0..5].iter().fold(f32::MAX, |m, b| m.min(b.l)));
+        // A pane wide enough for the minute keeps the minute.
+        let (fine, b1) = fitted(&bars, 2_000);
+        assert_eq!((b1, fine.len()), (60.0, 390));
+    }
+
+    #[test]
+    fn a_break_in_the_session_is_not_closed_by_folding() {
+        let bars = vec![
+            Bar { dt: 0.0, o: 1.0, h: 1.0, l: 1.0, c: 1.0 },
+            Bar { dt: 60.0, o: 1.0, h: 1.0, l: 1.0, c: 1.0 },
+            // An hour later: the market was shut, and five-minute buckets must not merge across it.
+            Bar { dt: 3_660.0, o: 2.0, h: 2.0, l: 2.0, c: 2.0 },
+        ];
+        let folded = fold(&bars, 300.0);
+        assert_eq!(folded.len(), 2);
+        assert_eq!((folded[0].c, folded[1].o), (1.0, 2.0));
+    }
+
+    #[test]
+    fn a_chart_pane_takes_half_the_frame_and_leaves_the_cards_whole_columns() {
+        let g = geometry_in(1_490, 6, 0, 96, false, true);
+        let chart = g.chart.expect("the pane is open");
+        assert_eq!(chart.right - chart.left, 720, "capped so the eye can hold it");
+        assert_eq!(chart.left, 1_490 - g.pad - 720);
+        // 1,490 - 720 - 10 = 760: exactly the natural panel, so the cards keep three columns.
+        assert_eq!(g.cols, 3);
+        assert_eq!(g.h, 394);
+    }
+
+    #[test]
+    fn the_chart_never_costs_the_cards_a_column() {
+        // 1,488 was the frame the old half-the-window rule produced, and it left two columns where
+        // 1,490 left three. The pane now takes the leftover after the cards keep their grid.
+        let natural = geometry(6, 0, 96, false);
+        assert_eq!(geometry_in(1_488, 6, 0, 96, false, true).cols, 3, "1,488 must hold three");
+        for w in [1_130, 1_200, 1_400, 1_488, 1_490, 1_600, 1_920, 2_560] {
+            let split = geometry_in(w, 6, 0, 96, false, true);
+            let cw = split.chart.map(|c| c.right - c.left).unwrap_or(0);
+            // Once there is room for the cards' own grid plus a chart, the chart never costs a
+            // column. Above that the extra width still goes to the cards, up to a 720 px pane.
+            assert!(split.cols >= natural.cols, "w={w} cols={}", split.cols);
+            assert!((360..=720).contains(&cw), "w={w} chart={cw}");
+        }
+        // A frame too narrow for both: the chart still gets its 360 and the cards give up a column,
+        // which is the one case where opening a pane costs the grid something.
+        let tight = geometry_in(1_000, 6, 0, 96, false, true);
+        assert_eq!(tight.cols, 2);
+        assert_eq!(tight.chart.map(|c| c.right - c.left), Some(360));
+    }
+
+    #[test]
+    fn an_open_chart_raises_the_window_floor_to_two_whole_panes() {
+        let (w, h) = minimum(6, 0, 96, false, true);
+        assert_eq!((w, h), (760 + 360 + 10, 394), "the cards' grid plus a whole pane");
+        // At that floor the cards still have all three columns: the pane never costs a column.
+        let g = geometry_in(w, 6, 0, 96, false, true);
+        assert_eq!(g.chart.map(|c| c.right - c.left), Some(360));
+        assert_eq!(g.cols, 3);
+        // Closed, the floor is the panel it has always been.
+        assert_eq!(minimum(6, 0, 96, false, false), (geometry(6, 0, 96, false).w, 394));
+    }
+
+    #[test]
+    fn a_closed_chart_leaves_the_panel_exactly_as_it_was() {
+        let plain = geometry(6, 0, 96, false);
+        let same = geometry_in(plain.w, 6, 0, 96, false, false);
+        assert!(same.chart.is_none());
+        assert_eq!((same.cols, same.h), (plain.cols, plain.h));
+    }
 
     fn cell(label: &str, price: f64, pct: Option<f64>) -> Cell {
         Cell {

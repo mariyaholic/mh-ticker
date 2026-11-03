@@ -14,10 +14,10 @@
 //! ```
 
 use crate::config::Row;
-use crate::model::{Board, Quote};
-use crate::panel::{self, Fonts, History, Scene};
+use crate::model::{Bar, Board, Quote};
+use crate::panel::{self, Chart, Fonts, History, Scene};
 use crate::theme::{self, Gradient, Theme};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use windows_sys::Win32::Graphics::Gdi::*;
 
 /// Six symbols, because six is two rows of three and shows the panel at the size most people run.
@@ -137,16 +137,25 @@ fn render(t: &Theme, phase: f64, now: f64, b: &Board, h: &History, dpi: u32) -> 
         hover: None,
         picker: None,
         picker_btn: true,
+        // Stills are the resting panel: the chart is a live pane, and a shot of it belongs to the
+        // window test, not to the theme catalogue.
+        chart: None,
+        chart_btn: false,
         alert: None,
         phase,
     };
+    capture(w, hh, &sc)
+}
+
+/// Paint a scene into a top-down RGBA buffer.
+fn capture(w: i32, hh: i32, sc: &Scene) -> (u32, u32, Vec<u8>) {
     let mut px = vec![0u8; (w * hh * 4) as usize];
     unsafe {
         let screen = GetDC(std::ptr::null_mut());
         let dc = CreateCompatibleDC(screen);
         let bmp = CreateCompatibleBitmap(screen, w, hh);
         let old = SelectObject(dc, bmp);
-        panel::draw(dc, w, hh, &sc);
+        panel::draw(dc, w, hh, sc);
         // `GetDIBits` refuses a bitmap that is still selected into a DC.
         SelectObject(dc, old);
         let mut bi: BITMAPINFO = std::mem::zeroed();
@@ -179,6 +188,134 @@ fn write_png(path: &Path, w: u32, h: u32, px: &[u8]) -> Result<(), String> {
     enc.set_depth(png::BitDepth::Eight);
     let mut w = enc.write_header().map_err(|e| format!("{}: {e}", path.display()))?;
     w.write_image_data(px).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+
+/// `write_chart` by palette name: the example should not need `theme` to be public.
+pub fn write_chart_named(dir: &Path, name: &str, dpi: u32, w: i32) -> Result<PathBuf, String> {
+    write_chart_named_at(dir, name, dpi, w, None)
+}
+
+/// `write_chart_named` with a card held under the pointer, so a review can watch the pane follow it.
+pub fn write_chart_named_at(
+    dir: &Path,
+    name: &str,
+    dpi: u32,
+    w: i32,
+    hover: Option<usize>,
+) -> Result<PathBuf, String> {
+    let t = theme::ALL.iter().find(|t| t.name == name).ok_or_else(|| format!("no theme named {name}"))?;
+    write_chart_at(dir, t, dpi, w, hover)
+}
+
+/// One rendered panel with the candle pane open, from deterministic bars.
+///
+/// This exists because the live feed can be closed (a weekend) or blocked (rate limited), and the
+/// pane still has to be reviewable. The bars are a seeded walk, not a market: the point is the
+/// painter, the axes and the layout. The six cards are the catalogue's own fixture, so the pane is
+/// always seen beside the prices it will be read with.
+pub fn write_chart(dir: &Path, t: &Theme, dpi: u32, w: i32) -> Result<PathBuf, String> {
+    write_chart_at(dir, t, dpi, w, None)
+}
+
+/// `write_chart` with a card held under the pointer.
+pub fn write_chart_at(
+    dir: &Path,
+    t: &Theme,
+    dpi: u32,
+    w: i32,
+    hover: Option<usize>,
+) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let now = 1_792_052_981.0;
+    let mut b = board(now);
+    // 390 one-minute bars is 6.5 h, the length of a US equity day.
+    let (n, t0) = (390, now - 390.0 * 60.0);
+    let bars: Vec<Vec<Bar>> = b
+        .cells
+        .iter()
+        .enumerate()
+        .map(|(i, c)| walk(c.quote.as_ref().map(|q| q.price).unwrap_or(100.0), n, i as u64 + 1))
+        .collect();
+    b.bars_t0 = vec![t0; b.cells.len()];
+    b.bars = bars.iter().map(|v| std::sync::Arc::from(v.as_slice())).collect();
+    let row = hover.unwrap_or_else(|| b.cells.iter().position(|c| c.label == "S&P").unwrap_or(0));
+    let label = b.cells.get(row).map(|c| c.label.clone()).unwrap_or_default();
+    let digits = b.cells.get(row).map(|c| c.digits).unwrap_or(2);
+    let last = b.cells.get(row).and_then(|c| c.quote.as_ref()).map(|q| q.price);
+    let charted = bars.get(row).cloned().unwrap_or_default();
+    // The sparklines seed from the hour of bars, exactly as they do on a live board.
+    let mut hist = History::new();
+    hist.record(&b, now);
+    let g = panel::geometry_in(w, b.cells.len(), 0, dpi, false, true);
+    let fonts = Fonts::new(theme::font_of(t, None), dpi, t.is_pixel());
+    let grad = Gradient::new(t);
+    let sc = Scene {
+        title: "MH Ticker Ultra",
+        board: &b,
+        hist: &hist,
+        fonts: &fonts,
+        theme: t,
+        grad: &grad,
+        dpi,
+        now,
+        btn_hover: false,
+        pick_hover: false,
+        hover: hover.map(|row| panel::Hover { row, t: snap_t(now) }),
+        picker: None,
+        picker_btn: true,
+        chart: Some(Chart { label: &label, digits, t0, bars: &charted, last }),
+        chart_btn: true,
+        alert: None,
+        phase: 0.0,
+    };
+    let (pw, ph, px8) = capture(g.w, g.h, &sc);
+    let path = dir.join(format!("chart-{}.png", t.name));
+    write_png(&path, pw, ph, &px8)?;
+    Ok(path)
+}
+
+/// The pointer's moment on a card, snapped to five minutes the way the live hit-test does: the pane
+/// reads it as the time under the cursor, and a fixture should not disagree with the app.
+fn snap_t(t: f64) -> f64 {
+    (t / 5.0).round() * 5.0
+}
+
+/// A session that ends exactly on `last`: a drift, a midday sell-off, a recovery, at a scale that
+/// suits the price it is charting. Deterministic, so the same picture every run.
+fn walk(last: f64, n: usize, salt: u64) -> Vec<Bar> {
+    let mut seed = 0x2545_f491_4f6c_dd1d ^ salt.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    let amp = last.abs() * 0.0004;
+    let mut close = Vec::with_capacity(n);
+    let mut px = 0.0;
+    for i in 0..n {
+        let drift = if (n * 2 / 5..n * 3 / 5).contains(&i) { -0.8 } else { 0.3 };
+        px += noise(&mut seed) * amp + drift * amp * 0.4;
+        close.push(px);
+    }
+    let shift = last - close.last().copied().unwrap_or(0.0);
+    let mut bars = Vec::with_capacity(n);
+    for i in 0..n {
+        let c = close[i] + shift;
+        let o = if i == 0 { c - noise(&mut seed) * amp } else { close[i - 1] + shift };
+        let w = amp * 0.35 * noise(&mut seed).abs();
+        bars.push(Bar {
+            dt: (i * 60) as f32,
+            o: o as f32,
+            h: (o.max(c) + w) as f32,
+            l: (o.min(c) - w) as f32,
+            c: c as f32,
+        });
+    }
+    bars
+}
+
+/// xorshift64 -> [-1, 1). No dependency, and the same numbers on every platform.
+fn noise(seed: &mut u64) -> f64 {
+    *seed ^= *seed << 13;
+    *seed ^= *seed >> 7;
+    *seed ^= *seed << 17;
+    ((*seed >> 11) as f64 / (1u64 << 53) as f64 - 0.5) * 2.0
 }
 
 /// Render every theme into `dir`. Animated themes get three frames a third of a cycle apart, since
