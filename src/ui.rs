@@ -291,8 +291,11 @@ fn face_of(theme: &Theme, cfg: &Config, ultra: bool) -> &'static str {
     }
 }
 
-fn face_for(u: &Ui) -> &'static str {
-    face_of(u.theme, &u.cfg, u.profile.ultra)
+/// The palette the config names and the face that goes with it. Resolved together, because a face
+/// read off the palette still on screen is the previous theme's.
+fn selected_look(cfg: &Config, ultra: bool) -> (&'static Theme, &'static str) {
+    let theme = theme::pick(ultra, &cfg.theme);
+    (theme, face_of(theme, cfg, ultra))
 }
 
 /// The panel's geometry, from one place. `draw` and every hit test call this, so a click lands
@@ -1613,8 +1616,7 @@ fn scroll_picker(hwnd: HWND, delta: i32) {
 /// no repaint can be left using the previous palette's brush or font.
 fn apply_theme(hwnd: HWND) {
     let Some((icon, tip)) = with_ui(|u| {
-        let t = theme::pick(u.profile.ultra, &u.cfg.theme);
-        let face = face_for(u);
+        let (t, face) = selected_look(&u.cfg, u.profile.ultra);
         if std::ptr::eq(u.theme, t) && face == u.face {
             return None;
         }
@@ -2257,6 +2259,19 @@ pub fn run(cfg: Config, board: Arc<Mutex<Board>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_theme_switch_takes_the_new_themes_face() {
+        let mut cfg = Config::default();
+        for name in ["midnight", "aurora", "pc98", "midnight"] {
+            cfg.theme = name.to_string();
+            let (theme, face) = selected_look(&cfg, true);
+            assert_eq!(theme.name, name);
+            assert_eq!(face, theme.font, "{name} must not keep the previous theme's face");
+        }
+        cfg.theme_font = Some("Consolas".to_string());
+        assert_eq!(selected_look(&cfg, true).1, "Consolas", "an explicit face still wins");
+    }
 
     #[test]
     fn high_resolution_wheel_accumulates_partial_events() {
