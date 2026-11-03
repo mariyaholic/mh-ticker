@@ -115,19 +115,21 @@ impl Board {
         }
     }
 
-    /// Swap in a new symbol list. A symbol that stays keeps its last quote, so the strip does not
-    /// blink; a new one is empty until the feed has its price.
+    /// Swap in a new symbol list, keeping data only for the same label and symbol.
+    /// Candle and backfill vectors are indexed like `rows`; remap them atomically with the cells
+    /// so an in-flight fetch cannot briefly put one instrument's history under another label.
     pub fn set_rows(&mut self, rows: &[Row]) {
-        self.cells = rows
-            .iter()
-            .map(|r| {
-                self.cells
-                    .iter()
-                    .find(|c| c.label == r.label)
-                    .map(|c| Cell { digits: r.digits, ..c.clone() })
-                    .unwrap_or_else(|| empty_cell(r))
-            })
-            .collect();
+        let indices: Vec<_> = rows.iter().map(|r| {
+            self.rows.iter().position(|old| old.label == r.label && old.symbol == r.symbol)
+        }).collect();
+        self.cells = rows.iter().zip(&indices).map(|(r, i)| {
+            i.and_then(|i| self.cells.get(i))
+                .map(|c| Cell { digits: r.digits, ..c.clone() })
+                .unwrap_or_else(|| empty_cell(r))
+        }).collect();
+        self.bars = indices.iter().map(|i| i.and_then(|i| self.bars.get(i)).cloned().unwrap_or_default()).collect();
+        self.bars_t0 = indices.iter().map(|i| i.and_then(|i| self.bars_t0.get(i)).copied().unwrap_or_default()).collect();
+        self.backfill = indices.iter().map(|i| i.and_then(|i| self.backfill.get(i)).cloned().unwrap_or_default()).collect();
         self.rows = rows.to_vec();
         self.rows_gen += 1;
     }
@@ -202,6 +204,36 @@ mod tests {
         assert_eq!(cells[0].label, "XAU");
         assert!(!cells[0].stale);
         assert!(cells[1].quote.is_none() && cells[1].stale);
+    }
+
+    #[test]
+    fn row_changes_keep_chart_data_attached_to_their_symbols() {
+        let a = Row { label: "A".into(), symbol: "AAA".into(), digits: 2, name: String::new() };
+        let b = Row { label: "B".into(), symbol: "BBB".into(), digits: 2, name: String::new() };
+        let c = Row { label: "C".into(), symbol: "CCC".into(), digits: 2, name: String::new() };
+        let mut board = Board::new(&[a, b.clone()]);
+        let bar = |v| Bar { dt: 0.0, o: v, h: v, l: v, c: v };
+        board.bars = vec![vec![bar(1.0)].into(), vec![bar(2.0)].into()];
+        board.bars_t0 = vec![100.0, 200.0];
+        board.backfill = vec![vec![(100.0, 1.0)], vec![(200.0, 2.0)]];
+        board.set_rows(&[b, c]);
+        assert_eq!(board.bars[0][0].c, 2.0);
+        assert_eq!(board.bars_t0[0], 200.0);
+        assert_eq!(board.backfill[0], vec![(200.0, 2.0)]);
+        assert!(board.bars[1].is_empty());
+        assert!(board.backfill[1].is_empty());
+    }
+
+    #[test]
+    fn row_with_same_label_but_new_symbol_does_not_keep_old_quote_or_chart() {
+        let old = Row { label: "A".into(), symbol: "OLD".into(), digits: 2, name: String::new() };
+        let new = Row { symbol: "NEW".into(), ..old.clone() };
+        let mut board = Board::new(&[old]);
+        board.cells[0].quote = Some(q("OLD", Some(100.0), true));
+        board.bars = vec![vec![Bar { dt: 0.0, o: 1.0, h: 1.0, l: 1.0, c: 1.0 }].into()];
+        board.set_rows(&[new]);
+        assert!(board.cells[0].quote.is_none());
+        assert!(board.bars[0].is_empty());
     }
 
     #[test]

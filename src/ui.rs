@@ -44,7 +44,7 @@ use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_ESCAPE};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_ESCAPE, VK_PRIOR, VK_NEXT, VK_HOME, VK_END};
 use windows_sys::Win32::UI::HiDpi::{GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
 use windows_sys::Win32::UI::Shell::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
@@ -184,6 +184,8 @@ struct Ui {
     morph: Option<Morph>,
     /// Where the strip sits (screen px): the morph's small end.
     strip_rect: RECT,
+    /// Last open frame, including a panel not yet manually resized.
+    last_panel: Option<RECT>,
     /// Panel fonts, made on first expand.
     fonts: Option<panel::Fonts>,
     hist: panel::History,
@@ -193,6 +195,8 @@ struct Ui {
     pick_hover: bool,
     /// The picker strip is open (Ultra only).
     pick_open: bool,
+    picker_scroll: i32,
+    wheel_remainder: i32,
     /// The candle pane is open (Ultra only). It shows the card under the pointer.
     chart: bool,
     /// The row the candle pane shows: the card last under the pointer, so pointing at a price
@@ -307,7 +311,7 @@ fn panel_geo(u: &Ui) -> panel::Geo {
         return natural;
     }
     let mut g = panel::geometry_in(rc.right, n, catalog_len(u), u.dpi, picker_open(u), u.chart);
-    g.h = rc.bottom;
+    panel::viewport(&mut g, rc.bottom, u.picker_scroll);
     g
 }
 
@@ -315,6 +319,13 @@ fn panel_geo(u: &Ui) -> panel::Geo {
 /// every event; over an hour-wide plot 5 s is well under a pixel, so nothing visible is lost.
 fn snap(h: panel::Hover) -> panel::Hover {
     panel::Hover { row: h.row, t: (h.t / 5.0).round() * 5.0 }
+}
+
+/// Report an unreadable configuration without replacing it or exposing its contents.
+pub fn config_error(error: &str) {
+    let message = wide(&format!("{error}\n\nThe settings file was not changed. Correct it and start the app again."));
+    let title = wide("MH Ticker — settings error");
+    unsafe { MessageBoxW(null_mut(), message.as_ptr(), title.as_ptr(), MB_OK | MB_ICONERROR); }
 }
 
 /// False when another instance of *this* build already runs (one strip, one tray icon per
@@ -561,6 +572,7 @@ fn draw_panel(u: &mut Ui, dc: HDC, w: i32, h: i32) {
         pick_hover: u.pick_hover,
         hover: u.hover_at,
         picker: picker_open(u).then(|| panel::Picker { list: &list, shown: &shown }),
+        picker_scroll: u.picker_scroll,
         picker_btn: u.profile.ultra,
         chart_btn: u.profile.ultra,
         // The chart follows the pointer: hovering a card charts that symbol, which is how a ticker
@@ -790,6 +802,11 @@ fn on_feed(hwnd: HWND) {
             u.view = b.clone();
         }
         let now = crate::source::now_s();
+        for cell in &mut u.view.cells {
+            if let Some(q) = &cell.quote {
+                cell.stale |= crate::model::is_stale(q, now, u.cfg.stale_after_s, u.cfg.delayed_grace_s);
+            }
+        }
         u.hist.record(&u.view, now);
         // Alerts run after the view is current, so a balloon names the price the strip is showing.
         // The checker drops stale quotes itself: a closed market frozen at a level must not
@@ -1006,6 +1023,8 @@ fn panel_rect(near: &RECT, w: i32, h: i32) -> RECT {
         mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
         GetMonitorInfoW(MonitorFromRect(near, MONITOR_DEFAULTTONEAREST), &mut mi);
         let wa = mi.rcWork;
+        let w = w.min(wa.right - wa.left).max(1);
+        let h = h.min(wa.bottom - wa.top).max(1);
         let x = wa.left + (wa.right - wa.left - w) / 2;
         let y = wa.top + (wa.bottom - wa.top - h) / 2;
         RECT { left: x, top: y, right: x + w, bottom: y + h }
@@ -1040,24 +1059,6 @@ fn grow_for_chart(hwnd: HWND) {
         let new_w = want.min(wa.right - wa.left);
         let x = rc.left.min((wa.right - new_w).max(wa.left));
         SetWindowPos(hwnd, null_mut(), x, rc.top, new_w, h, SWP_NOZORDER | SWP_NOACTIVATE);
-    }
-}
-
-/// Refit the frame's height to its content, keeping its width. Opening one pane closes the other,
-/// and a window left as tall as the chips it no longer shows is a hole under the cards.
-fn fit_height(hwnd: HWND) {
-    let mut rc: RECT = unsafe { std::mem::zeroed() };
-    unsafe { GetWindowRect(hwnd, &mut rc) };
-    let Some(h) = with_ui(|u| {
-        panel::geometry_in(rc.right - rc.left, u.view.cells.len(), catalog_len(u), u.dpi, picker_open(u), u.chart).h
-    }) else {
-        return;
-    };
-    if rc.bottom - rc.top == h {
-        return;
-    }
-    unsafe {
-        SetWindowPos(hwnd, null_mut(), rc.left, rc.top, rc.right - rc.left, h, SWP_NOZORDER | SWP_NOACTIVATE);
     }
 }
 
@@ -1099,10 +1100,12 @@ fn expand(hwnd: HWND) {
         let natural = panel_geo(u);
         // A frame the user dragged last time comes back the way they left it; anything that no longer
         // fits the monitor (unplugged, resolution changed) is fitted again rather than lost.
-        let b = match u.cfg.panel {
+        let b = if let Some(last) = u.last_panel {
+            fit_panel(last)
+        } else { match u.cfg.panel {
             Some(p) => fit_panel(RECT { left: p[0], top: p[1], right: p[0] + p[2], bottom: p[1] + p[3] }),
             None => panel_rect(&a, natural.w, natural.h),
-        };
+        }};
         // The content is laid out for the frame it is about to be drawn in, not for the one it would
         // have had if the window were still content-sized.
         let (pw, ph) = (b.right - b.left, b.bottom - b.top);
@@ -1139,6 +1142,7 @@ fn collapse(hwnd: HWND) {
         }
         let mut a: RECT = unsafe { std::mem::zeroed() };
         unsafe { GetWindowRect(hwnd, &mut a) };
+        u.last_panel = Some(a);
         let psz = ((a.right - a.left).max(1), (a.bottom - a.top).max(1));
         u.hover = false;
         let from = snapshot(hwnd, psz.0, psz.1, |dc| draw_panel(u, dc, psz.0, psz.1));
@@ -1511,45 +1515,45 @@ fn apply_rows(hwnd: HWND) {
             u.view = b.clone();
         }
         u.hist.record(&u.view, crate::source::now_s());
-        (u.mode == Mode::Panel).then(|| {
-            let g = panel_geo(u);
-            let mut cur: RECT = unsafe { std::mem::zeroed() };
-            unsafe { GetWindowRect(hwnd, &mut cur) };
-            panel_rect(&cur, g.w, g.h)
-        })
+        u.mode == Mode::Panel
     }) else {
         return;
     };
-    match panel {
-        Some(r) => unsafe {
-            SetWindowPos(hwnd, null_mut(), r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
-            InvalidateRect(hwnd, null(), 0);
-        },
-        None => relayout_and_place(hwnd),
-    }
+    if panel { unsafe { InvalidateRect(hwnd, null(), 0); } }
+    else { relayout_and_place(hwnd); }
     unsafe { PostMessageW(hwnd, WM_FEED, 0, 0) };
 }
 
 /// Open or close the symbol picker: the panel grows or shrinks in place, staying centred.
 fn apply_picker(hwnd: HWND, open: bool) {
-    let Some(r) = with_ui(|u| {
+    with_ui(|u| {
         u.pick_open = open;
+        u.picker_scroll = 0;
+        u.wheel_remainder = 0;
+        if open { u.chart = false; }
         u.hover_at = None;
-        (u.mode == Mode::Panel).then(|| {
-            let g = panel_geo(u);
-            let mut cur: RECT = unsafe { std::mem::zeroed() };
-            unsafe { GetWindowRect(hwnd, &mut cur) };
-            panel_rect(&cur, g.w, g.h)
-        })
-    })
-    .flatten()
-    else {
-        return;
-    };
-    unsafe {
-        SetWindowPos(hwnd, null_mut(), r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
-        InvalidateRect(hwnd, null(), 0);
-    }
+    });
+    unsafe { InvalidateRect(hwnd, null(), 0); }
+}
+
+fn wheel_movement(remainder: &mut i32, delta: i32, dpi: u32) -> i32 {
+    if delta != 0 && *remainder != 0 && delta.signum() != remainder.signum() { *remainder = 0; }
+    let total = remainder.saturating_add(delta);
+    *remainder = total % 120;
+    -(total / 120) * (dpi as i32).max(1)
+}
+
+fn scroll_picker(hwnd: HWND, delta: i32) {
+    let changed = with_ui(|u| {
+        if u.mode != Mode::Panel { return false; }
+        let g = panel_geo(u);
+        let old = u.picker_scroll.clamp(0, g.scroll_max);
+        u.picker_scroll = old.saturating_add(delta).clamp(0, g.scroll_max);
+        let changed = old != u.picker_scroll;
+        if changed { u.hover_at = None; }
+        changed
+    }).unwrap_or(false);
+    if changed { unsafe { InvalidateRect(hwnd, null(), 0); } }
 }
 
 /// Switch palette or face. Every GDI object derived from either is rebuilt here, in one place, so
@@ -1726,7 +1730,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             // The floor is both panes when the chart is open: a narrower frame would have to fold
             // the card grid, and a pane opened by hand must not reflow the thing it sits beside.
             let Some((mode, min)) = with_ui(|u| {
-                let (w, h) = panel::minimum(u.view.cells.len(), catalog_len(u), u.dpi, picker_open(u), u.chart);
+                let (w, h) = panel::minimum(u.view.cells.len(), catalog_len(u), u.dpi, false, u.chart);
                 (u.mode, (w, h))
             }) else {
                 return 0;
@@ -1742,6 +1746,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
                     if GetMonitorInfoW(mon, &mut mi) != 0 {
                         (*info).ptMaxTrackSize = POINT { x: mi.rcWork.right - mi.rcWork.left, y: mi.rcWork.bottom - mi.rcWork.top };
+                        (*info).ptMinTrackSize.x = (*info).ptMinTrackSize.x.min((*info).ptMaxTrackSize.x);
+                        (*info).ptMinTrackSize.y = (*info).ptMinTrackSize.y.min((*info).ptMaxTrackSize.y);
                     }
                 }
             }
@@ -1898,7 +1904,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     if on {
                         grow_for_chart(hwnd);
                     }
-                    fit_height(hwnd);
                     InvalidateRect(hwnd, null(), 0);
                 }
                 Some(Act::Symbol(sym)) if with_ui(|u| config::toggle(&mut u.cfg, &sym)).unwrap_or(false) => {
@@ -1966,6 +1971,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             0
         }
+        WM_MOUSEWHEEL => {
+            let delta = ((wp >> 16) as u16 as i16) as i32;
+            let movement = with_ui(|u| wheel_movement(&mut u.wheel_remainder, delta, u.dpi)).unwrap_or(0);
+            if movement != 0 { scroll_picker(hwnd, movement); }
+            0
+        }
+        WM_KEYDOWN if [VK_PRIOR as usize, VK_NEXT as usize, VK_HOME as usize, VK_END as usize].contains(&wp) => {
+            let step = with_ui(|u| (240 * u.dpi as i32 / 96).max(1)).unwrap_or(240);
+            let delta = if wp == VK_PRIOR as usize { -step } else if wp == VK_NEXT as usize { step } else if wp == VK_HOME as usize { -i32::MAX } else { i32::MAX };
+            scroll_picker(hwnd, delta);
+            0
+        }
         WM_KEYDOWN if wp == VK_ESCAPE as usize => {
             collapse(hwnd);
             0
@@ -2024,7 +2041,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     let mut r: RECT = std::mem::zeroed();
                     GetWindowRect(hwnd, &mut r);
                     let b = panel_rect(&r, g.w, g.h);
-                    SetWindowPos(hwnd, null_mut(), b.left, b.top, g.w, g.h, SWP_NOZORDER | SWP_NOACTIVATE);
+                    SetWindowPos(hwnd, null_mut(), b.left, b.top, b.right - b.left, b.bottom - b.top, SWP_NOZORDER | SWP_NOACTIVATE);
                 }
                 None => relayout_and_place(hwnd),
             }
@@ -2137,11 +2154,14 @@ pub fn run(cfg: Config, board: Arc<Mutex<Board>>) {
             mode: Mode::Strip,
             morph: None,
             strip_rect: RECT { left: 0, top: 0, right: 0, bottom: 0 },
+            last_panel: None,
             fonts: None,
             hist: panel::History::new(),
             hover: false,
             pick_hover: false,
             pick_open: false,
+            picker_scroll: 0,
+            wheel_remainder: 0,
             chart: false,
             chart_row: 0,
             hover_at: None,
@@ -2183,6 +2203,18 @@ pub fn run(cfg: Config, board: Arc<Mutex<Board>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn high_resolution_wheel_accumulates_partial_events() {
+        let mut remainder = 0;
+        let mut total = 0;
+        for _ in 0..12 { total += wheel_movement(&mut remainder, -10, 144); }
+        assert_eq!(total, 144);
+        assert_eq!(remainder, 0);
+        assert_eq!(wheel_movement(&mut remainder, 120, 144), -144);
+        assert_eq!(wheel_movement(&mut remainder, -60, 144), 0);
+        assert_eq!(wheel_movement(&mut remainder, 120, 144), -144, "reversing direction must not consume a full detent");
+    }
 
     #[test]
     fn the_classic_build_never_runs_a_clock() {

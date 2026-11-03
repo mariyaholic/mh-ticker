@@ -30,19 +30,10 @@ fn row(label: &str, symbol: &str, digits: u32) -> Row {
 /// Plausible values rather than the same number six times: a card with no 52-week range, one with a
 /// volume and one without, and a delayed quote among live ones, so the screenshot exercises the
 /// layout's awkward cases instead of its easy one.
-fn quote(
-    row: &Row,
-    price: f64,
-    pct: f64,
-    prev: f64,
-    high: f64,
-    low: f64,
-    vol: Option<f64>,
-    yr: (f64, f64),
-    date: &str,
-    realtime: bool,
-    now: f64,
-) -> Quote {
+type QuoteSpec<'a> = (f64, f64, f64, f64, f64, Option<f64>, (f64, f64), &'a str, bool);
+
+fn quote(row: &Row, spec: QuoteSpec<'_>, now: f64) -> Quote {
+    let (price, pct, prev, high, low, vol, yr, date, realtime) = spec;
     Quote {
         symbol: row.symbol.clone(),
         name: row.name.clone(),
@@ -71,7 +62,7 @@ fn board(now: f64) -> Board {
         row("S&P", "@SP.1", 2),
         row("NAS", "@ND.1", 2),
     ];
-    let spec: [(f64, f64, f64, f64, f64, Option<f64>, (f64, f64), &str, bool); ROWS] = [
+    let spec: [QuoteSpec<'_>; ROWS] = [
         (4155.24, 0.62, 4130.60, 4190.00, 4102.50, None, (3940.0, 4381.0), "2026-09-22", true),
         (56.590, -0.31, 56.766, 57.100, 56.020, None, (38.20, 58.90), "2025-10-30", true),
         (112_480.0, 1.94, 110_340.0, 113_200.0, 109_800.0, Some(24.8e9), (74_200.0, 126_500.0), "2025-10-06", true),
@@ -85,10 +76,10 @@ fn board(now: f64) -> Board {
     b.cells = rows
         .iter()
         .zip(spec)
-        .map(|(r, (price, pct, prev, high, low, vol, yr, date, realtime))| crate::model::Cell {
+        .map(|(r, s)| crate::model::Cell {
             label: r.label.clone(),
             digits: r.digits,
-            quote: Some(quote(r, price, pct, prev, high, low, vol, yr, date, realtime, now)),
+            quote: Some(quote(r, s, now)),
             stale: false,
         })
         .collect();
@@ -136,6 +127,7 @@ fn render(t: &Theme, phase: f64, now: f64, b: &Board, h: &History, dpi: u32) -> 
         pick_hover: false,
         hover: None,
         picker: None,
+        picker_scroll: 0,
         picker_btn: true,
         // Stills are the resting panel: the chart is a live pane, and a shot of it belongs to the
         // window test, not to the theme catalogue.
@@ -164,7 +156,7 @@ fn capture(w: i32, hh: i32, sc: &Scene) -> (u32, u32, Vec<u8>) {
         bi.bmiHeader.biHeight = -hh; // top-down, so row 0 is the top
         bi.bmiHeader.biPlanes = 1;
         bi.bmiHeader.biBitCount = 32;
-        bi.bmiHeader.biCompression = BI_RGB as u32;
+        bi.bmiHeader.biCompression = BI_RGB;
         GetDIBits(dc, bmp, 0, hh as u32, px.as_mut_ptr() as *mut _, &mut bi, DIB_RGB_COLORS);
         DeleteObject(bmp);
         DeleteDC(dc);
@@ -174,7 +166,7 @@ fn capture(w: i32, hh: i32, sc: &Scene) -> (u32, u32, Vec<u8>) {
     // than a second buffer, and the source is dropped right after. The alpha byte has to be forced
     // opaque: a 32-bit `BI_RGB` DIB leaves it zero, and an RGBA PNG with alpha 0 renders as an
     // empty rectangle.
-    for p in px.chunks_exact_mut(4) {
+    for p in px.as_chunks_mut::<4>().0 {
         p.swap(0, 2);
         p[3] = 255;
     }
@@ -263,6 +255,7 @@ pub fn write_chart_at(
         pick_hover: false,
         hover: hover.map(|row| panel::Hover { row, t: snap_t(now) }),
         picker: None,
+        picker_scroll: 0,
         picker_btn: true,
         chart: Some(Chart { label: &label, digits, t0, bars: &charted, last }),
         chart_btn: true,
