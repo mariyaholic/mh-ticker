@@ -9,7 +9,7 @@
 //! and drawn as such. These endpoints are public but unofficial: CNBC can change them.
 
 use crate::config::{Config, Row};
-use crate::model::{resolve, Board, Link, Quote};
+use crate::model::{resolve, Bar, Board, Link, Quote};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -21,9 +21,14 @@ const CHART_URL: &str = "https://ts-api.cnbc.com/harmony/app/charts/1D.json";
 const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 const BARS_REFRESH: Duration = Duration::from_secs(600);
 const BARS_RETRY: Duration = Duration::from_secs(60);
+/// A day of 1-minute bars is ~220 KB: more than the quote feed's timeout was set for.
+const BARS_TIMEOUT: Duration = Duration::from_secs(45);
 /// While waiting for the next poll, how often to look for a Symbols-menu change.
 const ROWS_CHECK: Duration = Duration::from_millis(250);
 const HOUR_S: f64 = 3600.0;
+/// Bars kept per row. A day of 1-minute bars is ~1,400; the cap only guards against a payload that
+/// is not what this endpoint is documented to be.
+const MAX_BARS: usize = 1_600;
 
 pub fn now_s() -> f64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
@@ -114,20 +119,32 @@ pub fn parse_quotes(v: &Value) -> Vec<Quote> {
     .unwrap_or_default()
 }
 
-/// 1-day chart body -> the last hour as (utc_s, close), stamped at each bar's end (open + 60 s)
-/// and capped at `now` for the bar still forming.
-pub fn parse_chart(v: &Value, now: f64) -> Vec<(f64, f64)> {
-    let bars = v.pointer("/barData/priceBars").and_then(Value::as_array);
-    bars.map(|bars| {
-        bars.iter()
-            .filter_map(|b| {
-                let t = b.get("tradeTimeinMills").and_then(number)? / 1000.0 + 60.0;
-                let close = b.get("close").and_then(number)?;
-                (t >= now - HOUR_S - 60.0).then_some((t.min(now), close))
-            })
-            .collect()
-    })
-    .unwrap_or_default()
+/// 1-day chart body -> (t0, bars): the whole day of 1-minute OHLC bars, each stamped at its end
+/// (open + 60 s) and capped at `now` for the bar still forming. The sparkline takes the last hour of
+/// this same series, so a line and a candle can never disagree about what the price did.
+pub fn parse_chart(v: &Value, now: f64) -> (f64, Vec<Bar>) {
+    let mut pts: Vec<(f64, Bar)> = Vec::new();
+    if let Some(bars) = v.pointer("/barData/priceBars").and_then(Value::as_array) {
+        for b in bars {
+            let Some(t) = b.get("tradeTimeinMills").and_then(number).map(|ms| ms / 1000.0 + 60.0) else { continue };
+            // A bar still forming is clamped to now, as the close series always was.
+            let t = t.min(now);
+            let Some(c) = b.get("close").and_then(number) else { continue };
+            // A bar without o/h/l is not a candle: fall back to the close so it draws as a doji
+            // rather than a spike to zero.
+            let o = b.get("open").and_then(number).unwrap_or(c);
+            let h = b.get("high").and_then(number).unwrap_or(c);
+            let l = b.get("low").and_then(number).unwrap_or(c);
+            pts.push((t, Bar { dt: 0.0, o: o as f32, h: h as f32, l: l as f32, c: c as f32 }));
+        }
+    }
+    pts.sort_by(|a, b| a.0.total_cmp(&b.0));
+    // A day of 1-minute bars is ~1,400; anything longer is a different endpoint, not a chart.
+    let keep = pts.len().saturating_sub(MAX_BARS);
+    pts.drain(..keep);
+    let t0 = pts.first().map(|p| p.0).unwrap_or(now);
+    let bars = pts.into_iter().map(|(t, mut b)| { b.dt = (t - t0) as f32; b }).collect();
+    (t0, bars)
 }
 
 /// One outbound POST, for alerts. Deliberately a free function: alert traffic is rare, so it gets
@@ -174,7 +191,19 @@ impl Client {
     }
 
     fn get(&self, url: &str) -> Result<Value, String> {
-        match self.agent.get(url).call() {
+        self.get_within(url, None)
+    }
+
+    /// `timeout` overrides the agent's for one request: a quote is a few hundred bytes, a day of
+    /// bars is a quarter of a megabyte, and the ten seconds that serve the first are not enough
+    /// for the second on a slow link. A truncated body is worse than a late one.
+    fn get_within(&self, url: &str, timeout: Option<Duration>) -> Result<Value, String> {
+        let req = self.agent.get(url);
+        let req = match timeout {
+            Some(t) => req.timeout(t),
+            None => req,
+        };
+        match req.call() {
             Ok(resp) => resp.into_json::<Value>().map_err(|e| e.to_string()),
             Err(ureq::Error::Status(code, _)) => Err(format!("HTTP {code}")),
             Err(e) => Err(e.to_string()),
@@ -194,8 +223,9 @@ impl Client {
         Ok(qs)
     }
 
-    pub fn chart(&self, symbol: &str) -> Result<Vec<(f64, f64)>, String> {
-        Ok(parse_chart(&self.get(&format!("{CHART_URL}?symbol={}", encode(symbol)))?, now_s()))
+    pub fn chart(&self, symbol: &str) -> Result<(f64, Vec<Bar>), String> {
+        let url = format!("{CHART_URL}?symbol={}", encode(symbol));
+        Ok(parse_chart(&self.get_within(&url, Some(BARS_TIMEOUT))?, now_s()))
     }
 }
 
@@ -208,10 +238,34 @@ struct Feed {
     notify: Box<dyn Fn() + Send>,
     client: Client,
     quotes: HashMap<String, Quote>,
+    /// (t0, bars) per row: the candles, and the hour of closes the sparklines are seeded from.
+    chart: Vec<(f64, Vec<Bar>)>,
     backfill: Vec<Vec<(f64, f64)>>,
     backfill_gen: u64,
     bars_next: Instant,
     fails: u32,
+}
+
+/// A symbol that timed out this pass keeps the bars it got last pass.
+///
+/// A day of bars is a quarter of a megabyte over SChannel: on a slow link a pass is a few wins and
+/// a few losses, and replacing the set wholesale would make the chart flap between drawn and empty.
+/// The rows are stable between passes — a change clears `chart` in `sync_rows` — so an empty result
+/// for row `i` means the fetch failed, not that the symbol has no bars.
+fn merge_bars(prev: &[(f64, Vec<Bar>)], got: Vec<(f64, Vec<Bar>)>) -> Vec<(f64, Vec<Bar>)> {
+    let mut got = got;
+    if got.len() == prev.len() {
+        for (i, want) in got.iter_mut().enumerate() {
+            if want.1.is_empty() {
+                if let Some((t0, kept)) = prev.get(i) {
+                    if !kept.is_empty() {
+                        *want = (*t0, kept.clone());
+                    }
+                }
+            }
+        }
+    }
+    got
 }
 
 impl Feed {
@@ -221,6 +275,7 @@ impl Feed {
             if b.rows_gen != self.rows_gen {
                 self.rows = b.rows.clone();
                 self.rows_gen = b.rows_gen;
+                self.chart.clear();
                 self.backfill.clear();
                 self.bars_next = Instant::now();
             }
@@ -240,6 +295,9 @@ impl Feed {
             if b.backfill_gen != self.backfill_gen {
                 b.backfill = self.backfill.clone();
                 b.backfill_gen = self.backfill_gen;
+                b.bars = self.chart.iter().map(|(_, bars)| bars.clone().into()).collect();
+                b.bars_t0 = self.chart.iter().map(|(t0, _)| *t0).collect();
+                b.bars_gen = self.backfill_gen;
             }
         }
         (self.notify)();
@@ -268,9 +326,21 @@ impl Feed {
         if Instant::now() < self.bars_next {
             return false;
         }
-        let got: Vec<Vec<(f64, f64)>> = self.rows.iter().map(|r| self.client.chart(&r.symbol).unwrap_or_default()).collect();
-        if got.iter().any(|p| !p.is_empty()) {
-            self.backfill = got;
+        let got: Vec<(f64, Vec<Bar>)> = self.rows.iter().map(|r| self.client.chart(&r.symbol).unwrap_or_default()).collect();
+        let got = merge_bars(&self.chart, got);
+        if got.iter().any(|(_, bars)| !bars.is_empty()) {
+            // The sparkline is the last hour of the same bars, so the two never disagree.
+            let now = now_s();
+            self.backfill = got
+                .iter()
+                .map(|(t0, bars)| {
+                    bars.iter()
+                        .filter(|b| b.t(*t0) >= now - HOUR_S - 60.0)
+                        .map(|b| (b.t(*t0), b.c as f64))
+                        .collect()
+                })
+                .collect();
+            self.chart = got;
             self.backfill_gen += 1;
             self.bars_next = Instant::now() + BARS_REFRESH;
             true
@@ -340,6 +410,7 @@ pub fn spawn(cfg: Config, shared: Arc<Mutex<Board>>, notify: Box<dyn Fn() + Send
         notify,
         client,
         quotes: HashMap::new(),
+        chart: Vec::new(),
         backfill: Vec::new(),
         backfill_gen: 0,
         bars_next: Instant::now(),
@@ -378,14 +449,14 @@ pub fn probe(cfg: &Config) {
     }
     for r in &cfg.rows {
         match client.chart(&r.symbol) {
-            Ok(p) if !p.is_empty() => println!(
-                "bars {:<5} {} points, {:.0} min back to {:.0} s ago",
+            Ok((t0, bars)) if !bars.is_empty() => println!(
+                "bars {:<5} {} bars, {:.0} min long, last {:.0} s ago",
                 r.label,
-                p.len(),
-                (now - p[0].0) / 60.0,
-                (now - p[p.len() - 1].0).max(0.0)
+                bars.len(),
+                (bars[bars.len() - 1].t(t0) - t0) / 60.0,
+                (now - bars[bars.len() - 1].t(t0)).max(0.0)
             ),
-            Ok(_) => println!("bars {:<5} none in the last hour", r.label),
+            Ok(_) => println!("bars {:<5} none", r.label),
             Err(e) => println!("bars {:<5} {e}", r.label),
         }
     }
@@ -435,15 +506,58 @@ mod tests {
     }
 
     #[test]
-    fn chart_keeps_the_last_hour_stamped_at_bar_end() {
+    fn chart_keeps_the_whole_payload_with_ohlc() {
         let v: Value = serde_json::from_str(
             r#"{"barData":{"priceBars":[
-              {"close":"1.0","tradeTimeinMills":1000000},
+              {"close":"1.0","open":"0.5","high":"1.5","low":"0.25","tradeTimeinMills":1000000},
               {"close":"2.0","tradeTimeinMills":10000000},
               {"close":"3.0","tradeTimeinMills":10060000}]}}"#,
         )
         .unwrap();
-        assert_eq!(parse_chart(&v, 10_100.0), vec![(10_060.0, 2.0), (10_100.0, 3.0)]);
+        let (t0, bars) = parse_chart(&v, 10_100.0);
+        // The whole day is kept now, not just the last hour: the chart needs it and the hour is a
+        // slice of it.
+        assert_eq!((t0, bars.len()), (1_060.0, 3));
+        assert_eq!((bars[0].o, bars[0].h, bars[0].l, bars[0].c), (0.5, 1.5, 0.25, 1.0));
+        assert_eq!(bars[2].t(t0), 10_100.0);
+        // A bar with no o/h/l is a doji at its close, never a spike to zero.
+        assert_eq!((bars[1].o, bars[1].h, bars[1].l, bars[1].c), (2.0, 2.0, 2.0, 2.0));
+    }
+
+    #[test]
+    fn parses_the_bars_cnbc_sends_today() {
+        // Copied verbatim from a live `1D.json` for `@SP.1`: prices arrive as strings with four
+        // decimals, volume as a number, and the time in milliseconds. Two real bars and one flat
+        // one, because a flat bar is what a spot symbol sends for most of its minutes.
+        let v: Value = serde_json::from_str(
+            r#"{"barData":{"priceBars":[
+              {"open":"7626.0000","high":"7638.7500","low":"7626.0000","close":"7635.7500","volume":3443,"tradeTime":"20261101180000","tradeTimeinMills":1793574000000},
+              {"open":"7635.7500","high":"7636.0000","low":"7626.5000","close":"7627.7500","volume":1026,"tradeTime":"20261101180100","tradeTimeinMills":1793574060000},
+              {"open":"7584.0000","high":"7584.0000","low":"7584.0000","close":"7584.0000","volume":0,"tradeTime":"20261102191100","tradeTimeinMills":1793664660000}]}}"#,
+        )
+        .unwrap();
+        let (t0, bars) = parse_chart(&v, 1_793_664_900.0);
+        assert_eq!(bars.len(), 3);
+        assert_eq!(t0, 1_793_574_060.0, "the first bar stamped at its end");
+        assert_eq!((bars[0].o, bars[0].h, bars[0].l, bars[0].c), (7_626.0, 7_638.75, 7_626.0, 7_635.75));
+        assert_eq!(bars[2].dt, 90_660.0, "offsets, not absolute times");
+        // A flat bar survives as a degenerate candle rather than vanishing.
+        assert_eq!((bars[2].o, bars[2].h, bars[2].l, bars[2].c), (7_584.0, 7_584.0, 7_584.0, 7_584.0));
+    }
+
+    #[test]
+    fn a_timed_out_symbol_keeps_the_bars_it_had() {
+        let bar = |c: f32| Bar { dt: 0.0, o: c, h: c, l: c, c };
+        let prev = vec![(100.0, vec![bar(1.0)]), (100.0, vec![])];
+        // Row 0 lost its fetch this pass, row 1 won one: neither result may wipe the other.
+        let got = vec![(0.0, vec![]), (200.0, vec![bar(2.0)])];
+        let merged = merge_bars(&prev, got);
+        assert_eq!(merged[0], (100.0, vec![bar(1.0)]), "the chart keeps its day");
+        assert_eq!(merged[1], (200.0, vec![bar(2.0)]), "the new day wins over the empty one");
+        // A changed row list is not merged at all: the indices no longer mean the same symbol.
+        let moved = merge_bars(&prev, vec![(0.0, vec![])]);
+        assert_eq!(moved.len(), 1);
+        assert!(moved[0].1.is_empty());
     }
 
     #[test]
