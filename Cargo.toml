@@ -1,6 +1,6 @@
 [package]
 name = "mh_ticker"
-version = "1.6.0"
+version = "1.7.0"
 edition = "2021"
 description = "MH Ticker: a price strip docked in the Windows taskbar that opens into a centred panel. Public CNBC quotes, no login, no server. Two builds from one source: MH_Ticker (one theme, lean) and MH_Ticker_Ultra (themes, alerts, symbol picker)."
 license = "MIT"
