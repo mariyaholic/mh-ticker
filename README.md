@@ -107,7 +107,7 @@ Double click it. If prompted, simply select Run anyway.
   already use, folded to 5/15/30/60 minutes on a narrow pane so a candle is never a one-pixel scratch. candles are
   whole-pixel and uniform, gridlines sit on round prices, the time axis ticks on round UTC hours, and a tag on the
   price axis marks where it last traded. opening it on a narrow window widens the frame to fit both, **closing it
-  gives that width back** (unless u dragged the edge yourself), and the picker and the chart take turns (they
+  glides the window back to the size and spot it came from**, centred again (unless u dragged the edge yourself), and the picker and the chart take turns (they
   want the same space)
 - **Settings button (Ultra):** the cog at the left end of the panel header opens the same menu as the tray icon
   (Symbols, Poll, Theme, Font, Alerts, Position...) right under it, so u don't have to go hunting for the tray
