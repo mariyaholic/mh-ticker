@@ -319,6 +319,28 @@ fn rect_after_chart(current: RECT, grown: RECT, before: RECT) -> Option<RECT> {
     Some(RECT { left: before.left + dx, top: current.top, right: before.right + dx, bottom: current.bottom })
 }
 
+/// `frame` as it would be if the chart had not widened the window: the compact frame, in the same
+/// place the user has the window now. `grew` is the `(before, after)` pair `grow_target` recorded; with
+/// none (the chart never widened it, or the user has resized it) the frame is returned as it is.
+/// Used wherever a frame outlives the chart (the saved panel rectangle, the one a collapsed panel
+/// reopens at), because the chart is not remembered but a frame is: without this a wide frame saved
+/// while the chart was open reopens wide with no chart in it, and nothing shrinks it.
+fn compact_frame(frame: RECT, grew: Option<(RECT, RECT)>) -> RECT {
+    grew.and_then(|(before, grown)| rect_after_chart(frame, grown, before)).unwrap_or(frame)
+}
+
+/// Which card stays locked when the rows change underneath it. The lock is by label, so it survives a
+/// reorder; but a label that is no longer there must not sit invisibly in the state and light up again
+/// if the symbol is re-added later. With the chart open the first card takes over (the pane is never
+/// left asking for a card); with it closed there is simply no lock.
+fn settle_lock(selected: Option<&str>, labels: &[&str], chart_open: bool) -> Option<String> {
+    match selected {
+        Some(l) if labels.contains(&l) => Some(l.to_string()),
+        _ if chart_open => labels.first().map(|l| l.to_string()),
+        _ => None,
+    }
+}
+
 /// The locked card's row. Ultra only: the classic build has no chart to lock, so a click there still
 /// opens CNBC at once. Looked up by label every time, because rows come and go with the Symbols menu.
 fn selected_row(u: &Ui) -> Option<usize> {
@@ -1162,7 +1184,14 @@ fn set_chart(hwnd: HWND, on: bool) {
     // Only an open panel has a frame to move; a chart toggled from the tray menu while the strip is up
     // just changes state.
     let target = if !open {
-        with_ui(|u| u.chart_grew = None);
+        // No window to move, but the frame the panel will reopen at may be the chart's wide one: closing
+        // the chart gives that back too, or the next expand is wide with nothing in the gap.
+        with_ui(|u| {
+            let grew = u.chart_grew.take();
+            if !on {
+                u.last_panel = u.last_panel.map(|f| compact_frame(f, grew));
+            }
+        });
         None
     } else if on {
         grow_target(hwnd, cur)
@@ -1188,14 +1217,24 @@ fn set_chart(hwnd: HWND, on: bool) {
             }
         }
     });
-    if let (Some(to_rect), Some(from)) = (target, from) {
+    if let Some(to_rect) = target {
         let (w, h) = size(to_rect);
-        if let Some(to) = with_ui(|u| (snapshot(hwnd, w, h, |dc| draw_panel(u, dc, w, h)), (w, h))) {
-            run_morph(hwnd, cur, to_rect, from, to, (255, 255), CHART_MS, ease_in_out);
-            with_ui(|u| u.mode = Mode::Panel);
-            unsafe {
-                SetWindowPos(hwnd, null_mut(), to_rect.left, to_rect.top, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+        let to = with_ui(|u| (snapshot(hwnd, w, h, |dc| draw_panel(u, dc, w, h)), (w, h)));
+        match (from, to) {
+            (Some(from), Some(to)) => {
+                run_morph(hwnd, cur, to_rect, from, to, (255, 255), CHART_MS, ease_in_out);
+                with_ui(|u| u.mode = Mode::Panel);
             }
+            // The glide is a nicety; the frame is not. If a picture could not be taken, the window
+            // still goes where the state says, and nothing is leaked.
+            (from, to) => unsafe {
+                for pic in [from, to].into_iter().flatten() {
+                    DeleteObject(pic.0);
+                }
+            },
+        }
+        unsafe {
+            SetWindowPos(hwnd, null_mut(), to_rect.left, to_rect.top, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
         }
     }
     unsafe { InvalidateRect(hwnd, null(), 0) };
@@ -1329,6 +1368,9 @@ fn settings_menu(hwnd: HWND) {
     let mut pt = POINT { x, y };
     unsafe { ClientToScreen(hwnd, &mut pt) };
     menu_at(hwnd, None, Some((pt.x, pt.y)));
+    // The menu ran its own message loop, so the pointer's departure from the button was never seen.
+    with_ui(|u| u.gear_hover = false);
+    unsafe { InvalidateRect(hwnd, null(), 0) };
 }
 
 /// `anchor` is a screen point to drop the menu from; `None` drops it at the cursor.
@@ -1726,6 +1768,10 @@ fn apply_rows(hwnd: HWND) {
             u.view = b.clone();
         }
         u.hist.record(&u.view, crate::source::now_s());
+        if u.profile.ultra {
+            let labels: Vec<&str> = u.view.cells.iter().map(|c| c.label.as_str()).collect();
+            u.selected = settle_lock(u.selected.as_deref(), &labels, u.chart);
+        }
         u.mode == Mode::Panel
     }) else {
         return;
@@ -2241,12 +2287,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             GetWindowRect(hwnd, &mut r);
             with_ui(|u| match u.mode {
                 Mode::Panel => {
-                    // The frame is the user's now: remember it, and only write when it changed.
-                    let frame = [r.left, r.top, r.right - r.left, r.bottom - r.top];
                     // A dragged edge makes the width the user's, so closing the chart must not undo it.
-                    if u.chart_grew.is_some_and(|(_, grown)| grown.right - grown.left != frame[2]) {
+                    if u.chart_grew.is_some_and(|(_, grown)| grown.right - grown.left != r.right - r.left) {
                         u.chart_grew = None;
                     }
+                    // The frame is the user's now: remember it, and only write when it changed. While
+                    // the chart is what made it wide, the compact frame is what is worth remembering:
+                    // the chart is not saved, so the wide one would reopen empty.
+                    let c = compact_frame(r, u.chart_grew);
+                    let frame = [c.left, c.top, c.right - c.left, c.bottom - c.top];
                     if u.cfg.panel != Some(frame) {
                         u.cfg.panel = Some(frame);
                         config::save(&u.cfg);
@@ -2267,6 +2316,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let open = with_ui(|u| {
                 unsafe { DeleteObject(u.font) };
                 u.dpi = dpi;
+                // The recorded frames are in the old scale's pixels and could never match again.
+                u.chart_grew = None;
                 u.font = make_font(&u.cfg, dpi);
                 u.fonts = u.fonts.take().map(|_| panel::Fonts::new(u.face, dpi, u.theme.is_pixel()));
                 (u.mode == Mode::Panel).then(|| panel_geo(u))
@@ -2499,6 +2550,34 @@ mod tests {
         assert_eq!((back.left, back.right, back.top, back.bottom), (680, 1_440, 340, 734));
         // Resized by hand: the size is the user's, so nothing is undone.
         assert!(rect_after_chart(rect(215, 300, 1_600, 694), grown, before).is_none());
+    }
+
+    #[test]
+    fn a_frame_that_outlives_the_chart_is_the_compact_one() {
+        let before = rect(580, 300, 1_340, 694);
+        let grown = rect(215, 300, 1_705, 694);
+        // Saved or reopened while the chart is what made it wide: the compact frame, in the same place.
+        let c = compact_frame(grown, Some((before, grown)));
+        assert_eq!((c.left, c.right), (580, 1_340));
+        // Dragged to the right first: compact, and carried by the same distance.
+        let c = compact_frame(rect(415, 300, 1_905, 694), Some((before, grown)));
+        assert_eq!((c.left, c.right), (780, 1_540));
+        // No chart growth on record, or a width the chart did not make: left exactly as it is.
+        let hand = rect(100, 100, 1_000, 600);
+        assert_eq!(compact_frame(hand, None).right, 1_000);
+        assert_eq!(compact_frame(hand, Some((before, grown))).right, 1_000);
+    }
+
+    #[test]
+    fn a_lock_on_a_vanished_symbol_does_not_come_back_with_it() {
+        let rows = ["XAU", "BTC", "S&P"];
+        assert_eq!(settle_lock(Some("BTC"), &rows, false).as_deref(), Some("BTC"), "still there");
+        // Removed, chart closed: no lock at all, so re-adding the symbol later does not re-light it.
+        assert_eq!(settle_lock(Some("NAS"), &rows, false), None);
+        // Removed with the chart open: the first card takes over, so the pane is not left asking.
+        assert_eq!(settle_lock(Some("NAS"), &rows, true).as_deref(), Some("XAU"));
+        assert_eq!(settle_lock(None, &rows, false), None, "no lock stays no lock");
+        assert_eq!(settle_lock(Some("XAU"), &[], true), None, "nothing to lock");
     }
 
     #[test]

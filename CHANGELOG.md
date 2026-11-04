@@ -19,8 +19,16 @@ stuck left of where it opened, and both moves snapped.
   new, stretched between the frames). It is a picture, not the live window, because the panel lays out
   from its width and animating the window itself would reflow the card grid every frame. Opening was
   animated too, which was not asked for: a glide on close and a snap on open would feel like a bug.
-- A chart toggled from the tray menu while the strip is showing only changes state; it has no frame to
-  move.
+- A chart toggled from the tray menu while the strip is showing has no window to move, but it now
+  rewrites the frame the panel will reopen at (see the state-machine pass below).
+
+**State-machine pass (same release).** Re-audited the chart/lock/mode transitions (`STATE-MACHINES.md`,
+"Re-audit 1.7.1") and fixed five that were wrong in 1.7.0: a wide frame stranded in `last_panel` after
+the chart was closed from the tray while collapsed; the chart-wide frame saved to the config when the
+window was merely moved (so the next launch opened wide with no chart); a lock on a removed symbol that
+re-lit when it came back; a morph that could skip moving the window and leak a bitmap if a picture
+failed; and a give-back record that outlived a DPI change. The first two are one rule, now one function:
+a frame that outlives the chart is the compact one (`compact_frame`).
 
 **Checked.** Under Wine (Haiku subagents): 100 tests pass; the one failure is the known
 `a_theme_switch_takes_the_new_themes_face` (Wine has no Consolas). Clippy is clean and both binaries
