@@ -107,6 +107,9 @@ const MIN_FORCED_GAP: i32 = 60;
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const EXPAND_MS: f64 = 230.0;
 const COLLAPSE_MS: f64 = 190.0;
+/// The window gliding wider for the chart, or back. Shorter than a strip <-> panel morph: the content
+/// is the same panel, only the frame changes.
+const CHART_MS: f64 = 210.0;
 /// The fallback cycle length, and how often a moving background is advanced. Each palette names its
 /// own cycle in `theme::ALL`; this only covers a theme that somehow has none.
 const ANIM_CYCLE_S: f64 = 9.0;
@@ -210,10 +213,10 @@ struct Ui {
     /// card and the candle pane follows it; hovering never changes it, because a chart that moves
     /// while the pointer travels to it cannot be read.
     selected: Option<String>,
-    /// `(width before, width after)` when opening the chart widened the window. Closing the chart
-    /// gives the width back, but only while the window is still the width the chart made it: once
-    /// the user has dragged an edge, the size is theirs.
-    chart_grew: Option<(i32, i32)>,
+    /// `(frame before, frame after)` when opening the chart widened the window. Closing the chart
+    /// glides back to the frame it came from, but only while the window is still the width the chart
+    /// made it: once the user has dragged an edge, the size is theirs.
+    chart_grew: Option<(RECT, RECT)>,
     /// Pointer position on a chart, `None` when it is off every sparkline.
     hover_at: Option<panel::Hover>,
     /// Last alert outcome, shown in the footer so a swallowed balloon is not silent.
@@ -294,10 +297,26 @@ fn toggle_lock(current: Option<&str>, clicked: String) -> Option<String> {
     if current == Some(clicked.as_str()) { None } else { Some(clicked) }
 }
 
-/// The width to give back when the chart closes: `before` if the window is still exactly as wide as
-/// the chart made it, `None` if the user has resized it since (the size is theirs, leave it).
-fn width_after_chart(current: i32, grown: i32, before: i32) -> Option<i32> {
-    (current == grown).then_some(before)
+/// The frame the window grows to when the chart opens: `want_w` wide, centred on where it was so the
+/// panel opens out in both directions instead of lurching to one side, and slid back inside the work
+/// area where that would hang off an edge. The height is untouched.
+fn grown_rect(before: RECT, want_w: i32, work: RECT) -> RECT {
+    let w = want_w.min(work.right - work.left);
+    let centre = (before.left + before.right) / 2;
+    let x = (centre - w / 2).clamp(work.left, (work.right - w).max(work.left));
+    RECT { left: x, top: before.top, right: x + w, bottom: before.bottom }
+}
+
+/// The frame to glide back to when the chart closes: the one it grew from, carried by however far the
+/// user has moved the window since (so a panel dragged to another corner shrinks where it is, not back
+/// to where it started), with the window's current height. `None` if the width is no longer the one the
+/// chart made it: the user has resized the window, and the size is theirs.
+fn rect_after_chart(current: RECT, grown: RECT, before: RECT) -> Option<RECT> {
+    if current.right - current.left != grown.right - grown.left {
+        return None;
+    }
+    let dx = current.left - grown.left;
+    Some(RECT { left: before.left + dx, top: current.top, right: before.right + dx, bottom: current.bottom })
 }
 
 /// The locked card's row. Ultra only: the classic build has no chart to lock, so a click there still
@@ -1085,65 +1104,81 @@ fn panel_rect(near: &RECT, w: i32, h: i32) -> RECT {
     }
 }
 
-/// Opening the chart needs room for both pans. A frame that cannot hold them is widened to the
-/// two-pane minimum rather than squeezing the cards into a single column.
-fn grow_for_chart(hwnd: HWND) {
-    unsafe {
-        let mut rc: RECT = std::mem::zeroed();
-        GetWindowRect(hwnd, &mut rc);
-        let Some((natural, chart_max, gap)) = with_ui(|u| {
-            let s = |v: i32| v * u.dpi as i32 / 96;
-            (panel::geometry(u.view.cells.len(), catalog_len(u), u.dpi, false), s(720), s(10))
-        }) else {
-            return;
-        };
-        // Wide enough for the cards' natural grid plus a full chart pane; the pane takes what is
-        // left over, so this is the one width where both are whole.
-        let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
-        let want = natural.w + chart_max + gap;
-        if w >= want {
-            with_ui(|u| u.chart_grew = None);
-            return;
-        }
+/// Where the window goes when the chart opens, if it has to widen at all. Both panes need room: a frame
+/// that cannot hold them is widened to the two-pane size rather than squeezing the cards into one
+/// column. Records the move so closing the chart can undo exactly it.
+fn grow_target(hwnd: HWND, cur: RECT) -> Option<RECT> {
+    let (natural, chart_max, gap) = with_ui(|u| {
+        let s = |v: i32| v * u.dpi as i32 / 96;
+        (panel::geometry(u.view.cells.len(), catalog_len(u), u.dpi, false), s(720), s(10))
+    })?;
+    // Wide enough for the cards' natural grid plus a full chart pane; the pane takes what is left
+    // over, so this is the one width where both are whole.
+    let want = natural.w + chart_max + gap;
+    if cur.right - cur.left >= want {
+        with_ui(|u| u.chart_grew = None);
+        return None;
+    }
+    let work = unsafe {
         let mut mi: MONITORINFO = std::mem::zeroed();
         mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
         if GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut mi) == 0 {
-            return;
+            return None;
         }
-        let wa = mi.rcWork;
-        let new_w = want.min(wa.right - wa.left);
-        let x = rc.left.min((wa.right - new_w).max(wa.left));
-        SetWindowPos(hwnd, null_mut(), x, rc.top, new_w, h, SWP_NOZORDER | SWP_NOACTIVATE);
-        // Remember what the chart cost, so closing it can pay it back.
-        with_ui(|u| u.chart_grew = Some((w, new_w)));
-    }
+        mi.rcWork
+    };
+    let grown = grown_rect(cur, want, work);
+    // Remember what the chart cost, so closing it can pay it back.
+    with_ui(|u| u.chart_grew = Some((cur, grown)));
+    Some(grown)
 }
 
-/// Close the chart's extra width again. Opening the chart may have widened the window to make room
-/// for both panes (`grow_for_chart`); without this the pane could be closed but the window stayed
-/// wide, with the cards stretched across the gap, and the only way back to the compact panel was to
-/// drag an edge. It only undoes its own growth: a window the user has resized since is left alone.
-fn shrink_after_chart(hwnd: HWND) {
-    let Some((before, grown)) = with_ui(|u| u.chart_grew.take()).flatten() else {
+/// Where the window goes when the chart closes: back to the frame it grew from (see
+/// `rect_after_chart`), fitted to the monitor it is on. `None` when the chart never widened it, or
+/// the user has resized it since.
+fn shrink_target(cur: RECT) -> Option<RECT> {
+    let (before, grown) = with_ui(|u| u.chart_grew.take()).flatten()?;
+    rect_after_chart(cur, grown, before).map(fit_panel)
+}
+
+/// Open or close the candle pane, with the window gliding to match: opening widens it (centred on where
+/// it was), closing brings it back to where it came from. Without the give-back the pane could be
+/// closed but the window stayed wide, with the cards stretched across the gap. The picker and the chart
+/// share the space under the cards, so opening one closes the other (`apply_picker` calls this with
+/// `false`).
+///
+/// The glide is the strip <-> panel morph: a picture of the old state and one of the new, stretched
+/// between the two frames. The panel is laid out from its width, so animating the live window would
+/// reflow the card grid on every frame.
+fn set_chart(hwnd: HWND, on: bool) {
+    let Some((was, open)) = with_ui(|u| (u.chart, u.mode == Mode::Panel)) else {
         return;
     };
-    unsafe {
-        let mut rc: RECT = std::mem::zeroed();
-        GetWindowRect(hwnd, &mut rc);
-        let Some(w) = width_after_chart(rc.right - rc.left, grown, before) else {
-            return;
-        };
-        SetWindowPos(hwnd, null_mut(), rc.left, rc.top, w, rc.bottom - rc.top, SWP_NOZORDER | SWP_NOACTIVATE);
+    if was == on {
+        return;
     }
-}
-
-/// Open or close the candle pane, with the window following: opening may widen it, closing gives the
-/// width back. The picker and the chart share the space under the cards, so opening one closes the
-/// other (`apply_picker` calls this with `false`).
-fn set_chart(hwnd: HWND, on: bool) {
-    let was = with_ui(|u| {
-        let was = u.chart;
+    let mut cur: RECT = unsafe { std::mem::zeroed() };
+    unsafe { GetWindowRect(hwnd, &mut cur) };
+    // Only an open panel has a frame to move; a chart toggled from the tray menu while the strip is up
+    // just changes state.
+    let target = if !open {
+        with_ui(|u| u.chart_grew = None);
+        None
+    } else if on {
+        grow_target(hwnd, cur)
+    } else {
+        shrink_target(cur)
+    };
+    let size = |r: RECT| ((r.right - r.left).max(1), (r.bottom - r.top).max(1));
+    // The old picture is taken before the state changes, the new one after.
+    let from = target.and_then(|_| {
+        let (w, h) = size(cur);
+        with_ui(|u| (snapshot(hwnd, w, h, |dc| draw_panel(u, dc, w, h)), (w, h)))
+    });
+    with_ui(|u| {
         u.chart = on;
+        u.open_hover = false;
+        u.chart_hover = false;
         if on {
             u.pick_open = false;
             // Nothing locked yet: lock the first card, so the pane opens on a chart instead of an
@@ -1152,15 +1187,16 @@ fn set_chart(hwnd: HWND, on: bool) {
                 u.selected = u.view.cells.first().map(|c| c.label.clone());
             }
         }
-        was
-    })
-    .unwrap_or(on);
-    if on && !was {
-        // A narrow frame has no room for both panes, so opening the chart on one widens the window
-        // to the two-pane minimum instead of squeezing the cards into a column.
-        grow_for_chart(hwnd);
-    } else if !on && was {
-        shrink_after_chart(hwnd);
+    });
+    if let (Some(to_rect), Some(from)) = (target, from) {
+        let (w, h) = size(to_rect);
+        if let Some(to) = with_ui(|u| (snapshot(hwnd, w, h, |dc| draw_panel(u, dc, w, h)), (w, h))) {
+            run_morph(hwnd, cur, to_rect, from, to, (255, 255), CHART_MS, ease_in_out);
+            with_ui(|u| u.mode = Mode::Panel);
+            unsafe {
+                SetWindowPos(hwnd, null_mut(), to_rect.left, to_rect.top, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+        }
     }
     unsafe { InvalidateRect(hwnd, null(), 0) };
 }
@@ -2208,7 +2244,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     // The frame is the user's now: remember it, and only write when it changed.
                     let frame = [r.left, r.top, r.right - r.left, r.bottom - r.top];
                     // A dragged edge makes the width the user's, so closing the chart must not undo it.
-                    if u.chart_grew.is_some_and(|(_, grown)| grown != frame[2]) {
+                    if u.chart_grew.is_some_and(|(_, grown)| grown.right - grown.left != frame[2]) {
                         u.chart_grew = None;
                     }
                     if u.cfg.panel != Some(frame) {
@@ -2430,12 +2466,39 @@ mod tests {
         assert_eq!(toggle_lock(Some("BTC"), "BTC".into()), None);
     }
 
+    fn rect(l: i32, t: i32, r: i32, b: i32) -> RECT {
+        RECT { left: l, top: t, right: r, bottom: b }
+    }
+
     #[test]
-    fn closing_the_chart_gives_back_only_the_width_it_took() {
-        // Widened 760 -> 1,490 by the chart and untouched since: back to 760.
-        assert_eq!(width_after_chart(1_490, 1_490, 760), Some(760));
-        // The user dragged it to 1,300 in between: that size is theirs.
-        assert_eq!(width_after_chart(1_300, 1_490, 760), None);
+    fn the_chart_opens_the_window_out_from_its_centre() {
+        let work = rect(0, 0, 1_920, 1_040);
+        // The panel as it opens: 760 wide, centred. The old rule kept its left edge and slid it to 430
+        // to fit, so the wide panel hugged the right and closing left the compact one stuck left.
+        let before = rect(580, 300, 1_340, 694);
+        let grown = grown_rect(before, 1_490, work);
+        assert_eq!((grown.left, grown.right), (215, 1_705), "centred, 1,490 wide");
+        assert_eq!(((grown.left + grown.right) / 2), (before.left + before.right) / 2, "same centre");
+        assert_eq!((grown.top, grown.bottom), (before.top, before.bottom), "height untouched");
+        // Near an edge it slides back inside rather than hanging off the screen...
+        let near = grown_rect(rect(1_200, 300, 1_960, 694), 1_490, work);
+        assert_eq!((near.left, near.right), (430, 1_920));
+        // ...and a monitor narrower than the want caps the width.
+        assert_eq!(grown_rect(before, 2_500, work).right - grown_rect(before, 2_500, work).left, 1_920);
+    }
+
+    #[test]
+    fn closing_the_chart_glides_back_to_where_the_window_came_from() {
+        let before = rect(580, 300, 1_340, 694);
+        let grown = rect(215, 300, 1_705, 694);
+        // Untouched since it opened: exactly the frame it grew from, so it is centred again.
+        assert_eq!(rect_after_chart(grown, grown, before).map(|r| (r.left, r.right)), Some((580, 1_340)));
+        // Dragged 100 px right and 40 down in between: it shrinks where it now is, not back where it was.
+        let moved = rect(315, 340, 1_805, 734);
+        let back = rect_after_chart(moved, grown, before).unwrap();
+        assert_eq!((back.left, back.right, back.top, back.bottom), (680, 1_440, 340, 734));
+        // Resized by hand: the size is the user's, so nothing is undone.
+        assert!(rect_after_chart(rect(215, 300, 1_600, 694), grown, before).is_none());
     }
 
     #[test]
