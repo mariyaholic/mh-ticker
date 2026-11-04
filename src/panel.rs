@@ -1029,7 +1029,7 @@ fn candles(dc: HDC, sc: &Scene, r: RECT, c: &Chart) {
     if plot.right - plot.left < s(40) || plot.bottom - plot.top < s(30) {
         return;
     }
-    let (bars, bucket) = fitted(c.bars, plot.right - plot.left);
+    let (bars, bucket) = fitted(c.bars, plot.right - plot.left, c.t0);
     let span = match bucket as i64 {
         60 => "1 m",
         300 => "5 m",
@@ -1091,7 +1091,9 @@ fn candles(dc: HDC, sc: &Scene, r: RECT, c: &Chart) {
         }
         let x = centre(i as i32);
         fill_rect(dc, RECT { left: x, top: plot.bottom, right: x + 1, bottom: plot.bottom + s(4) }, t.guide);
-        let label = clock(key * every);
+        // The bar's own start, which is the boundary itself except after a break in the session
+        // (a market reopening at 23:15 is labelled 23:15, not a 23:00 it did not trade at).
+        let label = clock(tb);
         let w = text_width(dc, sc.fonts.small, &label);
         let lx = (x - w / 2).clamp(plot.left, (plot.right - w).max(plot.left));
         if lx > last_label_right + s(8) {
@@ -1162,7 +1164,7 @@ fn candle_metrics(plot_w: i32, n: i32, dpi: u32) -> (i32, i32, i32) {
 /// arbitrary quarters of its own range.
 fn nice_ticks(lo: f64, hi: f64, want: usize) -> (Vec<f64>, u32) {
     let span = hi - lo;
-    if !(span > 0.0) || !span.is_finite() || want == 0 {
+    if span <= 0.0 || !span.is_finite() || want == 0 {
         return (Vec::new(), 0);
     }
     let raw = span / want as f64;
@@ -1197,13 +1199,13 @@ const MIN_BAR: i32 = 5;
 
 /// The bars to draw and the bucket they are drawn at: the finest bucket on the ladder whose candles
 /// still have `MIN_BAR` pixels each.
-fn fitted(bars: &[Bar], plot_w: i32) -> (Vec<Bar>, f64) {
+fn fitted(bars: &[Bar], plot_w: i32, t0: f64) -> (Vec<Bar>, f64) {
     const LADDER: [f64; 5] = [60.0, 300.0, 900.0, 1_800.0, 3_600.0];
-    let (mut best, mut bucket) = (fold(bars, LADDER[0]), LADDER[0]);
+    let (mut best, mut bucket) = (fold(bars, LADDER[0], t0), LADDER[0]);
     // The finest bucket that fits wins; if none does, the coarsest is still better than a comb.
     if best.len() as i32 * MIN_BAR > plot_w {
         for b in &LADDER[1..] {
-            best = fold(bars, *b);
+            best = fold(bars, *b, t0);
             bucket = *b;
             if best.len() as i32 * MIN_BAR <= plot_w {
                 break;
@@ -1214,13 +1216,15 @@ fn fitted(bars: &[Bar], plot_w: i32) -> (Vec<Bar>, f64) {
 }
 
 /// Fold one-minute bars into `bucket_s`-second candles: the open of the first bar in a bucket, the
-/// extreme high and low of all of them, the close of the last. Buckets are cut on the clock, not by
-/// counting bars, so a break in the session stays a gap instead of being papered over.
-fn fold(bars: &[Bar], bucket_s: f64) -> Vec<Bar> {
+/// extreme high and low of all of them, the close of the last. Buckets are cut on the UTC clock
+/// (`t0` is the absolute time of `dt == 0`), not from the first bar and not by counting bars: a day
+/// that opens at 13:31 still has its five-minute candles start at 13:30, 13:35 ..., which is what the
+/// time axis labels say, and a break in the session stays a gap instead of being papered over.
+fn fold(bars: &[Bar], bucket_s: f64, t0: f64) -> Vec<Bar> {
     let mut out: Vec<Bar> = Vec::new();
     let mut key: Option<f64> = None;
     for b in bars {
-        let k = (b.dt as f64 / bucket_s).floor();
+        let k = ((t0 + b.dt as f64) / bucket_s).floor();
         if key == Some(k) {
             if let Some(last) = out.last_mut() {
                 last.h = last.h.max(b.h);
@@ -1230,7 +1234,7 @@ fn fold(bars: &[Bar], bucket_s: f64) -> Vec<Bar> {
             }
         }
         key = Some(k);
-        out.push(Bar { dt: (k * bucket_s) as f32, o: b.o, h: b.h, l: b.l, c: b.c });
+        out.push(Bar { dt: (k * bucket_s - t0) as f32, o: b.o, h: b.h, l: b.l, c: b.c });
     }
     out
 }
@@ -1255,7 +1259,7 @@ mod tests {
             })
             .collect();
         // 390 bars in 650 px is 1.6 px a bar: fold to five minutes, 78 of them at 8 px.
-        let (folded, bucket) = fitted(&bars, 650);
+        let (folded, bucket) = fitted(&bars, 650, 0.0);
         assert_eq!(bucket, 300.0);
         assert_eq!(folded.len(), 78);
         // Open from the first bar of the bucket, extremes across the bucket, close from the last.
@@ -1264,7 +1268,7 @@ mod tests {
         assert_eq!(folded[0].h, bars[0..5].iter().fold(f32::MIN, |m, b| m.max(b.h)));
         assert_eq!(folded[0].l, bars[0..5].iter().fold(f32::MAX, |m, b| m.min(b.l)));
         // A pane wide enough for the minute keeps the minute.
-        let (fine, b1) = fitted(&bars, 2_000);
+        let (fine, b1) = fitted(&bars, 2_000, 0.0);
         assert_eq!((b1, fine.len()), (60.0, 390));
     }
 
@@ -1276,9 +1280,29 @@ mod tests {
             // An hour later: the market was shut, and five-minute buckets must not merge across it.
             Bar { dt: 3_660.0, o: 2.0, h: 2.0, l: 2.0, c: 2.0 },
         ];
-        let folded = fold(&bars, 300.0);
+        let folded = fold(&bars, 300.0, 0.0);
         assert_eq!(folded.len(), 2);
         assert_eq!((folded[0].c, folded[1].o), (1.0, 2.0));
+    }
+
+    #[test]
+    fn candles_start_on_the_utc_clock_even_when_the_day_opens_off_it() {
+        // A session that opens at 13:31:00 UTC: `dt` counts from there, `t0` places it on the clock.
+        let t0 = 13.0 * 3_600.0 + 31.0 * 60.0 + 86_400.0 * 20_000.0;
+        let bars: Vec<Bar> = (0..14)
+            .map(|i| Bar { dt: (i * 60) as f32, o: i as f32, h: i as f32 + 1.0, l: i as f32 - 1.0, c: i as f32 })
+            .collect();
+        let folded = fold(&bars, 300.0, t0);
+        // 13:31-13:34 | 13:35-13:39 | 13:40-13:44: three candles, cut at :30 / :35 / :40, not at :31.
+        assert_eq!(folded.len(), 3);
+        for b in &folded {
+            assert_eq!(((t0 + b.dt as f64) % 300.0).abs(), 0.0, "bucket starts on a five-minute boundary");
+        }
+        assert_eq!(clock(folded[0].t(t0)), "13:30");
+        assert_eq!(clock(folded[1].t(t0)), "13:35");
+        // The first candle holds only the four minutes the session actually traded.
+        assert_eq!(folded[0].o, bars[0].o);
+        assert_eq!(folded[0].c, bars[3].c);
     }
 
     #[test]

@@ -1,5 +1,57 @@
 # Changelog — MH Ticker
 
+## 2026-11-04 — 1.7.0: lock a card, settings in the panel, a chart that reads   [claude.impl]
+
+**Files:** `src/panel.rs` (selection border, Open button, cog, the candle pane rewritten, clock-aligned
+`fold`), `src/ui.rs` (the lock, `set_chart` / width give-back, settings menu anchor, hover state),
+`src/shot.rs` + `examples/chart.rs` (the fixture shows the locked state), `README.md`,
+`STATE-MACHINES.md`, `Cargo.toml`/`Cargo.lock` (1.7.0).
+
+**What.** Four complaints about the Ultra panel, one release.
+
+- **A click locks a card; it no longer opens CNBC.** The card gets an accent outline and an
+  *Open on CNBC* button in the corner where its source tag sits; clicking the same card again unlocks
+  it. The candle pane follows the lock and **only** the lock: it used to re-target on hover, so it
+  changed on the way to it. Opening the chart with nothing locked locks the first card, so the pane
+  never opens on an instruction. Right-click *Open ... on CNBC* is unchanged. **The classic build is
+  untouched** and still opens CNBC on click: it has no chart to lock.
+- **Closing the chart gives the width back.** Opening it widens the window to fit both panes; closing
+  it left the window wide with the cards stretched across the gap, and the only way back was dragging
+  an edge. The widening is remembered and undone exactly, and only while the window is still the
+  width the chart made it: a frame the user dragged is theirs. The picker closes the chart through the
+  same path, so it hands the width back too.
+- **Settings in the panel (Ultra).** A cog at the left end of the header buttons opens the same menu the
+  tray icon does, dropped from under it. It sits on the far side of the chart toggle so the buttons that
+  were already there keep their pixels. The chart and cog buttons also light on hover now.
+- **The candle pane.** Bodies alternated 5 and 6 px in one row and a 1 px wick cannot centre on an even
+  body, so candles looked uneven. The step is now a whole odd pixel count, every body is the same odd
+  width, and the wick is the middle pixel. Gridlines sit on round prices (1/2/2.5/5 × 10ⁿ) instead of
+  quarters of the day's range (`6,709.47 / 6,686.35 / 6,663.23` is now `6,725 / 6,700 / 6,675 / 6,650`),
+  the time axis ticks on round UTC times instead of two labels at odd minutes, and a tag on the price
+  axis marks where it last traded, with a dotted line under the candles. The axis is as wide as its
+  widest label. `MIN_BAR` is 5 (odd) so a fitting candle can be centred.
+- **Buckets are cut on the UTC clock.** `fold` bucketed from the first bar, so a day opening at 13:31
+  had candles at 13:31, 13:36... and the new axis labels would have lied by up to a bucket. It now uses
+  `t0 + dt`. This also narrows the "inaccurate time axis" note in `STATE-MACHINES.md`; the by-index
+  spacing across a market closure remains.
+
+**Why.** A ticker is read by pointing and travelling; a chart that moves while the pointer is on its way
+to it, an action that throws a browser window at a stray click, a window that cannot shrink back, and a
+settings menu that lives only in the tray are four ways the panel got in the way of that. The chart
+fixes are arithmetic on whole pixels and round numbers, which is most of what makes a candle chart look
+right.
+
+**Checked** (under Wine against `x86_64-pc-windows-gnu`, by Haiku subagents; the author reviewed the
+renders). 99 tests pass; the one failure, `a_theme_switch_takes_the_new_themes_face`, fails on the
+unmodified HEAD too, because Wine has no Consolas. 8 tests are new (button row, Open-button targeting,
+candle pixel parity over 4 dpis × 6 widths × 7 counts, round ticks, time ticks, clock-aligned buckets, the
+lock toggle, the width give-back). Clippy is clean (HEAD was too). 32 chart renders (midnight, paper,
+pc98, aurora, ega × 96/192 dpi × three locked cards, plus 1,130 and 1,920 px frames) exited 0 and were
+inspected. **`shots/*.png` regenerate byte-identically: 36 of 36 SAME against HEAD.**
+**Not checked:** a real Windows session. The window-level behaviour (click lock, width restore on a live
+window, the menu dropping from the cog) is covered by pure-function tests and by reading the message
+handler, not by driving a live window, and the fonts under Wine are not Windows' fonts.
+
 ## 2026-11-03 — 1.6.0: a window that resizes, and a candle pane that reads   [hermes.impl]
 
 **Files:** `src/workspace.rs` (width-aware grid), `src/panel.rs` (`geometry_in`, `minimum`, the
