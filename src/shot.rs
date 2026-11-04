@@ -127,6 +127,13 @@ fn render(t: &Theme, phase: f64, now: f64, b: &Board, h: &History, dpi: u32) -> 
         now,
         btn_hover: false,
         pick_hover: false,
+        chart_hover: false,
+        gear_hover: false,
+        open_hover: false,
+        // Nothing is locked in a still, and the settings button is chrome rather than palette: the
+        // catalogue pictures stay what they were, byte for byte.
+        select: false,
+        selected: None,
         hover: None,
         picker: None,
         picker_scroll: 0,
@@ -135,6 +142,7 @@ fn render(t: &Theme, phase: f64, now: f64, b: &Board, h: &History, dpi: u32) -> 
         // window test, not to the theme catalogue.
         chart: None,
         chart_btn: false,
+        settings_btn: false,
         alert: None,
         phase,
     };
@@ -190,7 +198,8 @@ pub fn write_chart_named(dir: &Path, name: &str, dpi: u32, w: i32) -> Result<Pat
     write_chart_named_at(dir, name, dpi, w, None)
 }
 
-/// `write_chart_named` with a card held under the pointer, so a review can watch the pane follow it.
+/// `write_chart_named` with card `hover` locked (and its crosshair drawn), so a review can see the
+/// pane, the border and the Open button on any of the six.
 pub fn write_chart_named_at(
     dir: &Path,
     name: &str,
@@ -212,7 +221,7 @@ pub fn write_chart(dir: &Path, t: &Theme, dpi: u32, w: i32) -> Result<PathBuf, S
     write_chart_at(dir, t, dpi, w, None)
 }
 
-/// `write_chart` with a card held under the pointer.
+/// `write_chart` with a card locked.
 pub fn write_chart_at(
     dir: &Path,
     t: &Theme,
@@ -255,12 +264,20 @@ pub fn write_chart_at(
         now,
         btn_hover: false,
         pick_hover: false,
+        chart_hover: false,
+        gear_hover: false,
+        open_hover: false,
+        // The pane charts the locked card, so the fixture locks it: the border and the Open button
+        // are part of what this picture is for.
+        select: true,
+        selected: Some(row),
         hover: hover.map(|row| panel::Hover { row, t: snap_t(now) }),
         picker: None,
         picker_scroll: 0,
         picker_btn: true,
         chart: Some(Chart { label: &label, digits, t0, bars: &charted, last, unavailable: false }),
         chart_btn: true,
+        settings_btn: true,
         alert: None,
         phase: 0.0,
     };

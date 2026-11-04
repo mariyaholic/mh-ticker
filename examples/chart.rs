@@ -6,7 +6,7 @@
 //!
 //! ```text
 //! cargo run --release --example chart --features shots -- shots-chart/ midnight 96 1488
-//! cargo run --release --example chart --features shots -- shots-chart/ midnight 96 1488 4
+//! cargo run --release --example chart --features shots -- shots-chart/ midnight 96 1488 4   # lock card 4
 //! ```
 
 use mh_ticker::shot;
@@ -17,7 +17,7 @@ fn main() {
     let name = args.next().unwrap_or_else(|| "midnight".into());
     let dpi: u32 = args.next().and_then(|v| v.parse().ok()).unwrap_or(96);
     let width: i32 = args.next().and_then(|v| v.parse().ok()).unwrap_or(1488);
-    // Optional 5th argument: hold card N under the pointer, as hovering it would.
+    // Optional 5th argument: lock card N, as clicking it would (the chart follows the lock).
     let hover: Option<usize> = args.next().and_then(|v| v.parse().ok());
     match shot::write_chart_named_at(&dir, name.as_str(), dpi, width, hover) {
         Ok(p) => println!("{}", p.display()),
