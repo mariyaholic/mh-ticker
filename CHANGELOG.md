@@ -1,5 +1,41 @@
 # Changelog — MH Ticker
 
+## 2026-11-04 — 1.7.1: closing the chart glides back to the middle   [claude.impl]
+
+**Files:** `src/ui.rs` (`grown_rect`, `rect_after_chart`, `grow_target`, `shrink_target`, `set_chart`),
+`README.md`, `STATE-MACHINES.md`, `Cargo.toml`/`Cargo.lock`.
+
+**What.** 1.7.0 gave the chart's width back on close, but kept the window's left edge. Opening the chart
+had anchored the left edge and slid the window left only when it would overflow the screen (a 760 px
+panel at x = 580 on a 1,920 px screen became 1,490 px at x = 430), so the compact panel came back
+stuck left of where it opened, and both moves snapped.
+
+- **Opening centres the wider frame on the old one**, clamped to the work area, so the panel opens out
+  in both directions.
+- **Closing returns to the exact frame it grew from**, carried by however far the user moved the
+  window in between (a panel dragged to another corner shrinks where it is). A window the user has
+  resized is still left alone.
+- **Both directions glide** (210 ms, the strip <-> panel morph: a picture of the old state and one of the
+  new, stretched between the frames). It is a picture, not the live window, because the panel lays out
+  from its width and animating the window itself would reflow the card grid every frame. Opening was
+  animated too, which was not asked for: a glide on close and a snap on open would feel like a bug.
+- A chart toggled from the tray menu while the strip is showing has no window to move, but it now
+  rewrites the frame the panel will reopen at (see the state-machine pass below).
+
+**State-machine pass (same release).** Re-audited the chart/lock/mode transitions (`STATE-MACHINES.md`,
+"Re-audit 1.7.1") and fixed five that were wrong in 1.7.0: a wide frame stranded in `last_panel` after
+the chart was closed from the tray while collapsed; the chart-wide frame saved to the config when the
+window was merely moved (so the next launch opened wide with no chart); a lock on a removed symbol that
+re-lit when it came back; a morph that could skip moving the window and leak a bitmap if a picture
+failed; and a give-back record that outlived a DPI change. The first two are one rule, now one function:
+a frame that outlives the chart is the compact one (`compact_frame`).
+
+**Checked.** Under Wine (Haiku subagents): 100 tests pass; the one failure is the known
+`a_theme_switch_takes_the_new_themes_face` (Wine has no Consolas). Clippy is clean and both binaries
+link in release. 2 tests replace the old width-only one: the centred growth (including the edge clamp and a screen narrower than the want) and
+the give-back (untouched, dragged, resized). **Not checked: the animation itself.** It needs a live
+window on Windows; what is covered is the geometry it animates between.
+
 ## 2026-11-04 — 1.7.0: lock a card, settings in the panel, a chart that reads   [claude.impl]
 
 **Files:** `src/panel.rs` (selection border, Open button, cog, the candle pane rewritten, clock-aligned
