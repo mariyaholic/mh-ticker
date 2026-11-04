@@ -55,7 +55,8 @@ Double click it. If prompted, simply select Run anyway.
   - **point at the line** and it tells u what the price was at that moment ("-12m  4,155.24") with a dotted
     crosshair, so u can actually read the hour instead of just eyeballing the shape. the session high and low
     sit as little dashes where the line turned, and the day's open is the faint guide line across the plot
-  - **click a card** to open that symbol on CNBC, or right click it for *Copy XAU 4,155.24*
+  - **click a card** to open that symbol on CNBC, or right click it for *Copy XAU 4,155.24*. (In Ultra a click
+    *locks* the card instead - see Candles below - and CNBC is an *Open on CNBC* button on the locked card.)
 - **Put it back:** The minimize button top right, **Esc**, or the tray icon again
 - **Pick ur symbols:** right click → *Symbols* and tick whatever u want from 23 of them (metals, crypto, us
   futures, oil, gas, copper, fx, the dollar index, us yields, vix, nikkei, dax, ftse, hang seng). the strip and
@@ -97,17 +98,25 @@ Double click it. If prompted, simply select Run anyway.
 - **Resize it (Ultra):** drag any edge or corner. the window is the layout: a wider frame adds card columns
   (up to six) instead of stretching the cards, and it remembers the size it was left at, so expanding it again
   comes back where u left it. no native border - the frame is still drawn by the app
-- **Candles (Ultra):** the button left of the picker opens a candle pane down the right side. it charts whatever
-  card is under the pointer, so pointing at a price changes the chart and clicking still opens CNBC. one-minute
-  bars from the same CNBC request the sparklines already use, folded to 5/15/30/60 minutes on a narrow pane so a
-  candle is never a one-pixel scratch. the header names the resolution and the axis is UTC. opening it on a narrow
-  window widens the frame to fit both, and the picker and the chart take turns (they want the same space)
+- **Locking a card (Ultra):** click a card and it stays locked: an accent outline, and the candle pane (below)
+  follows it. nothing changes when u just move the mouse, so u can travel to the chart without it changing under
+  u. click the same card again to unlock it. CNBC is one explicit button on the locked card, *Open on CNBC*, and
+  right click → *Open ... on CNBC* still works on any card
+- **Candles (Ultra):** the candle button in the panel header opens a candle pane down the right side, charting the
+  locked card (it locks the first card if nothing is). one-minute bars from the same CNBC request the sparklines
+  already use, folded to 5/15/30/60 minutes on a narrow pane so a candle is never a one-pixel scratch. candles are
+  whole-pixel and uniform, gridlines sit on round prices, the time axis ticks on round UTC hours, and a tag on the
+  price axis marks where it last traded. opening it on a narrow window widens the frame to fit both, **closing it
+  gives that width back** (unless u dragged the edge yourself), and the picker and the chart take turns (they
+  want the same space)
+- **Settings button (Ultra):** the cog at the left end of the panel header opens the same menu as the tray icon
+  (Symbols, Poll, Theme, Font, Alerts, Position...) right under it, so u don't have to go hunting for the tray
 - **Alerts (Ultra):** right click → *Alerts* → pick a symbol → *above 1 %* / *above 2 %* / *below 1 %* / *below 2 %*
   (of whatever it is right now). u get a tray balloon and, if u set a `webhook`, a message in Discord/Slack/ntfy.
   it fires once per cooldown and **never on a stale price** (a market closed at a level would otherwise ping u
   forever). Focus Assist eats balloons, so the panel footer also shows the last alert - and arbitrary levels are a
   one-line config edit for now
-- **Quit or whatever else:** Right click the strip or the tray icon. u get *Expand view*, *Symbols*,
+- **Quit or whatever else:** Right click the strip or the tray icon (or use the cog in the Ultra panel). u get *Expand view*, *Symbols*,
   *Poll every*, *Theme* and *Alerts* (Ultra), *Position*, *Show strip*, *Always on top*, what its currently doing,
   *Open config folder* and *Quit* - so no more going to Task Manager every time u need it killed
 - **Tray only:** Untick *Show strip* if u just want the tray icon. hovering it still shows every price and clicking

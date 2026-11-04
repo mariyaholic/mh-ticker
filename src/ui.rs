@@ -194,15 +194,26 @@ struct Ui {
     hover: bool,
     /// The symbol-picker toggle is hovered.
     pick_hover: bool,
+    /// The chart toggle is hovered.
+    chart_hover: bool,
+    /// The settings button is hovered.
+    gear_hover: bool,
+    /// The Open button on the locked card is hovered.
+    open_hover: bool,
     /// The picker strip is open (Ultra only).
     pick_open: bool,
     picker_scroll: i32,
     wheel_remainder: i32,
-    /// The candle pane is open (Ultra only). It shows the card under the pointer.
+    /// The candle pane is open (Ultra only). It shows the locked card.
     chart: bool,
-    /// The row the candle pane shows: the card last under the pointer, so pointing at a price
-    /// changes the chart without a click and without the pane ever going blank.
-    chart_row: usize,
+    /// The locked card, by label (so it survives the symbol list changing under it). A click locks a
+    /// card and the candle pane follows it; hovering never changes it, because a chart that moves
+    /// while the pointer travels to it cannot be read.
+    selected: Option<String>,
+    /// `(width before, width after)` when opening the chart widened the window. Closing the chart
+    /// gives the width back, but only while the window is still the width the chart made it: once
+    /// the user has dragged an edge, the size is theirs.
+    chart_grew: Option<(i32, i32)>,
     /// Pointer position on a chart, `None` when it is off every sparkline.
     hover_at: Option<panel::Hover>,
     /// Last alert outcome, shown in the footer so a swallowed balloon is not silent.
@@ -275,6 +286,28 @@ fn catalog_len(u: &Ui) -> usize {
 
 fn picker_open(u: &Ui) -> bool {
     u.profile.ultra && u.pick_open
+}
+
+/// What a click on card `clicked` does to the lock: the same card again unlocks it, any other card
+/// takes the lock. A lock that cannot be undone is a trap.
+fn toggle_lock(current: Option<&str>, clicked: String) -> Option<String> {
+    if current == Some(clicked.as_str()) { None } else { Some(clicked) }
+}
+
+/// The width to give back when the chart closes: `before` if the window is still exactly as wide as
+/// the chart made it, `None` if the user has resized it since (the size is theirs, leave it).
+fn width_after_chart(current: i32, grown: i32, before: i32) -> Option<i32> {
+    (current == grown).then_some(before)
+}
+
+/// The locked card's row. Ultra only: the classic build has no chart to lock, so a click there still
+/// opens CNBC at once. Looked up by label every time, because rows come and go with the Symbols menu.
+fn selected_row(u: &Ui) -> Option<usize> {
+    if !u.profile.ultra {
+        return None;
+    }
+    let label = u.selected.as_deref()?;
+    u.view.cells.iter().position(|c| c.label == label)
 }
 
 /// The panel face for a palette. The classic build ignores `theme_font` for the same reason it
@@ -577,24 +610,33 @@ fn draw_panel(u: &mut Ui, dc: HDC, w: i32, h: i32) {
         now: crate::source::now_s(),
         btn_hover: u.hover,
         pick_hover: u.pick_hover,
+        chart_hover: u.chart_hover,
+        gear_hover: u.gear_hover,
+        select: u.profile.ultra,
+        selected: selected_row(u),
+        open_hover: u.open_hover,
         hover: u.hover_at,
         picker: picker_open(u).then(|| panel::Picker { list: &list, shown: &shown }),
         picker_scroll: u.picker_scroll,
         picker_btn: u.profile.ultra,
         chart_btn: u.profile.ultra,
-        // The chart follows the pointer: hovering a card charts that symbol, which is how a ticker
-        // is read — point at the thing you want to see, without a click that would open a browser.
-        chart: u.chart.then(|| {
-            let row = u.chart_row.min(u.view.cells.len().saturating_sub(1));
-            let fallback = u.view.cells.get(row).and_then(|c| c.quote.as_ref()).is_some_and(|q| !q.source.is_empty());
-            panel::Chart {
-                unavailable: fallback,
-                label: u.view.cells.get(row).map(|c| c.label.as_str()).unwrap_or(""),
-                digits: u.view.cells.get(row).map(|c| c.digits).unwrap_or(2),
-                t0: u.view.bars_t0.get(row).copied().unwrap_or(0.0),
-                bars: if fallback { &[] } else { u.view.bars.get(row).map(|b| &b[..]).unwrap_or(&[]) },
-                last: u.view.cells.get(row).and_then(|c| c.quote.as_ref()).map(|q| q.price),
+        settings_btn: u.profile.ultra,
+        // The chart shows the locked card and nothing else. It used to follow the pointer, which made
+        // the pane change under the cursor on the way to it; a click is the one thing that moves it now.
+        // With nothing locked the pane says so instead of guessing which card was meant.
+        chart: u.chart.then(|| match selected_row(u) {
+            Some(row) => {
+                let fallback = u.view.cells.get(row).and_then(|c| c.quote.as_ref()).is_some_and(|q| !q.source.is_empty());
+                panel::Chart {
+                    unavailable: fallback,
+                    label: u.view.cells.get(row).map(|c| c.label.as_str()).unwrap_or(""),
+                    digits: u.view.cells.get(row).map(|c| c.digits).unwrap_or(2),
+                    t0: u.view.bars_t0.get(row).copied().unwrap_or(0.0),
+                    bars: if fallback { &[] } else { u.view.bars.get(row).map(|b| &b[..]).unwrap_or(&[]) },
+                    last: u.view.cells.get(row).and_then(|c| c.quote.as_ref()).map(|q| q.price),
+                }
             }
+            None => panel::Chart { label: "", digits: 2, t0: 0.0, bars: &[], last: None, unavailable: false },
         }),
         alert: u.alert_note.as_deref(),
         phase,
@@ -1060,6 +1102,7 @@ fn grow_for_chart(hwnd: HWND) {
         let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
         let want = natural.w + chart_max + gap;
         if w >= want {
+            with_ui(|u| u.chart_grew = None);
             return;
         }
         let mut mi: MONITORINFO = std::mem::zeroed();
@@ -1071,7 +1114,55 @@ fn grow_for_chart(hwnd: HWND) {
         let new_w = want.min(wa.right - wa.left);
         let x = rc.left.min((wa.right - new_w).max(wa.left));
         SetWindowPos(hwnd, null_mut(), x, rc.top, new_w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+        // Remember what the chart cost, so closing it can pay it back.
+        with_ui(|u| u.chart_grew = Some((w, new_w)));
     }
+}
+
+/// Close the chart's extra width again. Opening the chart may have widened the window to make room
+/// for both panes (`grow_for_chart`); without this the pane could be closed but the window stayed
+/// wide, with the cards stretched across the gap, and the only way back to the compact panel was to
+/// drag an edge. It only undoes its own growth: a window the user has resized since is left alone.
+fn shrink_after_chart(hwnd: HWND) {
+    let Some((before, grown)) = with_ui(|u| u.chart_grew.take()).flatten() else {
+        return;
+    };
+    unsafe {
+        let mut rc: RECT = std::mem::zeroed();
+        GetWindowRect(hwnd, &mut rc);
+        let Some(w) = width_after_chart(rc.right - rc.left, grown, before) else {
+            return;
+        };
+        SetWindowPos(hwnd, null_mut(), rc.left, rc.top, w, rc.bottom - rc.top, SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+}
+
+/// Open or close the candle pane, with the window following: opening may widen it, closing gives the
+/// width back. The picker and the chart share the space under the cards, so opening one closes the
+/// other (`apply_picker` calls this with `false`).
+fn set_chart(hwnd: HWND, on: bool) {
+    let was = with_ui(|u| {
+        let was = u.chart;
+        u.chart = on;
+        if on {
+            u.pick_open = false;
+            // Nothing locked yet: lock the first card, so the pane opens on a chart instead of an
+            // instruction. A second click on the locked card unlocks it again.
+            if u.profile.ultra && selected_row(u).is_none() {
+                u.selected = u.view.cells.first().map(|c| c.label.clone());
+            }
+        }
+        was
+    })
+    .unwrap_or(on);
+    if on && !was {
+        // A narrow frame has no room for both panes, so opening the chart on one widens the window
+        // to the two-pane minimum instead of squeezing the cards into a column.
+        grow_for_chart(hwnd);
+    } else if !on && was {
+        shrink_after_chart(hwnd);
+    }
+    unsafe { InvalidateRect(hwnd, null(), 0) };
 }
 
 /// A saved panel rect, kept inside the work area of the monitor it lands on. A rect whose header
@@ -1106,6 +1197,9 @@ fn expand(hwnd: HWND) {
         u.anim = None;
         u.hover = false;
         u.pick_hover = false;
+        u.chart_hover = false;
+        u.gear_hover = false;
+        u.open_hover = false;
         u.hover_at = None;
         u.prev_fg = unsafe { GetForegroundWindow() };
         let a = u.strip_rect;
@@ -1183,6 +1277,26 @@ fn collapse(hwnd: HWND) {
 /// The context menu. `at` is the client-space click that opened it, when there was one: a
 /// right-click on a card acts on that card, everywhere else it is the window's own menu.
 fn menu(hwnd: HWND, at: Option<(i32, i32)>) {
+    menu_at(hwnd, at, None)
+}
+
+/// The panel's settings button: the same menu the tray icon opens, dropped from under the button
+/// (left edges aligned; Windows slides it back on screen if it would not fit) instead of wherever
+/// the cursor happened to be.
+fn settings_menu(hwnd: HWND) {
+    let Some((x, y)) = with_ui(|u| {
+        let g = panel_geo(u);
+        (g.gear_btn.left, g.gear_btn.bottom + 4 * u.dpi as i32 / 96)
+    }) else {
+        return;
+    };
+    let mut pt = POINT { x, y };
+    unsafe { ClientToScreen(hwnd, &mut pt) };
+    menu_at(hwnd, None, Some((pt.x, pt.y)));
+}
+
+/// `anchor` is a screen point to drop the menu from; `None` drops it at the cursor.
+fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
     #[allow(clippy::type_complexity)]
     let Some((visible, top, docked, status, open, list, shown, theme_name, theme_font, poll_s, ultra, picked, alerted)) = with_ui(|u| {
         let list = config::menu_list(&u.cfg);
@@ -1368,7 +1482,12 @@ fn menu(hwnd: HWND, at: Option<(i32, i32)>) {
         AppendMenuW(m, MF_SEPARATOR, 0, null());
         item(MF_STRING, CMD_EXIT, "Quit");
         let mut pt = POINT { x: 0, y: 0 };
-        GetCursorPos(&mut pt);
+        match anchor {
+            Some((x, y)) => pt = POINT { x, y },
+            None => {
+                GetCursorPos(&mut pt);
+            }
+        }
         SetForegroundWindow(hwnd);
         let cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, null());
         PostMessageW(hwnd, WM_NULL, 0, 0);
@@ -1582,11 +1701,12 @@ fn apply_rows(hwnd: HWND) {
 
 /// Open or close the symbol picker: the panel grows or shrinks in place, staying centred.
 fn apply_picker(hwnd: HWND, open: bool) {
+    // The chart goes first so its width is handed back before the chips need the room.
+    if open { set_chart(hwnd, false); }
     with_ui(|u| {
         u.pick_open = open;
         u.picker_scroll = 0;
         u.wheel_remainder = 0;
-        if open { u.chart = false; }
         u.hover_at = None;
     });
     unsafe { InvalidateRect(hwnd, null(), 0); }
@@ -1849,9 +1969,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     return h as LRESULT;
                 }
             }
-            let Some((mode, dock, header, btn, pick_btn, chart_btn)) = with_ui(|u| {
+            let Some((mode, dock, header, btn, pick_btn, chart_btn, gear_btn)) = with_ui(|u| {
                 let g = panel_geo(u);
-                (u.mode, u.cfg.placement() != Placement::Floating, g.header, g.btn, g.pick_btn, g.chart_btn)
+                (u.mode, u.cfg.placement() != Placement::Floating, g.header, g.btn, g.pick_btn, g.chart_btn, g.gear_btn)
             }) else {
                 return HTCLIENT as LRESULT;
             };
@@ -1862,7 +1982,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     ScreenToClient(hwnd, &mut pt);
                     let on_button = panel::in_rect(&btn, pt.x, pt.y)
                         || panel::in_rect(&pick_btn, pt.x, pt.y)
-                        || panel::in_rect(&chart_btn, pt.x, pt.y);
+                        || panel::in_rect(&chart_btn, pt.x, pt.y)
+                        || panel::in_rect(&gear_btn, pt.x, pt.y);
                     if pt.y < header && !on_button {
                         HTCAPTION as LRESULT
                     } else {
@@ -1882,7 +2003,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_SETCURSOR => {
             let fixed = |u: &Ui| u.cfg.placement() != Placement::Floating;
-            // The whole open panel is clickable now (a card opens CNBC, the chips toggle symbols),
+            // The whole open panel is clickable (a card locks or opens, the chips toggle symbols),
             // so the hand cursor covers it. The header stays a drag handle via WM_NCHITTEST, which
             // reports HTCAPTION there and never reaches this branch.
             let hand = with_ui(|u| (u.mode == Mode::Strip && fixed(u)) || u.mode == Mode::Panel).unwrap_or(false);
@@ -1894,22 +2015,31 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_LBUTTONUP => {
             let (x, y) = ((lp & 0xffff) as i16 as i32, ((lp >> 16) & 0xffff) as i16 as i32);
-            // One click can mean four things; decide which from the same `Geo` the painter used.
+            // One click can mean several things; decide which from the same `Geo` the painter used.
             enum Act {
                 Expand,
                 Collapse,
                 TogglePicker,
                 ToggleChart,
+                /// Open the settings menu from under its button.
+                Settings,
                 Symbol(String),
-                /// Open this symbol's CNBC page.
+                /// Lock (or unlock) this card by label. Ultra's answer to a click on a card.
+                Select(String),
+                /// Open this symbol's CNBC page: the classic build's click, and Ultra's Open button.
                 Open(String),
                 Nothing,
             }
             let what = with_ui(|u| {
                 let g = panel_geo(u);
+                // A card's symbol, for the places that open its page.
+                let symbol_of = |u: &Ui, i: usize| {
+                    u.view.cells.get(i).and_then(|c| u.cfg.rows.iter().find(|r| r.label == c.label)).map(|r| r.symbol.clone())
+                };
                 match u.mode {
                     Mode::Strip if u.cfg.placement() != Placement::Floating => Act::Expand,
                     Mode::Panel if panel::in_rect(&g.btn, x, y) => Act::Collapse,
+                    Mode::Panel if u.profile.ultra && panel::in_rect(&g.gear_btn, x, y) => Act::Settings,
                     Mode::Panel if u.profile.ultra && panel::in_rect(&g.pick_btn, x, y) => Act::TogglePicker,
                     Mode::Panel if u.profile.ultra && panel::in_rect(&g.chart_btn, x, y) => Act::ToggleChart,
                     // A chip, when the picker is open and the pointer is on one.
@@ -1920,10 +2050,24 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                             None => Act::Nothing,
                         }
                     }
-                    // Otherwise the card under the pointer is the target: click opens it on CNBC.
+                    // The Open button on the locked card is the one way Ultra reaches CNBC from a card,
+                    // and it is checked before the card under it: the button is *on* the card.
+                    Mode::Panel if panel::open_btn_at(&g, selected_row(u), u.dpi, x, y) => {
+                        match selected_row(u).and_then(|i| symbol_of(u, i)) {
+                            Some(sym) => Act::Open(sym),
+                            None => Act::Nothing,
+                        }
+                    }
+                    // Otherwise the card under the pointer is the target. Ultra locks it (the chart
+                    // follows, and the page is a button away); the classic build has no chart to lock,
+                    // so its click still opens CNBC at once.
                     Mode::Panel => match panel::card_at(&g, u.view.cells.len(), x, y) {
-                        Some(i) => match u.view.cells.get(i).and_then(|c| u.cfg.rows.iter().find(|r| r.label == c.label)) {
-                            Some(r) => Act::Open(r.symbol.clone()),
+                        Some(i) if u.profile.ultra => match u.view.cells.get(i) {
+                            Some(c) => Act::Select(c.label.clone()),
+                            None => Act::Nothing,
+                        },
+                        Some(i) => match symbol_of(u, i) {
+                            Some(sym) => Act::Open(sym),
                             None => Act::Nothing,
                         },
                         None => Act::Nothing,
@@ -1934,31 +2078,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             match what {
                 Some(Act::Expand) => expand(hwnd),
                 Some(Act::Collapse) => collapse(hwnd),
+                Some(Act::Settings) => settings_menu(hwnd),
+                // `apply_picker` closes the chart when the picker opens, and hands its width back.
                 Some(Act::TogglePicker) => {
                     let open = !with_ui(|u| u.pick_open).unwrap_or(false);
-                    // The chips and the candles both live under the cards, and a strip of chips
-                    // drawn over a chart is not a feature: opening one closes the other.
-                    if open {
-                        with_ui(|u| u.chart = false);
-                    }
                     apply_picker(hwnd, open);
                 }
                 Some(Act::ToggleChart) => {
-                    // The chart and the picker both want the space under the cards, and a chip strip
-                    // drawn over a chart is not a feature. Opening one closes the other.
-                    let on = with_ui(|u| {
-                        u.chart = !u.chart;
-                        if u.chart {
-                            u.pick_open = false;
-                        }
-                        u.chart
-                    })
-                    .unwrap_or(false);
-                    // A narrow frame has no room for both pans, so opening the chart on one widens
-                    // the window to the two-pane minimum instead of squeezing the cards to a column.
-                    if on {
-                        grow_for_chart(hwnd);
-                    }
+                    let on = !with_ui(|u| u.chart).unwrap_or(false);
+                    set_chart(hwnd, on);
+                }
+                Some(Act::Select(label)) => {
+                    with_ui(|u| {
+                        // The same card again unlocks it: a lock that cannot be undone is a trap.
+                        u.selected = toggle_lock(u.selected.as_deref(), label);
+                        u.open_hover = false;
+                    });
                     InvalidateRect(hwnd, null(), 0);
                 }
                 Some(Act::Symbol(sym)) if with_ui(|u| config::toggle(&mut u.cfg, &sym)).unwrap_or(false) => {
@@ -1983,21 +2118,24 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 let at = panel::hit(&g, u.view.cells.len(), u.dpi, x, y, now).map(snap).unwrap_or(away);
                 let btn = panel::in_rect(&g.btn, x, y);
                 let pick = u.profile.ultra && panel::in_rect(&g.pick_btn, x, y);
+                let chart_btn = u.profile.ultra && panel::in_rect(&g.chart_btn, x, y);
+                let gear = u.profile.ultra && panel::in_rect(&g.gear_btn, x, y);
+                let open = panel::open_btn_at(&g, selected_row(u), u.dpi, x, y);
                 let track = !u.tracking;
                 u.tracking = true;
-                // The candle pane shows the card under the pointer, so a move across the grid is a
-                // pane's worth of pixels to repaint. Only an open pane needs the frame.
-                let over = panel::card_at(&g, u.view.cells.len(), x, y);
-                let row_moved = u.chart && over.is_some_and(|r| r != u.chart_row);
-                if let Some(r) = over {
-                    u.chart_row = r;
-                }
+                // Hover moves the crosshair and lights buttons, and nothing else. In particular it no
+                // longer re-targets the chart: that is the lock's job.
                 let changed = btn != u.hover
                     || pick != u.pick_hover
-                    || at != u.hover_at.unwrap_or(away)
-                    || row_moved;
+                    || chart_btn != u.chart_hover
+                    || gear != u.gear_hover
+                    || open != u.open_hover
+                    || at != u.hover_at.unwrap_or(away);
                 u.hover = btn;
                 u.pick_hover = pick;
+                u.chart_hover = chart_btn;
+                u.gear_hover = gear;
+                u.open_hover = open;
                 u.hover_at = (at.row != usize::MAX).then_some(at);
                 (changed, track)
             });
@@ -2015,9 +2153,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_MOUSELEAVE => {
             let was = with_ui(|u| {
                 u.tracking = false;
-                let was = u.hover || u.pick_hover || u.hover_at.is_some();
+                let was = u.hover || u.pick_hover || u.chart_hover || u.gear_hover || u.open_hover || u.hover_at.is_some();
                 u.hover = false;
                 u.pick_hover = false;
+                u.chart_hover = false;
+                u.gear_hover = false;
+                u.open_hover = false;
                 u.hover_at = None;
                 was
             });
@@ -2066,6 +2207,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 Mode::Panel => {
                     // The frame is the user's now: remember it, and only write when it changed.
                     let frame = [r.left, r.top, r.right - r.left, r.bottom - r.top];
+                    // A dragged edge makes the width the user's, so closing the chart must not undo it.
+                    if u.chart_grew.is_some_and(|(_, grown)| grown != frame[2]) {
+                        u.chart_grew = None;
+                    }
                     if u.cfg.panel != Some(frame) {
                         u.cfg.panel = Some(frame);
                         config::save(&u.cfg);
@@ -2215,11 +2360,15 @@ pub fn run(cfg: Config, board: Arc<Mutex<Board>>) {
             hist: panel::History::new(),
             hover: false,
             pick_hover: false,
+            chart_hover: false,
+            gear_hover: false,
+            open_hover: false,
             pick_open: false,
             picker_scroll: 0,
             wheel_remainder: 0,
             chart: false,
-            chart_row: 0,
+            selected: None,
+            chart_grew: None,
             hover_at: None,
             alert_note: None,
             tracking: false,
@@ -2271,6 +2420,22 @@ mod tests {
         }
         cfg.theme_font = Some("Consolas".to_string());
         assert_eq!(selected_look(&cfg, true).1, "Consolas", "an explicit face still wins");
+    }
+
+    #[test]
+    fn a_click_locks_a_card_and_the_same_click_again_unlocks_it() {
+        assert_eq!(toggle_lock(None, "XAU".into()).as_deref(), Some("XAU"));
+        // Another card takes the lock; it does not stack.
+        assert_eq!(toggle_lock(Some("XAU"), "BTC".into()).as_deref(), Some("BTC"));
+        assert_eq!(toggle_lock(Some("BTC"), "BTC".into()), None);
+    }
+
+    #[test]
+    fn closing_the_chart_gives_back_only_the_width_it_took() {
+        // Widened 760 -> 1,490 by the chart and untouched since: back to 760.
+        assert_eq!(width_after_chart(1_490, 1_490, 760), Some(760));
+        // The user dragged it to 1,300 in between: that size is theirs.
+        assert_eq!(width_after_chart(1_300, 1_490, 760), None);
     }
 
     #[test]

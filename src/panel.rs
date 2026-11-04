@@ -212,6 +212,11 @@ pub struct Geo {
     pub pick_btn: RECT,
     /// The chart toggle, beside the picker.
     pub chart_btn: RECT,
+    /// The settings button, at the left end of the header buttons. Ultra only: it opens the same menu
+    /// the tray icon does, so settings no longer live in one place nobody looks. It goes on the far
+    /// side of the chart toggle rather than beside the cross so the buttons that were already there
+    /// keep their pixels (the theme stills are pinned byte for byte).
+    pub gear_btn: RECT,
     /// The candle pane, when it is open. Its bottom is the caller's to set: the pane grows with a
     /// resized window, and `geometry` does not know how tall the frame is yet.
     pub chart: Option<RECT>,
@@ -260,11 +265,14 @@ pub fn geometry_in(w: i32, n: usize, catalog: usize, dpi: u32, picker: bool, cha
     let (chip_h, chip_gap) = (s(26), s(6));
     let chip_rows = if picker { catalog.div_ceil(CHIP_COLS).max(1) as i32 } else { 0 };
     let pick_h = if picker { s(22) + chip_rows * (chip_h + chip_gap) } else { 0 };
-    // Two header buttons: the picker toggle then the minimise cross, both the same size.
+    // Header buttons, right to left: minimise, picker, chart, settings. All the same size and the
+    // same gap, so the row reads as one control. Each new button goes on the left end, which leaves
+    // every existing button where it was.
     let (bw, bh, bx) = (s(30), s(30), w - s(12));
     let btn = RECT { left: bx - bw, top: s(10), right: bx, bottom: s(10) + bh };
     let pick_btn = RECT { left: btn.left - s(6) - bw, top: s(10), right: btn.left - s(6), bottom: s(10) + bh };
     let chart_btn = RECT { left: pick_btn.left - s(6) - bw, top: s(10), right: pick_btn.left - s(6), bottom: s(10) + bh };
+    let gear_btn = RECT { left: chart_btn.left - s(6) - bw, top: s(10), right: chart_btn.left - s(6), bottom: s(10) + bh };
     let chart_rect = chart.then(|| RECT { left: w - pad - chart_w, top: header, right: w - pad, bottom: cards_h });
     let mut chips = Vec::new();
     if picker {
@@ -277,7 +285,7 @@ pub fn geometry_in(w: i32, n: usize, catalog: usize, dpi: u32, picker: bool, cha
         }
     }
     let h = cards_h + pick_h + s(36);
-    Geo { w, h, header, footer: s(36), scroll: 0, scroll_max: 0, btn, pick_btn, chart_btn, chart: chart_rect, cols, pad, gap, card_w, card_h, pick_top: cards_h, chips }
+    Geo { w, h, header, footer: s(36), scroll: 0, scroll_max: 0, btn, pick_btn, chart_btn, gear_btn, chart: chart_rect, cols, pad, gap, card_w, card_h, pick_top: cards_h, chips }
 }
 
 /// Clip and scroll the panel body while keeping header and footer fixed.
@@ -347,6 +355,22 @@ pub fn pick_hit(g: &Geo, x: i32, y: i32) -> Option<usize> {
 pub fn card_at(g: &Geo, n: usize, x: i32, y: i32) -> Option<usize> {
     if y < g.header || y >= g.h - g.footer { return None; }
     (0..n).find(|i| in_rect(&card_rect(g, *i), x, y))
+}
+
+/// The "Open on CNBC" button on a locked card: the top-right corner, where the source tag normally
+/// sits. A fixed size in device-independent pixels, so the painter and the click handler agree on it
+/// without either needing a font to measure with.
+pub fn open_btn_rect(card: RECT, dpi: u32) -> RECT {
+    let s = |v: i32| v * dpi as i32 / 96;
+    RECT { left: card.right - s(14) - s(96), top: card.top + s(6), right: card.right - s(14), bottom: card.top + s(6) + s(19) }
+}
+
+/// Whether a click lands on the locked card's Open button. Only the locked card has one.
+pub fn open_btn_at(g: &Geo, selected: Option<usize>, dpi: u32, x: i32, y: i32) -> bool {
+    if y < g.header || y >= g.h - g.footer {
+        return false;
+    }
+    selected.is_some_and(|i| in_rect(&open_btn_rect(card_rect(g, i), dpi), x, y))
 }
 
 fn utf16(s: &str) -> Vec<u16> {
@@ -487,6 +511,17 @@ pub struct Scene<'a> {
     pub btn_hover: bool,
     /// The picker toggle is under the pointer.
     pub pick_hover: bool,
+    /// The chart toggle is under the pointer.
+    pub chart_hover: bool,
+    /// The settings button is under the pointer.
+    pub gear_hover: bool,
+    /// Cards are selectable (Ultra). A click locks a card instead of opening CNBC; the page is one
+    /// explicit button on the locked card. The classic build keeps its one-click behaviour.
+    pub select: bool,
+    /// The locked card, drawn with an accent border and the Open button. The chart follows it.
+    pub selected: Option<usize>,
+    /// The Open button on the locked card is under the pointer.
+    pub open_hover: bool,
     /// The pointer is on a chart.
     pub hover: Option<Hover>,
     /// `Some` when the picker is open. `None` also hides the toggle: the classic build has no
@@ -500,6 +535,8 @@ pub struct Scene<'a> {
     pub chart: Option<Chart<'a>>,
     /// The chart toggle is drawn (Ultra only: the classic build has one window, one look).
     pub chart_btn: bool,
+    /// The settings button is drawn (Ultra only, for the same reason).
+    pub settings_btn: bool,
     /// The last alert outcome. Replaces the footer hint, because Focus Assist can swallow the
     /// tray balloon and the panel is then the only place the alert is visible.
     pub alert: Option<&'a str>,
@@ -641,7 +678,19 @@ fn short_date(s: &str) -> Option<String> {
 fn card(dc: HDC, sc: &Scene, r: RECT, i: usize, c: &Cell) {
     let t = sc.theme;
     let s = |v: i32| v * sc.dpi as i32 / 96;
-    fill_round(dc, r, if t.is_pixel() { 0 } else { s(12) }, t.card);
+    let radius = if t.is_pixel() { 0 } else { s(12) };
+    // A locked card is outlined in the accent: that is the whole of "this is the one the chart shows".
+    // The border is a second, inset fill rather than a pen, so it is the same two pixels on every
+    // edge and the corners stay round at any dpi.
+    let locked = sc.select && sc.selected == Some(i);
+    if locked {
+        let edge = s(2).max(2);
+        fill_round(dc, r, radius, t.accent);
+        let inner = RECT { left: r.left + edge, top: r.top + edge, right: r.right - edge, bottom: r.bottom - edge };
+        fill_round(dc, inner, (radius - edge).max(0), t.card);
+    } else {
+        fill_round(dc, r, radius, t.card);
+    }
     let (ix, rx) = (r.left + s(14), r.right - s(14));
     text(dc, sc.fonts.mid, ix, r.top + s(8), &c.label, t.label);
     match &c.quote {
@@ -666,7 +715,11 @@ fn card(dc: HDC, sc: &Scene, r: RECT, i: usize, c: &Cell) {
                 }
                 None => tag,
             };
-            text_right(dc, sc.fonts.small, rx, r.top + s(10), &tag, if c.stale { t.amber } else { t.dim });
+            // The Open button takes the tag's corner on a locked card; the tag is the first thing to
+            // give way, as it already is for the volume.
+            if !locked {
+                text_right(dc, sc.fonts.small, rx, r.top + s(10), &tag, if c.stale { t.amber } else { t.dim });
+            }
             let pw = text(dc, sc.fonts.big, ix, r.top + s(26), &fmt_price(q.price, c.digits), if c.stale { t.dim } else { t.price });
             if !q.currency.is_empty() {
                 text(dc, sc.fonts.small, ix + pw + s(5), r.top + s(40), &q.currency, t.dim);
@@ -740,6 +793,63 @@ fn card(dc: HDC, sc: &Scene, r: RECT, i: usize, c: &Cell) {
     } else {
         spark(dc, sc, spark_rect(r, sc.dpi), i, sc.hist.row(i), day_baseline(c));
     }
+    if locked {
+        open_button(dc, sc, r);
+    }
+}
+
+/// The "Open on CNBC" button: the card's one outward action, shown only on the locked card so a
+/// stray click on a price can no longer throw a browser window at the user.
+fn open_button(dc: HDC, sc: &Scene, card: RECT) {
+    let t = sc.theme;
+    let s = |v: i32| v * sc.dpi as i32 / 96;
+    let r = open_btn_rect(card, sc.dpi);
+    // Idle it is a chip (the picker's "on" look); under the pointer it fills with the accent, so the
+    // one clickable thing on the card announces itself.
+    fill_round(dc, r, if t.is_pixel() { 0 } else { s(8) }, if sc.open_hover { t.accent } else { t.btn });
+    let label = "Open on CNBC";
+    let (tw, th) = (text_width(dc, sc.fonts.small, label), line_height(dc, sc.fonts.small));
+    text(
+        dc,
+        sc.fonts.small,
+        r.left + (r.right - r.left - tw) / 2,
+        r.top + (r.bottom - r.top - th) / 2,
+        label,
+        if sc.open_hover { t.card } else { t.accent },
+    );
+}
+
+/// A cog centred on `c`, `r` pixels to the tip of a tooth. One filled polygon with the hub cut out:
+/// `PolyPolygon` fills with the alternate rule, so the inner ring is a hole and the header's
+/// gradient shows through it, which a hub painted in a flat colour would not on a ramp theme.
+fn gear(dc: HDC, c: (i32, i32), r: i32, color: COLORREF) {
+    const TEETH: usize = 8;
+    let (root, hole) = (r as f64 * 0.74, r as f64 * 0.32);
+    let at = |rad: f64, a: f64| POINT { x: c.0 + (rad * a.cos()).round() as i32, y: c.1 + (rad * a.sin()).round() as i32 };
+    let mut pts: Vec<POINT> = Vec::with_capacity(TEETH * 4 + 16);
+    let step = std::f64::consts::TAU / TEETH as f64;
+    for k in 0..TEETH {
+        // Each tooth is a trapezoid: it leaves the root circle, runs out to the tip, and returns.
+        let a = k as f64 * step;
+        pts.push(at(root, a - step * 0.30));
+        pts.push(at(r as f64, a - step * 0.16));
+        pts.push(at(r as f64, a + step * 0.16));
+        pts.push(at(root, a + step * 0.30));
+    }
+    let outer = pts.len() as i32;
+    for k in 0..16 {
+        pts.push(at(hole, k as f64 * std::f64::consts::TAU / 16.0));
+    }
+    let counts = [outer, 16];
+    unsafe {
+        let brush = CreateSolidBrush(color);
+        let old_b = SelectObject(dc, brush);
+        let old_p = SelectObject(dc, GetStockObject(NULL_PEN));
+        PolyPolygon(dc, pts.as_ptr(), counts.as_ptr(), 2);
+        SelectObject(dc, old_p);
+        SelectObject(dc, old_b);
+        DeleteObject(brush);
+    }
 }
 
 /// The catalogue as clickable chips: ticked entries are on the strip, the rest are one click away.
@@ -808,14 +918,23 @@ pub fn draw(dc: HDC, w: i32, h: i32, sc: &Scene) {
     if sc.btn_hover {
         fill_round(dc, g.btn, radius(8), t.btn);
     }
+    if sc.settings_btn {
+        if sc.gear_hover {
+            fill_round(dc, g.gear_btn, radius(8), t.btn);
+        }
+        let c = ((g.gear_btn.left + g.gear_btn.right) / 2, (g.gear_btn.top + g.gear_btn.bottom) / 2);
+        gear(dc, c, s(8), if sc.gear_hover { t.price } else { t.label });
+    }
     if sc.chart_btn {
+        // Lit while the pane is open, and under the pointer: the toggle is the way back to the compact
+        // panel, so it has to look pressable in both states.
         let hot = sc.chart.is_some();
-        if hot {
+        if hot || sc.chart_hover {
             fill_round(dc, g.chart_btn, radius(8), t.btn);
         }
         // Three candles, tallest in the middle: a chart, at 12 px.
         let (px, py) = ((g.chart_btn.left + g.chart_btn.right) / 2, (g.chart_btn.top + g.chart_btn.bottom) / 2);
-        let col = if hot { t.price } else { t.label };
+        let col = if hot || sc.chart_hover { t.price } else { t.label };
         for (k, len) in [(-1, s(7)), (0, s(12)), (1, s(9))] {
             let x = px + k * s(5);
             fill_rect(dc, RECT { left: x, top: py - len / 2, right: x + s(2).max(2), bottom: py + len / 2 }, col);
@@ -856,7 +975,12 @@ pub fn draw(dc: HDC, w: i32, h: i32, sc: &Scene) {
     };
     let left: String = left.chars().take(70).collect();
     text(dc, sc.fonts.small, g.pad + s(2), fy, &left, t.dim);
-    if g.scroll_max == 0 { text_right(dc, sc.fonts.small, w - g.pad - s(2), fy, "click a card: CNBC \u{b7} Esc: dock", t.dim); }
+    if g.scroll_max == 0 {
+        // Where a click goes depends on the build: Ultra locks the card (and offers the page as a
+        // button), the classic build opens CNBC straight away, as it always has.
+        let hint = if sc.select { "click a card: lock it \u{b7} Esc: dock" } else { "click a card: CNBC \u{b7} Esc: dock" };
+        text_right(dc, sc.fonts.small, w - g.pad - s(2), fy, hint, t.dim);
+    }
 }
 
 /// The candle pane.
@@ -866,19 +990,42 @@ pub fn draw(dc: HDC, w: i32, h: i32, sc: &Scene) {
 /// than a candle the same session is folded into 5-, 15-, 30- or 60-minute candles instead of being
 /// squeezed. Flat bars still draw a one-pixel body rather than being skipped — spot symbols return
 /// `open == high == low == close` for most minutes, and a chart with holes reads as missing data.
+///
+/// What makes a candle chart look right is mostly arithmetic on whole pixels, and that is where the
+/// first version looked wrong: a fractional step rounded per candle gave bodies 5 and 6 px wide in
+/// the same row, and a 1 px wick cannot sit in the middle of an even-width body. So the step is a
+/// whole, odd number of pixels, every body is the same odd width, and the wick is the middle pixel.
+/// The axes follow the same rule: gridlines sit on round prices and round clock times, not on
+/// quarters of whatever the day's range happened to be.
 fn candles(dc: HDC, sc: &Scene, r: RECT, c: &Chart) {
     let t = sc.theme;
     let s = |v: i32| v * sc.dpi as i32 / 96;
     let radius = if t.is_pixel() { 0 } else { s(12) };
     fill_round(dc, r, radius, t.card);
-    let plot = RECT { left: r.left + s(10), top: r.top + s(30), right: r.right - s(54), bottom: r.bottom - s(16) };
     if c.bars.is_empty() {
         // Named even when empty: a bare rectangle could be any pane, and the reason it is empty is
         // the one thing the reader wants to know.
         text(dc, sc.fonts.small, r.left + s(12), r.top + s(8), c.label, t.label);
-        text(dc, sc.fonts.small, r.left + s(12), r.top + s(28), if c.unavailable { "chart unavailable for this source" } else { "waiting for the day's bars" }, t.dim);
+        let why = if c.label.is_empty() {
+            "select a card to chart it"
+        } else if c.unavailable {
+            "chart unavailable for this source"
+        } else {
+            "waiting for the day's bars"
+        };
+        text(dc, sc.fonts.small, r.left + s(12), r.top + s(28), why, t.dim);
         return;
     }
+    // The price axis is as wide as the widest label it will carry, so a six-figure price is not
+    // clipped and a two-figure one does not waste a quarter of the pane.
+    let last = c.last.unwrap_or_else(|| c.bars[c.bars.len() - 1].c as f64);
+    let (mut lo, mut hi) = (f64::MAX, f64::MIN);
+    for b in c.bars {
+        lo = lo.min(b.l as f64);
+        hi = hi.max(b.h as f64);
+    }
+    let widest = [lo, hi, last].iter().map(|v| text_width(dc, sc.fonts.small, &fmt_price(*v, c.digits))).max().unwrap_or(0);
+    let plot = RECT { left: r.left + s(12), top: r.top + s(34), right: r.right - widest - s(22), bottom: r.bottom - s(24) };
     if plot.right - plot.left < s(40) || plot.bottom - plot.top < s(30) {
         return;
     }
@@ -892,14 +1039,7 @@ fn candles(dc: HDC, sc: &Scene, r: RECT, c: &Chart) {
     };
     // What is being charted, at what resolution, in which time zone, and where it last traded.
     text(dc, sc.fonts.small, r.left + s(12), r.top + s(8), &format!("{} \u{b7} {span} UTC", c.label), t.label);
-    if let Some(last) = c.last {
-        text_right(dc, sc.fonts.mid, r.right - s(12), r.top + s(6), &fmt_price(last, c.digits), t.price);
-    }
-    let (mut lo, mut hi) = (f32::MAX, f32::MIN);
-    for b in &bars {
-        lo = lo.min(b.l);
-        hi = hi.max(b.h);
-    }
+    text_right(dc, sc.fonts.mid, r.right - s(12), r.top + s(6), &fmt_price(last, c.digits), t.price);
     if hi <= lo {
         // Every bar identical: give it a window anyway, or the division below is by zero. (A bar
         // price is parsed from JSON, so it cannot be NaN; `<=` and `!(> )` mean the same here.)
@@ -909,22 +1049,71 @@ fn candles(dc: HDC, sc: &Scene, r: RECT, c: &Chart) {
     }
     let pad = (hi - lo) * 0.08;
     let (lo, hi) = (lo - pad, hi + pad);
-    let span_px = (plot.bottom - plot.top) as f32;
-    let price_span = (hi - lo).max(f32::EPSILON);
-    let py = |v: f32| plot.bottom - (((v - lo) / price_span) * span_px).round() as i32;
+    let span_px = (plot.bottom - plot.top) as f64;
+    let price_span = (hi - lo).max(f64::EPSILON);
+    let py = |v: f64| plot.bottom - (((v - lo) / price_span) * span_px).round() as i32;
+    let lh = line_height(dc, sc.fonts.small);
+    let up = bars.last().map(|b| b.c).unwrap_or(0.0) as f64 >= bars[0].o as f64;
+    let tone = if up { t.up } else { t.down };
+    let (ylast, tag_h) = (py(last).clamp(plot.top, plot.bottom), lh + s(4));
 
-    for k in 1..=3 {
-        let v = lo + price_span * k as f32 / 4.0;
+    // Price gridlines on round values. A label that would sit under the last-price tag is skipped:
+    // two numbers on one line is how a chart gets read wrong.
+    let (ticks, decimals) = nice_ticks(lo, hi, 4);
+    for v in ticks {
         let y = py(v);
         fill_rect(dc, RECT { left: plot.left, top: y, right: plot.right, bottom: y + 1 }, t.guide);
-        text_right(dc, sc.fonts.small, r.right - s(8), y - s(7), &fmt_price(v as f64, c.digits), t.label);
+        if (y - ylast).abs() >= tag_h {
+            text_right(dc, sc.fonts.small, r.right - s(10), y - lh / 2, &fmt_price(v, decimals), t.label);
+        }
     }
 
-    let n = bars.len() as f32;
-    let step = (plot.right - plot.left) as f32 / n;
-    let body = (step * 0.62).max(2.0);
+    // Candles: a whole, odd number of pixels per bar, so every body is the same width and the wick
+    // is exactly the middle pixel. The leftover (under a bar's width per candle) is the open right
+    // edge of a session still in progress.
+    let n = bars.len() as i32;
+    let (step, body, wick) = candle_metrics(plot.right - plot.left, n, sc.dpi);
+    let centre = |i: i32| plot.left + i * step + step / 2;
+
+    // Time ticks on round clock times, short marks under the plot and a label centred on each.
+    let step_s = bucket;
+    let label_w = text_width(dc, sc.fonts.small, "00:00");
+    let every = tick_interval(step as f64 / step_s, (label_w + s(28)) as f64);
+    let mut prev_key = None;
+    let mut last_label_right = i32::MIN;
     for (i, b) in bars.iter().enumerate() {
-        let x = plot.left as f32 + (i as f32 + 0.5) * step;
+        let tb = b.t(c.t0);
+        let key = (tb / every).floor();
+        let crossed = prev_key.is_some_and(|k| k != key);
+        prev_key = Some(key);
+        if !crossed {
+            continue;
+        }
+        let x = centre(i as i32);
+        fill_rect(dc, RECT { left: x, top: plot.bottom, right: x + 1, bottom: plot.bottom + s(4) }, t.guide);
+        let label = clock(key * every);
+        let w = text_width(dc, sc.fonts.small, &label);
+        let lx = (x - w / 2).clamp(plot.left, (plot.right - w).max(plot.left));
+        if lx > last_label_right + s(8) {
+            text(dc, sc.fonts.small, lx, plot.bottom + s(6), &label, t.label);
+            last_label_right = lx + w;
+        }
+    }
+
+    // Where it last traded: a dotted line across the plot, under the candles so it never cuts a
+    // body, running into a tag on the price axis. Coloured by the session's direction, like the
+    // cards' lines are.
+    unsafe {
+        let pen = CreatePen(PS_DOT, 1, tone);
+        let old = SelectObject(dc, pen);
+        let seg = [POINT { x: plot.left, y: ylast }, POINT { x: plot.right, y: ylast }];
+        Polyline(dc, seg.as_ptr(), 2);
+        SelectObject(dc, old);
+        DeleteObject(pen);
+    }
+
+    for (i, b) in bars.iter().enumerate() {
+        let x = centre(i as i32);
         let col = if (b.c - b.o).abs() <= f32::EPSILON {
             t.dim
         } else if b.c > b.o {
@@ -932,23 +1121,79 @@ fn candles(dc: HDC, sc: &Scene, r: RECT, c: &Chart) {
         } else {
             t.down
         };
-        let (y0, y1) = (py(b.h), py(b.l));
-        fill_rect(dc, RECT { left: x as i32, top: y0.min(y1), right: x as i32 + 1, bottom: y1.max(y0 + 1) }, col);
-        let (b0, b1) = (py(b.o.max(b.c)), py(b.o.min(b.c)));
-        let left = (x - body / 2.0).round() as i32;
-        let right = ((x + body / 2.0).round() as i32).max(left + 1);
-        fill_rect(dc, RECT { left, top: b0.min(b1), right, bottom: b1.max(b0 + 1) }, col);
+        let (y0, y1) = (py(b.h as f64), py(b.l as f64));
+        let wx = x - wick / 2;
+        fill_rect(dc, RECT { left: wx, top: y0.min(y1), right: wx + wick, bottom: y1.max(y0 + 1) }, col);
+        let (b0, b1) = (py(b.o.max(b.c) as f64), py(b.o.min(b.c) as f64));
+        let bx = x - body / 2;
+        fill_rect(dc, RECT { left: bx, top: b0.min(b1), right: bx + body, bottom: b1.max(b0 + 1) }, col);
     }
 
-    let first = bars[0].t(c.t0);
-    let last = bars[bars.len() - 1].t(c.t0);
-    text(dc, sc.fonts.small, plot.left, plot.bottom + s(2), &clock(first), t.label);
-    text_right(dc, sc.fonts.small, plot.right, plot.bottom + s(2), &clock(last), t.label);
+    // The tag itself goes on last, over the axis, so nothing can paint across the number.
+    let tag = fmt_price(last, c.digits);
+    let tag_w = text_width(dc, sc.fonts.small, &tag) + s(10);
+    let tag_r = RECT { left: r.right - s(6) - tag_w, top: ylast - tag_h / 2, right: r.right - s(6), bottom: ylast - tag_h / 2 + tag_h };
+    fill_round(dc, tag_r, if t.is_pixel() { 0 } else { s(4) }, tone);
+    text(dc, sc.fonts.small, tag_r.left + s(5), tag_r.top + (tag_h - lh) / 2, &tag, t.card);
 }
 
-/// The narrowest candle that still reads as one. Below four pixels a body is a scratch between two
-/// wicks, whatever the colour.
-const MIN_BAR: i32 = 4;
+/// `(step, body, wick)` in whole pixels for `n` candles across `plot_w`: the slot each candle owns,
+/// the width of its body and the width of its wick. The step and body are odd and the wick is odd, so
+/// the wick is exactly the middle pixel of the body and of the slot; and they are the same for every
+/// candle in the row, which is the whole of the difference between a chart and a bar code.
+fn candle_metrics(plot_w: i32, n: i32, dpi: u32) -> (i32, i32, i32) {
+    let s = |v: i32| v * dpi as i32 / 96;
+    let mut step = (plot_w / n.max(1)).clamp(1, s(15) | 1);
+    if step >= MIN_BAR && step % 2 == 0 {
+        step -= 1;
+    }
+    let wick = s(1) | 1;
+    // About 70 % of the step, made odd so it is symmetric about the wick, and never thinner than it.
+    let mut body = ((step as f32 * 0.7).round() as i32).max(wick);
+    if body % 2 == 0 {
+        body -= 1;
+    }
+    (step, body.clamp(1, step.max(1)), wick)
+}
+
+/// Round gridline values inside `[lo, hi]`, about `want` of them, and how many decimals they need.
+/// The step is 1, 2, 2.5 or 5 times a power of ten — the spacings a reader can subtract in their
+/// head — so a day that runs 6,655 to 6,733 is gridded at 6,680 / 6,700 / 6,720, not at the
+/// arbitrary quarters of its own range.
+fn nice_ticks(lo: f64, hi: f64, want: usize) -> (Vec<f64>, u32) {
+    let span = hi - lo;
+    if !(span > 0.0) || !span.is_finite() || want == 0 {
+        return (Vec::new(), 0);
+    }
+    let raw = span / want as f64;
+    let mag = 10f64.powf(raw.log10().floor());
+    let norm = raw / mag;
+    let step = mag * [1.0, 2.0, 2.5, 5.0, 10.0].iter().copied().find(|m| *m >= norm - 1e-9).unwrap_or(10.0);
+    let mut out = Vec::new();
+    let mut v = (lo / step).ceil() * step;
+    while v <= hi + step * 1e-9 && out.len() < 16 {
+        // Strip the float drift (0.30000000000000004) so the label and the line agree.
+        out.push((v / step).round() * step);
+        v += step;
+    }
+    let decimals = (0..=6u32).find(|d| {
+        let f = step * 10f64.powi(*d as i32);
+        (f - f.round()).abs() < 1e-6
+    });
+    (out, decimals.unwrap_or(6))
+}
+
+/// The smallest round clock interval (15 min .. 12 h) whose ticks are at least `min_px` apart when a
+/// second is `px_per_s` wide. A day of 5-minute candles ticks hourly; a pane stretched wide enough
+/// to hold the minute ticks every half hour.
+fn tick_interval(px_per_s: f64, min_px: f64) -> f64 {
+    const LADDER: [f64; 8] = [900.0, 1_800.0, 3_600.0, 7_200.0, 10_800.0, 14_400.0, 21_600.0, 43_200.0];
+    LADDER.iter().copied().find(|s| s * px_per_s >= min_px).unwrap_or(86_400.0)
+}
+
+/// The narrowest candle that still reads as one. Below five pixels a body is a scratch between two
+/// wicks, whatever the colour, and an odd width is what lets the wick be exactly the middle pixel.
+const MIN_BAR: i32 = 5;
 
 /// The bars to draw and the bucket they are drawn at: the finest bucket on the ladder whose candles
 /// still have `MIN_BAR` pixels each.
@@ -1199,6 +1444,7 @@ mod tests {
         assert!(g.chips.is_empty());
         assert!(g.btn.right < g.w && g.btn.top > 0);
         assert!(g.pick_btn.right < g.btn.left, "the picker toggle sits left of the cross");
+        assert!(g.gear_btn.right < g.chart_btn.left, "settings sits at the left end of the group");
         assert_eq!(geometry(2, 0, 96, false).w, 2 * 16 + 2 * 236 + 10);
     }
 
@@ -1307,5 +1553,88 @@ mod tests {
         assert_eq!(h.labels, ["XAG", "BTC"]);
         assert_eq!(h.row(0).unwrap().len(), 1);
         assert!(h.row(1).unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_four_header_buttons_sit_in_one_row_without_touching() {
+        for dpi in [96, 144, 192] {
+            let g = geometry(6, 0, dpi, false);
+            let row = [g.gear_btn, g.chart_btn, g.pick_btn, g.btn];
+            for pair in row.windows(2) {
+                assert!(pair[0].right < pair[1].left, "dpi {dpi}: buttons overlap or touch");
+            }
+            assert!(row.iter().all(|b| b.top == g.btn.top && b.bottom == g.btn.bottom), "one row");
+            assert!(g.gear_btn.left > 0, "the leftmost button is on the panel");
+        }
+    }
+
+    #[test]
+    fn only_the_locked_cards_open_button_is_a_target() {
+        let g = geometry(6, 0, 96, false);
+        let card = card_rect(&g, 2);
+        let btn = open_btn_rect(card, 96);
+        let (cx, cy) = ((btn.left + btn.right) / 2, (btn.top + btn.bottom) / 2);
+        // The button lives inside its own card, in the corner, clear of the price below it.
+        assert!(btn.left > card.left + 100 && btn.right <= card.right && btn.top >= card.top && btn.bottom <= card.top + 26);
+        assert!(open_btn_at(&g, Some(2), 96, cx, cy));
+        // The same pixel on an unlocked card, or with nothing locked, is just a card.
+        assert!(!open_btn_at(&g, Some(1), 96, cx, cy));
+        assert!(!open_btn_at(&g, None, 96, cx, cy));
+        // And the card is still a card around it: a click beside the button locks, it does not open.
+        assert_eq!(card_at(&g, 6, card.left + 20, card.top + 90), Some(2));
+        assert!(!open_btn_at(&g, Some(2), 96, card.left + 20, card.top + 90));
+    }
+
+    #[test]
+    fn candles_are_whole_pixels_with_the_wick_in_the_middle() {
+        for dpi in [96, 120, 144, 192] {
+            for plot_w in [296, 400, 650, 720, 1_200, 2_000] {
+                for n in [1, 4, 8, 24, 78, 96, 390] {
+                    let (step, body, wick) = candle_metrics(plot_w, n, dpi);
+                    assert!(step >= 1 && body >= 1 && wick >= 1);
+                    // Same parity all round: the wick is the middle pixel of the body and the slot.
+                    assert_eq!(body % 2, 1, "dpi {dpi} w {plot_w} n {n}: body {body} not odd");
+                    assert_eq!(wick % 2, 1, "wick {wick} not odd");
+                    assert!(body <= step, "a body wider than its slot overlaps the next candle");
+                    if step >= MIN_BAR {
+                        assert_eq!(step % 2, 1, "step {step} not odd");
+                        assert!(body < step, "candles that fit keep a gap between bodies");
+                        assert!(n * step <= plot_w, "{n} candles of {step}px overflow {plot_w}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gridlines_land_on_round_prices() {
+        // The case from the screenshot: S&P over 6,655 .. 6,733 used to grid at 6,709.47 / 6,686.35.
+        let (ticks, decimals) = nice_ticks(6_655.0, 6_733.0, 4);
+        assert_eq!(ticks, [6_660.0, 6_680.0, 6_700.0, 6_720.0]);
+        assert_eq!(decimals, 0);
+        // A narrow range steps in quarters and says so in the label.
+        let (q, d) = nice_ticks(0.0, 1.0, 4);
+        assert_eq!((q.len(), d), (5, 2));
+        assert!((q[1] - 0.25).abs() < 1e-12 && (q[4] - 1.0).abs() < 1e-12);
+        // Spot gold: two decimals only when the step needs them.
+        let (g, gd) = nice_ticks(4_150.0, 4_162.0, 4);
+        assert!(g.iter().all(|v| *v >= 4_150.0 && *v <= 4_162.0), "{g:?}");
+        assert_eq!(gd, 0, "a 2-dollar step prints whole dollars");
+        // Nothing to grid: no span, no ticks, and no panic.
+        assert_eq!(nice_ticks(5.0, 5.0, 4).0.len(), 0);
+        assert_eq!(nice_ticks(f64::NAN, 1.0, 4).0.len(), 0);
+    }
+
+    #[test]
+    fn time_ticks_are_round_clock_times_that_do_not_collide() {
+        // Five-minute candles 9 px wide: 0.03 px a second, so an hourly tick is ~108 px apart.
+        assert_eq!(tick_interval(9.0 / 300.0, 80.0), 3_600.0);
+        // A wide pane of one-minute candles can afford every quarter hour.
+        assert_eq!(tick_interval(15.0 / 60.0, 80.0), 900.0);
+        // A hopelessly narrow one falls back to a day rather than dividing by nothing.
+        assert_eq!(tick_interval(0.0, 80.0), 86_400.0);
+        // The clock labels are what they say, in UTC, wrapping past midnight.
+        assert_eq!(clock(13.0 * 3_600.0), "13:00");
+        assert_eq!(clock(86_400.0 + 30.0 * 60.0), "00:30");
     }
 }
