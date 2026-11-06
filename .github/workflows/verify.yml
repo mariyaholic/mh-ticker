@@ -1,0 +1,28 @@
+name: verify
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Native Windows tests
+        run: cargo test --locked --all-features
+      - name: Build both products without publishing
+        run: cargo build --locked --release --bins
+  linux-components:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test pure components with explicit config stub
+        run: bash scripts/check-state-linux.sh

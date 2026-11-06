@@ -89,11 +89,8 @@ pub fn balloon(hwnd: HWND, id: u32, title: &str, body: &str) {
     unsafe { Shell_NotifyIconW(NIM_MODIFY, &nid) };
 }
 
-/// Strip a URL down to its host, for any message a human might read. The path carries the secret.
-pub fn redact(url: &str) -> String {
-    let host = url.split("://").nth(1).unwrap_or(url);
-    host.split('/').next().unwrap_or(host).to_string()
-}
+// URL parsing/redaction is pure and tested separately from Win32 alert delivery.
+use crate::webhook_host::redact;
 
 /// What to POST for this endpoint. Discord and Slack both take `{"content"}`/`{"text"}`; ntfy takes
 /// a plain body with the title in a header. Anything else gets both keys, which most receivers
@@ -200,6 +197,9 @@ mod tests {
         let url = "https://discord.com/api/webhooks/1234/abcdefSECRET";
         assert_eq!(redact(url), "discord.com");
         assert!(!redact(url).contains("SECRET"));
+        assert_eq!(redact("https://user:SECRET@example.com?token=SECRET#fragment"), "example.com");
+        assert_eq!(redact("https://example.com#SECRET"), "example.com");
+        assert_eq!(redact("https://user:SECRET@[::1]:443/path"), "[::1]");
         let (body, ct) = payload(url, "XAU above 4,100", "spot");
         assert!((ct, body.contains("SECRET")) == ("application/json", false));
         assert!(body.contains("XAU above 4,100"));
