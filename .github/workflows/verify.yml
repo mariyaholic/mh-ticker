@@ -20,6 +20,20 @@ jobs:
         run: cargo test --locked --all-features
       - name: Build both products without publishing
         run: cargo build --locked --release --bins
+      - name: Upload Classic Windows build
+        uses: actions/upload-artifact@v4
+        with:
+          name: MH_Ticker_Classic-windows-x64
+          path: target/release/MH_Ticker.exe
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload Ultra Windows build
+        uses: actions/upload-artifact@v4
+        with:
+          name: MH_Ticker_Ultra-windows-x64
+          path: target/release/MH_Ticker_Ultra.exe
+          if-no-files-found: error
+          retention-days: 14
   linux-components:
     runs-on: ubuntu-latest
     steps:
