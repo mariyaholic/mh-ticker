@@ -27,11 +27,13 @@ pub mod shot;
 pub(crate) mod alerts;
 pub(crate) mod dock;
 pub(crate) mod model;
+pub(crate) mod menu_commands;
 pub(crate) mod panel;
 pub(crate) mod source;
 pub(crate) mod theme;
 pub(crate) mod ui;
 pub(crate) mod workspace;
+pub(crate) mod webhook_host;
 
 use std::sync::{Arc, Mutex};
 
