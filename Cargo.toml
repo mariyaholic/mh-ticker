@@ -48,6 +48,8 @@ serde_json = "1"
 # uncompressed, ~6x the bytes for no benefit.
 ureq = { version = "2.12", default-features = false, features = ["json", "native-tls", "gzip"] }
 native-tls = "0.2"
+# Already used by ureq; parse webhook hosts without exposing URL credentials.
+url = "2"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_UI_Accessibility",

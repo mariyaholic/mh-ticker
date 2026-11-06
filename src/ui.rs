@@ -74,11 +74,8 @@ const CMD_EXIT: usize = 1005;
 const CMD_PANEL: usize = 1007;
 const CMD_RESET: usize = 1008;
 const CMD_FALLBACK: usize = 1009;
-/// Symbols submenu: CMD_SYM + index into `config::menu_list`.
-const CMD_SYM: usize = 2000;
-/// Position submenu: CMD_POS + index into `Placement::ALL`, CMD_MON + index into `dock::monitors()`.
+/// Position submenu: CMD_POS + index into `Placement::ALL`.
 const CMD_POS: usize = 4000;
-const CMD_MON: usize = 4100;
 /// Poll interval: CMD_POLL + index into `POLL_CHOICES`.
 const CMD_POLL: usize = 5000;
 /// Theme: CMD_THEME + index into `theme::ALL` (Ultra only).
@@ -91,9 +88,6 @@ const CMD_COPY: usize = 5600;
 const CMD_OPEN: usize = 5700;
 /// The Ultra symbol picker open/closed toggle.
 const CMD_PICK: usize = 5800;
-/// Alerts: CMD_ALERT + row*4 + step, CMD_ALERT_CLEAR + row (Ultra only).
-const CMD_ALERT: usize = 5200;
-const CMD_ALERT_CLEAR: usize = 5400;
 /// Offsets offered by the Alerts submenu, in percent from the current price. Arbitrary levels are
 /// a config edit for now; these are the ones a glance-at-the-strip user actually reaches for.
 const ALERT_STEPS: [(f64, bool); 4] = [(1.0, true), (2.0, true), (1.0, false), (2.0, false)];
@@ -1407,6 +1401,7 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
     };
     let (placement, cur_mon) = with_ui(|u| (u.cfg.placement(), u.cfg.monitor.clone())).unwrap_or((Placement::Auto, None));
     let mons = dock::monitors();
+    let mut commands = crate::menu_commands::MenuCommands::default();
     let cmd = unsafe {
         let m = CreatePopupMenu();
         let add = |menu: HMENU, flags: u32, id: usize, text: &str| {
@@ -1414,6 +1409,11 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
             AppendMenuW(menu, flags, id, t.as_ptr());
         };
         let item = |flags: u32, id: usize, text: &str| add(m, flags, id, text);
+        let dynamic = |menu, flags, commands: &mut crate::menu_commands::MenuCommands, action, text: &str| {
+            let id = commands.add(action);
+            add(menu, flags | if id.is_some() { 0 } else { MF_GRAYED }, id.unwrap_or(0), text);
+            id
+        };
         // A card under the pointer: the two things a card is for, first in the menu.
         let card = at.and_then(|(x, y)| {
             with_ui(|u| {
@@ -1441,7 +1441,7 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
             let locked = if on { n_shown <= 1 } else { full };
             let flags = MF_STRING | if on { MF_CHECKED } else { 0 } | if locked { MF_GRAYED } else { 0 };
             let text = if r.name.is_empty() { r.label.clone() } else { format!("{}\t{}", r.label, r.name) };
-            add(syms, flags, CMD_SYM + i, &text);
+            dynamic(syms, flags, &mut commands, crate::menu_commands::Action::Symbol(r.symbol.clone()), &text);
         }
         AppendMenuW(syms, MF_SEPARATOR, 0, null());
         add(syms, MF_STRING, CMD_RESET, "Reset to default");
@@ -1516,11 +1516,11 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
                     .and_then(|c| alerts::reference_price(c, &u.cfg, crate::source::now_s())).is_some()).unwrap_or(false);
                 for (k, (pct, up)) in ALERT_STEPS.iter().enumerate() {
                     let text = format!("{} {pct:.0} %", if *up { "above" } else { "below" });
-                    add(sub, MF_STRING | if can_base_alert { 0 } else { MF_GRAYED }, CMD_ALERT + i * 4 + k, &text);
+                    dynamic(sub, MF_STRING | if can_base_alert { 0 } else { MF_GRAYED }, &mut commands, crate::menu_commands::Action::Alert(r.label.clone(), k), &text);
                 }
                 if alerted.contains(&r.label) {
                     AppendMenuW(sub, MF_SEPARATOR, 0, null());
-                    add(sub, MF_STRING, CMD_ALERT_CLEAR + i, "Clear this symbol's alerts");
+                    dynamic(sub, MF_STRING, &mut commands, crate::menu_commands::Action::ClearAlert(r.label.clone()), "Clear this symbol's alerts");
                 }
                 add(al, MF_POPUP, sub as usize, &r.label);
             }
@@ -1543,13 +1543,20 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
             AppendMenuW(pos, MF_SEPARATOR, 0, null());
             let primary = mons.iter().position(|d| d.primary).unwrap_or(0);
             let active = mons.iter().position(|d| Some(&d.device) == cur_mon.as_ref()).unwrap_or(primary);
+            let mut monitor_ids = Vec::with_capacity(mons.len());
             for (i, d) in mons.iter().enumerate() {
                 let (w, h) = (d.bounds.right - d.bounds.left, d.bounds.bottom - d.bounds.top);
                 let main = if d.primary { ", main" } else { "" };
-                add(pos, MF_STRING, CMD_MON + i, &format!("Display {}{main}\t{w} x {h}", i + 1));
+                let id = dynamic(pos, MF_STRING, &mut commands,
+                    crate::menu_commands::Action::Monitor((!d.primary).then(|| d.device.clone())),
+                    &format!("Display {}{main}\t{w} x {h}", i + 1));
+                monitor_ids.push(id);
             }
-            let lastm = CMD_MON + mons.len() - 1;
-            CheckMenuRadioItem(pos, CMD_MON as u32, lastm as u32, (CMD_MON + active) as u32, MF_BYCOMMAND);
+            if let (Some(first), Some(last), Some(selected)) = (
+                monitor_ids.iter().flatten().next(), monitor_ids.iter().flatten().next_back(), monitor_ids[active]
+            ) {
+                CheckMenuRadioItem(pos, *first as u32, *last as u32, selected as u32, MF_BYCOMMAND);
+            }
         }
         add(m, MF_POPUP | if open { MF_GRAYED } else { 0 }, pos as usize, "Position");
         item(MF_STRING | if top || docked { MF_CHECKED } else { 0 } | if docked { MF_GRAYED } else { 0 }, CMD_TOP, "Always on top");
@@ -1572,6 +1579,50 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
         DestroyMenu(m);
         cmd as usize
     };
+    // Dynamic actions are assigned unique IDs when this particular menu is built. They retain
+    // their row identity even if an event changes the catalogue during the modal menu loop.
+    if let Some(action) = commands.get(cmd) {
+        use crate::menu_commands::Action;
+        match action {
+            Action::Symbol(symbol) => {
+                if with_ui(|u| config::toggle(&mut u.cfg, symbol)).unwrap_or(false) {
+                    apply_rows(hwnd);
+                }
+            }
+            Action::Alert(label, step) => {
+                let price = with_ui(|u| {
+                    u.view.cells.iter().find(|c| &c.label == label)
+                        .and_then(|c| alerts::reference_price(c, &u.cfg, crate::source::now_s()))
+                }).flatten();
+                if let Some(price) = price {
+                    let (pct, up) = ALERT_STEPS[*step];
+                    let level = price * (1.0 + if up { pct } else { -pct } / 100.0);
+                    with_ui(|u| {
+                        if !u.cfg.alerts.iter().any(|a| &a.label == label) {
+                            u.cfg.alerts.push(config::Alert { label: label.clone(), ..Default::default() });
+                        }
+                        if let Some(a) = u.cfg.alerts.iter_mut().find(|a| &a.label == label) {
+                            if up { a.above = Some(level); } else { a.below = Some(level); }
+                            a.last = 0.0;
+                        }
+                        config::save(&u.cfg);
+                    });
+                }
+            }
+            Action::ClearAlert(label) => with_ui(|u| {
+                u.cfg.alerts.retain(|a| &a.label != label);
+                config::save(&u.cfg);
+            }).unwrap_or(()),
+            Action::Monitor(device) => {
+                // The modal menu pumps messages: use the current mode, not its opening snapshot.
+                if with_ui(|u| u.mode == Mode::Strip).unwrap_or(false) {
+                    with_ui(|u| u.cfg.monitor = device.clone());
+                    apply_placement(hwnd);
+                }
+            }
+        }
+        return;
+    }
     match cmd {
         CMD_PANEL => {
             if open {
@@ -1629,12 +1680,6 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
             with_ui(|u| u.cfg.set_placement(Placement::ALL[c - CMD_POS]));
             apply_placement(hwnd);
         }
-        c if !open && (CMD_MON..CMD_MON + mons.len()).contains(&c) => {
-            let d = &mons[c - CMD_MON];
-            let pick = (!d.primary).then(|| d.device.clone());
-            with_ui(|u| u.cfg.monitor = pick);
-            apply_placement(hwnd);
-        }
         CMD_TOP => {
             with_ui(|u| {
                 u.cfg.topmost = !top;
@@ -1652,12 +1697,6 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
         CMD_EXIT => unsafe {
             DestroyWindow(hwnd);
         },
-        c if (CMD_SYM..CMD_SYM + list.len()).contains(&c) => {
-            let k = list[c - CMD_SYM].symbol.clone();
-            if with_ui(|u| config::toggle(&mut u.cfg, &k)).unwrap_or(false) {
-                apply_rows(hwnd);
-            }
-        }
         CMD_RESET => {
             with_ui(|u| u.cfg.rows = config::default_rows());
             apply_rows(hwnd);
@@ -1702,40 +1741,6 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
             }
         }
         CMD_PICK if ultra => apply_picker(hwnd, !picked),
-        c if ultra && (CMD_ALERT..CMD_ALERT + list.len() * 4).contains(&c) => {
-            let (i, step) = ((c - CMD_ALERT) / 4, (c - CMD_ALERT) % 4);
-            let label = list.get(i).map(|r| r.label.clone());
-            let price = with_ui(|u| {
-                u.view.cells.iter().find(|c| Some(&c.label) == label.as_ref()).and_then(|c| alerts::reference_price(c, &u.cfg, crate::source::now_s()))
-            })
-            .flatten();
-            if let (Some(label), Some(price)) = (label, price) {
-                let (pct, up) = ALERT_STEPS[step];
-                let level = price * (1.0 + if up { pct } else { -pct } / 100.0);
-                with_ui(|u| {
-                    if !u.cfg.alerts.iter().any(|a| a.label == label) {
-                        u.cfg.alerts.push(config::Alert { label: label.clone(), ..Default::default() });
-                    }
-                    if let Some(a) = u.cfg.alerts.iter_mut().find(|a| a.label == label) {
-                        if up {
-                            a.above = Some(level);
-                        } else {
-                            a.below = Some(level);
-                        }
-                        // A fresh level may already be met: let it fire on the next poll.
-                        a.last = 0.0;
-                    }
-                    config::save(&u.cfg);
-                });
-            }
-        }
-        c if ultra && (CMD_ALERT_CLEAR..CMD_ALERT_CLEAR + list.len()).contains(&c) => {
-            let label = list[c - CMD_ALERT_CLEAR].label.clone();
-            with_ui(|u| {
-                u.cfg.alerts.retain(|a| a.label != label);
-                config::save(&u.cfg);
-            });
-        }
         _ => {}
     }
 }
@@ -1935,6 +1940,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_SETTINGCHANGE => {
+            let motion = allow_motion();
+            let changed = with_ui(|u| {
+                let changed = u.motion != motion;
+                u.motion = motion;
+                changed
+            }).unwrap_or(false);
+            if changed {
+                sync_anim(hwnd);
+                InvalidateRect(hwnd, null(), 0);
+            }
             PostMessageW(hwnd, WM_DOCK, 0, 0);
             DefWindowProcW(hwnd, msg, wp, lp)
         }
