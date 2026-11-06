@@ -2494,6 +2494,11 @@ pub fn run(cfg: Config, board: Arc<Mutex<Board>>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn theme_commands_do_not_overlap_font_commands() {
+        assert!(super::CMD_THEME + crate::theme::ALL.len() <= super::CMD_FONT);
+    }
+
     use super::*;
 
     #[test]

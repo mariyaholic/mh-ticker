@@ -9,8 +9,9 @@
 //! | Animated | `Animated` | a 96-band ring cycling `bg → bg_to → bg_mid → bg`, slid by a phase |
 //! | Retro | `Pixel` | 16 chunky bands, scanlines, square corners, a bitmap face |
 //!
-//! Motion is separate from the tier: every palette names a `cycle`, and the same surface moves in
-//! the way that surface can. A flat theme breathes — one colour, lifted and settled, still flat.
+//! Motion is separate from the tier: moving palettes name a `cycle`, and the same surface moves in
+//! the way that surface can. Imported Yozora palettes are still. A moving flat theme breathes
+//! through one colour, lifted and settled, still flat.
 //! A ramp becomes a ring. Retro keeps its sixteen bands and rolls its scanlines a cell per cycle.
 //!
 //! The classic build has exactly one theme (`MIDNIGHT`, today's look) and no menu. The Ultra build
@@ -153,208 +154,8 @@ macro_rules! theme {
     };
 }
 
-// ---------------------------------------------------------------- basic: one solid fill
-
-/// Today's look, byte for byte. The classic build uses only this.
-pub const MIDNIGHT: Theme = theme!("midnight", "the original dark", Kind::Flat, Some(16.0), "Bahnschrift", {
-    bg: rgb(18, 20, 24), bg_to: rgb(23, 26, 33), bg_mid: rgb(15, 17, 21), card: rgb(28, 31, 37),
-    label: rgb(140, 148, 160), price: rgb(235, 238, 242), dim: rgb(105, 110, 118),
-    up: rgb(80, 200, 120), down: rgb(235, 90, 90), amber: rgb(240, 180, 60),
-    guide: rgb(52, 56, 64), btn: rgb(52, 57, 66), accent: rgb(150, 120, 255),
-});
-
-const INK: Theme = theme!("ink", "near-black navy, cyan", Kind::Flat, Some(14.0), "Cascadia Mono", {
-    bg: rgb(12, 14, 22), bg_to: rgb(17, 21, 35), bg_mid: rgb(9, 11, 17), card: rgb(20, 24, 36),
-    label: rgb(128, 140, 164), price: rgb(230, 238, 250), dim: rgb(96, 106, 128),
-    up: rgb(72, 206, 168), down: rgb(236, 88, 104), amber: rgb(240, 184, 72),
-    guide: rgb(40, 48, 68), btn: rgb(42, 50, 70), accent: rgb(88, 196, 236),
-});
-
-const SLATE: Theme = theme!("slate", "cool grey, ice blue", Kind::Flat, Some(18.0), "Corbel", {
-    bg: rgb(34, 37, 42), bg_to: rgb(40, 45, 53), bg_mid: rgb(30, 33, 38), card: rgb(46, 50, 57),
-    label: rgb(158, 166, 178), price: rgb(242, 245, 249), dim: rgb(122, 130, 142),
-    up: rgb(96, 206, 142), down: rgb(236, 108, 108), amber: rgb(236, 190, 86),
-    guide: rgb(66, 72, 82), btn: rgb(62, 68, 78), accent: rgb(120, 180, 255),
-});
-
-const MOSS: Theme = theme!("moss", "deep green, soft", Kind::Flat, Some(16.0), "Candara", {
-    bg: rgb(18, 26, 22), bg_to: rgb(23, 34, 28), bg_mid: rgb(14, 21, 18), card: rgb(28, 40, 33),
-    label: rgb(144, 166, 150), price: rgb(232, 244, 236), dim: rgb(104, 124, 110),
-    up: rgb(110, 220, 140), down: rgb(232, 96, 96), amber: rgb(238, 192, 88),
-    guide: rgb(44, 60, 50), btn: rgb(46, 62, 52), accent: rgb(132, 214, 150),
-});
-
-const OXBLOOD: Theme = theme!("oxblood", "wine, warm cream", Kind::Flat, Some(18.0), "Constantia", {
-    bg: rgb(28, 14, 16), bg_to: rgb(36, 18, 20), bg_mid: rgb(22, 11, 13), card: rgb(42, 22, 25),
-    label: rgb(176, 148, 148), price: rgb(246, 232, 230), dim: rgb(132, 104, 104),
-    up: rgb(110, 208, 132), down: rgb(246, 112, 112), amber: rgb(240, 186, 96),
-    guide: rgb(66, 36, 40), btn: rgb(68, 38, 42), accent: rgb(232, 148, 96),
-});
-
-const TAUPE: Theme = theme!("taupe", "muted stone, sage", Kind::Flat, Some(20.0), "Franklin Gothic Medium", {
-    bg: rgb(40, 38, 34), bg_to: rgb(46, 44, 39), bg_mid: rgb(33, 31, 28), card: rgb(54, 51, 46),
-    label: rgb(172, 166, 152), price: rgb(244, 241, 233), dim: rgb(130, 124, 112),
-    up: rgb(142, 200, 128), down: rgb(226, 116, 104), amber: rgb(230, 186, 100),
-    guide: rgb(72, 68, 60), btn: rgb(70, 66, 58), accent: rgb(196, 176, 128),
-});
-
-/// Light. Contrast is inverted here, so `price` is dark on light and the rises/falls are deepened
-/// rather than brightened to stay legible on paper.
-const PAPER: Theme = theme!("paper", "light, low glare", Kind::Flat, Some(22.0), "Sitka Text", {
-    bg: rgb(247, 245, 240), bg_to: rgb(241, 238, 231), bg_mid: rgb(250, 249, 245), card: rgb(255, 255, 252),
-    label: rgb(96, 96, 92), price: rgb(24, 24, 26), dim: rgb(132, 130, 124),
-    up: rgb(20, 132, 76), down: rgb(186, 46, 46), amber: rgb(158, 110, 8),
-    guide: rgb(210, 206, 198), btn: rgb(226, 222, 214), accent: rgb(52, 86, 196),
-});
-
-const SAND: Theme = theme!("sand", "warm paper, clay", Kind::Flat, Some(20.0), "Palatino Linotype", {
-    bg: rgb(240, 234, 222), bg_to: rgb(246, 240, 229), bg_mid: rgb(233, 226, 213), card: rgb(250, 246, 238),
-    label: rgb(108, 98, 84), price: rgb(34, 30, 24), dim: rgb(146, 134, 116),
-    up: rgb(22, 128, 84), down: rgb(176, 52, 44), amber: rgb(150, 104, 10),
-    guide: rgb(220, 210, 192), btn: rgb(232, 222, 206), accent: rgb(170, 96, 40),
-});
-
-const MONO: Theme = theme!("mono", "black, white, one red", Kind::Flat, Some(14.0), "Cascadia Mono", {
-    bg: rgb(8, 8, 8), bg_to: rgb(12, 12, 12), bg_mid: rgb(5, 5, 5), card: rgb(20, 20, 20),
-    label: rgb(150, 150, 150), price: rgb(245, 245, 245), dim: rgb(110, 110, 110),
-    up: rgb(0, 210, 120), down: rgb(255, 70, 70), amber: rgb(255, 200, 0),
-    guide: rgb(44, 44, 44), btn: rgb(34, 34, 34), accent: rgb(255, 255, 255),
-});
-
-// ---------------------------------------------------------------- gradients: two-stop ramp
-
-const GRAPHITE: Theme = theme!("graphite", "flat neutral grey, blue accent", Kind::Gradient, Some(14.0), "Bahnschrift", {
-    bg: rgb(28, 28, 30), bg_to: rgb(19, 19, 21), bg_mid: rgb(24, 25, 30), card: rgb(38, 38, 41),
-    label: rgb(150, 152, 158), price: rgb(240, 240, 243), dim: rgb(112, 114, 120),
-    up: rgb(88, 205, 130), down: rgb(238, 100, 100), amber: rgb(238, 184, 72),
-    guide: rgb(58, 58, 63), btn: rgb(56, 56, 61), accent: rgb(90, 170, 255),
-});
-
-/// Violet to rose, the same ramp as the app icon's price line.
-const AURORA: Theme = theme!("aurora", "violet to rose", Kind::Gradient, Some(12.0), "Candara", {
-    bg: rgb(24, 18, 40), bg_to: rgb(46, 22, 48), bg_mid: rgb(34, 20, 58), card: rgb(37, 30, 56),
-    label: rgb(168, 156, 196), price: rgb(246, 240, 250), dim: rgb(128, 118, 152),
-    up: rgb(112, 226, 160), down: rgb(255, 112, 142), amber: rgb(246, 190, 110),
-    guide: rgb(66, 52, 88), btn: rgb(62, 50, 84), accent: rgb(192, 124, 255),
-});
-
-const DUSK: Theme = theme!("dusk", "indigo to plum", Kind::Gradient, Some(14.0), "Cambria", {
-    bg: rgb(22, 18, 46), bg_to: rgb(58, 26, 58), bg_mid: rgb(40, 20, 66), card: rgb(36, 28, 62),
-    label: rgb(164, 152, 196), price: rgb(244, 238, 252), dim: rgb(126, 114, 156),
-    up: rgb(108, 220, 164), down: rgb(255, 116, 140), amber: rgb(246, 190, 110),
-    guide: rgb(64, 50, 90), btn: rgb(60, 46, 86), accent: rgb(190, 120, 255),
-});
-
-const OCEAN: Theme = theme!("ocean", "teal to deep blue", Kind::Gradient, Some(16.0), "Corbel", {
-    bg: rgb(10, 34, 42), bg_to: rgb(8, 18, 40), bg_mid: rgb(6, 30, 52), card: rgb(16, 44, 56),
-    label: rgb(138, 172, 184), price: rgb(232, 246, 250), dim: rgb(100, 132, 146),
-    up: rgb(96, 222, 168), down: rgb(244, 104, 116), amber: rgb(240, 190, 96),
-    guide: rgb(26, 58, 74), btn: rgb(24, 54, 70), accent: rgb(80, 208, 214),
-});
-
-const EMBER: Theme = theme!("ember", "charcoal to rust", Kind::Gradient, Some(14.0), "Franklin Gothic Medium", {
-    bg: rgb(26, 20, 18), bg_to: rgb(48, 22, 16), bg_mid: rgb(38, 18, 12), card: rgb(38, 28, 24),
-    label: rgb(176, 152, 138), price: rgb(248, 238, 230), dim: rgb(134, 112, 100),
-    up: rgb(128, 216, 144), down: rgb(250, 118, 92), amber: rgb(248, 180, 88),
-    guide: rgb(64, 44, 36), btn: rgb(62, 42, 34), accent: rgb(255, 150, 80),
-});
-
-const GLASS: Theme = theme!("glass", "light, cool and airy", Kind::Gradient, Some(18.0), "Segoe UI Variable", {
-    bg: rgb(236, 242, 248), bg_to: rgb(214, 226, 240), bg_mid: rgb(226, 236, 246), card: rgb(252, 254, 255),
-    label: rgb(96, 110, 126), price: rgb(20, 28, 40), dim: rgb(134, 148, 164),
-    up: rgb(18, 132, 96), down: rgb(190, 52, 72), amber: rgb(160, 112, 20),
-    guide: rgb(200, 214, 230), btn: rgb(226, 236, 246), accent: rgb(44, 110, 220),
-});
-
-// ---------------------------------------------------------------- animated: bg -> bg_to -> bg_mid
-
-const DRIFT: Theme = theme!("drift", "blue, indigo, violet", Kind::Animated, Some(12.0), "Bahnschrift", {
-    bg: rgb(16, 20, 44), bg_to: rgb(30, 24, 62), bg_mid: rgb(44, 26, 58), card: rgb(26, 30, 58),
-    label: rgb(152, 164, 200), price: rgb(236, 242, 255), dim: rgb(112, 124, 160),
-    up: rgb(96, 224, 180), down: rgb(244, 110, 140), amber: rgb(244, 192, 104),
-    guide: rgb(48, 54, 90), btn: rgb(44, 50, 86), accent: rgb(120, 180, 255),
-});
-
-const PULSE: Theme = theme!("pulse", "charcoal, violet breath", Kind::Animated, Some(16.0), "Segoe UI", {
-    bg: rgb(18, 18, 22), bg_to: rgb(30, 26, 44), bg_mid: rgb(22, 20, 28), card: rgb(34, 34, 42),
-    label: rgb(156, 156, 170), price: rgb(242, 242, 248), dim: rgb(116, 116, 130),
-    up: rgb(96, 214, 150), down: rgb(244, 104, 120), amber: rgb(240, 186, 88),
-    guide: rgb(58, 56, 70), btn: rgb(56, 54, 68), accent: rgb(198, 130, 255),
-});
-
-const VAPOR: Theme = theme!("vaporwave", "magenta and cyan", Kind::Animated, Some(6.0), "Cascadia Code", {
-    bg: rgb(30, 14, 42), bg_to: rgb(14, 38, 58), bg_mid: rgb(52, 16, 48), card: rgb(44, 22, 58),
-    label: rgb(196, 160, 214), price: rgb(255, 246, 255), dim: rgb(150, 120, 172),
-    up: rgb(110, 240, 214), down: rgb(255, 110, 190), amber: rgb(255, 200, 120),
-    guide: rgb(66, 38, 84), btn: rgb(62, 34, 80), accent: rgb(90, 240, 255),
-});
-
-const AURORA_LIVE: Theme = theme!("aurora-live", "green and violet", Kind::Animated, Some(10.0), "Candara", {
-    bg: rgb(10, 26, 26), bg_to: rgb(30, 18, 48), bg_mid: rgb(14, 40, 34), card: rgb(22, 40, 42),
-    label: rgb(146, 180, 182), price: rgb(236, 250, 246), dim: rgb(104, 140, 142),
-    up: rgb(116, 240, 176), down: rgb(250, 110, 132), amber: rgb(244, 200, 110),
-    guide: rgb(34, 62, 64), btn: rgb(32, 58, 60), accent: rgb(150, 255, 200),
-});
-
-const SUNSET: Theme = theme!("sunset", "amber through purple", Kind::Animated, Some(14.0), "Georgia", {
-    bg: rgb(40, 18, 14), bg_to: rgb(46, 16, 44), bg_mid: rgb(70, 34, 12), card: rgb(52, 26, 24),
-    label: rgb(200, 160, 140), price: rgb(255, 240, 226), dim: rgb(158, 118, 100),
-    up: rgb(130, 222, 150), down: rgb(255, 120, 100), amber: rgb(255, 196, 92),
-    guide: rgb(74, 38, 32), btn: rgb(72, 36, 30), accent: rgb(255, 170, 90),
-});
-
-// ---------------------------------------------------------------- retro: chunky, bitmap faces
-
-const EGA: Theme = theme!("ega", "EGA 16-colour, cyan", Kind::Pixel, Some(8.0), "Terminal", {
-    bg: rgb(0, 0, 42), bg_to: rgb(0, 0, 20), bg_mid: rgb(0, 0, 30), card: rgb(0, 0, 84),
-    label: rgb(85, 85, 255), price: rgb(255, 255, 255), dim: rgb(85, 85, 170),
-    up: rgb(85, 255, 85), down: rgb(255, 85, 85), amber: rgb(255, 255, 85),
-    guide: rgb(0, 0, 120), btn: rgb(0, 0, 140), accent: rgb(85, 255, 255),
-});
-
-const AMBER: Theme = theme!("amber-crt", "amber phosphor", Kind::Pixel, Some(7.0), "Terminal", {
-    bg: rgb(18, 11, 2), bg_to: rgb(10, 6, 1), bg_mid: rgb(14, 8, 1), card: rgb(30, 18, 3),
-    label: rgb(190, 120, 30), price: rgb(255, 196, 96), dim: rgb(140, 88, 20),
-    up: rgb(255, 214, 120), down: rgb(214, 88, 24), amber: rgb(255, 176, 48),
-    guide: rgb(46, 28, 6), btn: rgb(44, 26, 5), accent: rgb(255, 176, 48),
-});
-
-const PHOSPHOR: Theme = theme!("phosphor", "green phosphor", Kind::Pixel, Some(7.0), "Lucida Console", {
-    bg: rgb(3, 10, 4), bg_to: rgb(2, 6, 3), bg_mid: rgb(3, 8, 3), card: rgb(8, 20, 10),
-    label: rgb(90, 160, 100), price: rgb(190, 255, 196), dim: rgb(64, 116, 72),
-    up: rgb(140, 255, 150), down: rgb(255, 96, 88), amber: rgb(200, 255, 140),
-    guide: rgb(20, 44, 26), btn: rgb(18, 40, 22), accent: rgb(140, 255, 150),
-});
-
-const GAMEBOY: Theme = theme!("gameboy", "four shades of green", Kind::Pixel, Some(10.0), "Fixedsys", {
-    bg: rgb(15, 56, 15), bg_to: rgb(10, 38, 10), bg_mid: rgb(12, 47, 12), card: rgb(48, 98, 48),
-    label: rgb(138, 171, 15), price: rgb(214, 232, 140), dim: rgb(96, 130, 60),
-    up: rgb(190, 230, 80), down: rgb(230, 110, 80), amber: rgb(220, 190, 60),
-    guide: rgb(60, 110, 60), btn: rgb(56, 112, 56), accent: rgb(155, 188, 15),
-});
-
-const C64: Theme = theme!("c64", "breadbin blue", Kind::Pixel, Some(9.0), "Fixedsys", {
-    bg: rgb(53, 40, 121), bg_to: rgb(32, 24, 82), bg_mid: rgb(42, 32, 101), card: rgb(66, 50, 140),
-    label: rgb(120, 160, 255), price: rgb(164, 190, 255), dim: rgb(96, 116, 200),
-    up: rgb(140, 230, 160), down: rgb(255, 120, 120), amber: rgb(240, 220, 100),
-    guide: rgb(78, 62, 160), btn: rgb(74, 58, 150), accent: rgb(255, 255, 255),
-});
-
-/// The estate palette: PC-98's 16 colours with the canon's single gold accent.
-const PC98: Theme = theme!("pc98", "PC-98, gold accent", Kind::Pixel, Some(8.0), "MS Gothic", {
-    bg: rgb(6, 6, 10), bg_to: rgb(0, 0, 4), bg_mid: rgb(3, 3, 7), card: rgb(20, 20, 30),
-    label: rgb(170, 170, 170), price: rgb(255, 255, 255), dim: rgb(110, 110, 120),
-    up: rgb(85, 255, 85), down: rgb(255, 85, 85), amber: rgb(255, 205, 90),
-    guide: rgb(60, 60, 80), btn: rgb(40, 40, 60), accent: rgb(255, 205, 90),
-});
-
-/// The whole catalogue, in menu order: basic, gradients, animated, retro.
-pub const ALL: [Theme; 26] = [
-    MIDNIGHT, INK, SLATE, MOSS, OXBLOOD, TAUPE, PAPER, SAND, MONO, //
-    GRAPHITE, AURORA, DUSK, OCEAN, EMBER, GLASS, //
-    DRIFT, PULSE, VAPOR, AURORA_LIVE, SUNSET, //
-    EGA, AMBER, PHOSPHOR, GAMEBOY, C64, PC98,
-];
+// Palette values and stable IDs are generated from the shared estate catalog.
+include!("theme_catalog.rs");
 
 /// The catalogue entry a config names, or the classic look if the name is unknown.
 pub fn resolve(name: &str) -> &'static Theme {
@@ -696,8 +497,8 @@ mod tests {
     }
 
     #[test]
-    fn every_theme_moves_through_three_distinct_stops() {
-        for t in ALL.iter() {
+    fn moving_themes_keep_three_distinct_stops() {
+        for t in ALL.iter().filter(|t| t.cycle.is_some()) {
             assert!(t.animated(), "{}: every palette in this catalogue moves", t.name);
             assert_ne!(t.bg, t.bg_to, "{}: a cycle with one stop is still", t.name);
             assert_ne!(t.bg_mid, t.bg_to, "{}: two stops, so nothing to cycle through", t.name);
@@ -739,7 +540,7 @@ mod tests {
 
     #[test]
     fn motion_is_a_ring_and_stillness_is_one_brush() {
-        // A still theme — not in the catalogue any more, but the code path has to keep working.
+        // Imported web palettes are deliberately still; this code path must keep working.
         let still = Theme { cycle: None, ..MIDNIGHT };
         let s = Gradient::new(&still);
         assert_eq!(s.brushes.len(), 1);

@@ -185,3 +185,8 @@ sits behind the `shots` feature, so neither shipped exe links it - the binaries 
 
 [MIT](LICENSE) © 2026 mariyaholic - Use it, change it, share it, just keep the copyright notice and the license
 text with it. And if u build something on top of it please credit this repo as the original source!
+
+## Shared application catalog
+
+See [theme catalog adoption](docs/THEME-CATALOG.md) for the shared 37-theme set,
+renderer compatibility, regeneration and validation limits.
