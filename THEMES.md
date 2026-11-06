@@ -1,8 +1,11 @@
 # MH Ticker — the theme catalogue
 
-Twenty-six palettes in four tiers, twenty-two faces in four groups. Every one of them is a row in
-`src/theme.rs`; the Theme and Font menus in `MH_Ticker_Ultra` are built from that list, so nothing
-below can drift out of the menu.
+Thirty-seven palettes in four tiers, twenty-two faces in four groups. Palette values are generated
+in `src/theme_catalog.rs` from the shared Uika application catalog; rendering stays in `src/theme.rs`.
+The original twenty-six palettes below retain their colors, fonts and motion. Eleven Yozora
+identities are also available as still native palettes: Yozora, Uika, Pine, Kurisu, Ava, Astra,
+Mariyaholic-98, Sumimi, Ledger, Confluence and Astra light. See
+[shared catalog adoption](docs/THEME-CATALOG.md) for refresh commands and validation limits.
 
 The classic build ignores all of it: `theme::pick(false, …)` always returns `MIDNIGHT` and never
 runs a clock, and the Theme and Font menus are not built at all.

@@ -23,7 +23,7 @@ effort went:
 
 | | `MH_Ticker.exe` | `MH_Ticker_Ultra.exe` |
 |---|---|---|
-| Look | one theme, exactly as it always was | **26 palettes in 4 tiers**, every one of them moving, plus 22 fonts — see [THEMES.md](THEMES.md) |
+| Look | one theme, exactly as it always was | **37 palettes in 4 tiers**: 26 original moving palettes and 11 still Yozora imports, plus 22 fonts. See [THEMES.md](THEMES.md). |
 | Symbols | the *Symbols* menu | that **plus a picker strip inside the panel** |
 | Alerts | — | price alerts, tray balloon, optional **Discord/Slack/ntfy webhook** |
 | Memory after a minute | ~5.7 MB | ~5.8 MB |
