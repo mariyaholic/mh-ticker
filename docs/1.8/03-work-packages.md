@@ -80,11 +80,16 @@ Insert at your anchor and nowhere near another package's. This is what lets thre
 | Menu IDs | 5200 to 5299 | 5300 to 5349 | 5400 to 5499 | 5500 to 5549 | 5900 to 5999 | 6000 to 6099 |
 | Window messages | `WM_APP + 6`, `+ 7` | `+ 8` | `+ 9`, `+ 10` | `+ 11`, `+ 12` | `+ 13` | `+ 14`, `+ 15` |
 | Timer IDs | 4 | 5 | 6 | 7 | 8 | 9 |
-| Your constants in `ui.rs` | right after `ALERT_STEPS` | right after `CHART_MS` | right after `TRAY_DEBOUNCE` | assigned at wave 2 | | |
-| Your `Ui` fields (struct and the initialiser in `run`) | after `alert_note` | after `open_hover` | after `tray_click_at` | | | |
-| Your `Config` fields (struct and `Default`) | after `webhook` | after `panel` | after `topmost` | | | |
-| A config test, if you need one | after `fallback_policy_is_off_by_default_and_persists_explicit_consent` | after `malformed_settings_are_not_accepted_as_defaults` | after `placement_falls_back_to_the_old_dock_flag` | | | |
-| `mod` lines in `lib.rs` | none | after `pub(crate) mod alerts;` | after `pub(crate) mod webhook_host;` | | | |
+| Your constants in `ui.rs` | right after `ALERT_STEPS` | right after `CHART_MS` | right after `TRAY_DEBOUNCE` | right after `CHART_Y_BAND` | right after `ANIM_MS` | right after `OPACITY_STEPS` |
+| Your `Ui` fields (struct and the initialiser in `run`) | after `alert_note` | after `open_hover` | after `tray_click_at` | after `chart_layout` | after `wheel_remainder` | after `update_result` |
+| Your `Config` fields (struct and `Default`) | after `webhook` | after `panel` | after `topmost` | none | none | none |
+| A config test, if you need one | after `fallback_policy_is_off_by_default_and_persists_explicit_consent` | after `malformed_settings_are_not_accepted_as_defaults` | after `placement_falls_back_to_the_old_dock_flag` | none | after `hand_added_rows_stay_listed_and_in_place` | after `toggle_keeps_catalog_order_and_limits` |
+| `mod` lines in `lib.rs` | none | after `pub(crate) mod alerts;` | after `pub(crate) mod webhook_host;` | after `pub(crate) mod panel;` | after `pub(crate) mod dock;` | after `pub(crate) mod update;` |
+| `panel::Chart` fields (struct, both literals in `ui::draw_panel`, the fixture in `shot.rs`) | | | | after `unavailable` | none | after `change_pct` |
+| `menu_commands::Action` variants, and their arms in `menu_at` | | | | none | after `Symbol(String)` | after `ClearAlert(String)` |
+| New `wndproc` arms | | | | right after the `WM_ALERT` arm | right before `WM_KEYDOWN if wp == VK_ESCAPE` | right before `WM_UPDATE =>` |
+| `config.rs` functions | | | | none | after `toggle` | after `menu_list` |
+| `source.rs` functions | | | | after `Client::chart` | none | right after `get_release` |
 
 Tests for a helper you add to `ui.rs` go in a small `#[cfg(test)] mod` directly under that helper, not
 in the big `mod tests` at the bottom of the file.
@@ -247,30 +252,197 @@ hand-written release JSON and on junk, `board_text`, the save-failed flag settin
 
 ---
 
-## Wave 2 (outlines; the anchors are assigned after wave 1 merges)
+## Wave 2
 
-**P4. Chart ranges (Ultra).** New `src/ranges.rs`: the range table (1D from the bars already held; 5D
-from `5D.json`; 1M, 6M and 1Y from `1M.json`, which carries about a year of daily bars; 5Y from
-`5Y.json`, weekly), each trimmed to its named span by time; and a pure state machine for "which
-series is wanted, which is in flight, which are cached and how old" (select, arrive, tick, close) with
-a generation so a late answer for a previous symbol or range is dropped. Fetched only for the locked
-symbol, only while the pane is open, cached with a time to live. The cache holds at most twelve
-series and outlives the pane (the RAM ceiling was doubled on 2026-11-13, so it no longer has to be
-thrown away): a series goes when its symbol leaves the strip or when it is the oldest of thirteen.
-`Bar` gains `v: f32` and the pane draws a volume strip under the candles when the series has volume. Bar duration is inferred from the data, not assumed. Range tabs in the pane header;
-dates on the axis; `--probe` prints every range. **Unverified live by construction**: the shapes come
-from `FEATURES.md` Appendix A.
+Starts from the merged wave 1 (171 tests pass under Wine plus the one known failure; the Linux harness
+runs 65; the stills baseline is unchanged). The anchors are in the table above. Three things are new
+since wave 1 and every wave 2 package builds on them:
 
-**P5. Keyboard, cards and order.** New `src/keys.rs` (pure: key and state in, action out). Arrows move
-the lock across the grid, Enter opens CNBC, C the chart, S the picker, Ctrl+C copies, Delete removes
-(never the last symbol), Ctrl+Left/Right moves the locked card. Card menu: Remove from strip, Move
-left, Move right, Move first. Order is a permutation of the catalogue, so rows still follow catalogue
-order. A click on a symbol in the strip opens the panel with that card locked.
+- `src/chartview.rs` owns the candle pane's arithmetic: `Layout` (plot, step, body, wick, price window,
+  `x_of`, `index_at`, `y_of`, `price_at`, `pointer_at`), `fitted`, `fold`, `gaps`, `clock`, `readout`.
+  It is pure and portable (`crate::model::Bar` and `std` only) and must stay that way.
+- `panel::candles` draws from one `Layout` and stores it in `Scene::layout`; `Ui::chart_layout` is that
+  cell, and the pointer is answered from it.
+- `src/alerts.rs` has `PRESETS`, `preset_level`, `apply_level`, `Level`, `reference_price`, `silence`,
+  `Log`. `ui::alerts_view` and `ui::alert_command` are the menu's read and write sides.
 
-**P6. Type it in.** New `src/prompt.rs`: a modal one-line prompt from an in-memory dialog template.
-*Add symbol* (both builds): the symbol is checked against CNBC on a worker thread before it is added;
-a second add while one is in flight is refused; hand-added symbols can be removed. `MAX_ROWS` goes
-from 12 to 24 (the cap was a byte budget; every range sized by it and the test that assumes the
-catalogue is longer than the cap are checked). *Alert at price*
-per symbol. Alert levels drawn on the candle pane, and a right-click on the pane offers "Alert at
-<price under the pointer>".
+Review pictures: P4 and P6 render their own with `examples/chart.rs` and commit them as
+`docs/1.8/notes/p4-*.png` and `p6-*.png`. The default fixture (no extra arguments) must keep rendering
+exactly what it renders now.
+
+## P4. Chart ranges and volume (Ultra)
+
+Owns new `src/ranges.rs`. Shared: `src/model.rs` (`Bar`), `src/source.rs`, `src/chartview.rs`,
+`src/panel.rs`, `src/ui.rs`, `src/shot.rs`, `examples/chart.rs`, `src/lib.rs`.
+
+**Unverified live by construction.** Nothing here can be tried against CNBC from this sandbox. The
+shapes come from `FEATURES.md` §3 and Appendix A, which measured one symbol on one day. So the code
+assumes as little as it can: it trims by time instead of trusting a file's name, infers the bar
+duration from the data, accepts either spelling of the time field, and shows "no data for this
+range" instead of drawing something wrong.
+
+**`ranges` (pure, portable: `crate::model::Bar` and `std` only):**
+
+- `Range`: `D1`, `D5`, `M1`, `M6`, `Y1`, `Y5`, with `label()` ("1D" ... "5Y"), `file()` (`None` for
+  `D1`, which uses the day of bars the board already holds; `"5D.json"`; `"1M.json"` for both `M1`
+  and `M6`, because that file carries about a year of daily bars; `"1Y.json"`; `"5Y.json"`),
+  `span_s()` (5, 31, 183, 366 and 5 x 366 days) and `ttl_s()` (10 minutes for `D5`, an hour for the
+  daily files, six hours for `5Y`).
+- `Key { symbol, file }`: the cache is keyed by the **file**, so `M1` and `M6` share one fetch.
+- `Series { t0, bars: Arc<[Bar]>, bar_s, fetched }`. `bar_s` is the median spacing of consecutive
+  bars, inferred, never assumed. `Series::window(now, span_s)` is the slice inside the range's span.
+- `Book`: the state machine. It holds the cache (at most 12 series; the least recently used goes
+  first), the one request in flight with its generation, and the last failure per key with its time.
+  - `want(key, now) -> Option<Request>`: a fetch is due when the key is not cached or its time to
+    live has passed, nothing is in flight for it, and it did not fail in the last 30 s.
+  - `arrived(generation, key, result, now) -> bool`: accepted only when the generation is the one in
+    flight. A late answer for a key the user has left is still cached (it is good data); an answer
+    with a stale generation is dropped.
+  - `status(key, now)`: `Ready`, `Loading`, `Failed`, `Empty`.
+  - `forget(symbols_still_shown)`: called when the rows change.
+  The cache outlives the pane (the RAM ceiling was doubled on 2026-11-13).
+
+**Fetching (`source.rs`):** `Client::chart_file(symbol, file)` and `parse_series(json, now)`: the bar's
+time is `tradeTimeinMills` or `tradeTimeInMills`, as given (the start of the bar), close required,
+open/high/low falling back to the close, volume optional, newest 4,000 bars kept. `parse_chart` (the
+1D path) is unchanged apart from reading volume. One long-lived `ranges` worker thread, started in
+`spawn`, polls a shared request slot (the way the other workers poll, every `ROWS_CHECK`), fetches,
+stores the result in a shared slot and notifies the window with `WM_APP + 11`. No thread per click. A
+new request replaces one that has not been picked up yet; one that is already being fetched finishes
+and is cached.
+
+**`Bar` gains `v: f32`** (0 when the feed sends none; `Bar` derives `Default`). Every literal in the
+tests gets the field. 24 bytes a bar.
+
+**The pane:**
+
+- Range tabs on the header's second line, right-aligned: `1D 5D 1M 6M 1Y 5Y`, the current one lit.
+  Their rectangles are in the `Layout` (it stays `Copy`), and a click is answered from the stored
+  layout like the zone button. The hover legend shares that line and falls back to its compact form
+  when the two would touch.
+- `Ui::range` (session only, like the chart flag; starts at `D1`). Changing the range or the locked
+  card calls `Book::want`. `on_feed` calls it too, which is the retry and refresh tick: no new timer.
+- While a series is loading or failed the pane keeps its header and tabs and says so in the plot:
+  "loading 5D", "could not load 5D, retrying", "no data for this range". The way out of every one of
+  those is a tab that still works.
+- Buckets for long ranges: `fitted` starts at the series' own `bar_s` (never finer than the data) and
+  climbs 1, 5, 15, 30, 60 minutes, 4 hours, a day, a week, a calendar month. Days are cut on local
+  midnight, weeks on Monday, months on the calendar (a small pure civil-date function in
+  `chartview`). The header names the bucket ("1 d", "1 w", "1 mo").
+- Axis: intraday ranges tick on clock times as today and label a day boundary with the date
+  ("Nov 12"); daily and longer ranges tick on month starts ("Oct") or year starts ("2025"), whichever
+  leaves room for the labels. The hover legend shows the date, and the time only for intraday bars.
+- Session-break lines are drawn only for buckets shorter than a day (every weekend is not a break).
+- Volume: when any displayed candle has volume, the bottom fifth of the plot is a volume strip
+  (bars in the candle's colour) and the price plot is that much shorter. No volume, no strip, and the
+  pane is exactly as it is today.
+- The reference lines (previous close, day high and low) are drawn only on `D1`.
+
+`--probe` prints, for the first row, each range file's bar count, inferred bar duration, span in
+days and whether it carried volume. That is the one-command live check for the owner.
+
+`examples/chart.rs` takes a range argument with a synthetic series so each range can be rendered.
+
+**Accept:** tests for `Book` (a full select, arrive, expire, refresh cycle; a stale generation
+dropped; a late answer for a left key cached; failure back-off; the 13th series evicting the least
+recently used; `forget`), `Series::window` and `bar_s` on minute, daily and weekly spacing,
+`parse_series` on both time spellings, missing fields, an empty array and junk, the long-range bucket
+ladder (never finer than the data; a day, a week on Monday, a month on the calendar, with a non-zero
+zone offset), the date labels, the volume strip geometry (`y_of` and `price_at` still round-trip with
+a strip), and that a series with no volume produces the same `Layout` as today. Pictures of 5D, 1M
+and 5Y, and of 1D with volume. `stills-check` identical.
+
+## P5. Keyboard, cards and order
+
+Owns new `src/keys.rs`. Shared: `src/ui.rs`, `src/config.rs`, `src/menu_commands.rs`, `src/panel.rs`
+(the footer hint only), `src/lib.rs`.
+
+**`keys` (pure, portable: `std` only):** `map(vk, ctrl, state) -> Option<Action>` with
+`state = { ultra, has_lock, picker_open, chart_open }`, and `step(index, n, cols, dir) -> usize` for
+moving across the card grid (left and right stop at the ends, up and down stay put when there is no
+card there).
+
+| Key | Does | Build |
+|---|---|---|
+| Arrows | move the lock; with nothing locked, lock the first card | Ultra |
+| Enter | open the locked card on CNBC | Ultra |
+| C | open or close the chart | Ultra |
+| S | open or close the symbol picker | Ultra |
+| Ctrl+C | copy the locked card's line; with nothing locked, copy all prices | both |
+| Delete | remove the locked card from the strip (never the last one) | Ultra |
+| Ctrl+Left, Ctrl+Right | move the locked card one place | Ultra |
+| Esc, PgUp, PgDn, Home, End | unchanged | both |
+
+A moved lock is scrolled into view when the body scrolls. Moving the lock clears the chart pointer
+exactly as a click on a card does.
+
+**Order (`config.rs`, pure):** `move_row(cfg, symbol, delta) -> bool` and `move_first(cfg, symbol)`.
+Order is a permutation of the **catalogue**: a row that is shown but not in the catalogue is appended
+to it first (which changes nothing visible), then the symbol swaps places with its shown neighbour,
+then `rows` is rebuilt the way `toggle` builds it. "Rows keep catalogue order" stays true, so adding a
+symbol later does not undo the order.
+
+**Card menu** (the block in `menu_at` that starts `if let Some((i, label, price)) = &card` is yours):
+*Remove from strip* (greyed for the last one), *Move left*, *Move right*, *Move first*, as
+`menu_commands::Action` entries that carry the symbol, so they act on the card that was clicked even
+if the rows change while the menu is open.
+
+**Strip click (Ultra):** the strip's layout records each symbol's rectangle (`Frame`); a click on a
+symbol in a docked or cornered strip opens the panel with that card locked. A click between symbols,
+or on the classic strip, does what it does today. The floating strip is a drag handle and is
+unchanged.
+
+**Footer hint** for Ultra names the keys. The classic hint and the stills do not change.
+
+**Accept:** tests for `map` (every row of the table, for both builds, with and without a lock; an
+unmapped key is `None`), `step` on full and ragged grids of 1, 2, 3 and 6 columns, `move_row` and
+`move_first` (ends, a hand-added row, the order surviving a later `toggle`, the existing config tests
+untouched), and the strip hit test. `stills-check` identical.
+
+## P6. Type it in
+
+Owns new `src/prompt.rs`. Shared: `src/ui.rs`, `src/config.rs`, `src/source.rs`, `src/alerts.rs`,
+`src/menu_commands.rs`, `src/panel.rs`, `src/shot.rs`, `examples/chart.rs`, `src/lib.rs`.
+
+**`prompt`:** `ask(owner, title, label, initial, max_len) -> Option<String>`, a modal one-line prompt
+built from an in-memory dialog template (`DialogBoxIndirectParamW`): a label, an edit box, OK and
+Cancel; Enter accepts, Esc cancels; the text is selected when it opens. `template(...)` builds the
+bytes and is pure. Never called from inside `with_ui`. A test builds the real dialog, has it accept
+itself from `WM_INITDIALOG` (a test-only switch), and checks the text comes back, so native CI proves
+the template is one Windows will take.
+
+**Add a symbol (both builds):** *Symbols > Add symbol...* asks for a CNBC symbol.
+`config::clean_symbol` trims and upper-cases it and allows `A-Z 0-9 . @ = - ^ / : _`, 1 to 20
+characters. If it is already listed it is simply ticked. Otherwise it is looked up on a worker thread
+(`source::lookup`, one quote request) and the result comes back as `WM_APP + 14`. `Ui::adding` holds
+the symbol in flight; the menu entry reads "Adding AAPL..." and is greyed; the handler clears it in
+every outcome, a failed thread start included. Found: `config::add_custom` appends it to the catalogue
+(label from the symbol, made unique; digits from the price's size; name from CNBC, cleaned and
+shortened) and ticks it when there is room. Not found, or no network: a message box that says which.
+*Symbols > Remove a symbol I added* lists the catalogue entries that are not in
+`default_catalog()`; removing the last shown symbol is refused.
+
+**`MAX_ROWS` goes from 12 to 24.** Check everything sized by it, and rewrite the config test that
+assumes the catalogue is longer than the cap so it builds its own long catalogue.
+
+**Alert at a price (Ultra):** each symbol's Alerts submenu gains *at a price...*. The prompt opens on
+the current price. `alerts::parse_level` accepts `4200`, `4,200.50` and `4200.5` and refuses zero,
+negatives, NaN, infinity and anything else. Above the fresh reference price it is an *above* level,
+below it a *below* level, equal is refused with a reason. Greyed when there is no fresh price, like
+the presets.
+
+**Alert levels on the pane:** `panel::Chart` gains the locked symbol's levels. Inside the price
+window each is a dashed line in the amber colour with its price at the right end of the plot; outside
+it, a small marker on the top or bottom edge with the price, so a level off the screen is still
+known. A right-click inside the plot (Ultra, pane open) opens a small menu of its own, before the
+main menu: *Alert at <price under the pointer>* (from the stored layout's `price_at`, rounded to the
+symbol's digits) and *Clear <symbol> alerts* when there are any. It is a separate function, not part
+of `menu_at`.
+
+`examples/chart.rs` takes an argument that adds alert levels to the fixture.
+
+**Accept:** tests for the template (every item starts on a 4-byte boundary; the item count and ids),
+the self-accepting dialog round trip, `clean_symbol`, the label and digits rules, `add_custom` and
+removal (a duplicate label, a full strip, the last shown symbol), `parse_level`, the side rule, and
+the in-window and off-window placement of alert levels (pure, in `chartview`). A picture with one
+level inside the window and one above it. `stills-check` identical.
