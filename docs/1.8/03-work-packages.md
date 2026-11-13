@@ -1,9 +1,9 @@
 # 1.8 work packages
 
 *The build plan for the BUILD NOW items in [02-feature-list.md](02-feature-list.md). Six packages in
-two waves of three. Each package is built by one Sonnet agent (the skeleton and every risky edit) and
-finished by one Haiku agent (bodies, tests, verification), then reviewed by the orchestrator until it
-is accepted and merged.*
+two waves of three. Each package is built by one **builder** agent (the skeleton and every risky edit) and
+finished by one **finisher** agent (bodies, tests, verification), then reviewed by the orchestrator
+until it is accepted and merged.*
 
 | Wave | Package | Branch | Worktree | Items |
 |---|---|---|---|---|
@@ -91,20 +91,20 @@ in the big `mod tests` at the bottom of the file.
 
 ### The hand-off
 
-**Sonnet builds the skeleton and makes every decision.** That means: the types, the function
+**The builder writes the skeleton and makes every decision.** That means: the types, the function
 signatures with doc comments that state the contract, the state fields, **all** of the Win32 and
 threading code (`wndproc`, `menu_at`, `run`, `unsafe` blocks), and the test names with their key
-assertions. When Sonnet stops:
+assertions. When the builder stops:
 
 - `wcargo check --all-features --all-targets` is clean and the existing tests still pass;
-- every unfinished piece is marked in the code as `// TODO(haiku): <what> (accept: <how to tell it is done>)`;
-- `docs/1.8/notes/<package>-handoff.md` lists the TODOs in the order to do them, with anything Haiku
-  must not change;
+- every unfinished piece is marked in the code as `// TODO(finish): <what> (accept: <how to tell it is done>)`;
+- `docs/1.8/notes/<package>-handoff.md` lists the TODOs in the order to do them, with anything the
+  finisher must not change;
 - the work is committed on the branch.
 
-**Haiku finishes it.** Every `TODO(haiku)`: the bodies of the pure functions, the unit tests (the ones
+**The finisher completes it.** Every `TODO(finish)`: the bodies of the pure functions, the unit tests (the ones
 named, plus edge cases: empty, zero, NaN, one element, the boundary itself), labels, clippy. Then the
-five commands above, the notes file, and a commit. Haiku does not redesign: if a contract looks wrong,
+five commands above, the notes file, and a commit. The finisher does not redesign: if a contract looks wrong,
 it says so in the notes and in its final message instead of changing it.
 
 **Final message, both agents:** under 200 words. Branch, commit hash, what is done, what is not, the
