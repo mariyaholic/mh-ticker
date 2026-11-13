@@ -90,7 +90,19 @@ fn set_command(id: &str, value: Option<String>) -> Result<(), &'static str> {
     // SAFETY: as in `read`; the data pointer and byte length describe `data` exactly.
     unsafe {
         let mut hkey: HKEY = std::ptr::null_mut();
-        if RegOpenKeyExW(HKEY_CURRENT_USER, key.as_ptr(), 0, KEY_SET_VALUE, &mut hkey) != ERROR_SUCCESS {
+        // The Run key is not there on a profile nothing has ever registered in (a fresh account, a
+        // CI runner): switching on creates it, and switching off has nothing to delete.
+        let opened = match &value {
+            Some(_) => RegCreateKeyExW(
+                HKEY_CURRENT_USER, key.as_ptr(), 0, std::ptr::null(), REG_OPTION_NON_VOLATILE, KEY_SET_VALUE,
+                std::ptr::null(), &mut hkey, std::ptr::null_mut(),
+            ),
+            None => RegOpenKeyExW(HKEY_CURRENT_USER, key.as_ptr(), 0, KEY_SET_VALUE, &mut hkey),
+        };
+        if opened == ERROR_FILE_NOT_FOUND && value.is_none() {
+            return Ok(());
+        }
+        if opened != ERROR_SUCCESS {
             return Err("registry");
         }
         let rc = match &value {
