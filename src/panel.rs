@@ -312,6 +312,21 @@ pub fn minimum(n: usize, catalog: usize, dpi: u32, picker: bool, chart: bool) ->
     }
 }
 
+/// The body scroll offset that brings card `i` fully into the body (between header and footer), or
+/// the current offset when it already is. A card taller than the body is aligned to its top.
+pub fn reveal(g: &Geo, i: usize) -> i32 {
+    let r = card_rect(g, i);
+    let bottom = g.h - g.footer;
+    let want = if r.top < g.header {
+        g.scroll - (g.header - r.top)
+    } else if r.bottom > bottom {
+        g.scroll + (r.bottom - bottom).min(r.top - g.header)
+    } else {
+        g.scroll
+    };
+    want.clamp(0, g.scroll_max)
+}
+
 pub fn in_rect(r: &RECT, x: i32, y: i32) -> bool {
     x >= r.left && x < r.right && y >= r.top && y < r.bottom
 }
@@ -540,6 +555,9 @@ pub struct Scene<'a> {
     /// Cards are selectable (Ultra). A click locks a card instead of opening CNBC; the page is one
     /// explicit button on the locked card. The classic build keeps its one-click behaviour.
     pub select: bool,
+    /// Ultra's footer names the keys (arrows, Enter, Del, Esc). False keeps the older hint, which is
+    /// what every catalogue still shows.
+    pub keys_hint: bool,
     /// The locked card, drawn with an accent border and the Open button. The chart follows it.
     pub selected: Option<usize>,
     /// The Open button on the locked card is under the pointer.
@@ -1004,11 +1022,16 @@ pub fn draw(dc: HDC, w: i32, h: i32, sc: &Scene) {
         (false, None) => format!("{note}   \u{b7}   {lines}"),
     };
     let left: String = left.chars().take(70).collect();
-    text(dc, sc.fonts.small, g.pad + s(2), fy, &left, t.dim);
+    let left_w = text(dc, sc.fonts.small, g.pad + s(2), fy, &left, t.dim);
     if g.scroll_max == 0 {
         // Where a click goes depends on the build: Ultra locks the card (and offers the page as a
         // button), the classic build opens CNBC straight away, as it always has.
-        let hint = if sc.select { "click a card: lock it \u{b7} Esc: dock" } else { "click a card: CNBC \u{b7} Esc: dock" };
+        let mut hint = if sc.select { "click a card: lock it \u{b7} Esc: dock" } else { "click a card: CNBC \u{b7} Esc: dock" };
+        // Ultra names the keys, when the line fits beside what the left side says.
+        const KEYS: &str = "arrows: pick \u{b7} Enter: CNBC \u{b7} Del: remove \u{b7} Esc: dock";
+        if sc.keys_hint && g.pad + s(2) + left_w + s(24) + text_width(dc, sc.fonts.small, KEYS) <= w - g.pad - s(2) {
+            hint = KEYS;
+        }
         text_right(dc, sc.fonts.small, w - g.pad - s(2), fy, hint, t.dim);
     }
 }

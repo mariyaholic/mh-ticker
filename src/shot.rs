@@ -136,6 +136,7 @@ fn render(t: &Theme, phase: f64, now: f64, b: &Board, h: &History, dpi: u32) -> 
         // Nothing is locked in a still, and the settings button is chrome rather than palette: the
         // catalogue pictures stay what they were, byte for byte.
         select: false,
+        keys_hint: false,
         selected: None,
         hover: None,
         chart_at: None,
@@ -356,6 +357,7 @@ fn write_chart_fixture(
         // The pane charts the locked card, so the fixture locks it: the border and the Open button
         // are part of what this picture is for.
         select: true,
+        keys_hint: false,
         selected: Some(row),
         hover: hover.map(|row| panel::Hover { row, t: snap_t(now) }),
         chart_at: None,

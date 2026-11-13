@@ -2,6 +2,12 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Action {
     Symbol(String),
+    /// Card menu: hide this symbol (the config refuses the last one).
+    Remove(String),
+    /// Card menu: move this symbol by this many places (-1 left, 1 right).
+    Move(String, i32),
+    /// Card menu: move this symbol to the front.
+    MoveFirst(String),
     Alert(String, usize),
     ClearAlert(String),
     Monitor(Option<String>),
