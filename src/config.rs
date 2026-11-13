@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
 /// The strip, dock grid and panel stay readable up to this many symbols.
-pub const MAX_ROWS: usize = 12;
+pub const MAX_ROWS: usize = 24;
 
 /// Which product this process is. One engine, two builds: the profile picks the config file,
 /// the single-instance mutex and the window title, so the two can run side by side and never
@@ -306,6 +306,146 @@ pub fn menu_list(cfg: &Config) -> Vec<Row> {
     list
 }
 
+/// The longest symbol *Add symbol...* accepts, in characters.
+pub const MAX_SYMBOL: usize = 20;
+/// The longest label made for an added symbol, in characters (the strip is narrow).
+pub const MAX_LABEL: usize = 8;
+/// The longest name kept for an added symbol, in characters, the ellipsis included.
+pub const MAX_NAME: usize = 40;
+
+/// A typed CNBC symbol, made safe to store and to send: trimmed, upper-cased (ASCII), and only when
+/// every character is one of `A-Z 0-9 . @ = - ^ / : _` and there are 1 to [`MAX_SYMBOL`] of them.
+/// `None` otherwise (empty, a space inside, a letter outside ASCII, too long). `" aapl "` gives
+/// `"AAPL"`, `"@gc.1"` gives `"@GC.1"`, `"eur="` gives `"EUR="`.
+pub fn clean_symbol(raw: &str) -> Option<String> {
+    let s = raw.trim().to_ascii_uppercase();
+    let count = s.chars().count();
+    let ok = (1..=MAX_SYMBOL).contains(&count) && s.chars().all(|c| c.is_ascii_alphanumeric() || ".@=-^/:_".contains(c));
+    ok.then_some(s)
+}
+
+/// The strip label for a newly added `symbol` (already cleaned): the symbol without a leading `@`,
+/// `.` or `^`, without a trailing `=`, and without a trailing `.1` (a front-month future: `@GC.1` is
+/// `GC`); cut to [`MAX_LABEL`] characters; `SYM` if nothing is left. Then made unique against every
+/// label in `catalog` and `rows`, compared ignoring ASCII case, by appending `2`, `3`, ... and cutting
+/// the base so the whole stays within [`MAX_LABEL`] (`GOLD` taken gives `GOLD2`).
+pub fn label_for(cfg: &Config, symbol: &str) -> String {
+    let base = symbol.trim_start_matches(['@', '.', '^']);
+    let base = base.strip_suffix('=').unwrap_or(base);
+    let base = base.strip_suffix(".1").unwrap_or(base);
+    let base: String = base.chars().take(MAX_LABEL).collect();
+    let base = if base.is_empty() { "SYM".to_string() } else { base };
+    let taken = |label: &str| cfg.catalog.iter().chain(cfg.rows.iter()).any(|r| r.label.eq_ignore_ascii_case(label));
+    if !taken(&base) {
+        return base;
+    }
+    let mut n = 2;
+    loop {
+        let suffix = n.to_string();
+        let head: String = base.chars().take(MAX_LABEL - suffix.len()).collect();
+        let candidate = format!("{head}{suffix}");
+        if !taken(&candidate) {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
+/// Decimal places for an added symbol, from the size of its first price: 0 at 10,000 and above, 2
+/// from 10, 4 from 0.01, and below 0.01 enough for three significant figures, at most 8. A price that
+/// is not positive and finite gives 2.
+pub fn digits_for(price: f64) -> u32 {
+    if !price.is_finite() || price <= 0.0 {
+        return 2;
+    }
+    if price >= 10_000.0 {
+        0
+    } else if price >= 10.0 {
+        2
+    } else if price >= 0.01 {
+        4
+    } else {
+        // Below 0.01: three significant figures. Here `exp` is at most -3, so `2 - exp` is positive.
+        let exp = price.log10().floor() as i32;
+        ((2 - exp) as u32).min(8)
+    }
+}
+
+/// CNBC's name for an added symbol, made fit for a menu line: control characters (a tab would split
+/// the menu's columns) dropped, runs of whitespace made one space, trimmed, and cut to [`MAX_NAME`]
+/// characters with a trailing `...` when longer. Empty stays empty.
+pub fn clean_name(raw: &str) -> String {
+    // Whitespace (a tab included) becomes a space and other control characters go; then the runs of
+    // spaces collapse and the ends are trimmed.
+    let mut kept = String::with_capacity(raw.len());
+    for c in raw.chars() {
+        if c.is_whitespace() {
+            kept.push(' ');
+        } else if !c.is_control() {
+            kept.push(c);
+        }
+    }
+    let joined = kept.split_whitespace().collect::<Vec<_>>().join(" ");
+    if joined.chars().count() <= MAX_NAME {
+        return joined;
+    }
+    let head: String = joined.chars().take(MAX_NAME - 3).collect();
+    format!("{head}...")
+}
+
+/// What [`add_custom`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Added {
+    /// The symbol is on the strip now (newly listed, or listed already and now ticked).
+    Shown,
+    /// Listed in the Symbols menu, but the strip already shows [`MAX_ROWS`]: not ticked.
+    Listed,
+    /// It was on the strip already; nothing changed.
+    AlreadyShown,
+}
+
+/// Add a symbol CNBC knows to the catalogue and tick it when there is room. `symbol` is already
+/// cleaned ([`clean_symbol`]), `name` is CNBC's and `price` its first price. A symbol already in the
+/// Symbols menu (`menu_list`) is not added twice: it is ticked if it is not shown. A new entry is
+/// appended to `catalog` with [`label_for`], [`digits_for`] and [`clean_name`], so it shows last.
+pub fn add_custom(cfg: &mut Config, symbol: &str, name: &str, price: f64) -> Added {
+    if is_shown(cfg, symbol) {
+        return Added::AlreadyShown;
+    }
+    if !menu_list(cfg).iter().any(|r| r.symbol == symbol) {
+        let label = label_for(cfg, symbol);
+        cfg.catalog.push(Row { label, symbol: symbol.to_string(), digits: digits_for(price), name: clean_name(name) });
+    }
+    if toggle(cfg, symbol) {
+        Added::Shown
+    } else {
+        Added::Listed
+    }
+}
+
+/// The catalogue entries that are not in `default_catalog()` (by symbol), in catalogue order: what
+/// *Remove a symbol I added* lists.
+pub fn custom_entries(cfg: &Config) -> Vec<Row> {
+    let defaults = default_catalog();
+    cfg.catalog.iter().filter(|r| !defaults.iter().any(|d| d.symbol == r.symbol)).cloned().collect()
+}
+
+/// Remove an added symbol: from `catalog`, from `rows`, and its alerts (by its label). Refused, with
+/// nothing changed, when the symbol is in `default_catalog()`, is not in the catalogue, or is the only
+/// symbol shown. Returns whether anything changed.
+pub fn forget_custom(cfg: &mut Config, symbol: &str) -> bool {
+    let Some(row) = custom_entries(cfg).into_iter().find(|r| r.symbol == symbol) else {
+        return false;
+    };
+    if is_shown(cfg, symbol) && cfg.rows.len() <= 1 {
+        return false;
+    }
+    cfg.catalog.retain(|r| r.symbol != symbol);
+    cfg.rows.retain(|r| r.symbol != symbol);
+    cfg.alerts.retain(|a| a.label != row.label);
+    true
+}
+
 pub fn is_shown(cfg: &Config, symbol: &str) -> bool {
     cfg.rows.iter().any(|r| r.symbol == symbol)
 }
@@ -549,9 +689,126 @@ mod tests {
         c.rows.truncate(1);
         let last = c.rows[0].symbol.clone();
         assert!(!toggle(&mut c, &last), "the last symbol stays");
-        let mut full = Config { rows: default_catalog(), ..Config::default() };
-        full.rows.truncate(MAX_ROWS);
-        assert!(!toggle(&mut full, ".HSI"), "no more than MAX_ROWS");
+        // A catalogue of its own, one longer than the cap: the default one is shorter than MAX_ROWS.
+        let long: Vec<Row> = (0..=MAX_ROWS).map(|i| row(&format!("S{i}"), &format!("S{i}="), 2, "")).collect();
+        let mut full = Config { rows: long[..MAX_ROWS].to_vec(), catalog: long, ..Config::default() };
+        assert!(!toggle(&mut full, &format!("S{MAX_ROWS}=")), "no more than MAX_ROWS");
+        assert_eq!(full.rows.len(), MAX_ROWS);
+    }
+
+    #[test]
+    fn clean_symbol_trims_uppercases_and_refuses_the_rest() {
+        assert_eq!(clean_symbol(" aapl ").as_deref(), Some("AAPL"));
+        assert_eq!(clean_symbol("@gc.1").as_deref(), Some("@GC.1"));
+        assert_eq!(clean_symbol("eur=").as_deref(), Some("EUR="));
+        let too_long = "A".repeat(21);
+        for bad in ["", "   ", "A B", "ÄPFEL", "A;B", too_long.as_str()] {
+            assert_eq!(clean_symbol(bad), None, "{bad:?} is refused");
+        }
+        assert_eq!(clean_symbol(&"A".repeat(20)).as_deref(), Some("A".repeat(20).as_str()));
+    }
+
+    #[test]
+    fn labels_are_derived_and_made_unique() {
+        let c = Config::default();
+        assert_eq!(label_for(&c, "AAPL"), "AAPL");
+        assert_eq!(label_for(&c, "@GC.1"), "GC");
+        assert_eq!(label_for(&c, "EUR="), "EUR");
+        assert_eq!(label_for(&c, ".SPX"), "SPX");
+        assert_eq!(label_for(&c, "BRK.B"), "BRK.B");
+        assert_eq!(label_for(&c, "ABCDEFGHIJ"), "ABCDEFGH");
+        assert_eq!(label_for(&c, "@="), "SYM");
+        assert_eq!(label_for(&c, "XAU"), "XAU2", "XAU is on the default strip");
+
+        let mut taken = Config::default();
+        taken.rows.push(row("ABCDEFGH", "ABCDEFGH=", 2, ""));
+        assert_eq!(label_for(&taken, "ABCDEFGHIJ"), "ABCDEFG2");
+    }
+
+    #[test]
+    fn digits_follow_the_price_size() {
+        let cases = [
+            (98000.0, 0),
+            (10000.0, 0),
+            (9999.5, 2),
+            (4200.0, 2),
+            (10.0, 2),
+            (9.99, 4),
+            (1.08, 4),
+            (0.01, 4),
+            (0.00123, 5),
+            (0.0000001234, 8),
+            (0.0, 2),
+            (-1.0, 2),
+            (f64::NAN, 2),
+            (f64::INFINITY, 2),
+        ];
+        for (price, want) in cases {
+            assert_eq!(digits_for(price), want, "price {price}");
+        }
+    }
+
+    #[test]
+    fn names_are_cleaned_and_shortened() {
+        assert_eq!(clean_name("  Apple\tInc  "), "Apple Inc");
+        assert_eq!(clean_name("Gold\u{7}Spot"), "GoldSpot", "other control characters go");
+        assert_eq!(clean_name(""), "");
+        let long = "x".repeat(60);
+        let short = clean_name(&long);
+        assert_eq!(short.chars().count(), MAX_NAME);
+        assert!(short.ends_with("..."));
+        let exact = "y".repeat(MAX_NAME);
+        assert_eq!(clean_name(&exact), exact);
+    }
+
+    #[test]
+    fn add_custom_appends_ticks_and_respects_the_cap() {
+        let mut c = Config::default();
+        assert_eq!(add_custom(&mut c, "NVDA", "NVIDIA", 120.0), Added::Shown);
+        assert_eq!(c.catalog.last().unwrap().symbol, "NVDA");
+        assert_eq!(c.rows.last().unwrap().symbol, "NVDA");
+        assert_eq!(c.rows.last().unwrap().label, "NVDA");
+        assert_eq!(add_custom(&mut c, "NVDA", "", 120.0), Added::AlreadyShown);
+        assert_eq!(c.catalog.iter().filter(|r| r.symbol == "NVDA").count(), 1);
+
+        assert!(!is_shown(&c, "ETH.CB="));
+        assert_eq!(add_custom(&mut c, "ETH.CB=", "", 2000.0), Added::Shown);
+        assert_eq!(c.catalog.iter().filter(|r| r.symbol == "ETH.CB=").count(), 1, "not duplicated");
+
+        let long: Vec<Row> = (0..=MAX_ROWS).map(|i| row(&format!("S{i}"), &format!("S{i}="), 2, "")).collect();
+        let mut full = Config { rows: long[..MAX_ROWS].to_vec(), catalog: long, ..Config::default() };
+        assert_eq!(add_custom(&mut full, "NEWX=", "New", 5.0), Added::Listed);
+        assert!(full.catalog.iter().any(|r| r.symbol == "NEWX="));
+        assert!(!is_shown(&full, "NEWX="));
+        assert_eq!(full.rows.len(), MAX_ROWS);
+
+        let mut c = Config::default();
+        assert_eq!(add_custom(&mut c, "XAU", "", 2000.0), Added::Shown);
+        assert_eq!(c.catalog.last().unwrap().label, "XAU2");
+    }
+
+    #[test]
+    fn forget_custom_removes_only_what_was_added() {
+        let mut c = Config::default();
+        assert!(!forget_custom(&mut c, "XAU="), "a default symbol is refused");
+        add_custom(&mut c, "NVDA", "", 120.0);
+        add_custom(&mut c, "AMD", "", 100.0);
+        assert_eq!(custom_entries(&c).iter().map(|r| r.symbol.as_str()).collect::<Vec<_>>(), ["NVDA", "AMD"]);
+        c.alerts.push(Alert { label: "NVDA".into(), above: Some(130.0), ..Alert::default() });
+        c.alerts.push(Alert { label: "AMD".into(), above: Some(130.0), ..Alert::default() });
+
+        assert!(forget_custom(&mut c, "NVDA"));
+        assert!(!c.catalog.iter().any(|r| r.symbol == "NVDA"));
+        assert!(!is_shown(&c, "NVDA"));
+        assert_eq!(c.alerts.iter().map(|a| a.label.as_str()).collect::<Vec<_>>(), ["AMD"]);
+        assert_eq!(custom_entries(&c).iter().map(|r| r.symbol.as_str()).collect::<Vec<_>>(), ["AMD"]);
+
+        let mut only = Config::default();
+        add_custom(&mut only, "NVDA", "", 120.0);
+        only.rows.retain(|r| r.symbol == "NVDA");
+        let before = (only.catalog.clone(), only.rows.clone());
+        assert!(!forget_custom(&mut only, "NVDA"), "the only symbol shown is refused");
+        assert_eq!((only.catalog, only.rows), before);
     }
 
     #[test]

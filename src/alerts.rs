@@ -229,6 +229,75 @@ pub fn apply_level(a: &mut Alert, level: Level) {
     a.last = 0.0;
 }
 
+/// A price level typed by hand (*at a price...*). After trimming, accepts digits with an optional
+/// decimal point and fraction (`4200`, `4200.5`, `.5`), and commas as thousands separators only
+/// between digits of the whole part (`4,200.50`, `1,234,567`). Refuses everything else: empty, a sign
+/// (`-5`, `+5`), an exponent (`1e3`), `inf`, `NaN`, a second point, a comma after the point, a
+/// leading, trailing or doubled comma, spaces inside, and any result that is zero or not finite.
+pub fn parse_level(text: &str) -> Option<f64> {
+    let t = text.trim();
+    let mut halves = t.split('.');
+    let whole = halves.next()?;
+    let frac = halves.next().unwrap_or("");
+    if halves.next().is_some() || !frac.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let digits: String = if whole.contains(',') {
+        // Comma-separated groups: the first group and every later one must be non-empty digits.
+        let mut groups = whole.split(',');
+        let first = groups.next()?;
+        if first.is_empty() || !first.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let mut out = first.to_string();
+        for g in groups {
+            if g.is_empty() || !g.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            out.push_str(g);
+        }
+        out
+    } else if whole.bytes().all(|b| b.is_ascii_digit()) {
+        whole.to_string()
+    } else {
+        return None;
+    };
+    if digits.is_empty() && frac.is_empty() {
+        return None;
+    }
+    let number = format!("{}.{}", if digits.is_empty() { "0" } else { &digits }, frac);
+    let v: f64 = number.parse().ok()?;
+    (v.is_finite() && v > 0.0).then_some(v)
+}
+
+/// The side rule for a typed or pointed level: `Above(level)` when it is above the fresh `reference`
+/// price, `Below(level)` when below, compared after rounding both to `digits` decimals (so accepting
+/// the prompt's initial text, the current price, is refused). `Err` with the reason, as a phrase that
+/// fits "No alert set: <reason>.": `"that is the current price"` when equal, `"that is not a price"`
+/// when `level` is not positive and finite, `"there is no fresh price"` when `reference` is not.
+pub fn side_of(level: f64, reference: f64, digits: u32) -> Result<Level, &'static str> {
+    if !(level.is_finite() && level > 0.0) {
+        return Err("that is not a price");
+    }
+    if !(reference.is_finite() && reference > 0.0) {
+        return Err("there is no fresh price");
+    }
+    let (l, r) = (round_level(level, digits), round_level(reference, digits));
+    if l == r {
+        Err("that is the current price")
+    } else if l > r {
+        Ok(Level::Above(level))
+    } else {
+        Ok(Level::Below(level))
+    }
+}
+
+/// `price` rounded to `digits` decimals (half away from zero), as the pane's *Alert at* offers it.
+pub fn round_level(price: f64, digits: u32) -> f64 {
+    let k = 10f64.powi(digits.min(12) as i32);
+    (price * k).round() / k
+}
+
 /// One line for the menu, greyed: what is set on this alert. Levels are formatted with
 /// `fmt_price(level, digits)`, joined by " \u{b7} ", in the order above, below, day move, once:
 /// `above 4,200.00 \u{b7} below 3,900.00 \u{b7} day \u{b1}2 % \u{b7} once`. An alert with nothing set
@@ -720,6 +789,47 @@ mod tests {
         assert_eq!((a.above, a.below, a.last), (Some(9.0), Some(1.0), 0.0));
         apply_level(&mut a, Level::DayMove(2.0));
         assert_eq!(a.day_move, Some(2.0));
+    }
+
+    #[test]
+    fn round_level_keeps_the_symbols_digits() {
+        assert_eq!(round_level(4200.126, 2), 4200.13);
+        assert_eq!(round_level(98_765.4, 0), 98_765.0);
+    }
+
+    #[test]
+    fn parse_level_accepts_plain_and_grouped_prices() {
+        for (text, want) in [
+            ("4200", 4200.0),
+            (" 4,200.50 ", 4200.5),
+            ("4200.5", 4200.5),
+            (".5", 0.5),
+            ("4,20,0", 4200.0),
+            ("1,234,567", 1_234_567.0),
+        ] {
+            assert_eq!(parse_level(text), Some(want), "{text:?}");
+        }
+        for text in ["0", "0.00", "-5", "+5", "1e3", "inf", "NaN", ",4200", "4200,", "4,,200", "4.2.0", "4.200,5", "4 200", "", "."] {
+            assert_eq!(parse_level(text), None, "{text:?} is refused");
+        }
+    }
+
+    #[test]
+    fn the_side_rule_follows_the_fresh_price() {
+        assert_eq!(side_of(4300.0, 4200.4, 2), Ok(Level::Above(4300.0)));
+        assert_eq!(side_of(4100.0, 4200.0, 2), Ok(Level::Below(4100.0)));
+        assert_eq!(side_of(4200.004, 4200.001, 2), Err("that is the current price"));
+        for bad in [f64::NAN, 0.0, -1.0] {
+            assert_eq!(side_of(bad, 4200.0, 2), Err("that is not a price"), "level {bad}");
+        }
+        for bad in [f64::NAN, 0.0] {
+            assert_eq!(side_of(4300.0, bad, 2), Err("there is no fresh price"), "reference {bad}");
+        }
+        // One tick above the reference: at digits 0 the tick is 1, at digits 4 it is 0.0001.
+        assert_eq!(side_of(4201.0, 4200.0, 0), Ok(Level::Above(4201.0)));
+        assert_eq!(side_of(4200.4, 4200.0, 0), Err("that is the current price"), "rounds to the same whole price");
+        assert_eq!(side_of(4200.0001, 4200.0, 4), Ok(Level::Above(4200.0001)));
+        assert_eq!(side_of(4200.00004, 4200.0, 4), Err("that is the current price"));
     }
 
     #[test]

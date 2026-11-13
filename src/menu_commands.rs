@@ -10,6 +10,10 @@ pub(crate) enum Action {
     MoveFirst(String),
     Alert(String, usize),
     ClearAlert(String),
+    /// Alerts submenu, per symbol (Ultra): ask for a price level for this label.
+    AlertAt(String),
+    /// Symbols > Remove a symbol I added (both builds): drop this catalogue entry, by symbol.
+    Forget(String),
     Monitor(Option<String>),
 }
 
