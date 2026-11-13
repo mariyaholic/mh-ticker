@@ -16,6 +16,7 @@
 use crate::config::Row;
 use crate::model::{Bar, Board, Quote};
 use crate::panel::{self, Chart, Fonts, History, Scene};
+use crate::ranges::{Range, Status};
 use crate::theme::{self, Gradient, Theme};
 use std::path::{Path, PathBuf};
 use windows_sys::Win32::Graphics::Gdi::*;
@@ -215,8 +216,32 @@ pub fn write_chart_named_at(
     bar: Option<usize>,
     refs: bool,
 ) -> Result<PathBuf, String> {
+    write_chart_named_range(dir, name, dpi, w, hover, bar, refs, None, false)
+}
+
+/// `write_chart_named_at` for a chart range. `range` is `1D`, `5D`, `1M`, `6M`, `1Y` or `5Y`
+/// (`None`: the pane exactly as it was before ranges, with no tabs). A range other than 1D charts a
+/// deterministic synthetic series with the shape of that file (1-minute bars over five sessions,
+/// daily bars, weekly bars) and ignores `refs`. `volume` gives the charted bars a synthetic volume,
+/// which turns the volume strip on.
+#[allow(clippy::too_many_arguments)]
+pub fn write_chart_named_range(
+    dir: &Path,
+    name: &str,
+    dpi: u32,
+    w: i32,
+    hover: Option<usize>,
+    bar: Option<usize>,
+    refs: bool,
+    range: Option<&str>,
+    volume: bool,
+) -> Result<PathBuf, String> {
     let t = theme::ALL.iter().find(|t| t.name == name).ok_or_else(|| format!("no theme named {name}"))?;
-    write_chart_fixture(dir, t, dpi, w, hover, bar, refs)
+    let range = match range {
+        Some(r) => Some(Range::parse(r).ok_or_else(|| format!("no range named {r} (1D 5D 1M 6M 1Y 5Y)"))?),
+        None => None,
+    };
+    write_chart_fixture(dir, t, dpi, w, hover, bar, refs, range, volume)
 }
 
 /// The fixture's clock: UTC-4, a US equity day in summer.
@@ -241,13 +266,14 @@ pub fn write_chart_at(
     hover: Option<usize>,
     bar: Option<usize>,
 ) -> Result<PathBuf, String> {
-    write_chart_fixture(dir, t, dpi, w, hover, bar, false)
+    write_chart_fixture(dir, t, dpi, w, hover, bar, false, None, false)
 }
 
 /// The fixture behind `write_chart_at` and `write_chart_named_at`. With `refs`, the pane alone gets
 /// the reference lines and one session break, so both can be reviewed from a picture: the previous
 /// close at the midpoint of the day's range, the day's high and low at its extremes, and about forty
 /// minutes cut from the middle of the bars. The cards keep the untouched bars.
+#[allow(clippy::too_many_arguments)]
 fn write_chart_fixture(
     dir: &Path,
     t: &Theme,
@@ -256,6 +282,8 @@ fn write_chart_fixture(
     hover: Option<usize>,
     bar: Option<usize>,
     refs: bool,
+    range: Option<Range>,
+    volume: bool,
 ) -> Result<PathBuf, String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let now = 1_792_052_981.0;
@@ -291,6 +319,19 @@ fn write_chart_fixture(
         day_hi = Some(hi);
         day_lo = Some(lo);
     }
+    // A range: the pane charts a synthetic series with the shape of that range's file (the cards keep
+    // the day). With no range the pane has no tabs and is the pane from before ranges.
+    let rg = range.unwrap_or(Range::D1);
+    let (mut chart_t0, mut bar_s) = (t0, 60.0);
+    if volume && rg == Range::D1 {
+        add_volume(&mut charted, row as u64 + 1);
+    }
+    if rg != Range::D1 {
+        let (st, sbars, sbs) = long_series(rg, now, last.unwrap_or(100.0), row as u64 + 1, volume);
+        (chart_t0, charted, bar_s) = (st, sbars, sbs);
+        (prev, day_hi, day_lo) = (None, None, None);
+    }
+    let coarsest = if rg == Range::D1 { 3_600.0 } else { crate::chartview::MONTH_S };
     // The sparklines seed from the hour of bars, exactly as they do on a live board.
     let mut hist = History::new();
     hist.record(&b, now);
@@ -326,16 +367,20 @@ fn write_chart_fixture(
         chart: Some(Chart {
             label: &label,
             digits,
-            t0,
+            t0: chart_t0,
             bars: &charted,
             last,
             unavailable: false,
+            range: rg,
+            status: Status::Ready,
+            bar_s,
+            tabs: range.is_some(),
             tz_offset_s: TZ_S,
             tz_label: "local",
             prev,
             day_hi,
             day_lo,
-            change_pct,
+            change_pct: change_pct.filter(|_| rg == Range::D1),
         }),
         chart_btn: true,
         settings_btn: true,
@@ -348,7 +393,7 @@ fn write_chart_fixture(
         capture(g.w, g.h, &sc);
         if let Some(lay) = layout.get() {
             let i = bar.min(lay.bars.saturating_sub(1));
-            let (drawn, _) = crate::chartview::fitted(&charted, lay.plot.right - lay.plot.left, t0, TZ_S);
+            let (drawn, _) = crate::chartview::fitted_to(&charted, lay.plot.right - lay.plot.left, chart_t0, TZ_S, bar_s, coarsest);
             let close = drawn.get(i).map_or(last.unwrap_or(0.0), |b| b.c as f64);
             let close = lay.y_of(close).clamp(lay.plot.top, lay.plot.bottom - 1);
             sc.chart_at = lay.pointer_at(lay.x_of(i), close, 2);
@@ -369,8 +414,13 @@ fn snap_t(t: f64) -> f64 {
 /// A session that ends exactly on `last`: a drift, a midday sell-off, a recovery, at a scale that
 /// suits the price it is charting. Deterministic, so the same picture every run.
 fn walk(last: f64, n: usize, salt: u64) -> Vec<Bar> {
+    walk_amp(last, n, salt, 1.0)
+}
+
+/// `walk` with the step scaled by `k`: a daily or weekly candle moves a lot more than a minute does.
+fn walk_amp(last: f64, n: usize, salt: u64, k: f64) -> Vec<Bar> {
     let mut seed = 0x2545_f491_4f6c_dd1d ^ salt.wrapping_mul(0x9e37_79b9_7f4a_7c15);
-    let amp = last.abs() * 0.0004;
+    let amp = last.abs() * 0.0004 * k;
     let mut close = Vec::with_capacity(n);
     let mut px = 0.0;
     for i in 0..n {
@@ -390,9 +440,65 @@ fn walk(last: f64, n: usize, salt: u64) -> Vec<Bar> {
             h: (o.max(c) + w) as f32,
             l: (o.min(c) - w) as f32,
             c: c as f32,
+            v: 0.0,
         });
     }
     bars
+}
+
+/// A synthetic volume, bigger in the first and last quarter of the bars (an open and a close), in
+/// units that read as thousands of shares. Deterministic.
+fn add_volume(bars: &mut [Bar], salt: u64) {
+    let mut seed = 0x9e37_79b9_7f4a_7c15 ^ salt.wrapping_mul(0x2545_f491_4f6c_dd1d);
+    let n = bars.len().max(1);
+    for (i, b) in bars.iter_mut().enumerate() {
+        let edge = if i < n / 4 || i > n * 3 / 4 { 2.0 } else { 1.0 };
+        b.v = (40_000.0 * edge * (1.0 + noise(&mut seed).abs() * 2.0)) as f32;
+    }
+}
+
+/// A series shaped like `range`'s file, ending at `last`, as `(t0, bars, bar_s)`: five 6.5-hour
+/// sessions of one-minute bars (5D), or daily bars on weekdays (1M and 6M, from the year the file
+/// carries), or weekly bars (5Y), trimmed to the range's span exactly as `Series::window` does. Bars
+/// are stamped at their START, at 13:30 UTC (an equity open), and `dt` counts from the first.
+fn long_series(range: Range, now: f64, last: f64, salt: u64, volume: bool) -> (f64, Vec<Bar>, f64) {
+    const DAY: f64 = 86_400.0;
+    let today = (now / DAY).floor() as i64;
+    // Day 0 (1970-01-01) was a Thursday: 0 = Sunday .. 6 = Saturday.
+    let weekday = |d: i64| (d + 4).rem_euclid(7);
+    let open = |d: i64| d as f64 * DAY + 13.5 * 3_600.0;
+    let (starts, bar_s, per, k): (Vec<f64>, f64, usize, f64) = match range {
+        Range::D1 | Range::D5 => {
+            let days: Vec<i64> = (0..30).map(|i| today - i).filter(|d| (1..=5).contains(&weekday(*d)) && open(*d) + 390.0 * 60.0 <= now).take(5).collect();
+            (days.into_iter().rev().map(open).collect(), 60.0, 390, 1.0)
+        }
+        Range::M1 | Range::M6 | Range::Y1 => {
+            let days: Vec<i64> = (1..400).map(|i| today - i).filter(|d| (1..=5).contains(&weekday(*d))).take(260).collect();
+            (days.into_iter().rev().map(open).collect(), DAY, 1, 10.0)
+        }
+        Range::Y5 => {
+            let mondays: Vec<i64> = (1..1_900).map(|i| today - i).filter(|d| weekday(*d) == 1).take(261).collect();
+            (mondays.into_iter().rev().map(open).collect(), 7.0 * DAY, 1, 25.0)
+        }
+    };
+    let n = starts.len() * per;
+    let walked = walk_amp(last, n, salt, k);
+    let mut bars: Vec<Bar> = Vec::with_capacity(n);
+    for (i, mut b) in walked.into_iter().enumerate() {
+        // Minute bars restart at each session's open; daily and weekly bars sit on their own start.
+        b.dt = (starts[i / per] + (i % per) as f64 * bar_s) as f32;
+        bars.push(b);
+    }
+    let keep = bars.iter().position(|b| b.dt as f64 >= now - range.span_s()).unwrap_or(bars.len());
+    bars.drain(..keep);
+    let t0 = bars.first().map_or(now, |b| b.dt as f64);
+    for b in &mut bars {
+        b.dt = (b.dt as f64 - t0) as f32;
+    }
+    if volume {
+        add_volume(&mut bars, salt);
+    }
+    (t0, bars, bar_s)
 }
 
 /// xorshift64 -> [-1, 1). No dependency, and the same numbers on every platform.

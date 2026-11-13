@@ -33,6 +33,7 @@ use crate::update;
 use crate::config::{self, Config, Placement, Profile};
 use crate::dock;
 use crate::panel;
+use crate::ranges::{self, Range};
 use crate::theme::{self, Gradient, Theme};
 use crate::model::{fmt_change, fmt_price, Board, Cell, Link};
 use std::cell::RefCell;
@@ -126,6 +127,10 @@ const CHART_MS: f64 = 210.0;
 /// The candle pane's crosshair moves in bands this tall (96-dpi px, scaled by DPI), so a mouse move
 /// inside one band repaints nothing.
 const CHART_Y_BAND: i32 = 2;
+/// The `ranges` worker finished a fetch (the result is in `Ui::range_slots`; `wparam` and `lparam`
+/// are unused). `WM_APP + 12` is reserved for P4 and unused: the design needs no second message and
+/// no timer (the retry and refresh tick is `on_feed`).
+const WM_RANGE: u32 = WM_APP + 11;
 /// The fallback cycle length, and how often a moving background is advanced. Each palette names its
 /// own cycle in `theme::ALL`; this only covers a theme that somehow has none.
 const ANIM_CYCLE_S: f64 = 9.0;
@@ -323,8 +328,20 @@ struct Ui {
     /// rows change (`apply_rows`), the zone flips (`Act::Zone`), the panel expands or collapses.
     chart_at: Option<chartview::Pointer>,
     /// The layout the pane was last painted with (`Scene::layout`); the pointer is answered from it.
-    /// Cleared by the painter whenever the pane draws no bars, and with every reset of `chart_at`.
+    /// Cleared by the painter whenever the pane names no card, and with every reset of `chart_at`.
+    /// While the pane names a card and draws no bars (loading, failed, no data) it holds the range
+    /// tabs alone (`bars == 0`): the pointer finds no candle and the zone button's rectangle is empty.
     chart_layout: std::cell::Cell<Option<chartview::Layout>>,
+    /// The chart range shown (session only, like the chart flag; starts at 1D). Reset: the chart
+    /// closes (`set_chart` back to 1D). Kept across a lock change and a collapse/expand: the range is
+    /// the user's choice of how to look, not a property of a card.
+    range: Range,
+    /// The series cache and the request state machine. Outlives the pane; `apply_rows` makes it
+    /// forget the symbols that left the strip. Never touched off the UI thread.
+    book: ranges::Book,
+    /// The slots shared with the `ranges` worker (see `ranges::Slots`). The only `Ui` field another
+    /// thread can reach, and only through the `Arc`.
+    range_slots: Arc<Mutex<ranges::Slots>>,
     /// The picker strip is open (Ultra only).
     pick_open: bool,
     picker_scroll: i32,
@@ -792,6 +809,7 @@ fn draw_panel(u: &mut Ui, dc: HDC, w: i32, h: i32) {
     } else {
         0.0
     };
+    let now = crate::source::now_s();
     let scene = panel::Scene {
         title: u.profile.title(),
         board: &u.view,
@@ -800,7 +818,7 @@ fn draw_panel(u: &mut Ui, dc: HDC, w: i32, h: i32) {
         theme: u.theme,
         grad: &u.grad,
         dpi: u.dpi,
-        now: crate::source::now_s(),
+        now,
         btn_hover: u.hover,
         pick_hover: u.pick_hover,
         chart_hover: u.chart_hover,
@@ -823,18 +841,47 @@ fn draw_panel(u: &mut Ui, dc: HDC, w: i32, h: i32) {
             Some(row) => {
                 let fallback = u.view.cells.get(row).and_then(|c| c.quote.as_ref()).is_some_and(|q| !q.source.is_empty());
                 let quote = u.view.cells.get(row).and_then(|c| c.quote.as_ref());
+                let range = u.range;
+                // The long ranges come from the cache: the series trimmed to the range's span, or the
+                // reason there is none yet. 1D is the board's own day, as it always was.
+                let long: Option<(&[crate::model::Bar], f64, f64, ranges::Status)> = u
+                    .view
+                    .cells
+                    .get(row)
+                    .and_then(|c| u.cfg.rows.iter().find(|r| r.label == c.label))
+                    .and_then(|r| range.key(&r.symbol))
+                    .map(|k| match u.book.get(&k) {
+                        Some(sr) => {
+                            let w = sr.window(now, range.span_s());
+                            (w, sr.t0, sr.bar_s, if w.is_empty() { ranges::Status::Empty } else { ranges::Status::Ready })
+                        }
+                        None => (&[][..], 0.0, 0.0, u.book.status(&k)),
+                    });
+                let day = range == Range::D1;
+                let (bars, t0, bar_s, status) = match long {
+                    Some(l) if !day => l,
+                    // A long range for a card with no configured row has nothing to show yet.
+                    _ if !day => (&[][..], 0.0, 0.0, ranges::Status::Loading),
+                    _ => (u.view.bars.get(row).map(|b| &b[..]).unwrap_or(&[]), u.view.bars_t0.get(row).copied().unwrap_or(0.0), 60.0, ranges::Status::Ready),
+                };
                 panel::Chart {
                     tz_offset_s: if u.cfg.chart_utc { 0 } else { local_offset_s() },
                     tz_label: chartview::zone_label(u.cfg.chart_utc),
-                    prev: chartview::positive(quote.and_then(|q| q.prev_close)),
-                    day_hi: chartview::positive(quote.and_then(|q| q.high)),
-                    day_lo: chartview::positive(quote.and_then(|q| q.low)),
-                    change_pct: quote.and_then(|q| q.change_pct),
+                    // Today's references and today's change belong to 1D; a long range is coloured by
+                    // its own first open and last close.
+                    prev: chartview::positive(quote.and_then(|q| q.prev_close)).filter(|_| day),
+                    day_hi: chartview::positive(quote.and_then(|q| q.high)).filter(|_| day),
+                    day_lo: chartview::positive(quote.and_then(|q| q.low)).filter(|_| day),
+                    change_pct: quote.and_then(|q| q.change_pct).filter(|_| day),
                     unavailable: fallback,
+                    range,
+                    status,
+                    bar_s,
+                    tabs: true,
                     label: u.view.cells.get(row).map(|c| c.label.as_str()).unwrap_or(""),
                     digits: u.view.cells.get(row).map(|c| c.digits).unwrap_or(2),
-                    t0: u.view.bars_t0.get(row).copied().unwrap_or(0.0),
-                    bars: if fallback { &[] } else { u.view.bars.get(row).map(|b| &b[..]).unwrap_or(&[]) },
+                    t0,
+                    bars: if fallback { &[] } else { bars },
                     last: u.view.cells.get(row).and_then(|c| c.quote.as_ref()).map(|q| q.price),
                 }
             }
@@ -845,6 +892,10 @@ fn draw_panel(u: &mut Ui, dc: HDC, w: i32, h: i32) {
                 bars: &[],
                 last: None,
                 unavailable: false,
+                range: Range::D1,
+                status: ranges::Status::Ready,
+                bar_s: 60.0,
+                tabs: false,
                 tz_offset_s: 0,
                 tz_label: "UTC",
                 prev: None,
@@ -1172,6 +1223,32 @@ fn post_alert(hwnd: HWND, url: String, title: String, body: String, seq: u64) {
     }
 }
 
+/// Ask the `ranges` worker for the file the pane needs, if one is due. Call it wherever the pane's
+/// answer could change: the range or the lock moved, the chart opened, the panel expanded, the rows
+/// changed, and on every feed tick (that is the retry and the refresh: `Book::want` is a no-op unless a
+/// fetch is due, so it is cheap). No window calls, no I/O: only a brief lock on the slot.
+///
+/// Nothing is asked for: off Ultra, with the pane closed or the panel collapsed, on 1D (the board's
+/// own day), with no card locked, or while the locked card is on a fallback source (it has no bars).
+/// A request this one replaces in the slot (the worker had not taken it) is cancelled in the book, so
+/// its key can be asked for again.
+fn want_range(u: &mut Ui) {
+    if !u.profile.ultra || !u.chart || u.mode != Mode::Panel || u.range == Range::D1 {
+        return;
+    }
+    let Some(cell) = selected_row(u).and_then(|i| u.view.cells.get(i)) else { return };
+    if cell.quote.as_ref().is_some_and(|q| !q.source.is_empty()) {
+        return;
+    }
+    let Some(key) = u.cfg.rows.iter().find(|r| r.label == cell.label).and_then(|r| u.range.key(&r.symbol)) else { return };
+    if let Some(req) = u.book.want(&key, crate::source::now_s()) {
+        let replaced = u.range_slots.lock().ok().and_then(|mut s| s.submit(req));
+        if let Some(old) = replaced {
+            u.book.cancel(old.generation);
+        }
+    }
+}
+
 /// Pull the latest board, refresh the tray icon colour and tooltip, redraw. The tray tooltip (an
 /// Explorer round trip) refreshes at most every 5 s unless the link colour changed, and a hidden
 /// strip is not re-measured.
@@ -1191,6 +1268,7 @@ fn on_feed(hwnd: HWND) {
             }
         }
         u.hist.record(&u.view, now);
+        want_range(u);
         // Alerts run after the view is current, so a balloon names the price the strip is showing.
         // The checker drops stale quotes itself: a closed market frozen at a level must not
         // retrigger on every cooldown.
@@ -1503,6 +1581,10 @@ fn set_chart(hwnd: HWND, on: bool) {
         u.chart_hover = false;
         u.chart_at = None;
         u.chart_layout.set(None);
+        if !on {
+            // The pane reopens on the day, as it always did; the cache keeps what was fetched.
+            u.range = Range::D1;
+        }
         if on {
             u.pick_open = false;
             // Nothing locked yet: lock the first card, so the pane opens on a chart instead of an
@@ -1510,6 +1592,7 @@ fn set_chart(hwnd: HWND, on: bool) {
             if u.profile.ultra && selected_row(u).is_none() {
                 u.selected = u.view.cells.first().map(|c| c.label.clone());
             }
+            want_range(u);
         }
     });
     if let Some(to_rect) = target {
@@ -1604,7 +1687,11 @@ fn expand(hwnd: HWND) {
         SetForegroundWindow(hwnd);
     }
     run_morph(hwnd, a, b, from, to, (op, 255), EXPAND_MS, ease_out);
-    with_ui(|u| u.mode = Mode::Panel);
+    with_ui(|u| {
+        u.mode = Mode::Panel;
+        // The cache may have expired while the panel was collapsed, and the pane is about to show.
+        want_range(u);
+    });
     sync_anim(hwnd);
     unsafe {
         SetWindowPos(hwnd, null_mut(), b.left, b.top, b.right - b.left, b.bottom - b.top, SWP_NOZORDER | SWP_NOACTIVATE);
@@ -2546,6 +2633,18 @@ fn apply_rows(hwnd: HWND) {
         if u.profile.ultra {
             let labels: Vec<&str> = u.view.cells.iter().map(|c| c.label.as_str()).collect();
             u.selected = settle_lock(u.selected.as_deref(), &labels, u.chart);
+            // Series of symbols that left the strip go, in-flight fetches for them are dropped when
+            // they arrive, and a request still waiting for the worker is taken back.
+            let shown: Vec<&str> = u.cfg.rows.iter().map(|r| r.symbol.as_str()).collect();
+            u.book.forget(&shown);
+            // The request taken back is cancelled in the book too: if its symbol is still shown, the
+            // key would otherwise count as in flight (and the pane say "loading") until the book gave
+            // it up for lost. `want_range` below asks again if it is still what the pane needs.
+            let waiting = u.range_slots.lock().ok().and_then(|mut s| s.clear_request());
+            if let Some(old) = waiting {
+                u.book.cancel(old.generation);
+            }
+            want_range(u);
         }
         u.mode == Mode::Panel
     }) else {
@@ -2775,6 +2874,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             0
         }
+        WM_RANGE => {
+            // Results are drained and filed under one borrow: no I/O, no window calls. A result the
+            // book does not recognise (rows changed, request lost) is dropped by `arrived`.
+            with_ui(|u| {
+                let done = u.range_slots.lock().map(|mut s| s.take_done()).unwrap_or_default();
+                let now = crate::source::now_s();
+                for d in done {
+                    u.book.arrived(d.generation, &d.key, d.result, now);
+                }
+            });
+            if with_ui(|u| u.mode == Mode::Panel && u.chart).unwrap_or(false) {
+                InvalidateRect(hwnd, null(), 0);
+            }
+            0
+        }
         WM_TIMER if wp == TIMER_ANIM => {
             // The clock keeps running while the strip is collapsed; only the panel draws it.
             if with_ui(|u| u.mode == Mode::Panel).unwrap_or(false) {
@@ -2943,6 +3057,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 ToggleChart,
                 /// The zone name in the chart pane's header: local time <-> UTC.
                 Zone,
+                /// A range tab in the chart pane's header.
+                Range(Range),
                 /// Open the settings menu from under its button.
                 Settings,
                 Symbol(String),
@@ -2966,8 +3082,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     Mode::Panel if u.profile.ultra && panel::in_rect(&g.chart_btn, x, y) => Act::ToggleChart,
                     // The zone name is inside the pane, which is beside the cards, never over them; it
                     // is still answered before the card hit test so no later arm can claim the click.
-                    // The layout exists only while the pane drew bars, so a stale button cannot be hit.
+                    // The button's rectangle is empty unless the pane drew it, so a stale button cannot be hit.
                     Mode::Panel if u.profile.ultra && u.chart && u.chart_layout.get().is_some_and(|l| l.zone_btn.contains(x, y)) => Act::Zone,
+                    // The range tabs are on the pane's second header line, answered from the stored layout
+                    // like the zone button: the layout exists only while the pane drew a card.
+                    Mode::Panel if u.profile.ultra && u.chart && u.chart_layout.get().and_then(|l| l.tab_at(x, y)).is_some() => {
+                        match u.chart_layout.get().and_then(|l| l.tab_at(x, y)).and_then(|i| Range::ALL.get(i)) {
+                            Some(rg) => Act::Range(*rg),
+                            None => Act::Nothing,
+                        }
+                    }
                     // A chip, when the picker is open and the pointer is on one.
                     Mode::Panel if picker_open(u) && panel::pick_hit(&g, x, y).is_some() => {
                         let list = config::menu_list(&u.cfg);
@@ -3028,6 +3152,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     }
                     InvalidateRect(hwnd, null(), 0);
                 }
+                Some(Act::Range(rg)) => {
+                    with_ui(|u| {
+                        if u.range != rg {
+                            u.range = rg;
+                            // The candles are refolded and may be another series: the pointer's bar
+                            // index means nothing now, and the old layout is not what is on screen.
+                            u.chart_at = None;
+                            u.chart_layout.set(None);
+                            want_range(u);
+                        }
+                    });
+                    InvalidateRect(hwnd, null(), 0);
+                }
                 Some(Act::Select(label)) => {
                     with_ui(|u| {
                         // The same card again unlocks it: a lock that cannot be undone is a trap.
@@ -3035,6 +3172,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         u.open_hover = false;
                         u.chart_at = None;
                         u.chart_layout.set(None);
+                        want_range(u);
                     });
                     InvalidateRect(hwnd, null(), 0);
                 }
@@ -3319,6 +3457,9 @@ pub fn run(cfg: Config, board: Arc<Mutex<Board>>) {
             open_hover: false,
             chart_at: None,
             chart_layout: std::cell::Cell::new(None),
+            range: Range::D1,
+            book: ranges::Book::new(),
+            range_slots: Arc::new(Mutex::new(ranges::Slots::default())),
             pick_open: false,
             picker_scroll: 0,
             wheel_remainder: 0,
@@ -3342,6 +3483,7 @@ pub fn run(cfg: Config, board: Arc<Mutex<Board>>) {
             motion: allow_motion(),
         };
         let (icon, tip) = (ui.icon, tooltip(&ui.view, None));
+        let range_slots = ui.range_slots.clone();
         UI.with(|c| *c.borrow_mut() = Some(ui));
 
         relayout_and_place(hwnd);
@@ -3359,6 +3501,14 @@ pub fn run(cfg: Config, board: Arc<Mutex<Board>>) {
         crate::source::spawn(cfg, board, Box::new(move || {
             PostMessageW(target as HWND, WM_FEED, 0, 0);
         }));
+        // Its own worker and message: `spawn`'s signature is shared with other packages, and a range
+        // result is not a feed update. Only Ultra has a chart to ask for a range, so Classic does not
+        // carry the thread: nothing would ever be put in its slot.
+        if profile.ultra {
+            crate::source::spawn_ranges(range_slots, Box::new(move || {
+                PostMessageW(target as HWND, WM_RANGE, 0, 0);
+            }));
+        }
 
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {

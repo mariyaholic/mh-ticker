@@ -9,6 +9,8 @@
 //! cargo run --release --example chart --features shots -- shots-chart/ midnight 96 1488 4   # lock card 4
 //! cargo run --release --example chart --features shots -- shots-chart/ midnight 96 1488 4 40  # and hover candle 40
 //! cargo run --release --example chart --features shots -- shots-chart/ midnight 96 1488 1 40 refs  # reference lines and a break
+//! cargo run --release --example chart --features shots -- shots-chart/ midnight 96 1488 1 40 - 5D     # a range (1D 5D 1M 6M 1Y 5Y) with a synthetic series
+//! cargo run --release --example chart --features shots -- shots-chart/ midnight 96 1488 1 40 - 1D vol # volume strip, with the tabs
 //! ```
 
 use mh_ticker::shot;
@@ -25,7 +27,12 @@ fn main() {
     let bar: Option<usize> = args.next().and_then(|v| v.parse().ok());
     // Optional 7th argument: the word `refs` draws the pane's reference lines and one session break.
     let refs = args.next().as_deref() == Some("refs");
-    match shot::write_chart_named_at(&dir, name.as_str(), dpi, width, hover, bar, refs) {
+    // Optional 8th argument: a range (`1D`, `5D`, `1M`, `6M`, `1Y`, `5Y`; `-` keeps the pane as it was
+    // before ranges). A range draws the tabs and charts a synthetic series shaped like that range's file.
+    let range = args.next().filter(|r| r != "-");
+    // Optional 9th argument: the word `vol` gives the charted bars a volume, which draws the strip.
+    let volume = args.next().as_deref() == Some("vol");
+    match shot::write_chart_named_range(&dir, name.as_str(), dpi, width, hover, bar, refs, range.as_deref(), volume) {
         Ok(p) => println!("{}", p.display()),
         Err(e) => {
             eprintln!("{e}");

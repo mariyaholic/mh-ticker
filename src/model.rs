@@ -55,16 +55,17 @@ pub struct Cell {
     pub stale: bool,
 }
 
-/// One 1-minute bar, as CNBC sends it. The time is an offset from the row's `bars_t0` and the four
-/// prices are `f32`: 20 bytes a bar, ~27 KB per symbol for a day, and a 400 px chart cannot tell the
-/// difference.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// One bar, as CNBC sends it. The time is an offset from the row's `bars_t0` and the prices and the
+/// volume are `f32`: 24 bytes a bar, and a 400 px chart cannot tell the difference.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Bar {
     pub dt: f32,
     pub o: f32,
     pub h: f32,
     pub l: f32,
     pub c: f32,
+    /// Volume of the bar; 0 when the feed sends none (FX, yields, spot metals).
+    pub v: f32,
 }
 
 impl Bar {
@@ -348,7 +349,7 @@ mod tests {
         let b = Row { label: "B".into(), symbol: "BBB".into(), digits: 2, name: String::new() };
         let c = Row { label: "C".into(), symbol: "CCC".into(), digits: 2, name: String::new() };
         let mut board = Board::new(&[a, b.clone()]);
-        let bar = |v| Bar { dt: 0.0, o: v, h: v, l: v, c: v };
+        let bar = |v| Bar { dt: 0.0, o: v, h: v, l: v, c: v, v: 0.0 };
         board.bars = vec![vec![bar(1.0)].into(), vec![bar(2.0)].into()];
         board.bars_t0 = vec![100.0, 200.0];
         board.backfill = vec![vec![(100.0, 1.0)], vec![(200.0, 2.0)]];
@@ -366,7 +367,7 @@ mod tests {
         let new = Row { symbol: "NEW".into(), ..old.clone() };
         let mut board = Board::new(&[old]);
         board.cells[0].quote = Some(q("OLD", Some(100.0), true));
-        board.bars = vec![vec![Bar { dt: 0.0, o: 1.0, h: 1.0, l: 1.0, c: 1.0 }].into()];
+        board.bars = vec![vec![Bar { dt: 0.0, o: 1.0, h: 1.0, l: 1.0, c: 1.0, v: 0.0 }].into()];
         board.set_rows(&[new]);
         assert!(board.cells[0].quote.is_none());
         assert!(board.bars[0].is_empty());

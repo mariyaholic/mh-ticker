@@ -10,6 +10,7 @@
 
 use crate::config::{Config, Row};
 use crate::model::{resolve, Bar, Board, Link, Quote};
+use crate::ranges::{Done, Series, Slots};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -18,6 +19,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const QUOTE_URL: &str = "https://quote.cnbc.com/quote-html-webservice/restQuote/symbolType/symbol";
 const CHART_URL: &str = "https://ts-api.cnbc.com/harmony/app/charts/1D.json";
+/// The folder the other range files (`5D.json`, `1M.json`, `1Y.json`, `5Y.json`) live in.
+const CHARTS_DIR: &str = "https://ts-api.cnbc.com/harmony/app/charts/";
+/// Bars kept from one range file: the newest. 5D is ~2,000 one-minute bars; the daily and weekly
+/// files are a few hundred.
+const SERIES_BARS: usize = 4_000;
 const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 const BARS_REFRESH: Duration = Duration::from_secs(600);
 const BARS_RETRY: Duration = Duration::from_secs(60);
@@ -156,7 +162,8 @@ pub fn parse_chart(v: &Value, now: f64) -> (f64, Vec<Bar>) {
             let o = b.get("open").and_then(number).unwrap_or(c);
             let h = b.get("high").and_then(number).unwrap_or(c);
             let l = b.get("low").and_then(number).unwrap_or(c);
-            pts.push((t, Bar { dt: 0.0, o: o as f32, h: h as f32, l: l as f32, c: c as f32 }));
+            let v = b.get("volume").and_then(number).filter(|v| v.is_finite() && *v > 0.0).unwrap_or(0.0);
+            pts.push((t, Bar { dt: 0.0, o: o as f32, h: h as f32, l: l as f32, c: c as f32, v: v as f32 }));
         }
     }
     pts.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -166,6 +173,86 @@ pub fn parse_chart(v: &Value, now: f64) -> (f64, Vec<Bar>) {
     let t0 = pts.first().map(|p| p.0).unwrap_or(now);
     let bars = pts.into_iter().map(|(t, mut b)| { b.dt = (t - t0) as f32; b }).collect();
     (t0, bars)
+}
+
+/// A range file (`5D.json` .. `5Y.json`) -> a [`Series`] fetched at `now`.
+///
+/// Assumes as little as it can, because it has only been measured on one symbol on one day:
+/// * the bars are `barData.priceBars`; anything else (junk, an empty array, no such path) is an EMPTY
+///   series (`t0 == now`), not an error: the pane says "no data for this range";
+/// * a bar's time is `tradeTimeinMills` or `tradeTimeInMills` (either spelling, a number or a numeric
+///   string), in milliseconds, and is the START of the bar: it is NOT shifted by a minute the way
+///   `parse_chart` stamps its bars at their end. A bar with neither field is skipped;
+/// * `close` is required (a bar without one is skipped); `open`, `high` and `low` fall back to the
+///   close; `volume` is optional and counts only when finite and above zero (else 0);
+/// * the bars are sorted by time (stably; equal times keep the later one), and only the newest
+///   [`SERIES_BARS`] are kept;
+/// * `t0` is the first kept bar's time and each `Bar::dt` is its offset from it; `Series::new` infers
+///   `bar_s`.
+pub fn parse_series(v: &Value, now: f64) -> Series {
+    let mut pts: Vec<(f64, Bar)> = Vec::new();
+    if let Some(bars) = v.pointer("/barData/priceBars").and_then(Value::as_array) {
+        for b in bars {
+            let ms = ["tradeTimeinMills", "tradeTimeInMills"].iter().find_map(|k| b.get(k).and_then(number));
+            let Some(t) = ms.map(|ms| ms / 1000.0).filter(|t| t.is_finite()) else { continue };
+            let Some(c) = b.get("close").and_then(number).filter(|c| c.is_finite()) else { continue };
+            let o = b.get("open").and_then(number).filter(|x| x.is_finite()).unwrap_or(c);
+            let h = b.get("high").and_then(number).filter(|x| x.is_finite()).unwrap_or(c);
+            let l = b.get("low").and_then(number).filter(|x| x.is_finite()).unwrap_or(c);
+            let v = b.get("volume").and_then(number).filter(|v| v.is_finite() && *v > 0.0).unwrap_or(0.0);
+            pts.push((t, Bar { dt: 0.0, o: o as f32, h: h as f32, l: l as f32, c: c as f32, v: v as f32 }));
+        }
+    }
+    // Stable sort, then one bar per instant: of equal times the later one in the file is kept.
+    pts.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut kept: Vec<(f64, Bar)> = Vec::with_capacity(pts.len());
+    for p in pts {
+        match kept.last_mut() {
+            Some(last) if last.0 == p.0 => *last = p,
+            _ => kept.push(p),
+        }
+    }
+    let drop = kept.len().saturating_sub(SERIES_BARS);
+    kept.drain(..drop);
+    let Some(t0) = kept.first().map(|p| p.0) else { return Series::new(now, Vec::new(), now) };
+    let bars = kept.into_iter().map(|(t, mut b)| { b.dt = (t - t0) as f32; b }).collect();
+    Series::new(t0, bars, now)
+}
+
+/// The long-lived `ranges` worker: polls the shared request slot every [`ROWS_CHECK`], fetches one
+/// range file at a time, hands the result back through the slot and tells the window with `notify`
+/// (which posts `WM_RANGE`). No thread per click.
+///
+/// * A request replaced in the slot before this thread takes it is never fetched (`Slots::submit`).
+/// * A request being fetched is not interrupted: it finishes, is delivered, and the UI's `Book`
+///   caches it if its generation is still the one in flight for that key and drops it otherwise.
+/// * The client is built on the first request, and again on the next one if TLS setup failed, so a
+///   failure is reported as a failed fetch (the pane shows "could not load, retrying") rather than as
+///   a request that never answers.
+/// * If the thread cannot be started nothing ever answers; the book presumes each request lost after
+///   two minutes and the pane keeps saying "loading". It is not worth a message box.
+pub fn spawn_ranges(slots: Arc<Mutex<Slots>>, notify: Box<dyn Fn() + Send + Sync>) {
+    let _ = thread::Builder::new().name("ranges".into()).spawn(move || {
+        let mut client: Option<Client> = None;
+        loop {
+            let req = slots.lock().ok().and_then(|mut s| s.take_request());
+            let Some(req) = req else {
+                thread::sleep(ROWS_CHECK);
+                continue;
+            };
+            if client.is_none() {
+                client = Client::new().ok();
+            }
+            let result = match &client {
+                Some(c) => c.chart_file(&req.key.symbol, req.key.file),
+                None => Err("TLS".to_string()),
+            };
+            if let Ok(mut s) = slots.lock() {
+                s.deliver(Done { generation: req.generation, key: req.key, result });
+            }
+            notify();
+        }
+    });
 }
 
 /// One outbound POST, for alerts. Deliberately a free function: alert traffic is rare, so it gets
@@ -293,6 +380,13 @@ impl Client {
     pub fn chart(&self, symbol: &str) -> Result<(f64, Vec<Bar>), String> {
         let url = format!("{CHART_URL}?symbol={}", encode(symbol));
         Ok(parse_chart(&self.get_within(&url, Some(BARS_TIMEOUT))?, now_s()))
+    }
+
+    /// One range file of one symbol, parsed (see [`parse_series`]). `file` is one of the constants
+    /// from `ranges::Range::file`, never text from a response.
+    pub fn chart_file(&self, symbol: &str, file: &str) -> Result<Series, String> {
+        let url = format!("{CHARTS_DIR}{file}?symbol={}", encode(symbol));
+        Ok(parse_series(&self.get_within(&url, Some(BARS_TIMEOUT))?, now_s()))
     }
 }
 
@@ -728,6 +822,36 @@ pub fn probe(cfg: &Config) {
             Err(e) => println!("bars {:<5} {e}", r.label),
         }
     }
+    // The live check for the range files, on the first row: what each file really carries.
+    if let Some(r) = cfg.rows.first() {
+        for file in ["5D.json", "1M.json", "1Y.json", "5Y.json"] {
+            match client.chart_file(&r.symbol, file) {
+                Ok(sr) => {
+                    let n = sr.bars.len();
+                    let span_d = sr.bars.last().map_or(0.0, |b| b.dt as f64) / 86_400.0;
+                    // The last bar's stamp, in UTC. Daily and weekly candles are dated on the
+                    // assumption that this is midnight on the exchange's clock (`chartview::date_zone`):
+                    // this line is where that can be seen to hold.
+                    let last = sr.bars.last().map_or_else(String::new, |b| {
+                        let t = b.t(sr.t0);
+                        format!(
+                            ", last bar {} {} UTC",
+                            crate::chartview::date_label(t, 0, crate::chartview::DateStyle::Full),
+                            crate::chartview::clock(t, 0)
+                        )
+                    });
+                    println!(
+                        "range {:<5} {file}: {n} bars, {:.0} s a bar, {:.1} days, volume {}{last}",
+                        r.label,
+                        sr.bar_s,
+                        span_d,
+                        if sr.bars.iter().any(|b| b.v > 0.0) { "yes" } else { "no" }
+                    );
+                }
+                Err(e) => println!("range {:<5} {file}: {e}", r.label),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -986,7 +1110,7 @@ mod tests {
         let cfg = Config::default();
         let rows = cfg.rows[..2].to_vec();
         let mut board = Board::new(&rows);
-        let bar = |c| Bar { dt: 0.0, o: c, h: c, l: c, c };
+        let bar = |c| Bar { dt: 0.0, o: c, h: c, l: c, c, v: 0.0 };
         board.bars = vec![vec![bar(1.0)].into(), vec![bar(2.0)].into()];
         board.bars_t0 = vec![100.0, 200.0];
         board.backfill = vec![vec![(100.0, 1.0)], vec![(200.0, 2.0)]];
@@ -1014,7 +1138,7 @@ mod tests {
         let cfg = Config::default();
         let rows = cfg.rows[..2].to_vec();
         let mut board = Board::new(&rows);
-        let bar = |c| Bar { dt: 0.0, o: c, h: c, l: c, c };
+        let bar = |c| Bar { dt: 0.0, o: c, h: c, l: c, c, v: 0.0 };
         board.bars = vec![vec![bar(1.0)].into(), vec![bar(2.0)].into()];
         board.bars_t0 = vec![100.0, 200.0];
         board.backfill_gen = 1;
@@ -1038,7 +1162,7 @@ mod tests {
         let cfg = Config::default();
         let rows = cfg.rows[..2].to_vec();
         let mut board = Board::new(&rows[..1]);
-        let bar = Bar { dt: 0.0, o: 1.0, h: 1.0, l: 1.0, c: 1.0 };
+        let bar = Bar { dt: 0.0, o: 1.0, h: 1.0, l: 1.0, c: 1.0, v: 0.0 };
         board.bars = vec![vec![bar].into()];
         board.bars_t0 = vec![100.0];
         board.backfill_gen = 1;
@@ -1087,7 +1211,7 @@ mod tests {
             chart_feed.maybe_bars_with(|_| {
                 entered_tx.send(()).unwrap();
                 release_rx.recv().unwrap();
-                (100.0, vec![Bar { dt: 0.0, o: 1.0, h: 1.0, l: 1.0, c: 1.0 }])
+                (100.0, vec![Bar { dt: 0.0, o: 1.0, h: 1.0, l: 1.0, c: 1.0, v: 0.0 }])
             })
         });
         entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -1104,7 +1228,7 @@ mod tests {
         let cfg = Config::default();
         let rows = cfg.rows[..2].to_vec();
         let mut board = Board::new(&rows);
-        let bar = Bar { dt: 0.0, o: 1.0, h: 1.0, l: 1.0, c: 1.0 };
+        let bar = Bar { dt: 0.0, o: 1.0, h: 1.0, l: 1.0, c: 1.0, v: 0.0 };
         board.bars = vec![vec![bar].into(), vec![bar].into()];
         board.bars_t0 = vec![100.0, 100.0];
         let shared = Arc::new(Mutex::new(board));
@@ -1128,7 +1252,7 @@ mod tests {
         let mut feed = Feed { cfg, rows: rows.clone(), rows_gen: 0, shared: shared.clone(), notify: Arc::new(|| {}),
             client: Client::new().unwrap(), quotes: HashMap::new(), chart: Vec::new(),
             backfill: Vec::new(), backfill_gen: 0, bars_next: Instant::now(), bars_due: Vec::new(), fails: 0 };
-        let bar = Bar { dt: 0.0, o: 1.0, h: 1.0, l: 1.0, c: 1.0 };
+        let bar = Bar { dt: 0.0, o: 1.0, h: 1.0, l: 1.0, c: 1.0, v: 0.0 };
         assert!(feed.maybe_bars_with(|_| (100.0, vec![bar])));
         shared.lock().unwrap().set_rows(&[rows[1].clone(), rows[0].clone()]);
         feed.publish_bars();
@@ -1168,7 +1292,7 @@ mod tests {
             client: Client::new().unwrap(), quotes: HashMap::new(), chart: Vec::new(),
             backfill: Vec::new(), backfill_gen: 0, bars_next: Instant::now(), bars_due: Vec::new(), fails: 0,
         };
-        let bar = Bar { dt: 0.0, o: 1.0, h: 1.0, l: 1.0, c: 1.0 };
+        let bar = Bar { dt: 0.0, o: 1.0, h: 1.0, l: 1.0, c: 1.0, v: 0.0 };
         let mut seen = Vec::new();
         assert!(feed.maybe_bars_with(|s| { seen.push(s.to_string()); (100.0, vec![bar]) }));
         feed.publish_bars();
@@ -1196,7 +1320,7 @@ mod tests {
             client: Client::new().unwrap(), quotes: HashMap::new(), chart: Vec::new(),
             backfill: Vec::new(), backfill_gen: 0, bars_next: Instant::now(), bars_due: Vec::new(), fails: 0,
         };
-        let bar = Bar { dt: 0.0, o: 1.0, h: 1.0, l: 1.0, c: 1.0 };
+        let bar = Bar { dt: 0.0, o: 1.0, h: 1.0, l: 1.0, c: 1.0, v: 0.0 };
         let before = Instant::now();
         feed.accept_bars(vec![(100.0, vec![bar]), (0.0, vec![])]);
         assert!(feed.bars_next <= before + BARS_RETRY + Duration::from_secs(1), "the failed row must not wait ten minutes");
@@ -1204,7 +1328,7 @@ mod tests {
 
     #[test]
     fn a_timed_out_symbol_keeps_the_bars_it_had() {
-        let bar = |c: f32| Bar { dt: 0.0, o: c, h: c, l: c, c };
+        let bar = |c: f32| Bar { dt: 0.0, o: c, h: c, l: c, c, v: 0.0 };
         let prev = vec![(100.0, vec![bar(1.0)]), (100.0, vec![])];
         // Row 0 lost its fetch this pass, row 1 won one: neither result may wipe the other.
         let got = vec![(0.0, vec![]), (200.0, vec![bar(2.0)])];
@@ -1247,7 +1371,7 @@ mod tests {
         let cfg = Config::default();
         let rows = cfg.rows[..2].to_vec();
         let shared = Arc::new(Mutex::new(Board::new(&rows)));
-        let bar = Bar { dt: 0.0, o: 1.0, h: 1.0, l: 1.0, c: 1.0 };
+        let bar = Bar { dt: 0.0, o: 1.0, h: 1.0, l: 1.0, c: 1.0, v: 0.0 };
         let later = Instant::now() + BARS_REFRESH;
         let mut feed = Feed { cfg, rows, rows_gen: 0, shared, notify: Arc::new(|| {}),
             client: Client::new().unwrap(), quotes: HashMap::new(),
@@ -1275,5 +1399,118 @@ mod tests {
         let started = Instant::now();
         feed.wait(Duration::from_secs(30), acted);
         assert!(started.elapsed() < Duration::from_secs(1), "lost wake-up: {:?}", started.elapsed());
+    }
+
+    // ---- range files (P4) ----
+    fn ms(secs: i64) -> i64 {
+        secs * 1000
+    }
+
+    #[test]
+    fn parse_series_reads_both_time_spellings() {
+        let v = serde_json::json!({"barData": {"priceBars": [
+            {"close": "10.0", "tradeTimeinMills": ms(1_793_500_000)},
+            {"close": "11.0", "tradeTimeInMills": ms(1_793_586_400)},
+            {"close": "12.0", "tradeTimeinMills": (ms(1_793_672_800)).to_string()}
+        ]}});
+        let s = parse_series(&v, 1_800_000_000.0);
+        assert_eq!(s.t0, 1_793_500_000.0);
+        assert_eq!(s.bars.len(), 3);
+        let times: Vec<f64> = s.bars.iter().map(|b| b.t(s.t0)).collect();
+        // The time is the bar START: no 60 s shift, and no clamp to `now`.
+        assert_eq!(times, [1_793_500_000.0, 1_793_586_400.0, 1_793_672_800.0]);
+        assert_eq!(s.bars[1].dt, 86_400.0);
+        assert_eq!(s.bar_s, 86_400.0);
+        assert_eq!(s.fetched, 1_800_000_000.0);
+    }
+
+    #[test]
+    fn parse_series_fills_missing_fields() {
+        let v = serde_json::json!({"barData": {"priceBars": [
+            {"close": "5.5", "tradeTimeinMills": ms(100), "volume": 0},
+            {"close": "6.0", "open": "5.0", "high": "7.0", "low": "4.0", "tradeTimeinMills": ms(160), "volume": -3},
+            {"close": "7.0", "tradeTimeinMills": ms(220), "volume": "text"},
+            {"close": "8.0", "tradeTimeinMills": ms(280), "volume": 3443},
+            {"close": "9.0", "tradeTimeinMills": ms(340), "volume": "1,026"},
+            {"open": "1.0", "high": "2.0", "low": "0.5", "tradeTimeinMills": ms(400)},
+            {"close": "2.0", "open": "1.0"}
+        ]}});
+        let s = parse_series(&v, 1_000.0);
+        // The bar without a close and the bar without a time are skipped: five bars remain.
+        assert_eq!(s.bars.len(), 5);
+        let b = s.bars[0];
+        assert_eq!((b.o, b.h, b.l, b.c), (5.5, 5.5, 5.5, 5.5), "no o/h/l: the close");
+        assert_eq!(b.v, 0.0, "volume 0 is none");
+        assert_eq!(s.bars[1].v, 0.0, "negative volume is none");
+        assert_eq!(s.bars[2].v, 0.0, "text volume is none");
+        assert_eq!(s.bars[3].v, 3443.0);
+        assert_eq!(s.bars[4].v, 1026.0, "a comma-grouped string counts");
+        assert_eq!((s.bars[1].o, s.bars[1].h, s.bars[1].l), (5.0, 7.0, 4.0));
+    }
+
+    #[test]
+    fn parse_series_sorts_and_caps() {
+        // Unsorted input comes back in time order.
+        let v = serde_json::json!({"barData": {"priceBars": [
+            {"close": "3", "tradeTimeinMills": ms(300)},
+            {"close": "1", "tradeTimeinMills": ms(100)},
+            {"close": "2", "tradeTimeinMills": ms(200)}
+        ]}});
+        let s = parse_series(&v, 1_000.0);
+        let closes: Vec<f32> = s.bars.iter().map(|b| b.c).collect();
+        assert_eq!(closes, [1.0, 2.0, 3.0]);
+        assert_eq!((s.t0, s.bars[2].dt), (100.0, 200.0));
+
+        // 4,001 minute bars keep the newest 4,000; t0 is the second bar's time.
+        let many: Vec<Value> = (0..4_001)
+            .map(|i| serde_json::json!({"close": "1", "tradeTimeinMills": ms(60 * i)}))
+            .collect();
+        let v = serde_json::json!({"barData": {"priceBars": many}});
+        let s = parse_series(&v, 1e9);
+        assert_eq!(s.bars.len(), SERIES_BARS);
+        assert_eq!(s.t0, 60.0);
+        assert_eq!(s.bar_s, 60.0);
+    }
+
+    #[test]
+    fn parse_series_keeps_the_later_of_two_bars_at_one_instant() {
+        let v = serde_json::json!({"barData": {"priceBars": [
+            {"close": "1", "tradeTimeinMills": ms(100)},
+            {"close": "2", "tradeTimeinMills": ms(100)},
+            {"close": "3", "tradeTimeinMills": ms(160)}
+        ]}});
+        let s = parse_series(&v, 1_000.0);
+        let closes: Vec<f32> = s.bars.iter().map(|b| b.c).collect();
+        assert_eq!(closes, [2.0, 3.0]);
+    }
+
+    #[test]
+    fn parse_series_survives_junk() {
+        let junk = [
+            serde_json::json!({}),
+            serde_json::json!(null),
+            serde_json::json!("x"),
+            serde_json::json!({"barData": null}),
+            serde_json::json!({"barData": {"priceBars": []}}),
+            serde_json::json!({"barData": {"priceBars": [1, "a", {}]}}),
+            serde_json::json!({"barData": {"priceBars": [{"close": "NaN", "tradeTimeinMills": ms(5)}]}}),
+        ];
+        for v in &junk {
+            let s = parse_series(v, 777.0);
+            assert!(s.bars.is_empty(), "{v}");
+            assert_eq!((s.t0, s.fetched, s.bar_s), (777.0, 777.0, 0.0), "{v}");
+        }
+    }
+
+    #[test]
+    fn parse_chart_reads_volume() {
+        let v = serde_json::json!({"barData": {"priceBars": [
+            {"open": "7626.0000", "high": "7638.7500", "low": "7626.0000", "close": "7635.7500", "volume": 3443, "tradeTimeinMills": 1793574000000i64},
+            {"open": "7635.7500", "high": "7636.0000", "low": "7626.5000", "close": "7627.7500", "volume": 1026, "tradeTimeinMills": 1793574060000i64},
+            {"open": "7584.0000", "high": "7584.0000", "low": "7584.0000", "close": "7584.0000", "volume": 0, "tradeTimeinMills": 1793664660000i64}
+        ]}});
+        let (_t0, bars) = parse_chart(&v, 1_793_664_900.0);
+        let vols: Vec<f32> = bars.iter().map(|b| b.v).collect();
+        assert_eq!(vols, [3443.0, 1026.0, 0.0]);
     }
 }
