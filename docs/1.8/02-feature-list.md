@@ -15,6 +15,13 @@ Two facts shaped the list:
   the native CI runner; the window itself is reviewed from rendered PNGs and from the code. Items
   whose value is all in the feel of a live window rank lower for that reason alone.
 
+- **The RAM ceiling doubled while wave 1 was being built.** The owner's instruction on 2026-11-13:
+  the budget may go up to twice what the app uses today (about 5.8 MB, so about 11.5 MB). Most of
+  this list was never limited by RAM, so most of it is unchanged. Three things moved: the range cache
+  (B6) no longer has to be thrown away when the pane closes, volume bars (B8) went from LATER to NOW,
+  and the 12-symbol cap, which was a byte budget and not a design limit, is raised (E5). Classic gets
+  the same ceiling and no reason to use it.
+
 ## A. Alerts (Ultra)
 
 The most under-built feature for its value: four presets, no way to silence, no record of what fired.
@@ -44,9 +51,9 @@ The most under-built feature for its value: four presets, no way to silence, no 
 | B3 | Previous close, day high and day low as reference lines | the card shows all three as numbers; the chart shows none | 0 bytes | **NOW (P2)** |
 | B4 | A visible break where the market was closed | `STATE-MACHINES.md`: "a market closure is not drawn as proportional empty time" | one pure helper | **NOW (P2)** |
 | B5 | Day change beside the last price in the pane header | the pane names the price and not the direction | 0 | **NOW (P2)** |
-| B6 | Ranges: 1D, 5D, 1M, 6M, 1Y, 5Y | `FEATURES.md` §3 measured the endpoints; §7 "daily candles: yes" | on-demand only, for the locked symbol while the pane is open; about 6 to 40 KB gzipped per fetch; bounded cache dropped when the pane closes | **NOW (P4)**, unverified live |
+| B6 | Ranges: 1D, 5D, 1M, 6M, 1Y, 5Y | `FEATURES.md` §3 measured the endpoints; §7 "daily candles: yes" | on-demand only, for the locked symbol while the pane is open; about 6 to 40 KB gzipped per fetch; a cache of at most twelve series (about 0.3 MB at worst) that outlives the pane, so flipping ranges and reopening are instant | **NOW (P4)**, unverified live |
 | B7 | `--probe` reports every range | `--probe` is the project's seam for "does it still fetch and parse" | 0 | **NOW (P4)** |
-| B8 | Volume bars | the payload has per-bar volume | +4 B a bar, absent for FX and metals | LATER: half the default symbols have none |
+| B8 | Volume bars under the candles, where the series has volume | the payload has per-bar volume and the app drops it | `Bar` grows from 20 to 24 B (about 0.15 MB at 24 symbols); absent for FX and spot metals, where the strip is simply not drawn | **NOW (P4)**: was LATER on bytes held; the new ceiling pays for it |
 | B9 | Moving averages, VWAP, indicators | n/a | scope | NO: a ticker, not a charting package |
 | B10 | Chart in the classic build | n/a | n/a | NO: classic stays one window, one look |
 | B11 | Remember chart and lock across restarts | `STATE-MACHINES.md` designs around the chart not being saved | interacts with `compact_frame` | LATER: real value, real state risk |
@@ -87,6 +94,7 @@ The most under-built feature for its value: four presets, no way to silence, no 
 | E2 | Remove a hand-added symbol from the list | follows from E1 | 0 | **NOW (P6)** |
 | E3 | A bigger default catalogue, grouped | 23 symbols, no stocks | every symbol must be checked live ("checked live on 2026-10-15" is a promise) | LATER: needs network to CNBC |
 | E4 | Computed rows (gold/silver ratio) | n/a | no chart, no day change | LATER |
+| E5 | Up to 24 symbols at once (was 12) | `config::MAX_ROWS`; `FEATURES.md` §7 refused this on bytes, and once any symbol can be added (E1) twelve fills quickly | about 90 KB of RAM a symbol (an hour of samples and a day of bars), so +1.1 MB at 24; traffic is the user's choice and the README says what it costs (about 12 MB/h at 24 symbols and a 3 s poll) | **NOW (P6)** |
 
 ## F. Building blocks
 
@@ -111,4 +119,4 @@ The most under-built feature for its value: four presets, no way to silence, no 
 
 ## Count
 
-33 items BUILD NOW in 6 packages, 15 LATER, 9 NO.
+35 items BUILD NOW in 6 packages, 14 LATER, 9 NO.
