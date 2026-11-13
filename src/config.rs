@@ -166,6 +166,16 @@ pub struct Config {
     /// This is a bearer secret: anyone with the URL can post to that channel. It is never printed
     /// in a note, tooltip or `--probe` line.
     pub webhook: Option<String>,
+    /// New alerts clear the level that fired (*Fire once, then clear*). The menu toggle also
+    /// rewrites `once` on every existing alert.
+    pub alert_once: bool,
+    /// Alerts are evaluated and logged but not shown or posted, until switched off.
+    pub alerts_muted: bool,
+    /// UTC seconds a timed mute lasts until; past it the mute is over by the clock, no timer.
+    pub alerts_mute_until: f64,
+    /// Quiet hours as `[from, to)` minutes of the local day; wraps midnight when `from > to`;
+    /// `from == to` is off.
+    pub quiet_hours: Option<[u16; 2]>,
 }
 
 /// One price threshold. Fires when the last price crosses `above` upward or `below` downward, at
@@ -181,11 +191,15 @@ pub struct Alert {
     pub cooldown_s: f64,
     /// UTC seconds the alert last fired. Persisted so a restart does not re-fire immediately.
     pub last: f64,
+    /// Fires when the day's change reaches this many percent, up or down (absolute value).
+    pub day_move: Option<f64>,
+    /// Clear the level that fired; an alert left with no level is removed.
+    pub once: bool,
 }
 
 impl Default for Alert {
     fn default() -> Self {
-        Self { label: String::new(), above: None, below: None, cooldown_s: 900.0, last: 0.0 }
+        Self { label: String::new(), above: None, below: None, cooldown_s: 900.0, last: 0.0, day_move: None, once: false }
     }
 }
 
@@ -253,6 +267,10 @@ impl Default for Config {
             theme_font: None,
             alerts: Vec::new(),
             webhook: None,
+            alert_once: false,
+            alerts_muted: false,
+            alerts_mute_until: 0.0,
+            quiet_hours: None,
         }
     }
 }
@@ -375,6 +393,17 @@ mod tests {
         assert_eq!(saved.get("fallback_enabled"), Some(&serde_json::json!(false)));
         let on: Config = serde_json::from_str(r#"{"fallback_enabled":true}"#).unwrap();
         assert_eq!(serde_json::to_value(on).unwrap()["fallback_enabled"], true);
+    }
+
+    #[test]
+    fn old_configs_parse_to_todays_alert_behaviour() {
+        let c: Config = serde_json::from_str("{}").unwrap();
+        assert!(!c.alert_once && !c.alerts_muted && c.alerts_mute_until == 0.0 && c.quiet_hours.is_none());
+        let c: Config = serde_json::from_str(r#"{"alerts":[{"label":"XAU","above":4100.0}]}"#).unwrap();
+        let a = &c.alerts[0];
+        assert_eq!((a.above, a.day_move, a.once, a.cooldown_s), (Some(4100.0), None, false, 900.0));
+        let c: Config = serde_json::from_str(r#"{"quiet_hours":[1320,420]}"#).unwrap();
+        assert_eq!(c.quiet_hours, Some([1320, 420]));
     }
 
     #[test]
