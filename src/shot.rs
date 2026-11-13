@@ -237,12 +237,32 @@ pub fn write_chart_named_range(
     range: Option<&str>,
     volume: bool,
 ) -> Result<PathBuf, String> {
+    write_chart_named_levels(dir, name, dpi, w, hover, bar, refs, range, volume, false)
+}
+
+/// `write_chart_named_range` with alert levels on the charted symbol when `levels` is true: one inside
+/// the price window (70 % of the way up the bars' range) and one above it (half the range over the
+/// high), so both the dashed line and the edge marker can be reviewed. False is
+/// `write_chart_named_range` exactly.
+#[allow(clippy::too_many_arguments)]
+pub fn write_chart_named_levels(
+    dir: &Path,
+    name: &str,
+    dpi: u32,
+    w: i32,
+    hover: Option<usize>,
+    bar: Option<usize>,
+    refs: bool,
+    range: Option<&str>,
+    volume: bool,
+    levels: bool,
+) -> Result<PathBuf, String> {
     let t = theme::ALL.iter().find(|t| t.name == name).ok_or_else(|| format!("no theme named {name}"))?;
     let range = match range {
         Some(r) => Some(Range::parse(r).ok_or_else(|| format!("no range named {r} (1D 5D 1M 6M 1Y 5Y)"))?),
         None => None,
     };
-    write_chart_fixture(dir, t, dpi, w, hover, bar, refs, range, volume)
+    write_chart_fixture(dir, t, dpi, w, hover, bar, refs, range, volume, levels)
 }
 
 /// The fixture's clock: UTC-4, a US equity day in summer.
@@ -267,7 +287,7 @@ pub fn write_chart_at(
     hover: Option<usize>,
     bar: Option<usize>,
 ) -> Result<PathBuf, String> {
-    write_chart_fixture(dir, t, dpi, w, hover, bar, false, None, false)
+    write_chart_fixture(dir, t, dpi, w, hover, bar, false, None, false, false)
 }
 
 /// The fixture behind `write_chart_at` and `write_chart_named_at`. With `refs`, the pane alone gets
@@ -285,6 +305,7 @@ fn write_chart_fixture(
     refs: bool,
     range: Option<Range>,
     volume: bool,
+    levels: bool,
 ) -> Result<PathBuf, String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let now = 1_792_052_981.0;
@@ -333,6 +354,14 @@ fn write_chart_fixture(
         (prev, day_hi, day_lo) = (None, None, None);
     }
     let coarsest = if rg == Range::D1 { 3_600.0 } else { crate::chartview::MONTH_S };
+    // Alert levels for the charted symbol, placed from the bars so they land where the doc says.
+    let alert_levels: Vec<f64> = if levels && !charted.is_empty() {
+        let hi = charted.iter().fold(f32::MIN, |m, b| m.max(b.h)) as f64;
+        let lo = charted.iter().fold(f32::MAX, |m, b| m.min(b.l)) as f64;
+        vec![lo + (hi - lo) * 0.7, hi + (hi - lo) * 0.5]
+    } else {
+        Vec::new()
+    };
     // The sparklines seed from the hour of bars, exactly as they do on a live board.
     let mut hist = History::new();
     hist.record(&b, now);
@@ -383,6 +412,7 @@ fn write_chart_fixture(
             day_hi,
             day_lo,
             change_pct: change_pct.filter(|_| rg == Range::D1),
+            levels: &alert_levels,
         }),
         chart_btn: true,
         settings_btn: true,

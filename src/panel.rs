@@ -531,6 +531,10 @@ pub struct Chart<'a> {
     pub day_lo: Option<f64>,
     /// The day's change in percent, drawn beside the last price in the up or down colour.
     pub change_pct: Option<f64>,
+    /// The charted symbol's alert levels (above and below, in any order), on every range. Inside the
+    /// price window a dashed amber line with the price at the plot's right end; outside it a marker on
+    /// the top or bottom edge (`chartview::level_marks`). Empty draws nothing.
+    pub levels: &'a [f64],
 }
 
 /// What the panel needs to draw one frame. Bundled so `draw` has one argument that can grow
@@ -1325,6 +1329,29 @@ fn candles(dc: HDC, sc: &Scene, r: RECT, c: &Chart) {
             let y = lay.y_of(p);
             fill_rect(dc, RECT { left: plot.right - s(8), top: y, right: plot.right, bottom: y + s(2).max(2) }, t.label);
         }
+    }
+
+    // Alert levels, over the candles and under the crosshair: a dashed amber line with its price at the
+    // right end of the plot (above the line, below it at the very top); a level outside the window is a
+    // small triangle on the top or bottom edge with the nearest price, and "+n" for the others there.
+    let marks = chartview::level_marks(&lay, c.levels);
+    for &(p, y) in &marks.lines {
+        pen_line(dc, PS_DASH, t.amber, (plot.left, y), (plot.right, y));
+        let ly = if y - lh > plot.top { y - lh - 1 } else { y + 2 };
+        text_right(dc, sc.fonts.small, plot.right - s(4), ly, &fmt_price(p, c.digits), t.amber);
+    }
+    for (mark, up) in [(marks.above, true), (marks.below, false)] {
+        let Some((p, n)) = mark else { continue };
+        let half = s(4).max(3);
+        let cx = plot.right - s(4) - half;
+        // The triangle points out of the window: its tip on the edge, its base one half-width inside.
+        for i in 0..half {
+            let y = if up { plot.top + i } else { plot.bottom - 1 - i };
+            fill_rect(dc, RECT { left: cx - i, top: y, right: cx + i + 1, bottom: y + 1 }, t.amber);
+        }
+        let more = if n > 1 { format!(" +{}", n - 1) } else { String::new() };
+        let ly = if up { plot.top + s(1) } else { plot.bottom - lh - s(1) };
+        text_right(dc, sc.fonts.small, cx - half - s(4), ly, &format!("{}{more}", fmt_price(p, c.digits)), t.amber);
     }
 
     // The crosshair, when the pointer is on a candle: a vertical line through it and a horizontal at

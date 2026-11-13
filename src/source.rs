@@ -302,6 +302,64 @@ pub fn get_release(url: &str) -> Result<String, String> {
     String::from_utf8(body).map_err(|_| "unreadable answer".to_string())
 }
 
+/// What one quote request said about a typed symbol (*Add symbol...*).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Lookup {
+    /// CNBC quotes it: its name (as sent, maybe empty) and a positive, finite last price.
+    Found { name: String, price: f64 },
+    /// CNBC answered, but not with a price for this symbol.
+    NotFound,
+    /// No answer: `"network"`, `"HTTP <code>"`, `"unreadable answer"` or `"could not start"`. Never
+    /// `ureq`'s own message.
+    Failed(String),
+}
+
+/// The longest quote answer `lookup` reads. One symbol's quote is about two kilobytes.
+const LOOKUP_MAX_BODY: usize = 256 * 1024;
+
+/// One quote request for `symbol` (already cleaned), with a short-lived agent (native-tls, the feed's
+/// UA, 10 s timeout, no redirects), reading at most `LOOKUP_MAX_BODY` bytes. Blocking: call it from a
+/// worker thread only.
+pub fn lookup(symbol: &str) -> Lookup {
+    use std::io::Read;
+    let Ok(tls) = native_tls::TlsConnector::new() else {
+        return Lookup::Failed("network".into());
+    };
+    let agent = ureq::AgentBuilder::new()
+        .tls_connector(Arc::new(tls))
+        .user_agent(UA)
+        .timeout(Duration::from_secs(10))
+        .redirects(0)
+        .build();
+    let url = format!("{QUOTE_URL}?symbols={}&requestMethod=itv&noform=1&partnerId=2&fund=1&exthrs=1&output=json", encode(symbol));
+    let resp = match agent.get(&url).call() {
+        Ok(r) => r,
+        Err(ureq::Error::Status(code, _)) => return Lookup::Failed(format!("HTTP {code}")),
+        Err(_) => return Lookup::Failed("network".into()),
+    };
+    let mut body = Vec::new();
+    if resp.into_reader().take((LOOKUP_MAX_BODY + 1) as u64).read_to_end(&mut body).is_err() {
+        return Lookup::Failed("network".into());
+    }
+    if body.len() > LOOKUP_MAX_BODY {
+        return Lookup::Failed("unreadable answer".into());
+    }
+    match serde_json::from_slice::<Value>(&body) {
+        Ok(v) => parse_lookup(&v, symbol),
+        Err(_) => Lookup::Failed("unreadable answer".into()),
+    }
+}
+
+/// The quote answer for `symbol`: `Found` when `parse_quotes` gives a quote whose symbol equals
+/// `symbol` ignoring ASCII case (CNBC echoes it), with a positive finite price; `NotFound` for any
+/// other answer, including an empty list, another symbol's quote, and a body of another shape.
+pub fn parse_lookup(v: &Value, symbol: &str) -> Lookup {
+    parse_quotes(v)
+        .into_iter()
+        .find(|q| q.symbol.eq_ignore_ascii_case(symbol) && q.price.is_finite() && q.price > 0.0)
+        .map_or(Lookup::NotFound, |q| Lookup::Found { name: q.name, price: q.price })
+}
+
 fn encode(s: &str) -> String {
     s.bytes()
         .map(|b| match b {
@@ -1063,6 +1121,45 @@ mod tests {
         // `0.00` is how CNBC says "this symbol has no such value"; it must not draw as a price.
         assert_eq!((qs[1].high, qs[1].yr_lo, qs[1].volume), (None, None, None));
         assert_eq!(qs[1].currency, "");
+    }
+
+    #[test]
+    fn lookup_answers_found_or_not_found() {
+        let v: Value = serde_json::from_str(
+            r#"{"FormattedQuoteResult":{"FormattedQuote":[{"symbol":"AAPL","name":"Apple Inc","last":"231.40"}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(parse_lookup(&v, "AAPL"), Lookup::Found { name: "Apple Inc".into(), price: 231.4 });
+        assert_eq!(parse_lookup(&v, "MSFT"), Lookup::NotFound, "another symbol's quote is not this one");
+        let lower: Value = serde_json::from_str(
+            r#"{"FormattedQuoteResult":{"FormattedQuote":[{"symbol":"aapl","name":"Apple Inc","last":"231.40"}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(parse_lookup(&lower, "AAPL"), Lookup::Found { name: "Apple Inc".into(), price: 231.4 }, "a lower-case echo");
+
+        for last in [r#""UNCH""#, r#""0.00""#] {
+            let v: Value = serde_json::from_str(&format!(
+                r#"{{"FormattedQuoteResult":{{"FormattedQuote":[{{"symbol":"AAPL","name":"Apple Inc","last":{last}}}]}}}}"#
+            ))
+            .unwrap();
+            assert_eq!(parse_lookup(&v, "AAPL"), Lookup::NotFound, "last {last}");
+        }
+        let no_last: Value = serde_json::from_str(
+            r#"{"FormattedQuoteResult":{"FormattedQuote":[{"symbol":"AAPL","name":"Apple Inc"}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(parse_lookup(&no_last, "AAPL"), Lookup::NotFound, "no last");
+
+        for empty in [r#"{}"#, r#"[]"#, r#"null"#, r#"{"FormattedQuoteResult":{}}"#] {
+            let v: Value = serde_json::from_str(empty).unwrap();
+            assert_eq!(parse_lookup(&v, "AAPL"), Lookup::NotFound, "{empty}");
+        }
+
+        let no_name: Value = serde_json::from_str(
+            r#"{"FormattedQuoteResult":{"FormattedQuote":[{"symbol":"AAPL","last":"231.40"}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(parse_lookup(&no_name, "AAPL"), Lookup::Found { name: String::new(), price: 231.4 });
     }
 
     #[test]

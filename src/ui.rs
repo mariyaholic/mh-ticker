@@ -31,6 +31,7 @@ use crate::chartview;
 use crate::hotkey;
 use crate::keys;
 use crate::update;
+use crate::prompt;
 use crate::config::{self, Config, Placement, Profile};
 use crate::dock;
 use crate::panel;
@@ -167,6 +168,23 @@ const STRIP_ROWS: [u32; 3] = [1, 2, 3];
 const TEXT_STEPS: [(i32, i32, &str); 4] = [(8, 9, "Small"), (9, 10, "Default"), (10, 11, "Large"), (11, 12, "Larger")];
 /// Opacities: `(cfg.opacity, label)`. The second step is today's default (235).
 const OPACITY_STEPS: [(u8, &str); 5] = [(255, "100 %"), (235, "92 %"), (205, "80 %"), (180, "70 %"), (155, "60 %")];
+
+// --- P6 "Type it in": reserved menu IDs 6000..6099, WM_APP + 14 and + 15, timer 9. ---
+/// A symbol lookup finished off-thread (its outcome is in `Ui::lookup_result`). `WM_APP + 15` and timer
+/// 9 are reserved for this package and unused.
+const WM_LOOKUP: u32 = WM_APP + 14;
+/// Symbols > *Add symbol...* (both builds).
+const CMD_ADD_SYMBOL: usize = 6000;
+/// The candle pane's own right-click menu (Ultra): alert at the price under the pointer, clear the
+/// symbol's alerts, and the main menu.
+const CMD_PANE_ALERT: usize = 6010;
+const CMD_PANE_CLEAR: usize = 6011;
+const CMD_PANE_MENU: usize = 6012;
+/// Characters the *Add symbol* prompt lets you type. More than `config::MAX_SYMBOL`, so spaces around a
+/// pasted symbol do not cut it; `clean_symbol` enforces the real limit.
+const SYMBOL_PROMPT_LEN: usize = 40;
+/// Characters the *at a price* prompt lets you type.
+const LEVEL_PROMPT_LEN: usize = 32;
 
 /// Index into `STRIP_ROWS` closest to `rows` (ties go to the lower index; 0 and anything above 3
 /// clamp to the ends).
@@ -388,6 +406,13 @@ struct Ui {
     update_running: bool,
     /// Where the worker leaves its `update::Outcome` before posting `WM_UPDATE`; taken by the handler.
     update_result: Arc<Mutex<Option<update::Outcome>>>,
+    /// The symbol *Add symbol...* is looking up while its worker runs: the menu entry then reads
+    /// "Adding <symbol>..." and is greyed, and a second add is refused. Set by `add_symbol` just before
+    /// the worker starts, cleared by `on_lookup` (the `WM_LOOKUP` handler) in every outcome: found, not
+    /// found, failed, and a worker that could not start (which posts `WM_LOOKUP` itself).
+    adding: Option<String>,
+    /// Where the lookup worker leaves `(symbol, outcome)` before posting `WM_LOOKUP`; taken by the handler.
+    lookup_result: Arc<Mutex<Option<(String, crate::source::Lookup)>>>,
     /// The cached back buffer, rebuilt only when the window changes size.
     back: Option<Back>,
     /// When the current background cycle started, so its phase is continuous across repaints.
@@ -839,6 +864,16 @@ fn draw_panel(u: &mut Ui, dc: HDC, w: i32, h: i32) {
         0.0
     };
     let now = crate::source::now_s();
+    // The locked symbol's alert levels, for the pane (Ultra: the classic build has no alerts menu).
+    let levels: Vec<f64> = if u.profile.ultra {
+        selected_row(u)
+            .and_then(|row| u.view.cells.get(row))
+            .and_then(|c| u.cfg.alerts.iter().find(|a| a.label == c.label))
+            .map(|a| [a.above, a.below].into_iter().flatten().collect())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     let scene = panel::Scene {
         title: u.profile.title(),
         board: &u.view,
@@ -903,6 +938,7 @@ fn draw_panel(u: &mut Ui, dc: HDC, w: i32, h: i32) {
                     day_hi: chartview::positive(quote.and_then(|q| q.high)).filter(|_| day),
                     day_lo: chartview::positive(quote.and_then(|q| q.low)).filter(|_| day),
                     change_pct: quote.and_then(|q| q.change_pct).filter(|_| day),
+                    levels: &levels,
                     unavailable: fallback,
                     range,
                     status,
@@ -932,6 +968,7 @@ fn draw_panel(u: &mut Ui, dc: HDC, w: i32, h: i32) {
                 day_hi: None,
                 day_lo: None,
                 change_pct: None,
+                levels: &[],
             },
         }),
         alert: u.alert_note.as_deref(),
@@ -1893,6 +1930,20 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
             dynamic(syms, flags, &mut commands, crate::menu_commands::Action::Symbol(r.symbol.clone()), &text);
         }
         AppendMenuW(syms, MF_SEPARATOR, 0, null());
+        // Add and remove by hand (both builds). Read in a call of its own: the big tuple is not extended.
+        let (adding, custom) = with_ui(|u| (u.adding.clone(), config::custom_entries(&u.cfg))).unwrap_or((None, Vec::new()));
+        match &adding {
+            Some(symbol) => add(syms, MF_STRING | MF_GRAYED, CMD_ADD_SYMBOL, &format!("Adding {symbol}...")),
+            None => add(syms, MF_STRING, CMD_ADD_SYMBOL, "Add symbol..."),
+        }
+        let forget = CreatePopupMenu();
+        for r in &custom {
+            // The only symbol shown cannot go, here as everywhere.
+            let last = n_shown <= 1 && list.iter().zip(&shown).any(|(l, on)| *on && l.symbol == r.symbol);
+            let text = format!("{}\t{}", r.label, r.symbol);
+            dynamic(forget, MF_STRING | if last { MF_GRAYED } else { 0 }, &mut commands, crate::menu_commands::Action::Forget(r.symbol.clone()), &text);
+        }
+        add(syms, MF_POPUP | if custom.is_empty() { MF_GRAYED } else { 0 }, forget as usize, "Remove a symbol I added");
         add(syms, MF_STRING, CMD_RESET, "Reset to default");
         item(MF_STRING, CMD_PANEL, if open { "Back to taskbar" } else { "Expand view" });
         SetMenuDefaultItem(m, CMD_PANEL as u32, 0);
@@ -1969,6 +2020,9 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
                     let on = row.enabled.get(k).copied().unwrap_or(false);
                     dynamic(sub, MF_STRING | if on { 0 } else { MF_GRAYED }, &mut commands, crate::menu_commands::Action::Alert(row.label.clone(), k), p.label);
                 }
+                // A level typed by hand: greyed without a fresh price, like the presets.
+                AppendMenuW(sub, MF_SEPARATOR, 0, null());
+                dynamic(sub, MF_STRING | if row.fresh { 0 } else { MF_GRAYED }, &mut commands, crate::menu_commands::Action::AlertAt(row.label.clone()), "at a price...");
                 AppendMenuW(sub, MF_SEPARATOR, 0, null());
                 let line = row.alert.as_ref().map(|a| alerts::describe(a, row.digits)).filter(|d| !d.is_empty());
                 add(sub, MF_STRING | MF_GRAYED, 0, &line.unwrap_or_else(|| "nothing set".into()));
@@ -2188,6 +2242,12 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
                 with_ui(|u| u.cfg.alerts.retain(|a| &a.label != label));
                 save_cfg();
             }
+            Action::AlertAt(label) => alert_at_price(hwnd, label),
+            Action::Forget(symbol) => {
+                if with_ui(|u| config::forget_custom(&mut u.cfg, symbol)).unwrap_or(false) {
+                    apply_rows(hwnd);
+                }
+            }
             Action::Monitor(device) => {
                 // The modal menu pumps messages: use the current mode, not its opening snapshot.
                 if with_ui(|u| u.mode == Mode::Strip).unwrap_or(false) {
@@ -2276,6 +2336,7 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
             with_ui(|u| u.cfg.rows = config::default_rows());
             apply_rows(hwnd);
         }
+        CMD_ADD_SYMBOL => add_symbol(hwnd),
         c if (CMD_POLL..CMD_POLL + POLL_CHOICES.len()).contains(&c) => {
             let secs = POLL_CHOICES[c - CMD_POLL];
             with_ui(|u| {
@@ -2393,6 +2454,8 @@ struct AlertsRow {
     digits: u32,
     /// Per `alerts::PRESETS` entry: can it be set now?
     enabled: Vec<bool>,
+    /// There is a fresh price (`alerts::reference_price`): *at a price...* can be offered.
+    fresh: bool,
     alert: Option<config::Alert>,
 }
 
@@ -2418,6 +2481,7 @@ fn alerts_view(list: &[config::Row], shown: &[bool]) -> Option<AlertsView> {
                     label: r.label.clone(),
                     digits: r.digits,
                     enabled,
+                    fresh: reference.is_some(),
                     alert: u.cfg.alerts.iter().find(|a| a.label == r.label).cloned(),
                 }
             })
@@ -2652,6 +2716,237 @@ fn on_update(hwnd: HWND) {
         }
     }
     with_ui(|u| u.update_running = false);
+}
+
+/// What *Add symbol...* does with a cleaned symbol, decided in one `with_ui` call.
+enum AddStep {
+    /// On the strip already.
+    Shown,
+    /// In the Symbols menu and now ticked.
+    Ticked,
+    /// In the Symbols menu, but the strip is full.
+    Full,
+    /// A lookup is in flight already.
+    Busy,
+    /// Look it up; the slot the worker writes.
+    Look(Arc<Mutex<Option<(String, crate::source::Lookup)>>>),
+}
+
+/// Text from the network or the keyboard, made safe for a message box: no control characters, at most
+/// `n` characters.
+fn shown_text(s: &str, n: usize) -> String {
+    s.chars().filter(|c| !c.is_control()).take(n).collect()
+}
+
+/// Symbols > *Add symbol...* (both builds). Asks for a symbol (outside `with_ui`), cleans it, ticks it
+/// when it is already listed, and otherwise looks it up on a worker thread: `adding` is set first and
+/// `WM_LOOKUP` comes back in every outcome, a failed thread start included, so it is always cleared.
+fn add_symbol(hwnd: HWND) {
+    if with_ui(|u| u.adding.is_some()).unwrap_or(true) {
+        return;
+    }
+    let title = "Add symbol";
+    let Some(text) = prompt::ask(hwnd, title, "CNBC symbol to add (for example AAPL, @GC.1 or EUR=):", "", SYMBOL_PROMPT_LEN) else {
+        return;
+    };
+    let Some(symbol) = config::clean_symbol(&text) else {
+        let typed = shown_text(text.trim(), 40);
+        let msg = format!("\"{typed}\" is not a CNBC symbol. Use 1 to {} letters, digits or . @ = - ^ / : _", config::MAX_SYMBOL);
+        alert_box(hwnd, title, &msg, MB_OK | MB_ICONWARNING);
+        return;
+    };
+    let step = with_ui(|u| {
+        if config::is_shown(&u.cfg, &symbol) {
+            AddStep::Shown
+        } else if config::menu_list(&u.cfg).iter().any(|r| r.symbol == symbol) {
+            if config::toggle(&mut u.cfg, &symbol) { AddStep::Ticked } else { AddStep::Full }
+        } else if u.adding.is_some() {
+            AddStep::Busy
+        } else {
+            u.adding = Some(symbol.clone());
+            AddStep::Look(u.lookup_result.clone())
+        }
+    });
+    match step {
+        Some(AddStep::Ticked) => apply_rows(hwnd),
+        Some(AddStep::Shown) => {
+            alert_box(hwnd, title, &format!("{symbol} is already on the strip."), MB_OK | MB_ICONINFORMATION);
+        }
+        Some(AddStep::Full) => {
+            let msg = format!("{symbol} is in the Symbols menu, but the strip already shows {} symbols. Untick one first.", config::MAX_ROWS);
+            alert_box(hwnd, title, &msg, MB_OK | MB_ICONINFORMATION);
+        }
+        Some(AddStep::Look(slot)) => start_lookup(hwnd, symbol, slot),
+        Some(AddStep::Busy) | None => {}
+    }
+}
+
+/// One `source::lookup` on its own thread; the outcome goes into `slot` and `WM_LOOKUP` is posted. A
+/// failed spawn takes the same road from here, so `on_lookup` always runs and clears `Ui::adding`.
+fn start_lookup(hwnd: HWND, symbol: String, slot: Arc<Mutex<Option<(String, crate::source::Lookup)>>>) {
+    let target = hwnd as isize;
+    let (worker_slot, worker_symbol) = (slot.clone(), symbol.clone());
+    let spawned = std::thread::Builder::new().name("lookup".into()).spawn(move || {
+        let outcome = crate::source::lookup(&worker_symbol);
+        if let Ok(mut g) = worker_slot.lock() {
+            *g = Some((worker_symbol, outcome));
+        }
+        unsafe { PostMessageW(target as HWND, WM_LOOKUP, 0, 0) };
+    });
+    if spawned.is_err() {
+        if let Ok(mut g) = slot.lock() {
+            *g = Some((symbol, crate::source::Lookup::Failed("could not start".into())));
+        }
+        unsafe { PostMessageW(hwnd, WM_LOOKUP, 0, 0) };
+    }
+}
+
+/// `WM_LOOKUP`: clear `adding` first (so the menu is usable again even while a box is up), then act on
+/// the outcome: found adds it to the catalogue and ticks it when there is room; not found and failed
+/// say which in a message box. A message with no outcome in the slot only clears `adding`.
+fn on_lookup(hwnd: HWND) {
+    let taken = with_ui(|u| {
+        u.adding = None;
+        u.lookup_result.lock().ok().and_then(|mut g| g.take())
+    })
+    .flatten();
+    let Some((symbol, outcome)) = taken else { return };
+    let title = "Add symbol";
+    match outcome {
+        crate::source::Lookup::Found { name, price } => match with_ui(|u| config::add_custom(&mut u.cfg, &symbol, &name, price)) {
+            Some(config::Added::Shown) => apply_rows(hwnd),
+            Some(config::Added::Listed) => {
+                apply_rows(hwnd);
+                let msg = format!("{symbol} is in the Symbols menu now, but the strip already shows {} symbols. Untick one to show it.", config::MAX_ROWS);
+                alert_box(hwnd, title, &msg, MB_OK | MB_ICONINFORMATION);
+            }
+            Some(config::Added::AlreadyShown) | None => {}
+        },
+        crate::source::Lookup::NotFound => {
+            let msg = format!("CNBC has no price for {symbol}. Check the symbol on cnbc.com; nothing was added.");
+            alert_box(hwnd, title, &msg, MB_OK | MB_ICONWARNING);
+        }
+        crate::source::Lookup::Failed(why) => {
+            let msg = format!("Could not reach CNBC ({}). {symbol} was not added; try again later.", shown_text(&why, 40));
+            alert_box(hwnd, title, &msg, MB_OK | MB_ICONWARNING);
+        }
+    }
+}
+
+/// The fresh price of the card labelled `label` and its digits, or `None` when there is no fresh
+/// CNBC price (`alerts::reference_price`).
+fn fresh_price(label: &str) -> Option<(f64, u32)> {
+    with_ui(|u| {
+        let cell = u.view.cells.iter().find(|c| c.label == label)?;
+        Some((alerts::reference_price(cell, &u.cfg, crate::source::now_s())?, cell.digits))
+    })
+    .flatten()
+}
+
+/// Set `level` on `label`'s alert, creating the alert (with the *Fire once* setting) if it has none.
+fn put_level(u: &mut Ui, label: &str, level: alerts::Level) {
+    if !u.cfg.alerts.iter().any(|a| a.label == label) {
+        u.cfg.alerts.push(config::Alert { label: label.to_string(), once: u.cfg.alert_once, ..Default::default() });
+    }
+    if let Some(a) = u.cfg.alerts.iter_mut().find(|a| a.label == label) {
+        alerts::apply_level(a, level);
+    }
+}
+
+/// Apply the side rule to `level` against the fresh price as it is NOW (not when a menu or prompt
+/// opened), then set it and save; a refusal says why in a message box.
+fn set_price_level(hwnd: HWND, label: &str, level: f64) {
+    let title = format!("Alert for {label}");
+    let Some((reference, digits)) = fresh_price(label) else {
+        alert_box(hwnd, &title, &format!("No alert set: there is no fresh price for {label} right now."), MB_OK | MB_ICONWARNING);
+        return;
+    };
+    match alerts::side_of(level, reference, digits) {
+        Ok(l) => {
+            with_ui(|u| put_level(u, label, l));
+            save_cfg();
+            unsafe { InvalidateRect(hwnd, null(), 0) };
+        }
+        Err(why) => {
+            alert_box(hwnd, &title, &format!("No alert set: {why}."), MB_OK | MB_ICONWARNING);
+        }
+    }
+}
+
+/// Alerts > symbol > *at a price...* (Ultra): the prompt opens on the current price; the typed text
+/// must parse (`alerts::parse_level`), then the side rule decides above or below.
+fn alert_at_price(hwnd: HWND, label: &str) {
+    let Some((reference, digits)) = fresh_price(label) else { return };
+    let now = fmt_price(reference, digits);
+    let title = format!("Alert for {label}");
+    let text = format!("Alert when {label} reaches this price (now {now}):");
+    let Some(typed) = prompt::ask(hwnd, &title, &text, &now, LEVEL_PROMPT_LEN) else { return };
+    match alerts::parse_level(&typed) {
+        Some(level) => set_price_level(hwnd, label, level),
+        None => {
+            let msg = format!("\"{}\" is not a price. Type a number such as 4200 or 4,200.50.", shown_text(typed.trim(), 32));
+            alert_box(hwnd, &title, &msg, MB_OK | MB_ICONWARNING);
+        }
+    }
+}
+
+/// The candle pane's right-click menu (Ultra, panel open, pane drawing candles, `at` inside the price
+/// plot of the stored layout): *Alert at <price under the pointer>*, rounded to the symbol's digits and
+/// greyed when there is no fresh price or it is the current price; *Clear <label> alerts* when it has
+/// any; and *More...*, the main menu. Returns false, having shown nothing, anywhere else, and the caller
+/// opens the main menu. Separate from `menu_at` on purpose: it is a menu about one point of one chart.
+fn pane_menu(hwnd: HWND, at: (i32, i32)) -> bool {
+    let (x, y) = at;
+    let Some((label, digits, price, alerted)) = with_ui(|u| {
+        if !u.profile.ultra || !u.chart || u.mode != Mode::Panel {
+            return None;
+        }
+        let lay = u.chart_layout.get()?;
+        if lay.bars == 0 || !lay.plot.contains(x, y) {
+            return None;
+        }
+        let price = lay.price_at(y)?;
+        let cell = u.view.cells.get(selected_row(u)?)?;
+        let alerted = u.cfg.alerts.iter().any(|a| a.label == cell.label && (a.above.is_some() || a.below.is_some() || a.day_move.is_some()));
+        Some((cell.label.clone(), cell.digits, price, alerted))
+    })
+    .flatten() else {
+        return false;
+    };
+    clear_pending(hwnd);
+    let level = alerts::round_level(price, digits);
+    let settable = fresh_price(&label).is_some_and(|(reference, d)| alerts::side_of(level, reference, d).is_ok());
+    let cmd = unsafe {
+        let m = CreatePopupMenu();
+        let add = |flags: u32, id: usize, text: &str| {
+            let t = wide(text);
+            AppendMenuW(m, flags, id, t.as_ptr());
+        };
+        add(MF_STRING | if settable { 0 } else { MF_GRAYED }, CMD_PANE_ALERT, &format!("Alert at {}", fmt_price(level, digits)));
+        if alerted {
+            add(MF_STRING, CMD_PANE_CLEAR, &format!("Clear {label} alerts"));
+        }
+        AppendMenuW(m, MF_SEPARATOR, 0, null());
+        add(MF_STRING, CMD_PANE_MENU, "More...");
+        let mut pt = POINT { x: 0, y: 0 };
+        GetCursorPos(&mut pt);
+        SetForegroundWindow(hwnd);
+        let cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, null());
+        PostMessageW(hwnd, WM_NULL, 0, 0);
+        DestroyMenu(m);
+        cmd as usize
+    };
+    match cmd {
+        CMD_PANE_ALERT => set_price_level(hwnd, &label, level),
+        CMD_PANE_CLEAR => {
+            with_ui(|u| u.cfg.alerts.retain(|a| a.label != label));
+            save_cfg();
+            unsafe { InvalidateRect(hwnd, null(), 0) };
+        }
+        CMD_PANE_MENU => menu(hwnd, Some(at)),
+        _ => {}
+    }
+    true
 }
 
 /// The Position menu moved the strip: new font (the taskbar grid uses `dock_font_pt`), topmost
@@ -3107,6 +3402,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             0
         }
+        WM_LOOKUP => {
+            on_lookup(hwnd);
+            0
+        }
         WM_UPDATE => {
             on_update(hwnd);
             0
@@ -3477,7 +3776,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 ScreenToClient(hwnd, &mut pt);
                 Some((pt.x, pt.y))
             };
-            menu(hwnd, at);
+            // Inside the candle plot the pane's own menu comes first (Ultra); anywhere else the main one.
+            if !at.is_some_and(|p| pane_menu(hwnd, p)) {
+                menu(hwnd, at);
+            }
             0
         }
         WM_EXITSIZEMOVE => {
@@ -3672,6 +3974,8 @@ pub fn run(cfg: Config, board: Arc<Mutex<Board>>) {
             hotkey_failed: false,
             update_running: false,
             update_result: Arc::new(Mutex::new(None)),
+            adding: None,
+            lookup_result: Arc::new(Mutex::new(None)),
             back: None,
             anim: None,
             motion: allow_motion(),

@@ -40,6 +40,7 @@ pub(crate) mod webhook_host;
 pub(crate) mod autostart;
 pub(crate) mod hotkey;
 pub(crate) mod update;
+pub(crate) mod prompt;
 
 use std::sync::{Arc, Mutex};
 

@@ -150,6 +150,37 @@ pub fn in_window(price: Option<f64>, lo: f64, hi: f64) -> Option<f64> {
     price.filter(|p| p.is_finite() && *p >= lo && *p <= hi)
 }
 
+/// Where the locked symbol's alert levels go on one frame of the pane.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LevelMarks {
+    /// The levels inside the price window (`in_window`), each with its pixel row (`Layout::y_of`), in
+    /// the order given. Drawn as a dashed line across the plot with the price at its right end.
+    pub lines: Vec<(f64, i32)>,
+    /// The nearest level above the window and how many levels lie above it in all. Drawn as a small
+    /// marker on the plot's top edge.
+    pub above: Option<(f64, usize)>,
+    /// The nearest level below the window and how many lie below it. A marker on the bottom edge.
+    pub below: Option<(f64, usize)>,
+}
+
+/// Place alert `levels` on the frame `lay` describes. A level that is not positive and finite is
+/// skipped (it can never trip). The painter draws exactly what this returns.
+pub fn level_marks(lay: &Layout, levels: &[f64]) -> LevelMarks {
+    let mut out = LevelMarks::default();
+    for &p in levels.iter().filter(|p| p.is_finite() && **p > 0.0) {
+        if in_window(Some(p), lay.lo, lay.hi).is_some() {
+            out.lines.push((p, lay.y_of(p)));
+        } else if p > lay.hi {
+            let (near, n) = out.above.unwrap_or((p, 0));
+            out.above = Some((near.min(p), n + 1));
+        } else {
+            let (near, n) = out.below.unwrap_or((p, 0));
+            out.below = Some((near.max(p), n + 1));
+        }
+    }
+    out
+}
+
 /// Indices of the drawn candles that start a new session: `i >= 1` where
 /// `bars[i].dt - bars[i - 1].dt > 1.5 * bucket_s`. Bars are in time order; `bars` are the folded
 /// candles, so a candle's `dt` is already on a bucket boundary. Empty for fewer than two bars or a
@@ -734,6 +765,31 @@ mod tests {
         assert_eq!(l.y_of(200.0), l.plot.top);
         assert_eq!(l.price_at(l.plot.top - 1), None);
         assert_eq!(l.price_at(l.plot.bottom + 1), None);
+    }
+
+    #[test]
+    fn alert_levels_are_lines_inside_and_markers_outside() {
+        let l = lay();
+        let m = level_marks(&l, &[150.0, 260.0, 230.0]);
+        assert_eq!(m.lines, vec![(150.0, l.y_of(150.0))]);
+        assert_eq!(m.above, Some((230.0, 2)), "the nearest above, and how many");
+        assert_eq!(m.below, None);
+        // The window's own ends are lines, at the bottom and top of the plot.
+        let e = level_marks(&l, &[100.0, 200.0]);
+        assert_eq!(e.lines, vec![(100.0, l.plot.bottom), (200.0, l.plot.top)]);
+        assert_eq!((e.above, e.below), (None, None));
+        // One tick below the window is a bottom marker and no line.
+        let b = level_marks(&l, &[99.0]);
+        assert!(b.lines.is_empty());
+        assert_eq!(b.below, Some((99.0, 1)));
+        // Levels that cannot trip are skipped, the rest are kept.
+        let s = level_marks(&l, &[f64::NAN, f64::INFINITY, 0.0, -150.0, 150.0]);
+        assert_eq!(s.lines, vec![(150.0, l.y_of(150.0))]);
+        assert_eq!((s.above, s.below), (None, None));
+        assert_eq!(level_marks(&l, &[]), LevelMarks::default());
+        // The lines keep the order given, not the price order.
+        let o = level_marks(&l, &[180.0, 120.0]);
+        assert_eq!(o.lines.iter().map(|(p, _)| *p).collect::<Vec<_>>(), [180.0, 120.0]);
     }
 
     #[test]
