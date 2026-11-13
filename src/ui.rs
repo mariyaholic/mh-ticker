@@ -1280,13 +1280,31 @@ fn relayout_and_place(hwnd: HWND) {
 /// Start the webhook POST for log entry `seq`. The result comes back as `WM_ALERT` with `wparam`
 /// 1 = failed and `lparam` = `seq`, so it updates the right log line. If the thread cannot even
 /// start, the failure is posted the same way.
-fn post_alert(hwnd: HWND, url: String, title: String, body: String, seq: u64) {
+fn post_alert(hwnd: HWND, url: String, title: String, body: String, seq: u64, test: bool) {
     let target = hwnd as isize;
     let started = alerts::spawn_post(url, title, body, Box::new(move |err| unsafe {
-        PostMessageW(target as HWND, WM_ALERT, err.is_some() as usize, seq as LPARAM);
+        PostMessageW(target as HWND, WM_ALERT, alert_wparam(err.is_some(), test), seq as LPARAM);
     }));
     if !started {
-        unsafe { PostMessageW(hwnd, WM_ALERT, 1, seq as LPARAM) };
+        unsafe { PostMessageW(hwnd, WM_ALERT, alert_wparam(true, test), seq as LPARAM) };
+    }
+}
+
+/// `WM_ALERT`'s `wparam`: bit 0 = the POST failed, bit 1 = it was the test alert. The test bit travels
+/// with the result because the log line it belongs to may be gone by the time it arrives (the list was
+/// cleared, or ten newer alerts pushed it out), and the note must still say which it was.
+fn alert_wparam(failed: bool, test: bool) -> usize {
+    failed as usize | (test as usize) << 1
+}
+
+/// The footer note for a webhook result decoded from `WM_ALERT`'s `wparam`.
+fn webhook_note(wp: usize) -> String {
+    let (failed, test) = (wp & 1 != 0, wp & 2 != 0);
+    let what = if test { "test alert" } else { "alert" };
+    match (failed, test) {
+        (true, true) => "test alert: webhook failed".to_string(),
+        (true, false) => "alert kept here: webhook failed".to_string(),
+        (false, _) => format!("{what}: webhook sent"),
     }
 }
 
@@ -1383,7 +1401,7 @@ fn on_feed(hwnd: HWND) {
     for (f, seq) in fired {
         alerts::balloon(hwnd, TRAY_ID, &f.title, &f.body);
         if let Some(url) = hook.clone() {
-            post_alert(hwnd, url, f.title, f.body, seq);
+            post_alert(hwnd, url, f.title, f.body, seq, false);
         }
     }
     match with_ui(|u| u.mode) {
@@ -1839,13 +1857,8 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
         let list = config::menu_list(&u.cfg);
         let shown: Vec<bool> = list.iter().map(|r| config::is_shown(&u.cfg, &r.symbol)).collect();
         let note = if u.view.note.is_empty() { theme::link_name(u.view.link).to_string() } else { u.view.note.clone() };
-        let alerted: Vec<String> = u
-            .cfg
-            .alerts
-            .iter()
-            .filter(|a| a.above.is_some() || a.below.is_some() || a.day_move.is_some())
-            .map(|a| a.label.clone())
-            .collect();
+        let shown_labels: Vec<&str> = list.iter().zip(&shown).filter(|(_, on)| **on).map(|(r, _)| r.label.as_str()).collect();
+        let alerted = armed_labels(&u.cfg.alerts, &shown_labels);
         (
             u.cfg.strip_visible,
             u.cfg.topmost,
@@ -2267,15 +2280,18 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
             }
         }
         CMD_FALLBACK => {
-            let Some(mut next) = with_ui(|u| u.cfg.clone()) else { return; };
-            let enabling = !next.fallback_enabled;
+            let Some(enabling) = with_ui(|u| !u.cfg.fallback_enabled) else { return; };
             if enabling {
                 let message = wide("If CNBC is unavailable or a quote is stale, MH Ticker may request prices from Gold API or Kraken. Prices and update times can differ; Bitcoin may come from a different exchange. Some symbols have no fallback.\n\nYour device connects directly to these providers. Check the source and freshness shown before relying on a quote. Disabling stops new requests from being scheduled and clears fallback prices. Already-authorized requests may still connect or finish; their results are discarded. Kraken requires permission for non-personal commercial use of its data.\n\nAllow fallback sources?");
                 let title = wide("Allow fallback sources?");
                 let yes = unsafe { MessageBoxW(hwnd, message.as_ptr(), title.as_ptr(), MB_YESNO | MB_DEFBUTTON2 | MB_ICONWARNING) } == IDYES;
                 if !yes { return; }
             }
-            next.fallback_enabled = enabling;
+            // The settings to write are read now, after the confirmation box: its modal loop runs the
+            // feed (a fired alert updates its cooldown and may spend a once level) and the tray menu,
+            // and a copy taken before it would write all of that back out of the file (audit 1.8,
+            // finding 2).
+            let Some(next) = with_ui(|u| fallback_settings(&u.cfg, enabling)) else { return; };
             // Refuse enable on persistence failure. Disable in memory first even when saving fails.
             if !enabling {
                 with_ui(|u| {
@@ -2379,10 +2395,14 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
         CMD_REFRESH => {
             // Wakes the quote loop and makes chart rows with no bars due now. The backoff counter
             // is untouched: a still-failing source backs off again after this one attempt.
+            // The range book is a separate machine: a long range that just failed would otherwise keep
+            // saying so until its own 30 s back-off ends (audit 1.8, finding 1).
             with_ui(|u| {
                 if let Ok(mut b) = u.board.lock() {
                     b.kick = b.kick.wrapping_add(1);
                 }
+                u.book.retry_now();
+                want_range(u);
             });
         }
         CMD_COPY_ALL => {
@@ -2429,6 +2449,26 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
         c if ultra && (CMD_ALERT_ONCE..=CMD_LOG_CLEAR).contains(&c) => alert_command(hwnd, c),
         _ => {}
     }
+}
+
+/// The labels with an alert set, among the symbols the Alerts submenu lists (the shown ones). The
+/// submenu's title counts these: an alert on a hidden symbol is kept (it fires again once the symbol
+/// is shown) but is not listed, so counting it promised an entry the menu did not have.
+fn armed_labels(alerts: &[config::Alert], shown_labels: &[&str]) -> Vec<String> {
+    alerts
+        .iter()
+        .filter(|a| a.above.is_some() || a.below.is_some() || a.day_move.is_some())
+        .filter(|a| shown_labels.contains(&a.label.as_str()))
+        .map(|a| a.label.clone())
+        .collect()
+}
+
+/// The settings *Allow fallback sources* writes: the configuration as it stands when the choice is
+/// made (not as it stood when the menu opened), with only the fallback policy changed.
+fn fallback_settings(current: &Config, enabling: bool) -> Config {
+    let mut next = current.clone();
+    next.fallback_enabled = enabling;
+    next
 }
 
 /// What the Alerts submenu needs, read in one `with_ui` call so the menu build never nests.
@@ -2581,7 +2621,7 @@ fn alert_command(hwnd: HWND, cmd: usize) {
             })
             .flatten();
             if let Some(seq) = seq {
-                post_alert(hwnd, url, alerts::TEST_TITLE.into(), "If you can read this, the webhook works.".into(), seq);
+                post_alert(hwnd, url, alerts::TEST_TITLE.into(), "If you can read this, the webhook works.".into(), seq, true);
             }
             if with_ui(|u| u.mode == Mode::Panel).unwrap_or(false) {
                 unsafe { InvalidateRect(hwnd, null(), 0) };
@@ -2777,7 +2817,13 @@ fn add_symbol(hwnd: HWND) {
             alert_box(hwnd, title, &msg, MB_OK | MB_ICONINFORMATION);
         }
         Some(AddStep::Look(slot)) => start_lookup(hwnd, symbol, slot),
-        Some(AddStep::Busy) | None => {}
+        Some(AddStep::Busy) => {
+            // A second prompt (opened from the tray while the first was up) can start its lookup first;
+            // the symbol typed here is then not dropped without a word (audit 1.8, finding 7).
+            let msg = format!("{symbol} was not added: another symbol is being looked up. Try again in a few seconds.");
+            alert_box(hwnd, title, &msg, MB_OK | MB_ICONINFORMATION);
+        }
+        None => {}
     }
 }
 
@@ -3331,18 +3377,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_ALERT => {
-            let failed = wp != 0;
+            let failed = wp & 1 != 0;
             let seq = lp as u64;
             with_ui(|u| {
                 let outcome = if failed { alerts::Outcome::SendFailed } else { alerts::Outcome::Sent };
                 u.alert_log.set_outcome(seq, outcome);
-                let test = u.alert_log.newest_first().iter().any(|e| e.seq == seq && e.title == alerts::TEST_TITLE);
-                let what = if test { "test alert" } else { "alert" };
-                u.alert_note = Some(match (failed, test) {
-                    (true, true) => "test alert: webhook failed".to_string(),
-                    (true, false) => "alert kept here: webhook failed".to_string(),
-                    (false, _) => format!("{what}: webhook sent"),
-                });
+                u.alert_note = Some(webhook_note(wp));
             });
             if with_ui(|u| u.mode == Mode::Panel).unwrap_or(false) {
                 InvalidateRect(hwnd, null(), 0);
@@ -4129,5 +4169,52 @@ mod tests {
         assert!(!clock_runs(true, false, t), "Show animations is off");
         let still = Theme { cycle: None, ..*t };
         assert!(!clock_runs(true, true, &still), "a still palette holds phase 0");
+    }
+
+    /// Audit 1.8, finding 2: the fallback toggle writes the settings as they are when the user
+    /// answers the confirmation box, not a copy from before it. Here a once alert fires while the box
+    /// is up (its modal loop runs the feed) and is spent; the file must not get it back.
+    #[test]
+    fn the_fallback_toggle_writes_what_happened_during_its_confirmation() {
+        let mut cfg = Config { fallback_enabled: false, ..Config::default() };
+        cfg.alerts.push(config::Alert { label: "XAU".into(), above: Some(4100.0), once: true, ..Default::default() });
+        // The menu opened: the old code took its copy here.
+        let before_box = cfg.clone();
+        // While the box is up the alert fires and, being a once alert, is spent.
+        cfg.alerts.clear();
+        cfg.poll_s = 10.0;
+        let next = fallback_settings(&cfg, true);
+        assert!(next.fallback_enabled);
+        assert!(next.alerts.is_empty(), "a spent once alert must not be written back");
+        assert_eq!(next.poll_s, 10.0, "a setting changed from the tray during the box is kept");
+        assert_ne!(next.alerts.len(), before_box.alerts.len());
+        assert!(!fallback_settings(&cfg, false).fallback_enabled);
+    }
+
+    /// Audit 1.8, finding 3: a webhook result names the test alert even when its log line is gone
+    /// (the list was cleared, or newer alerts pushed it out), and never calls a test a kept alert.
+    #[test]
+    fn a_webhook_result_knows_a_test_without_its_log_line() {
+        assert_eq!(webhook_note(alert_wparam(true, true)), "test alert: webhook failed");
+        assert_eq!(webhook_note(alert_wparam(false, true)), "test alert: webhook sent");
+        assert_eq!(webhook_note(alert_wparam(true, false)), "alert kept here: webhook failed");
+        assert_eq!(webhook_note(alert_wparam(false, false)), "alert: webhook sent");
+        assert_eq!(alert_wparam(true, false), 1, "bit 0 is still the failure, as before");
+        let mut log = alerts::Log::default();
+        let seq = log.push(0.0, alerts::TEST_TITLE.into(), alerts::Outcome::Shown);
+        log.clear();
+        assert!(!log.set_outcome(seq, alerts::Outcome::Sent), "the line is gone");
+    }
+
+    /// Audit 1.8, finding 4: the Alerts submenu's count is of the symbols it lists. An alert on a hidden
+    /// symbol is kept in the settings but not counted.
+    #[test]
+    fn the_alerts_count_is_of_listed_symbols_only() {
+        let set = |label: &str| config::Alert { label: label.into(), above: Some(1.0), ..Default::default() };
+        let empty = config::Alert { label: "EUR".into(), ..Default::default() };
+        let alerts = vec![set("XAU"), set("BTC"), empty];
+        assert_eq!(armed_labels(&alerts, &["XAU", "EUR"]), vec!["XAU".to_string()]);
+        assert_eq!(armed_labels(&alerts, &["XAU", "BTC"]).len(), 2);
+        assert!(armed_labels(&alerts, &[]).is_empty());
     }
 }
