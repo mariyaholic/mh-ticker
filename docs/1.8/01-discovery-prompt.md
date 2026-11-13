@@ -54,8 +54,11 @@ into a panel: one exe, public CNBC quotes, no login, no server. Two builds link 
 ## Hard constraints (a candidate that breaks one is a NO)
 
 - One exe. No server, no web view, no installer, no login, no history files on disk, no telemetry.
-- Budget: about 6 MB private RAM, under 2 MB binary, idle CPU near zero. **No new steady traffic.**
-  New requests happen only on an explicit click, to a host the README names.
+- Budget: private RAM up to **twice the 1.7.1 figure** (about 11.5 MB), under 2 MB binary, idle CPU
+  near zero. **No new steady traffic** beyond what the user's own choices cost (more symbols, a
+  faster poll); any other request happens only on an explicit click, to a host the README names.
+  *(The RAM ceiling was about 6 MB when this prompt was first run. The owner doubled it on
+  2026-11-13, mid-cycle; [02-feature-list.md](02-feature-list.md) records what that changed.)*
 - **Classic must not drift.** Same pixels (`shots/*.png` byte-identical) and the same click
   behaviour. An engine feature that reaches Classic defaults to exactly what Classic does today.
 - Never assume a response field exists. Never alert on stale or fallback data. A webhook URL is a

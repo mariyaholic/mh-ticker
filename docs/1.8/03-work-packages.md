@@ -10,9 +10,9 @@ until it is accepted and merged.*
 | 1 | P1 Alerts you can set and silence | `wip/p1-alerts` | `/home/user/mh-wt/a` | A1 to A9 |
 | 1 | P2 A chart that reads | `wip/p2-chart` | `/home/user/mh-wt/b` | B1 to B5, F2 |
 | 1 | P3 Everyday | `wip/p3-everyday` | `/home/user/mh-wt/c` | C1 to C7 |
-| 2 | P4 Chart ranges | `wip/p4-ranges` | `/home/user/mh-wt/a` | B6, B7 |
+| 2 | P4 Chart ranges and volume | `wip/p4-ranges` | `/home/user/mh-wt/a` | B6, B7, B8 |
 | 2 | P5 Keyboard, cards and order | `wip/p5-keys` | `/home/user/mh-wt/b` | D1 to D4 |
-| 2 | P6 Type it in | `wip/p6-prompt` | `/home/user/mh-wt/c` | F1, E1, E2, A10, A11 |
+| 2 | P6 Type it in | `wip/p6-prompt` | `/home/user/mh-wt/c` | F1, E1, E2, E5, A10, A11 |
 
 ## Rules for every package
 
@@ -254,8 +254,10 @@ from `5D.json`; 1M, 6M and 1Y from `1M.json`, which carries about a year of dail
 `5Y.json`, weekly), each trimmed to its named span by time; and a pure state machine for "which
 series is wanted, which is in flight, which are cached and how old" (select, arrive, tick, close) with
 a generation so a late answer for a previous symbol or range is dropped. Fetched only for the locked
-symbol, only while the pane is open, cached with a time to live, at most four series, all dropped when
-the pane closes. Bar duration is inferred from the data, not assumed. Range tabs in the pane header;
+symbol, only while the pane is open, cached with a time to live. The cache holds at most twelve
+series and outlives the pane (the RAM ceiling was doubled on 2026-11-13, so it no longer has to be
+thrown away): a series goes when its symbol leaves the strip or when it is the oldest of thirteen.
+`Bar` gains `v: f32` and the pane draws a volume strip under the candles when the series has volume. Bar duration is inferred from the data, not assumed. Range tabs in the pane header;
 dates on the axis; `--probe` prints every range. **Unverified live by construction**: the shapes come
 from `FEATURES.md` Appendix A.
 
@@ -267,6 +269,8 @@ order. A click on a symbol in the strip opens the panel with that card locked.
 
 **P6. Type it in.** New `src/prompt.rs`: a modal one-line prompt from an in-memory dialog template.
 *Add symbol* (both builds): the symbol is checked against CNBC on a worker thread before it is added;
-a second add while one is in flight is refused; hand-added symbols can be removed. *Alert at price*
+a second add while one is in flight is refused; hand-added symbols can be removed. `MAX_ROWS` goes
+from 12 to 24 (the cap was a byte budget; every range sized by it and the test that assumes the
+catalogue is longer than the cap are checked). *Alert at price*
 per symbol. Alert levels drawn on the candle pane, and a right-click on the pane offers "Alert at
 <price under the pointer>".
