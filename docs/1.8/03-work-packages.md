@@ -112,6 +112,15 @@ named, plus edge cases: empty, zero, NaN, one element, the boundary itself), lab
 five commands above, the notes file, and a commit. The finisher does not redesign: if a contract looks wrong,
 it says so in the notes and in its final message instead of changing it.
 
+**Checkpoints (added after wave 2 lost work to usage limits).** Every worker runs
+`/home/user/mh-wt/checkpoint "<what is done>" "<what is next>"` after each coherent step and at
+least every few edits, and before any long command. It commits everything as a `checkpoint:` commit
+and appends a line to `.progress.md` in the worktree (never committed) with the time, whether
+`check` passes and how many `TODO(finish)` remain. A worker that is cut off is resumed from that,
+not re-read: the orchestrator runs `/home/user/mh-wt/where` (each worktree's commits since the
+integration head, uncommitted files, open TODOs and the last progress lines) and sends the stopped
+worker, or a fresh one, the last "next" line. Squash-merging hides the checkpoint commits.
+
 **Final message, both agents:** under 200 words. Branch, commit hash, what is done, what is not, the
 test count, anything you are unsure about.
 
