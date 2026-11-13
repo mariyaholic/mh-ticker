@@ -30,6 +30,7 @@ pub(crate) mod dock;
 pub(crate) mod model;
 pub(crate) mod menu_commands;
 pub(crate) mod panel;
+pub(crate) mod ranges;
 pub(crate) mod source;
 pub(crate) mod theme;
 pub(crate) mod ui;

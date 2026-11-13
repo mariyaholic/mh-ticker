@@ -62,6 +62,13 @@ pub struct Layout {
     pub bucket_s: f64,
     /// The zone name in the header, which is a button (flips `Config::chart_utc`).
     pub zone_btn: Rect,
+    /// The six range tabs on the header's second line, in `Range::ALL` order. `Rect::default()`
+    /// (which contains nothing) for a tab that was not drawn.
+    pub tabs: [Rect; 6],
+    /// The volume strip under the price plot, when a displayed candle has volume. Its `left` and
+    /// `right` are the plot's; time ticks hang under its `bottom`, not under `plot.bottom`.
+    /// `plot` is then the PRICE plot (shortened), so `y_of` and `price_at` mean what they always did.
+    pub vol: Option<Rect>,
 }
 
 impl Layout {
@@ -96,6 +103,17 @@ impl Layout {
         }
         let span_px = ((self.plot.bottom - self.plot.top) as f64).max(1.0);
         Some(self.lo + (self.plot.bottom - y) as f64 / span_px * (self.hi - self.lo))
+    }
+
+    /// The range tab under `(x, y)`, as an index into `Range::ALL`.
+    pub fn tab_at(&self, x: i32, y: i32) -> Option<usize> {
+        self.tabs.iter().position(|t| t.contains(x, y))
+    }
+
+    /// The pixel row the time axis hangs from: the bottom of the volume strip when there is one,
+    /// else the bottom of the plot.
+    pub fn base(&self) -> i32 {
+        self.vol.map_or(self.plot.bottom, |v| v.bottom)
     }
 
     /// The pointer for client position `(x, y)`, or `None` when it is not over a candle's slot inside
@@ -168,9 +186,32 @@ pub fn bar_change_pct(b: &Bar) -> Option<f64> {
 /// `+0.00%`), or nothing when the change is `None`.
 /// `compact`: `"13:35  C 4,150.80  +0.01%"` (time, close, change), for a pane too narrow for the full
 /// line. `fmt` formats a price the way the axis does (the caller passes `fmt_price` with its digits).
+#[cfg(test)]
 pub fn readout(b: &Bar, t0: f64, tz_offset_s: i32, fmt: &dyn Fn(f64) -> String, compact: bool) -> String {
+    readout_with(b, t0, tz_offset_s, fmt, compact, Stamp::Clock)
+}
+
+/// How the legend names a candle's moment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stamp {
+    /// `13:35`: the 1D pane, as it always was.
+    Clock,
+    /// `Nov 12 13:35`: intraday candles over several days (5D).
+    DayClock,
+    /// `Nov 12 2026`: candles of a day or more, which have no time.
+    Day,
+}
+
+/// [`readout`] with the moment named by `stamp` instead of always the clock.
+pub fn readout_with(b: &Bar, t0: f64, tz_offset_s: i32, fmt: &dyn Fn(f64) -> String, compact: bool, stamp: Stamp) -> String {
     let change = bar_change_pct(b).map(|p| format!("  {p:+.2}%")).unwrap_or_default();
-    let time = clock(b.t(t0), tz_offset_s);
+    let t = b.t(t0);
+    let time = match stamp {
+        Stamp::Clock => clock(t, tz_offset_s),
+        Stamp::DayClock => format!("{} {}", date_label(t, tz_offset_s, DateStyle::DayMonth), clock(t, tz_offset_s)),
+        // A bucket of a day or more starts on a boundary that f32 may have put a few seconds early.
+        Stamp::Day => date_label(t + BIAS_S, tz_offset_s, DateStyle::Full),
+    };
     if compact {
         return format!("{time}  C {}{change}", fmt(b.c as f64));
     }
@@ -241,14 +282,39 @@ pub(crate) fn tick_interval(px_per_s: f64, min_px: f64) -> f64 {
 /// wicks, whatever the colour, and an odd width is what lets the wick be exactly the middle pixel.
 pub(crate) const MIN_BAR: i32 = 5;
 
-/// The bars to draw and the bucket they are drawn at: the finest bucket on the ladder whose candles
-/// still have `MIN_BAR` pixels each. Buckets are cut on the clock `tz_offset_s` seconds east of UTC.
+/// A week and a calendar month as bucket sizes. A month is not a fixed length: `MONTH_S` is only the
+/// nominal value that NAMES a calendar-month bucket (`fold` cuts it on the calendar), and `gaps` and
+/// the axis treat anything of a day or more as "no session breaks".
+pub(crate) const DAY_S: f64 = 86_400.0;
+pub(crate) const WEEK_S: f64 = 604_800.0;
+pub(crate) const MONTH_S: f64 = 2_629_800.0;
+/// Candle starts are stored as `f32` offsets, which are 16 s coarse five years out. A bucket of a day
+/// or more is therefore decided 30 s after the instant it names, so a bar stamped exactly on a local
+/// midnight is not filed under the day before.
+const BIAS_S: f64 = 30.0;
+
+/// The finest bucket on the ladder whose candles still have `MIN_BAR` pixels each, at one-minute
+/// bars and no coarser than an hour: the 1D pane. Buckets are cut on the clock `tz_offset_s` seconds
+/// east of UTC.
+#[cfg(test)]
 pub(crate) fn fitted(bars: &[Bar], plot_w: i32, t0: f64, tz_offset_s: i32) -> (Vec<Bar>, f64) {
-    const LADDER: [f64; 5] = [60.0, 300.0, 900.0, 1_800.0, 3_600.0];
-    let (mut best, mut bucket) = (fold(bars, LADDER[0], t0, tz_offset_s), LADDER[0]);
+    fitted_to(bars, plot_w, t0, tz_offset_s, 60.0, 3_600.0)
+}
+
+/// The bucket ladder: 1, 5, 15, 30, 60 minutes, 4 hours, a day, a week, a calendar month.
+pub(crate) const LADDER: [f64; 9] = [60.0, 300.0, 900.0, 1_800.0, 3_600.0, 14_400.0, DAY_S, WEEK_S, MONTH_S];
+
+/// [`fitted`] for data of `bar_s` seconds a bar (the series' inferred spacing; 0 when unknown),
+/// climbing no higher than `coarsest`. The ladder starts at the first rung that is not finer than the
+/// data (a rung within 5 % under `bar_s` counts as equal), so a daily series starts at a day. The
+/// finest rung that fits wins; if none does, `coarsest` is used rather than a comb. If `coarsest` is
+/// finer than the starting rung the starting rung is used.
+pub(crate) fn fitted_to(bars: &[Bar], plot_w: i32, t0: f64, tz_offset_s: i32, bar_s: f64, coarsest: f64) -> (Vec<Bar>, f64) {
+    let from = LADDER.iter().position(|r| *r >= bar_s * 0.95).unwrap_or(LADDER.len() - 1);
+    let (mut best, mut bucket) = (fold(bars, LADDER[from], t0, tz_offset_s), LADDER[from]);
     // The finest bucket that fits wins; if none does, the coarsest is still better than a comb.
     if best.len() as i32 * MIN_BAR > plot_w {
-        for b in &LADDER[1..] {
+        for b in LADDER[from + 1..].iter().take_while(|b| **b <= coarsest) {
             best = fold(bars, *b, t0, tz_offset_s);
             bucket = *b;
             if best.len() as i32 * MIN_BAR <= plot_w {
@@ -259,30 +325,249 @@ pub(crate) fn fitted(bars: &[Bar], plot_w: i32, t0: f64, tz_offset_s: i32) -> (V
     (best, bucket)
 }
 
-/// Fold one-minute bars into `bucket_s`-second candles: the open of the first bar in a bucket, the
-/// extreme high and low of all of them, the close of the last. Buckets are cut on the UTC clock
-/// (`t0` is the absolute time of `dt == 0`), shifted by `tz_offset_s` so a +05:30 zone gets its candles on
-/// local half-hours (0 is the UTC clock, and the output is then exactly what it was before zones), not from the first bar and not by counting bars: a day
-/// that opens at 13:31 still has its five-minute candles start at 13:30, 13:35 ..., which is what the
-/// time axis labels say, and a break in the session stays a gap instead of being papered over.
+/// Which bucket of size `bucket_s` the local instant `local` (seconds on the zone's clock) is in:
+/// `floor(local / bucket_s)`, except a week (cut on Monday) and a calendar month (`year * 12 + month`).
+fn bucket_key(local: f64, bucket_s: f64) -> i64 {
+    if bucket_s >= MONTH_S - 1.0 {
+        let (y, m, _) = civil_from_days(((local + BIAS_S) / DAY_S).floor() as i64);
+        y * 12 + (m as i64 - 1)
+    } else if bucket_s == WEEK_S {
+        // Day 0 (1970-01-01) was a Thursday, so Monday is day 4 and weeks turn over at 7k - 3.
+        let days = ((local + BIAS_S) / DAY_S).floor() as i64;
+        (days + 3).div_euclid(7)
+    } else if bucket_s >= DAY_S {
+        ((local + BIAS_S) / bucket_s).floor() as i64
+    } else {
+        (local / bucket_s).floor() as i64
+    }
+}
+
+/// The local instant a bucket starts at: the inverse of [`bucket_key`] on the boundary itself.
+fn bucket_start(key: i64, bucket_s: f64) -> f64 {
+    if bucket_s >= MONTH_S - 1.0 {
+        days_from_civil(key.div_euclid(12), key.rem_euclid(12) as u32 + 1, 1) as f64 * DAY_S
+    } else if bucket_s == WEEK_S {
+        (key * 7 - 3) as f64 * DAY_S
+    } else {
+        key as f64 * bucket_s
+    }
+}
+
+/// Fold bars into `bucket_s`-second candles: the open of the first bar in a bucket, the extreme high
+/// and low of all of them, the close of the last, the volumes added. Buckets are cut on the UTC clock
+/// (`t0` is the absolute time of `dt == 0`), shifted by `tz_offset_s` so a +05:30 zone gets its
+/// candles on local half-hours (0 is the UTC clock, and the output is then exactly what it was before
+/// zones), not from the first bar and not by counting bars: a day that opens at 13:31 still has its
+/// five-minute candles start at 13:30, which is what the time axis labels say, and a break in the
+/// session stays a gap instead of being papered over. A day is cut on local midnight, a week
+/// ([`WEEK_S`]) on local Monday 00:00, a month ([`MONTH_S`]) on the 1st.
 pub(crate) fn fold(bars: &[Bar], bucket_s: f64, t0: f64, tz_offset_s: i32) -> Vec<Bar> {
     let mut out: Vec<Bar> = Vec::new();
-    let mut key: Option<f64> = None;
+    let mut key: Option<i64> = None;
     let tz = tz_offset_s as f64;
     for b in bars {
-        let k = ((t0 + b.dt as f64 + tz) / bucket_s).floor();
+        let k = bucket_key(t0 + b.dt as f64 + tz, bucket_s);
         if key == Some(k) {
             if let Some(last) = out.last_mut() {
                 last.h = last.h.max(b.h);
                 last.l = last.l.min(b.l);
                 last.c = b.c;
+                last.v += b.v;
                 continue;
             }
         }
         key = Some(k);
-        out.push(Bar { dt: (k * bucket_s - tz - t0) as f32, o: b.o, h: b.h, l: b.l, c: b.c });
+        out.push(Bar { dt: (bucket_start(k, bucket_s) - tz - t0) as f32, o: b.o, h: b.h, l: b.l, c: b.c, v: b.v });
     }
     out
+}
+
+/// Days since 1970-01-01 of the civil date `y-m-d` (proleptic Gregorian; `m` 1..=12).
+pub(crate) fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (m as i64 + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// The civil date `(year, month 1..=12, day 1..=31)` of `days` since 1970-01-01.
+pub(crate) fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (yoe + era * 400 + (m <= 2) as i64, m, d)
+}
+
+const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/// The date forms the axis and the legend use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DateStyle {
+    /// `Nov 12`
+    DayMonth,
+    /// `Oct`
+    Month,
+    /// `2025`
+    Year,
+    /// `Nov 12 2026`
+    Full,
+}
+
+/// The local date of the absolute time `t` (UTC seconds) on the clock `tz_offset_s` east of UTC.
+pub fn date_label(t: f64, tz_offset_s: i32, style: DateStyle) -> String {
+    let (y, m, d) = civil_from_days(((t + tz_offset_s as f64) / DAY_S).floor() as i64);
+    let mon = MONTHS[(m as usize - 1).min(11)];
+    match style {
+        DateStyle::DayMonth => format!("{mon} {d}"),
+        DateStyle::Month => mon.to_string(),
+        DateStyle::Year => y.to_string(),
+        DateStyle::Full => format!("{mon} {d} {y}"),
+    }
+}
+
+/// The local calendar day number (days since 1970-01-01) of `t`; two instants on the same local
+/// date have the same number.
+pub fn local_day(t: f64, tz_offset_s: i32) -> i64 {
+    ((t + tz_offset_s as f64) / DAY_S).floor() as i64
+}
+
+/// Is a series of `bar_s` seconds a bar made of trading DAYS (daily bars or longer) rather than of
+/// instants? The same 5 % tolerance as the bucket ladder.
+pub fn daily(bar_s: f64) -> bool {
+    bar_s >= DAY_S * 0.95
+}
+
+/// The clock offset a series' buckets, axis and legend are read on.
+///
+/// Intraday bars are instants and are read on the viewer's clock (`tz_offset_s`). A daily or longer
+/// bar is a trading day, stamped at midnight on its exchange's clock. That instant is within 12 hours
+/// of the UTC midnight of the same calendar date wherever the exchange is (UTC-12 to UTC+12), so read
+/// 12 hours east of UTC it comes out as the exchange's own date for every viewer. Read on the
+/// viewer's clock instead, every candle would be dated a day early for anyone west of the exchange
+/// (a Tokyo session seen from Manila, a New York one from Los Angeles) and weeks would be cut on the
+/// wrong day. The midnight stamp is an assumption, unverified live: `--probe` prints the stamps.
+pub fn date_zone(bar_s: f64, tz_offset_s: i32) -> i32 {
+    if daily(bar_s) {
+        43_200
+    } else {
+        tz_offset_s
+    }
+}
+
+/// Axis ticks for candles of a day or more: `(candle index, label)` at each candle that starts a new
+/// local month, labelled `Oct` (`2026` for a January, which starts a year). When the month labels
+/// would not fit (two consecutive ticks closer than the widest label plus `gap_px`, with candles
+/// `step_px` apart and `width` measuring a label), only year starts are labelled (`2025`), thinned
+/// from the left so no two are closer than their width plus `gap_px`. With fewer than two ticks
+/// either way (a one-month window) it falls back to `Nov 12` style labels on candles spaced as far
+/// as the labels need. Never labels index 0 as a month start. Candle starts may be a few seconds
+/// early (f32); the date is read 30 s later.
+pub fn date_ticks(bars: &[Bar], t0: f64, tz_offset_s: i32, step_px: i32, width: &dyn Fn(&str) -> i32, gap_px: i32) -> Vec<(usize, String)> {
+    let ymd = |i: usize| civil_from_days(local_day(bars[i].t(t0) + BIAS_S, tz_offset_s));
+    // Keep a tick only when it clears the previous kept one.
+    let thin = |cands: Vec<(usize, String)>| -> Vec<(usize, String)> {
+        let mut out: Vec<(usize, String)> = Vec::new();
+        for (i, label) in cands {
+            let clear = out.last().is_none_or(|(j, prev)| {
+                ((i - j) as i32 * step_px) >= width(prev).max(width(&label)) + gap_px
+            });
+            if clear {
+                out.push((i, label));
+            }
+        }
+        out
+    };
+    let mut months = Vec::new();
+    let mut years = Vec::new();
+    #[allow(clippy::needless_range_loop)] // `i` also names the candle in the result
+    for i in 1..bars.len() {
+        let ((py, pm, _), (y, m, _)) = (ymd(i - 1), ymd(i));
+        if (y, m) != (py, pm) {
+            let t = bars[i].t(t0) + BIAS_S;
+            months.push((i, date_label(t, tz_offset_s, if m == 1 { DateStyle::Year } else { DateStyle::Month })));
+        }
+        if y != py {
+            years.push((i, date_label(bars[i].t(t0) + BIAS_S, tz_offset_s, DateStyle::Year)));
+        }
+    }
+    let kept = thin(months.clone());
+    if kept.len() == months.len() && months.len() >= 2 {
+        return kept;
+    }
+    let yearly = thin(years);
+    if yearly.len() >= 2 {
+        return yearly;
+    }
+    if months.len() >= 2 {
+        return kept;
+    }
+    thin((0..bars.len()).map(|i| (i, date_label(bars[i].t(t0) + BIAS_S, tz_offset_s, DateStyle::DayMonth))).collect())
+}
+
+/// Split a plot into the price plot and, when `has_volume`, a volume strip under it: the strip is the
+/// bottom fifth of `plot`'s height, the price plot is the rest above it, and `gap_px` pixels are left
+/// between them. Without volume the price plot is `plot` itself and there is no strip, so a series
+/// with no volume lays out exactly as before volume existed. A plot too short for both (a strip
+/// under 4 px, or a price plot under 3 times the strip) gets no strip.
+pub fn split_plot(plot: Rect, has_volume: bool, gap_px: i32) -> (Rect, Option<Rect>) {
+    let h = plot.bottom - plot.top;
+    let strip = h / 5;
+    if !has_volume || strip < 4 || h - strip - gap_px < 3 * strip {
+        return (plot, None);
+    }
+    let price = Rect { bottom: plot.bottom - strip - gap_px, ..plot };
+    (price, Some(Rect { top: plot.bottom - strip, ..plot }))
+}
+
+/// The pixel height of a volume bar: 0 for `v` that is not positive and finite (or `max` that is
+/// not), at least 1 for any positive volume, at most `strip_h`, linear in between.
+pub fn volume_px(v: f32, max: f32, strip_h: i32) -> i32 {
+    if !(v > 0.0 && v.is_finite() && max > 0.0 && max.is_finite()) || strip_h < 1 {
+        return 0;
+    }
+    (((v / max) as f64 * strip_h as f64).round() as i32).clamp(1, strip_h)
+}
+
+/// The header's name for a candle size: `1 m` .. `1 h`, `4 h`, `1 d`, `1 w`, `1 mo`.
+pub fn bucket_name(bucket_s: f64) -> &'static str {
+    match bucket_s as i64 {
+        60 => "1 m",
+        300 => "5 m",
+        900 => "15 m",
+        1_800 => "30 m",
+        3_600 => "1 h",
+        14_400 => "4 h",
+        86_400 => "1 d",
+        604_800 => "1 w",
+        b if b >= MONTH_S as i64 - 1 => "1 mo",
+        _ => "1 h",
+    }
+}
+
+/// Does a pane at candles of `bucket_s` mark session breaks? Only for candles shorter than a day:
+/// every weekend is not a break.
+pub fn marks_breaks(bucket_s: f64) -> bool {
+    bucket_s < DAY_S
+}
+
+/// What the legend names a candle with: the date alone for candles of a day or more, the clock alone
+/// on the 1D pane (`is_1d`), date and clock on the other intraday ranges.
+pub fn stamp_for(is_1d: bool, bucket_s: f64) -> Stamp {
+    if bucket_s >= DAY_S {
+        Stamp::Day
+    } else if is_1d {
+        Stamp::Clock
+    } else {
+        Stamp::DayClock
+    }
 }
 
 /// HH:MM on the clock `tz_offset_s` seconds east of UTC, for the absolute time `t` (UTC seconds).
@@ -302,7 +587,7 @@ mod tests {
         let bars: Vec<Bar> = (0..390)
             .map(|i| {
                 let o = 100.0 + (i as f32 % 7.0);
-                Bar { dt: (i * 60) as f32, o, h: o + 1.0, l: o - 1.0, c: o + 0.5 }
+                Bar { dt: (i * 60) as f32, o, h: o + 1.0, l: o - 1.0, c: o + 0.5, v: 0.0 }
             })
             .collect();
         // 390 bars in 650 px is 1.6 px a bar: fold to five minutes, 78 of them at 8 px.
@@ -322,10 +607,10 @@ mod tests {
     #[test]
     fn a_break_in_the_session_is_not_closed_by_folding() {
         let bars = vec![
-            Bar { dt: 0.0, o: 1.0, h: 1.0, l: 1.0, c: 1.0 },
-            Bar { dt: 60.0, o: 1.0, h: 1.0, l: 1.0, c: 1.0 },
+            Bar { dt: 0.0, o: 1.0, h: 1.0, l: 1.0, c: 1.0, v: 0.0 },
+            Bar { dt: 60.0, o: 1.0, h: 1.0, l: 1.0, c: 1.0, v: 0.0 },
             // An hour later: the market was shut, and five-minute buckets must not merge across it.
-            Bar { dt: 3_660.0, o: 2.0, h: 2.0, l: 2.0, c: 2.0 },
+            Bar { dt: 3_660.0, o: 2.0, h: 2.0, l: 2.0, c: 2.0, v: 0.0 },
         ];
         let folded = fold(&bars, 300.0, 0.0, 0);
         assert_eq!(folded.len(), 2);
@@ -337,7 +622,7 @@ mod tests {
         // A session that opens at 13:31:00 UTC: `dt` counts from there, `t0` places it on the clock.
         let t0 = 13.0 * 3_600.0 + 31.0 * 60.0 + 86_400.0 * 20_000.0;
         let bars: Vec<Bar> = (0..14)
-            .map(|i| Bar { dt: (i * 60) as f32, o: i as f32, h: i as f32 + 1.0, l: i as f32 - 1.0, c: i as f32 })
+            .map(|i| Bar { dt: (i * 60) as f32, o: i as f32, h: i as f32 + 1.0, l: i as f32 - 1.0, c: i as f32, v: 0.0 })
             .collect();
         let folded = fold(&bars, 300.0, t0, 0);
         // 13:31-13:34 | 13:35-13:39 | 13:40-13:44: three candles, cut at :30 / :35 / :40, not at :31.
@@ -418,6 +703,8 @@ mod tests {
             hi: 200.0,
             bucket_s: 300.0,
             zone_btn: Rect::new(60, 12, 100, 28),
+            tabs: [Rect::default(); 6],
+            vol: None,
         }
     }
 
@@ -464,7 +751,7 @@ mod tests {
     }
 
     fn bar(dt: f32, o: f32, h: f32, l: f32, c: f32) -> Bar {
-        Bar { dt, o, h, l, c }
+        Bar { dt, o, h, l, c, v: 0.0 }
     }
 
     fn two_decimals(v: f64) -> String {
@@ -499,6 +786,7 @@ mod tests {
                 h: g.iter().fold(f32::MIN, |m, b| m.max(b.h)),
                 l: g.iter().fold(f32::MAX, |m, b| m.min(b.l)),
                 c: g[g.len() - 1].c,
+                v: g.iter().map(|b| b.v).sum(),
             })
             .collect()
     }
@@ -741,6 +1029,8 @@ mod tests {
             hi: 6_733.0,
             bucket_s: 300.0,
             zone_btn: Rect::default(),
+            tabs: [Rect::default(); 6],
+            vol: None,
         }
     }
 
@@ -820,5 +1110,265 @@ mod tests {
     fn the_zone_button_is_a_hit_rectangle() {
         let z = lay().zone_btn;
         assert!(z.contains(z.left, z.top) && !z.contains(z.right, z.top) && !z.contains(z.left, z.bottom));
+    }
+
+    // ---- ranges and volume (P4) ----
+
+    #[test]
+    fn civil_dates_round_trip_and_know_the_calendar() {
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(days_from_civil(1970, 1, 1), 0);
+        assert_eq!(days_from_civil(2000, 3, 1), 11_017);
+        assert_eq!(civil_from_days(11_016), (2000, 2, 29), "2000 was a leap year");
+        assert_eq!(civil_from_days(days_from_civil(2100, 3, 1) - 1), (2100, 2, 28), "2100 was not");
+        for d in (-800_000..800_000).step_by(997) {
+            let (y, m, dd) = civil_from_days(d);
+            assert_eq!(days_from_civil(y, m, dd), d);
+        }
+    }
+
+    #[test]
+    fn days_weeks_and_months_are_cut_on_the_local_calendar() {
+        // 2026-10-15 (a Thursday) 12:00 UTC, one bar a day for 70 days.
+        let t0 = days_from_civil(2026, 10, 15) as f64 * DAY_S + 12.0 * 3_600.0;
+        let bars: Vec<Bar> = (0..70).map(|i| bar((i as f32) * 86_400.0, i as f32, i as f32 + 1.0, i as f32 - 1.0, i as f32 + 0.5)).collect();
+        // Weeks begin on Monday: the first bucket is Mon 2026-10-12 and holds Thu, Fri, Sat, Sun.
+        let weeks = fold(&bars, WEEK_S, t0, 0);
+        let start = weeks[0].t(t0);
+        assert_eq!(civil_from_days(local_day(start, 0)), (2026, 10, 12));
+        assert_eq!(((local_day(start, 0) + 3) % 7), 0, "a Monday");
+        assert_eq!((weeks[0].o, weeks[0].c), (0.0, 3.5));
+        assert_eq!(weeks[1].o, 4.0, "Monday 2026-10-19 is bar 4");
+        // Months are cut on the 1st: October holds bars 0..=16, November starts at bar 17.
+        let months = fold(&bars, MONTH_S, t0, 0);
+        assert_eq!(civil_from_days(local_day(months[0].t(t0), 0)), (2026, 10, 1));
+        assert_eq!(civil_from_days(local_day(months[1].t(t0), 0)), (2026, 11, 1));
+        assert_eq!(months[1].o, 17.0);
+        assert_eq!(months.len(), 3, "Oct, Nov and Dec");
+        // A +05:30 zone moves local midnight: 12:00 UTC is 17:30 local, still the same day, but a bar
+        // at 20:00 UTC would be the next local day.
+        let days = fold(&bars, DAY_S, t0, 19_800);
+        assert_eq!(days.len(), 70);
+        assert_eq!((t0 + days[0].dt as f64 + 19_800.0) % DAY_S, 0.0, "on a local midnight");
+        // 17:00 and 19:00 UTC are 22:30 and 00:30 at +05:30: two local days.
+        let late = [bar(5.0 * 3_600.0, 1.0, 1.0, 1.0, 1.0), bar(7.0 * 3_600.0, 2.0, 2.0, 2.0, 2.0)];
+        assert_eq!(fold(&late, DAY_S, t0, 19_800).len(), 2);
+        assert_eq!(fold(&late, DAY_S, t0, 0).len(), 1);
+    }
+
+    #[test]
+    fn a_bar_exactly_on_a_local_midnight_stays_on_that_day_despite_f32() {
+        // Five years out the f32 offset is 16 s coarse; the day must still be the right one.
+        let t0 = days_from_civil(2021, 11, 15) as f64 * DAY_S;
+        let dt = (5.0 * 365.0 * DAY_S) as f32;
+        let b = [Bar { dt: dt - 8.0, o: 1.0, h: 1.0, l: 1.0, c: 1.0, v: 0.0 }];
+        let day = fold(&b, DAY_S, t0, 0);
+        assert_eq!(local_day(day[0].t(t0) + 30.0, 0), local_day(t0 + dt as f64, 0));
+    }
+
+    #[test]
+    fn the_ladder_never_goes_finer_than_the_data() {
+        let daily: Vec<Bar> = (0..250).map(|i| bar(i as f32 * 86_400.0, 1.0, 2.0, 0.5, 1.5)).collect();
+        // 250 daily bars at 5 px each is 1,250 px: a 650 px plot gets weeks (36 x 5 = 180).
+        let (c, b) = fitted_to(&daily, 650, 0.0, 0, 86_400.0, MONTH_S);
+        assert_eq!(b, WEEK_S);
+        assert!(c.len() <= 130);
+        let (_, b) = fitted_to(&daily, 2_000, 0.0, 0, 86_400.0, MONTH_S);
+        assert_eq!(b, DAY_S, "room for days: days, not minutes");
+        // Weekly data starts at a week; a narrow plot climbs to a month.
+        let weekly: Vec<Bar> = (0..260).map(|i| bar(i as f32 * WEEK_S as f32, 1.0, 2.0, 0.5, 1.5)).collect();
+        assert_eq!(fitted_to(&weekly, 2_000, 0.0, 0, WEEK_S, MONTH_S).1, WEEK_S);
+        assert_eq!(fitted_to(&weekly, 650, 0.0, 0, WEEK_S, MONTH_S).1, MONTH_S);
+        // The 1D wrapper keeps its old ladder: nothing coarser than an hour.
+        assert_eq!(fitted(&minute_day(), 0, 0.0, 0).1, 3_600.0);
+    }
+
+    #[test]
+    fn volume_is_summed_when_candles_fold() {
+        let bars: Vec<Bar> = (0..10).map(|i| Bar { dt: i as f32 * 60.0, o: 1.0, h: 1.0, l: 1.0, c: 1.0, v: 10.0 }).collect();
+        let folded = fold(&bars, 300.0, 0.0, 0);
+        assert_eq!(folded.iter().map(|b| b.v).collect::<Vec<_>>(), [10.0 * 5.0, 10.0 * 5.0]);
+    }
+
+    #[test]
+    fn the_volume_strip_is_the_bottom_fifth_and_price_still_round_trips() {
+        let plot = Rect::new(20, 50, 320, 250);
+        let (price, vol) = split_plot(plot, true, 3);
+        let vol = vol.expect("a strip");
+        assert_eq!((vol.top, vol.bottom, vol.left, vol.right), (210, 250, 20, 320));
+        assert_eq!(price, Rect::new(20, 50, 320, 207));
+        assert_eq!(split_plot(plot, false, 3), (plot, None), "no volume, no change");
+        assert_eq!(split_plot(Rect::new(0, 0, 100, 15), true, 3).1, None, "too short for both");
+        let mut l = lay();
+        l.plot = price;
+        l.vol = Some(vol);
+        assert_eq!(l.base(), 250);
+        let per_px = (l.hi - l.lo) / (price.bottom - price.top) as f64;
+        for p in [100.0, 133.3, 199.9] {
+            assert!((l.price_at(l.y_of(p)).unwrap() - p).abs() <= per_px);
+        }
+        assert_eq!(l.price_at(vol.top), None, "the strip is not the price plot");
+        assert_eq!(volume_px(0.0, 10.0, 40), 0);
+        assert_eq!(volume_px(f32::NAN, 10.0, 40), 0);
+        assert_eq!(volume_px(0.001, 10.0, 40), 1, "any volume shows");
+        assert_eq!(volume_px(10.0, 10.0, 40), 40);
+        assert_eq!(volume_px(5.0, 10.0, 40), 20);
+    }
+
+    #[test]
+    fn date_ticks_take_months_then_years_then_days() {
+        let t0 = days_from_civil(2026, 1, 1) as f64 * DAY_S;
+        let at = |days: &[i64]| -> Vec<Bar> { days.iter().map(|d| bar((*d as f64 * DAY_S) as f32, 1.0, 1.0, 1.0, 1.0)).collect() };
+        let w = |s: &str| s.len() as i32 * 7;
+        // Daily bars across Oct-Dec 2026 at 4 px a bar: month starts, labelled by name.
+        let t0b = days_from_civil(2026, 10, 1) as f64 * DAY_S;
+        let all: Vec<i64> = (0..92).collect();
+        let ticks = date_ticks(&at(&all), t0b, 0, 8, &w, 8);
+        assert_eq!(ticks.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>(), ["Nov", "Dec"]);
+        assert_eq!(ticks[0].0, 31);
+        // A January is labelled with its year.
+        let t0c = days_from_civil(2026, 12, 1) as f64 * DAY_S;
+        let ticks = date_ticks(&at(&(0..70).collect::<Vec<_>>()), t0c, 0, 8, &w, 8);
+        assert_eq!(ticks.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>(), ["2027", "Feb"]);
+        // Months too close for their labels: years only.
+        let weekly: Vec<i64> = (0..260).map(|i| i * 7).collect();
+        let ticks = date_ticks(&at(&weekly), t0, 0, 1, &w, 8);
+        assert!(ticks.iter().all(|(_, l)| l.len() == 4), "{ticks:?}");
+        // A window inside one month: dates, spaced by their width.
+        let ticks = date_ticks(&at(&(0..20).collect::<Vec<_>>()), t0, 0, 10, &w, 8);
+        assert!(ticks.len() >= 2 && ticks[0].1 == "Jan 1", "{ticks:?}");
+        assert!(date_ticks(&[], t0, 0, 8, &w, 8).is_empty());
+    }
+
+    #[test]
+    fn dates_read_in_the_zone() {
+        let t = days_from_civil(2026, 11, 12) as f64 * DAY_S + 23.0 * 3_600.0;
+        assert_eq!(date_label(t, 0, DateStyle::DayMonth), "Nov 12");
+        assert_eq!(date_label(t, 7_200, DateStyle::DayMonth), "Nov 13", "23:00 UTC is already tomorrow at +02:00");
+        assert_eq!(date_label(t, 0, DateStyle::Month), "Nov");
+        assert_eq!(date_label(t, 0, DateStyle::Year), "2026");
+        assert_eq!(date_label(t, 0, DateStyle::Full), "Nov 12 2026");
+        assert_eq!(bucket_name(DAY_S), "1 d");
+        assert_eq!(bucket_name(WEEK_S), "1 w");
+        assert_eq!(bucket_name(MONTH_S), "1 mo");
+        assert_eq!(bucket_name(300.0), "5 m");
+        assert!(marks_breaks(3_600.0) && !marks_breaks(DAY_S));
+    }
+
+    #[test]
+    fn the_legend_dates_long_candles() {
+        // 12 Nov 2026 13:35 UTC.
+        let t0 = days_from_civil(2026, 11, 12) as f64 * DAY_S + 13.0 * 3_600.0 + 35.0 * 60.0;
+        let b = bar(0.0, 4_150.2, 4_151.0, 4_149.5, 4_150.8);
+        let dm = readout_with(&b, t0, 0, &two_decimals, false, Stamp::DayClock);
+        assert!(dm.starts_with("Nov 12 13:35  O 4150.20"), "{dm}");
+        let day = readout_with(&b, t0, 0, &two_decimals, false, Stamp::Day);
+        assert!(day.starts_with("Nov 12 2026  O 4150.20"), "{day}");
+        assert!(!day.contains(':'), "a day has no clock: {day}");
+        assert_eq!(readout_with(&b, t0, 0, &two_decimals, false, Stamp::Clock), readout(&b, t0, 0, &two_decimals, false));
+        // The zone moves the date too: 13:35 UTC at +11:00 is 00:35 on the 13th.
+        assert!(readout_with(&b, t0, 11 * 3_600, &two_decimals, false, Stamp::DayClock).starts_with("Nov 13 00:35"));
+        // Which stamp a range gets.
+        assert_eq!(stamp_for(true, 300.0), Stamp::Clock);
+        assert_eq!(stamp_for(false, 900.0), Stamp::DayClock);
+        assert_eq!(stamp_for(false, DAY_S), Stamp::Day);
+        assert_eq!(stamp_for(false, WEEK_S), Stamp::Day);
+    }
+
+    #[test]
+    fn a_series_with_no_volume_lays_out_as_before() {
+        let plot = Rect::new(20, 50, 320, 150);
+        // Without volume the plot is untouched, whatever the gap.
+        assert_eq!(split_plot(plot, false, 3), (plot, None));
+        let mut l = layout_for(300, 20, 96);
+        l.plot = plot;
+        l.vol = None;
+        assert_eq!(l.base(), plot.bottom, "the time axis hangs from the plot");
+        // Volume-less bars fold to zero volume everywhere.
+        let bars: Vec<Bar> = (0..10).map(|i| bar(i as f32 * 60.0, 1.0, 2.0, 0.5, 1.5)).collect();
+        let folded = fold(&bars, 300.0, 0.0, 0);
+        assert!(!folded.is_empty());
+        assert!(folded.iter().all(|b| b.v == 0.0));
+        // And with volume the strip takes the bottom fifth, and base() follows it.
+        let (price, strip) = split_plot(plot, true, 3);
+        let strip = strip.expect("a strip when there is volume");
+        assert_eq!(strip.bottom, plot.bottom);
+        assert_eq!(price.bottom, strip.top - 3);
+        l.plot = price;
+        l.vol = Some(strip);
+        assert_eq!(l.base(), plot.bottom);
+    }
+
+    #[test]
+    fn tab_at_finds_the_tab_under_the_pointer() {
+        let mut l = layout_for(300, 20, 96);
+        // Six adjacent rectangles, 10 px wide.
+        for i in 0..6 {
+            l.tabs[i] = Rect::new(i as i32 * 10, 0, i as i32 * 10 + 10, 10);
+        }
+        for i in 0..6 {
+            let x = i as i32 * 10;
+            assert_eq!(l.tab_at(x, 0), Some(i), "left edge of tab {i}");
+            assert_eq!(l.tab_at(x + 9, 9), Some(i), "last pixel of tab {i}");
+        }
+        assert_eq!(l.tab_at(60, 5), None, "right of the last tab");
+        assert_eq!(l.tab_at(5, 10), None, "below the tabs");
+        assert_eq!(l.tab_at(-1, 5), None, "left of the first tab");
+        // With a gap between them, the gap belongs to no tab.
+        for i in 0..6 {
+            l.tabs[i] = Rect::new(i as i32 * 12, 0, i as i32 * 12 + 10, 10);
+        }
+        assert_eq!(l.tab_at(10, 5), None, "the gap");
+        assert_eq!(l.tab_at(12, 5), Some(1));
+        // A default Rect (a tab not drawn) hits nothing.
+        l.tabs = [Rect::default(); 6];
+        assert_eq!(l.tab_at(0, 0), None);
+    }
+
+    #[test]
+    fn daily_bars_are_dated_by_their_exchange_not_by_the_viewer() {
+        let nov12 = days_from_civil(2026, 11, 12) as f64 * DAY_S;
+        // The same trading day stamped at midnight in New York (05:00 UTC), Tokyo (15:00 UTC the day
+        // before), London (00:00 UTC) and Auckland in winter (12:00 UTC the day before).
+        for stamp in [nov12 + 5.0 * 3_600.0, nov12 - 9.0 * 3_600.0, nov12, nov12 - 12.0 * 3_600.0] {
+            for viewer in [-8 * 3_600, 0, 8 * 3_600] {
+                let zone = date_zone(DAY_S, viewer);
+                assert_eq!(date_label(stamp, zone, DateStyle::Full), "Nov 12 2026", "stamp {stamp} viewer {viewer}");
+            }
+        }
+        // Weekly bars count as daily-or-longer; a daily series a shade under 24 h (the tolerance) too.
+        assert_eq!(date_zone(WEEK_S, -8 * 3_600), 43_200);
+        assert!(daily(DAY_S * 0.96) && !daily(DAY_S * 0.9));
+        // Intraday bars are instants: the viewer's clock, whatever it is.
+        for viewer in [-8 * 3_600, 0, 19_800] {
+            assert_eq!(date_zone(60.0, viewer), viewer);
+            assert_eq!(date_zone(14_400.0, viewer), viewer);
+        }
+        assert_eq!(date_zone(0.0, 3_600), 3_600, "unknown spacing is treated as intraday");
+    }
+
+    #[test]
+    fn a_week_of_daily_bars_is_one_candle_for_a_viewer_west_of_the_exchange() {
+        // Two weeks of New York daily bars (Mon Nov 2 .. Fri Nov 13 2026), each stamped 05:00 UTC.
+        let mon = days_from_civil(2026, 11, 2);
+        assert_eq!((mon + 3).rem_euclid(7), 0, "Nov 2 2026 is a Monday");
+        let t0 = mon as f64 * DAY_S + 5.0 * 3_600.0;
+        let bars: Vec<Bar> = (0..12)
+            .filter(|d| d % 7 < 5)
+            .map(|d| Bar { dt: d as f32 * 86_400.0, o: 1.0, h: 2.0, l: 0.5, c: 1.5, v: 10.0 })
+            .collect();
+        assert_eq!(bars.len(), 10);
+        let viewer = -8 * 3_600; // Los Angeles: 05:00 UTC is 21:00 the evening before
+        let weeks = fold(&bars, WEEK_S, t0, date_zone(DAY_S, viewer));
+        assert_eq!(weeks.len(), 2, "Monday to Friday is one candle");
+        assert_eq!(weeks[0].v, 50.0);
+        assert_eq!(weeks[1].v, 50.0);
+        // The viewer's own clock would have filed each Monday under the week before: three candles.
+        assert_eq!(fold(&bars, WEEK_S, t0, viewer).len(), 3);
+        // And each daily candle keeps its exchange date.
+        let days = fold(&bars, DAY_S, t0, date_zone(DAY_S, viewer));
+        assert_eq!(days.len(), 10);
+        assert_eq!(date_label(days[0].t(t0) + BIAS_S, date_zone(DAY_S, viewer), DateStyle::Full), "Nov 2 2026");
+        assert_eq!(date_label(days[9].t(t0) + BIAS_S, date_zone(DAY_S, viewer), DateStyle::Full), "Nov 13 2026");
     }
 }

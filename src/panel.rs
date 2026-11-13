@@ -16,7 +16,8 @@
 //! text uses (`day_open`), so the number and the line can no longer disagree.
 
 use crate::config::Row;
-use crate::chartview::{self, candle_metrics, clock, fitted, nice_ticks, tick_interval, Layout, Pointer};
+use crate::chartview::{self, candle_metrics, clock, nice_ticks, tick_interval, Layout, Pointer};
+use crate::ranges::{Range, Status};
 use crate::model::{fmt_change, fmt_price, Bar, Board, Cell};
 use crate::theme::{Gradient, Theme};
 use crate::workspace;
@@ -495,6 +496,15 @@ pub struct Chart<'a> {
     pub bars: &'a [Bar],
     pub last: Option<f64>,
     pub unavailable: bool,
+    /// The range shown. With `D1` the bars are the board's day; otherwise the series' window.
+    pub range: Range,
+    /// What to say while `bars` is empty: loading, failed, or no data. `Ready` otherwise.
+    pub status: Status,
+    /// Seconds one bar lasts (the series' inferred spacing; 60 for 1D). The fold never goes finer.
+    pub bar_s: f64,
+    /// Draw the range tabs and store them in the layout. False reproduces the pane from before
+    /// ranges (the shot fixture's default).
+    pub tabs: bool,
     /// Seconds east of UTC the pane's clock runs on (0 = UTC). Candles are cut and labelled on it.
     pub tz_offset_s: i32,
     /// The zone's name as the header shows it ("local" or "UTC"); it is the click target that flips it.
@@ -1022,18 +1032,48 @@ fn candles(dc: HDC, sc: &Scene, r: RECT, c: &Chart) {
     let s = |v: i32| v * sc.dpi as i32 / 96;
     let radius = if t.is_pixel() { 0 } else { s(12) };
     fill_round(dc, r, radius, t.card);
+    let lh = line_height(dc, sc.fonts.small);
+    // The range tabs are on the header's second line in every state that names a card, so the way out
+    // of "loading" or "could not load" is always a tab that still works. A pane with no tabs
+    // (`Chart::tabs` false: the shot fixture's default) is exactly the pane from before ranges.
+    let show_tabs = c.tabs && !c.label.is_empty();
+    let tabs = if show_tabs { range_tabs(dc, sc, r, c, lh) } else { [chartview::Rect::default(); 6] };
+    if show_tabs {
+        // Until the plot is laid out below, the tabs are all there is to hit.
+        sc.layout.set(Some(Layout {
+            pane: chartview::Rect::new(r.left, r.top, r.right, r.bottom),
+            plot: chartview::Rect::default(),
+            step: 1,
+            body: 1,
+            wick: 1,
+            bars: 0,
+            lo: 0.0,
+            hi: 0.0,
+            bucket_s: 60.0,
+            zone_btn: chartview::Rect::default(),
+            tabs,
+            vol: None,
+        }));
+    }
     if c.bars.is_empty() {
         // Named even when empty: a bare rectangle could be any pane, and the reason it is empty is
         // the one thing the reader wants to know.
         text(dc, sc.fonts.small, r.left + s(12), r.top + s(8), c.label, t.label);
         let why = if c.label.is_empty() {
-            "select a card to chart it"
+            "select a card to chart it".to_string()
         } else if c.unavailable {
-            "chart unavailable for this source"
+            "chart unavailable for this source".to_string()
         } else {
-            "waiting for the day's bars"
+            match (c.range, c.status) {
+                (Range::D1, _) => "waiting for the day's bars".to_string(),
+                (rg, Status::Loading) => format!("loading {}", rg.label()),
+                (rg, Status::Failed) => format!("could not load {}, retrying", rg.label()),
+                (_, _) => "no data for this range".to_string(),
+            }
         };
-        text(dc, sc.fonts.small, r.left + s(12), r.top + s(28), why, t.dim);
+        // Clear of the tabs when there are any; where it always was when there are none.
+        let wy = if show_tabs { r.top + s(56) } else { r.top + s(28) };
+        text(dc, sc.fonts.small, r.left + s(12), wy, &why, t.dim);
         return;
     }
     // The price axis is as wide as the widest label it will carry, so a six-figure price is not
@@ -1046,21 +1086,26 @@ fn candles(dc: HDC, sc: &Scene, r: RECT, c: &Chart) {
     }
     let widest = [lo, hi, last].iter().map(|v| text_width(dc, sc.fonts.small, &fmt_price(*v, c.digits))).max().unwrap_or(0);
     // The header is two lines: the pane's name, the day's change and the last price on the first, and
-    // a line of its own for the hover legend on the second, so the legend never has to share a row
-    // with (or replace) the label, the zone button or the price. The line is reserved even while
-    // nothing is hovered, so the plot does not jump when the pointer arrives.
-    let plot = RECT { left: r.left + s(12), top: r.top + s(50), right: r.right - widest - s(22), bottom: r.bottom - s(24) };
-    if plot.right - plot.left < s(40) || plot.bottom - plot.top < s(30) {
+    // a line of its own for the hover legend (and the range tabs) on the second, so the legend never
+    // has to share a row with (or replace) the label, the zone button or the price. The line is
+    // reserved even while nothing is hovered, so the plot does not jump when the pointer arrives.
+    let full = RECT { left: r.left + s(12), top: r.top + s(50), right: r.right - widest - s(22), bottom: r.bottom - s(24) };
+    if full.right - full.left < s(40) || full.bottom - full.top < s(30) {
         return;
     }
-    let (bars, bucket) = fitted(c.bars, plot.right - plot.left, c.t0, c.tz_offset_s);
-    let span = match bucket as i64 {
-        60 => "1 m",
-        300 => "5 m",
-        900 => "15 m",
-        1_800 => "30 m",
-        _ => "1 h",
-    };
+    // The clock the buckets, the axis and the legend are read on: the viewer's for intraday bars, the
+    // exchange's own date for daily and longer ones (see `chartview::date_zone`).
+    let zone = chartview::date_zone(c.bar_s, c.tz_offset_s);
+    // 1D folds minutes into at most hours, as it always has; the long ranges start at the series' own
+    // spacing and climb to a month.
+    let coarsest = if c.range == Range::D1 { 3_600.0 } else { chartview::MONTH_S };
+    let (bars, bucket) = chartview::fitted_to(c.bars, full.right - full.left, c.t0, zone, c.bar_s, coarsest);
+    let span = chartview::bucket_name(bucket);
+    // Volume: when any drawn candle has some, the bottom fifth of the plot is a strip for it and the
+    // price plot is that much shorter. No volume anywhere: no strip, and `plot == full`.
+    let has_volume = bars.iter().any(|b| b.v > 0.0);
+    let (price_plot, vol) = chartview::split_plot(chartview::Rect::new(full.left, full.top, full.right, full.bottom), has_volume, s(3));
+    let plot = RECT { left: price_plot.left, top: price_plot.top, right: price_plot.right, bottom: price_plot.bottom };
     if hi <= lo {
         // Every bar identical: give it a window anyway, or the division below is by zero. (A bar
         // price is parsed from JSON, so it cannot be NaN; `<=` and `!(> )` mean the same here.)
@@ -1070,16 +1115,22 @@ fn candles(dc: HDC, sc: &Scene, r: RECT, c: &Chart) {
     }
     let pad = (hi - lo) * 0.08;
     let (lo, hi) = (lo - pad, hi + pad);
-    let lh = line_height(dc, sc.fonts.small);
 
     // Header, first line. What is charted, at what resolution, in which time zone (the zone name is
     // a button: it is underlined, and its rectangle goes into the layout for the click), the day's
     // change, and where it last traded.
     let (hx, hy) = (r.left + s(12), r.top + s(8));
-    let hw = text(dc, sc.fonts.small, hx, hy, &format!("{} \u{b7} {span} \u{b7} ", c.label), t.label);
-    let zw = text(dc, sc.fonts.small, hx + hw, hy, c.tz_label, t.accent);
-    fill_rect(dc, RECT { left: hx + hw, top: hy + lh, right: hx + hw + zw, bottom: hy + lh + 1 }, t.accent);
-    let zone_btn = chartview::Rect::new(hx + hw - s(4), r.top + s(4), hx + hw + zw + s(4), hy + lh + s(4));
+    // Daily and longer candles are trading days, not instants: they have no zone to name or to switch,
+    // so the header ends at the candle size and there is no button (an empty rectangle is never hit).
+    let zone_btn = if chartview::daily(c.bar_s) {
+        text(dc, sc.fonts.small, hx, hy, &format!("{} \u{b7} {span}", c.label), t.label);
+        chartview::Rect::default()
+    } else {
+        let hw = text(dc, sc.fonts.small, hx, hy, &format!("{} \u{b7} {span} \u{b7} ", c.label), t.label);
+        let zw = text(dc, sc.fonts.small, hx + hw, hy, c.tz_label, t.accent);
+        fill_rect(dc, RECT { left: hx + hw, top: hy + lh, right: hx + hw + zw, bottom: hy + lh + 1 }, t.accent);
+        chartview::Rect::new(hx + hw - s(4), r.top + s(4), hx + hw + zw + s(4), hy + lh + s(4))
+    };
     let price_text = fmt_price(last, c.digits);
     let pw = text_width(dc, sc.fonts.mid, &price_text);
     text_right(dc, sc.fonts.mid, r.right - s(12), r.top + s(6), &price_text, t.price);
@@ -1107,6 +1158,8 @@ fn candles(dc: HDC, sc: &Scene, r: RECT, c: &Chart) {
         hi,
         bucket_s: bucket,
         zone_btn,
+        tabs,
+        vol,
     };
     // Coloured by the day's direction, the same one the header and the card report. Only when the
     // day's change is unknown does it fall back to the bars: the last close against the first open.
@@ -1130,45 +1183,75 @@ fn candles(dc: HDC, sc: &Scene, r: RECT, c: &Chart) {
         }
     }
 
-    // Time ticks on round clock times, short marks under the plot and a label centred on each.
-    let step_s = bucket;
-    let tz = c.tz_offset_s as f64;
-    let label_w = text_width(dc, sc.fonts.small, "00:00");
-    let every = tick_interval(step as f64 / step_s, (label_w + s(28)) as f64);
-    let mut prev_key = None;
-    let mut last_label_right = i32::MIN;
-    for (i, b) in bars.iter().enumerate() {
-        let tb = b.t(c.t0);
-        let key = ((tb + tz) / every).floor();
-        let crossed = prev_key.is_some_and(|k| k != key);
-        prev_key = Some(key);
-        if !crossed {
-            continue;
+    // Time ticks hang from the bottom of the plot, or of the volume strip when there is one. Every
+    // tick gets its mark; a label is placed only where it clears the labels already placed, and the
+    // date labels (a new day on the long intraday range) are placed first, so a clock label beside a
+    // day boundary gives way to the date and not the other way round.
+    let base = lay.base();
+    let tz = zone as f64;
+    let mut ticks: Vec<(i32, String, bool)> = Vec::new();
+    if bucket >= chartview::DAY_S {
+        // Candles of a day or more: month starts ("Oct"), or year starts ("2025") when the months
+        // would not fit, or dates when the window is under two months.
+        let measure = |label: &str| text_width(dc, sc.fonts.small, label);
+        for (i, label) in chartview::date_ticks(&bars, c.t0, zone, step, &measure, s(8)) {
+            ticks.push((lay.x_of(i), label, false));
         }
-        let x = lay.x_of(i);
-        fill_rect(dc, RECT { left: x, top: plot.bottom, right: x + 1, bottom: plot.bottom + s(4) }, t.guide);
-        // The bar's own start, which is the boundary itself except after a break in the session
-        // (a market reopening at 23:15 is labelled 23:15, not a 23:00 it did not trade at).
-        let label = clock(tb, c.tz_offset_s);
-        let w = text_width(dc, sc.fonts.small, &label);
-        let lx = (x - w / 2).clamp(plot.left, (plot.right - w).max(plot.left));
-        if lx > last_label_right + s(8) {
-            text(dc, sc.fonts.small, lx, plot.bottom + s(6), &label, t.label);
-            last_label_right = lx + w;
+    } else {
+        // Round clock times, short marks under the plot and a label centred on each. On the long
+        // intraday range the first tick of a local day is labelled with the date instead.
+        let label_w = text_width(dc, sc.fonts.small, "00:00");
+        let every = tick_interval(step as f64 / bucket, (label_w + s(28)) as f64);
+        let (mut prev_key, mut prev_day) = (None, None);
+        for (i, b) in bars.iter().enumerate() {
+            let tb = b.t(c.t0);
+            let key = ((tb + tz) / every).floor();
+            let crossed = prev_key.is_some_and(|k| k != key);
+            prev_key = Some(key);
+            let day = chartview::local_day(tb, zone);
+            let new_day = c.range != Range::D1 && prev_day.is_some_and(|d| d != day);
+            if !crossed {
+                continue;
+            }
+            prev_day = Some(day);
+            // The bar's own start, which is the boundary itself except after a break in the session
+            // (a market reopening at 23:15 is labelled 23:15, not a 23:00 it did not trade at).
+            let label = if new_day { chartview::date_label(tb, zone, chartview::DateStyle::DayMonth) } else { clock(tb, zone) };
+            ticks.push((lay.x_of(i), label, new_day));
         }
+    }
+    let mut placed: Vec<(i32, i32)> = Vec::new();
+    for date_pass in [true, false] {
+        for (x, label, is_date) in &ticks {
+            if *is_date != date_pass {
+                continue;
+            }
+            let w = text_width(dc, sc.fonts.small, label);
+            let lx = (*x - w / 2).clamp(plot.left, (plot.right - w).max(plot.left));
+            if placed.iter().all(|(a, b)| lx > b + s(8) || lx + w + s(8) < *a) {
+                text(dc, sc.fonts.small, lx, base + s(6), label, t.label);
+                placed.push((lx, lx + w));
+            }
+        }
+    }
+    for (x, _, _) in &ticks {
+        fill_rect(dc, RECT { left: *x, top: base, right: *x + 1, bottom: base + s(4) }, t.guide);
     }
 
     // Everything below up to the candles is under them, so nothing cuts a body.
     // Session breaks: a faint dotted line on the boundary between the last candle before the break
-    // and the first after it.
-    for i in chartview::gaps(&bars, bucket) {
-        let x = lay.x_of(i) - step / 2;
-        pen_line(dc, PS_DOT, t.guide, (x, plot.top), (x, plot.bottom));
+    // and the first after it. Only for candles shorter than a day: every weekend is not a break.
+    if chartview::marks_breaks(bucket) {
+        for i in chartview::gaps(&bars, bucket) {
+            let x = lay.x_of(i) - step / 2;
+            pen_line(dc, PS_DOT, t.guide, (x, plot.top), (x, plot.bottom));
+        }
     }
     // Previous close: a dashed line with a small label at the plot's left edge, above the line (below
     // it when the line is at the very top). The label is inside the plot and the last-price tag is on
-    // the axis, so the two can never touch.
-    if let Some(p) = chartview::in_window(chartview::positive(c.prev), lo, hi) {
+    // the axis, so the two can never touch. Reference lines belong to today's session: 1D only.
+    let refs = c.range == Range::D1;
+    if let Some(p) = chartview::in_window(chartview::positive(c.prev).filter(|_| refs), lo, hi) {
         let y = lay.y_of(p);
         pen_line(dc, PS_DASH, t.dim, (plot.left, y), (plot.right, y));
         let ly = if y - lh > plot.top { y - lh - 1 } else { y + 2 };
@@ -1181,15 +1264,18 @@ fn candles(dc: HDC, sc: &Scene, r: RECT, c: &Chart) {
     // Candles: a whole, odd number of pixels per bar, so every body is the same width and the wick
     // is exactly the middle pixel. The leftover (under a bar's width per candle) is the open right
     // edge of a session still in progress.
-    for (i, b) in bars.iter().enumerate() {
-        let x = lay.x_of(i);
-        let col = if (b.c - b.o).abs() <= f32::EPSILON {
+    let colour = |b: &Bar| {
+        if (b.c - b.o).abs() <= f32::EPSILON {
             t.dim
         } else if b.c > b.o {
             t.up
         } else {
             t.down
-        };
+        }
+    };
+    for (i, b) in bars.iter().enumerate() {
+        let x = lay.x_of(i);
+        let col = colour(b);
         let (y0, y1) = (lay.y_of(b.h as f64), lay.y_of(b.l as f64));
         let wx = x - wick / 2;
         fill_rect(dc, RECT { left: wx, top: y0.min(y1), right: wx + wick, bottom: y1.max(y0 + 1) }, col);
@@ -1197,11 +1283,22 @@ fn candles(dc: HDC, sc: &Scene, r: RECT, c: &Chart) {
         let bx = x - body / 2;
         fill_rect(dc, RECT { left: bx, top: b0.min(b1), right: bx + body, bottom: b1.max(b0 + 1) }, col);
     }
+    // The volume strip: one bar per candle, in the candle's colour, bottom-aligned.
+    if let Some(v) = vol {
+        let max = bars.iter().map(|b| b.v).fold(0.0f32, f32::max);
+        for (i, b) in bars.iter().enumerate() {
+            let h = chartview::volume_px(b.v, max, v.bottom - v.top);
+            if h > 0 {
+                let bx = lay.x_of(i) - body / 2;
+                fill_rect(dc, RECT { left: bx, top: v.bottom - h, right: bx + body, bottom: v.bottom }, colour(b));
+            }
+        }
+    }
 
     // The day's high and low: short ticks on the axis edge of the plot, over the candles, only when
-    // they are inside the window the bars set.
+    // they are inside the window the bars set (and only on 1D).
     for v in [c.day_hi, c.day_lo] {
-        if let Some(p) = chartview::in_window(chartview::positive(v), lo, hi) {
+        if let Some(p) = chartview::in_window(chartview::positive(v).filter(|_| refs), lo, hi) {
             let y = lay.y_of(p);
             fill_rect(dc, RECT { left: plot.right - s(8), top: y, right: plot.right, bottom: y + s(2).max(2) }, t.label);
         }
@@ -1232,17 +1329,43 @@ fn candles(dc: HDC, sc: &Scene, r: RECT, c: &Chart) {
         if let Some(price) = lay.price_at(y) {
             tag(price, y, t.accent);
         }
-        // The legend: its own header line, the whole candle. If the pane is too narrow for the full
-        // line the compact one (time, close, change) is used instead.
+        // The legend: the header's second line, the whole candle. If the line is too narrow for the
+        // full legend (the tabs take the right end of it) the compact one (time, close, change) is
+        // used instead, and if even that would touch the tabs it is left out.
         let fmt = |v: f64| fmt_price(v, c.digits);
-        let avail = r.right - r.left - s(24);
-        let mut line = chartview::readout(&bars[bar], c.t0, c.tz_offset_s, &fmt, false);
+        let avail = if show_tabs { tabs[0].left - (r.left + s(12)) - s(10) } else { r.right - r.left - s(24) };
+        let stamp = chartview::stamp_for(c.range == Range::D1, bucket);
+        let mut line = chartview::readout_with(&bars[bar], c.t0, zone, &fmt, false, stamp);
         if text_width(dc, sc.fonts.small, &line) > avail {
-            line = chartview::readout(&bars[bar], c.t0, c.tz_offset_s, &fmt, true);
+            line = chartview::readout_with(&bars[bar], c.t0, zone, &fmt, true, stamp);
         }
-        text(dc, sc.fonts.small, r.left + s(12), r.top + s(30), &line, t.price);
+        if !show_tabs || text_width(dc, sc.fonts.small, &line) <= avail {
+            text(dc, sc.fonts.small, r.left + s(12), r.top + s(30), &line, t.price);
+        }
     }
     sc.layout.set(Some(lay));
+}
+
+/// The six range tabs, right-aligned on the header's second line, the current one lit. Returns their
+/// rectangles in `Range::ALL` order for the layout (the click is answered from them).
+fn range_tabs(dc: HDC, sc: &Scene, r: RECT, c: &Chart, lh: i32) -> [chartview::Rect; 6] {
+    let t = sc.theme;
+    let s = |v: i32| v * sc.dpi as i32 / 96;
+    let (top, bottom) = (r.top + s(28), r.top + s(28) + lh + s(4));
+    let mut out = [chartview::Rect::default(); 6];
+    let mut right = r.right - s(12);
+    for (k, rg) in Range::ALL.iter().enumerate().rev() {
+        let w = text_width(dc, sc.fonts.small, rg.label()) + s(10);
+        let rc = RECT { left: right - w, top, right, bottom };
+        let lit = *rg == c.range;
+        if lit {
+            fill_round(dc, rc, if t.is_pixel() { 0 } else { s(4) }, t.btn);
+        }
+        text(dc, sc.fonts.small, rc.left + s(5), top + (bottom - top - lh) / 2, rg.label(), if lit { t.price } else { t.label });
+        out[k] = chartview::Rect::new(rc.left, rc.top, rc.right, rc.bottom);
+        right = rc.left - s(2);
+    }
+    out
 }
 
 /// A one-pixel straight line in a pen style (dotted, dashed), in `color`.
