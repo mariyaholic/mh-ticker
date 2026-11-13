@@ -29,6 +29,7 @@ use crate::alerts;
 use crate::autostart;
 use crate::chartview;
 use crate::hotkey;
+use crate::keys;
 use crate::update;
 use crate::config::{self, Config, Placement, Profile};
 use crate::dock;
@@ -50,7 +51,7 @@ use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_ESCAPE, VK_PRIOR, VK_NEXT, VK_HOME, VK_END};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, RegisterHotKey, UnregisterHotKey, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_ESCAPE, VK_PRIOR, VK_NEXT, VK_HOME, VK_END};
 use windows_sys::Win32::UI::HiDpi::{GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
 use windows_sys::Win32::UI::Shell::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
@@ -261,6 +262,9 @@ struct Frame {
     h: i32,
     /// Link dot: x, y, diameter.
     dot: (i32, i32, i32),
+    /// Each symbol's clickable rectangle, recorded by the layout functions while they place the
+    /// text (`keys::slot_at` answers the strip click from these, the painter draws the same runs).
+    slots: Vec<keys::Slot>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -452,6 +456,25 @@ fn picker_open(u: &Ui) -> bool {
 /// takes the lock. A lock that cannot be undone is a trap.
 fn toggle_lock(current: Option<&str>, clicked: String) -> Option<String> {
     if current == Some(clicked.as_str()) { None } else { Some(clicked) }
+}
+
+/// Every way the lock moves or clears goes through here (a click on a card, the arrow keys, Delete, the
+/// card menu's Remove, a click on the strip), so the resets cannot drift apart: the Open button's hover,
+/// the chart pointer and the layout it was answered from are forgotten, and the range the pane now needs
+/// is asked for. `apply_rows` does the same resets when the rows change under the lock.
+fn lock_card(u: &mut Ui, label: Option<String>) {
+    u.selected = label;
+    u.open_hover = false;
+    u.chart_at = None;
+    u.chart_layout.set(None);
+    want_range(u);
+}
+
+/// The card that should be locked after `label` leaves the strip: the one that takes its place (the next,
+/// or the previous for the last), `None` if it was the only card.
+fn neighbour_of(cells: &[crate::model::Cell], label: &str) -> Option<String> {
+    let i = cells.iter().position(|c| c.label == label)?;
+    cells.get(i + 1).or_else(|| i.checked_sub(1).and_then(|p| cells.get(p))).map(|c| c.label.clone())
 }
 
 /// The frame the window grows to when the chart opens: `want_w` wide, centred on where it was so the
@@ -672,9 +695,12 @@ fn layout_row(dc: HDC, cells: &[Cell], dpi: u32, t: &Theme) -> Frame {
     let (px, py) = (s(10), s(5));
     let (_, line_h) = text_size(dc, "Xg");
     let mut f = Frame::default();
+    let mut slots = Vec::new();
     let mut x = px;
     for (i, c) in cells.iter().enumerate() {
         let (label, price, pc, change) = cell_texts(c, t);
+        // The symbol's own extent starts after the gap that separates it from the one before.
+        let left = x + if i > 0 { text_size(dc, "    ").0 } else { 0 };
         let mut push = |t: String, col: COLORREF| {
             let (w, _) = text_size(dc, &t);
             f.runs.push(text_run(x, py, &t, col));
@@ -688,9 +714,11 @@ fn layout_row(dc: HDC, cells: &[Cell], dpi: u32, t: &Theme) -> Frame {
         if let Some((t, col)) = change {
             push(format!(" {t}"), col);
         }
+        slots.push(keys::Slot { index: i, left, top: 0, right: x, bottom: 0 });
     }
     let dot = (line_h / 2).max(4);
     f.h = line_h + 2 * py;
+    f.slots = slots.into_iter().map(|s| keys::Slot { bottom: f.h, ..s }).collect();
     f.dot = (x + px, (f.h - dot) / 2, dot);
     f.w = x + px + dot + px;
     f
@@ -720,6 +748,7 @@ fn layout_grid(dc: HDC, cells: &[Cell], dpi: u32, rows: usize, show_change: bool
         let col_w = lw + gap_s + pw + if cw > 0 { gap_s + cw } else { 0 };
         for (r, (label, price, pc, change)) in texts.iter().enumerate() {
             let y = py + r as i32 * line_h;
+            f.slots.push(keys::Slot { index: ci * rows + r, left: x, top: y, right: x + col_w, bottom: y + line_h });
             f.runs.push(text_run(x, y, label, t.label));
             let w = text_size(dc, price).0;
             // Without the change column the price itself carries the day's direction.
@@ -824,6 +853,7 @@ fn draw_panel(u: &mut Ui, dc: HDC, w: i32, h: i32) {
         chart_hover: u.chart_hover,
         gear_hover: u.gear_hover,
         select: u.profile.ultra,
+        keys_hint: u.profile.ultra,
         selected: selected_row(u),
         open_hover: u.open_hover,
         hover: u.hover_at,
@@ -1828,6 +1858,27 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
         if let Some((i, label, price)) = &card {
             add(m, MF_STRING, CMD_COPY + i, &format!("Copy {label} {price}"));
             add(m, MF_STRING, CMD_OPEN + i, &format!("Open {label} on CNBC"));
+            // Order and removal (Ultra). The actions carry the symbol, so they act on this card even
+            // if the rows change while the menu is open. Read in a call of its own (the big tuple
+            // above is not extended).
+            let place = if ultra {
+                with_ui(|u| {
+                    let pos = u.cfg.rows.iter().position(|r| &r.label == label)?;
+                    Some((u.cfg.rows[pos].symbol.clone(), pos, u.cfg.rows.len()))
+                })
+                .flatten()
+            } else {
+                None
+            };
+            if let Some((symbol, pos, count)) = place {
+                use crate::menu_commands::Action;
+                AppendMenuW(m, MF_SEPARATOR, 0, null());
+                let grey = |off: bool| MF_STRING | if off { MF_GRAYED } else { 0 };
+                dynamic(m, grey(pos == 0), &mut commands, Action::Move(symbol.clone(), -1), "Move left");
+                dynamic(m, grey(pos + 1 >= count), &mut commands, Action::Move(symbol.clone(), 1), "Move right");
+                dynamic(m, grey(pos == 0), &mut commands, Action::MoveFirst(symbol.clone()), "Move first");
+                dynamic(m, grey(count <= 1), &mut commands, Action::Remove(symbol), "Remove from strip");
+            }
             AppendMenuW(m, MF_SEPARATOR, 0, null());
         }
         // Symbols: tick to show, untick to hide. The last one cannot go; at most MAX_ROWS show.
@@ -2113,6 +2164,9 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
                     apply_rows(hwnd);
                 }
             }
+            Action::Remove(symbol) => remove_card(hwnd, symbol),
+            Action::Move(symbol, delta) => reorder(hwnd, symbol, Some(*delta)),
+            Action::MoveFirst(symbol) => reorder(hwnd, symbol, None),
             Action::Alert(label, k) => {
                 let changed = with_ui(|u| {
                     let def = alerts::PRESETS.get(*k)?;
@@ -2630,6 +2684,7 @@ fn apply_rows(hwnd: HWND) {
         u.hist.record(&u.view, crate::source::now_s());
         u.chart_at = None;
         u.chart_layout.set(None);
+        u.open_hover = false;
         if u.profile.ultra {
             let labels: Vec<&str> = u.view.cells.iter().map(|c| c.label.as_str()).collect();
             u.selected = settle_lock(u.selected.as_deref(), &labels, u.chart);
@@ -2653,6 +2708,131 @@ fn apply_rows(hwnd: HWND) {
     if panel { unsafe { InvalidateRect(hwnd, null(), 0); } }
     else { relayout_and_place(hwnd); }
     unsafe { PostMessageW(hwnd, WM_FEED, 0, 0) };
+}
+
+/// Hide `symbol` (the card menu's Remove and the Delete key). The lock passes to the card that takes the
+/// removed one's place when the locked card is the one going. A symbol that is no longer shown, or the
+/// last one, changes nothing.
+fn remove_card(hwnd: HWND, symbol: &str) {
+    let removed = with_ui(|u| {
+        let label = u.cfg.rows.iter().find(|r| r.symbol == symbol).map(|r| r.label.clone());
+        let next = label.as_deref().and_then(|l| neighbour_of(&u.view.cells, l));
+        if !config::remove(&mut u.cfg, symbol) {
+            return false;
+        }
+        if label.is_some() && u.selected == label {
+            lock_card(u, next);
+        }
+        true
+    })
+    .unwrap_or(false);
+    if removed {
+        apply_rows(hwnd);
+        reveal_lock(hwnd);
+    }
+}
+
+/// Move `symbol` along the strip: `Some(delta)` places, or `None` for the front. The saved order is
+/// `config`'s business; this applies it, then keeps the locked card in view.
+fn reorder(hwnd: HWND, symbol: &str, delta: Option<i32>) {
+    let changed = with_ui(|u| match delta {
+        Some(d) => config::move_row(&mut u.cfg, symbol, d),
+        None => config::move_first(&mut u.cfg, symbol),
+    })
+    .unwrap_or(false);
+    if changed {
+        apply_rows(hwnd);
+        reveal_lock(hwnd);
+    }
+}
+
+/// Scroll the body just far enough that the locked card is on screen, and repaint.
+fn reveal_lock(hwnd: HWND) {
+    let moved = with_ui(|u| {
+        if u.mode != Mode::Panel {
+            return false;
+        }
+        let Some(i) = selected_row(u) else { return false };
+        let want = panel::reveal(&panel_geo(u), i);
+        let moved = want != u.picker_scroll;
+        u.picker_scroll = want;
+        if moved {
+            u.hover_at = None;
+        }
+        moved
+    })
+    .unwrap_or(false);
+    if moved {
+        unsafe { InvalidateRect(hwnd, null(), 0) };
+    }
+}
+
+/// A key press in the open panel (`keys::is_bound` keys only). Returns whether it did something, so
+/// the caller can hand an unmapped key back to the system. State is decided inside one `with_ui`
+/// call; the clipboard, the browser, the config save and the chart/picker changes (which re-enter
+/// `with_ui`) all happen after it. Keys act only in `Mode::Panel`: a strip has no keyboard, and a
+/// morph in flight ignores them just as it ignores a click.
+fn on_key(hwnd: HWND, vk: u32) -> bool {
+    enum Do {
+        Redraw,
+        Open(String),
+        Chart(bool),
+        Picker(bool),
+        Copy(String),
+        Remove(String),
+        Shift(String, i32),
+    }
+    let ctrl = unsafe { GetKeyState(VK_CONTROL as i32) } < 0;
+    let todo = with_ui(|u| {
+        if u.mode != Mode::Panel {
+            return None;
+        }
+        let row = selected_row(u);
+        let state = keys::State { ultra: u.profile.ultra, has_lock: row.is_some(), picker_open: picker_open(u), chart_open: u.chart };
+        let action = keys::map(vk, ctrl, state)?;
+        let n = u.view.cells.len();
+        let symbol_of = |u: &Ui, i: usize| u.view.cells.get(i).and_then(|c| u.cfg.rows.iter().find(|r| r.label == c.label)).map(|r| r.symbol.clone());
+        use keys::Action as K;
+        Some(match action {
+            K::LockFirst | K::Move(_) => {
+                let to = match (action, row) {
+                    (K::Move(dir), Some(i)) => keys::step(i, n, panel_geo(u).cols, dir),
+                    _ => 0,
+                };
+                let label = u.view.cells.get(to)?.label.clone();
+                lock_card(u, Some(label));
+                u.picker_scroll = panel::reveal(&panel_geo(u), to);
+                u.hover_at = None;
+                Do::Redraw
+            }
+            K::OpenLocked => Do::Open(symbol_of(u, row?)?),
+            K::SetChart(on) => Do::Chart(on),
+            K::SetPicker(on) => Do::Picker(on),
+            K::CopyLocked => {
+                let c = u.view.cells.get(row?)?;
+                Do::Copy(format!("{} {}", c.label, fmt_price(c.quote.as_ref()?.price, c.digits)))
+            }
+            K::CopyAll => Do::Copy(crate::model::board_text(&u.view.cells)),
+            K::Remove => Do::Remove(symbol_of(u, row?)?),
+            K::Shift(d) => Do::Shift(symbol_of(u, row?)?, d),
+        })
+    })
+    .flatten();
+    match todo {
+        None => return false,
+        Some(Do::Redraw) => unsafe { InvalidateRect(hwnd, null(), 0); },
+        Some(Do::Open(sym)) => open_cnbc(hwnd, &sym),
+        Some(Do::Chart(on)) => set_chart(hwnd, on),
+        Some(Do::Picker(on)) => apply_picker(hwnd, on),
+        Some(Do::Copy(text)) => {
+            if !text.is_empty() {
+                copy_text(&text);
+            }
+        }
+        Some(Do::Remove(sym)) => remove_card(hwnd, &sym),
+        Some(Do::Shift(sym, d)) => reorder(hwnd, &sym, Some(d)),
+    }
+    true
 }
 
 /// Open or close the symbol picker: the panel grows or shrinks in place, staying centred.
@@ -3052,6 +3232,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             // One click can mean several things; decide which from the same `Geo` the painter used.
             enum Act {
                 Expand,
+                /// A click on one symbol of the docked or cornered strip: open with that card locked.
+                ExpandLock(String),
                 Collapse,
                 TogglePicker,
                 ToggleChart,
@@ -3075,7 +3257,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     u.view.cells.get(i).and_then(|c| u.cfg.rows.iter().find(|r| r.label == c.label)).map(|r| r.symbol.clone())
                 };
                 match u.mode {
-                    Mode::Strip if u.cfg.placement() != Placement::Floating => Act::Expand,
+                    Mode::Strip if u.cfg.placement() != Placement::Floating => {
+                        let hit = if u.profile.ultra { keys::slot_at(&u.frame.slots, x, y) } else { None };
+                        match hit.and_then(|i| u.view.cells.get(i)) {
+                            Some(c) => Act::ExpandLock(c.label.clone()),
+                            None => Act::Expand,
+                        }
+                    }
                     Mode::Panel if panel::in_rect(&g.btn, x, y) => Act::Collapse,
                     Mode::Panel if u.profile.ultra && panel::in_rect(&g.gear_btn, x, y) => Act::Settings,
                     Mode::Panel if u.profile.ultra && panel::in_rect(&g.pick_btn, x, y) => Act::TogglePicker,
@@ -3127,6 +3315,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             });
             match what {
                 Some(Act::Expand) => expand(hwnd),
+                Some(Act::ExpandLock(label)) => {
+                    with_ui(|u| lock_card(u, Some(label)));
+                    expand(hwnd);
+                }
                 Some(Act::Collapse) => collapse(hwnd),
                 Some(Act::Settings) => settings_menu(hwnd),
                 // `apply_picker` closes the chart when the picker opens, and hands its width back.
@@ -3168,11 +3360,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 Some(Act::Select(label)) => {
                     with_ui(|u| {
                         // The same card again unlocks it: a lock that cannot be undone is a trap.
-                        u.selected = toggle_lock(u.selected.as_deref(), label);
-                        u.open_hover = false;
-                        u.chart_at = None;
-                        u.chart_layout.set(None);
-                        want_range(u);
+                        let next = toggle_lock(u.selected.as_deref(), label);
+                        lock_card(u, next);
                     });
                     InvalidateRect(hwnd, null(), 0);
                 }
@@ -3264,6 +3453,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let delta = if wp == VK_PRIOR as usize { -step } else if wp == VK_NEXT as usize { step } else if wp == VK_HOME as usize { -i32::MAX } else { i32::MAX };
             scroll_picker(hwnd, delta);
             0
+        }
+        // P5: the card keys. `on_key` answers false for a key that means nothing right now (Classic's
+        // Ultra-only keys, a strip, a morph), and that key goes back to the system untouched.
+        WM_KEYDOWN if keys::is_bound(wp as u32) => {
+            if on_key(hwnd, wp as u32) { 0 } else { DefWindowProcW(hwnd, msg, wp, lp) }
         }
         WM_KEYDOWN if wp == VK_ESCAPE as usize => {
             collapse(hwnd);

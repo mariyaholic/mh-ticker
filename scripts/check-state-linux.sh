@@ -10,7 +10,7 @@ python3 - "$repo" "$d" <<'PY'
 import pathlib,sys
 repo,d=map(pathlib.Path,sys.argv[1:])
 p=d/'Cargo.toml';p.write_text(p.read_text().replace('path = "src/lib.rs"','path = "harness.rs"'))
-modules='\n'.join(f'#[path = "{repo}/src/{name}.rs"] mod {name};' for name in ['menu_commands','workspace','model','webhook_host','chartview','hotkey','update','autostart','ranges'])
+modules='\n'.join(f'#[path = "{repo}/src/{name}.rs"] mod {name};' for name in ['menu_commands','workspace','model','webhook_host','chartview','hotkey','update','autostart','ranges','keys'])
 (d/'harness.rs').write_text('''#![allow(dead_code)]
 mod config {
     #[derive(Clone, Debug, Default, PartialEq)]

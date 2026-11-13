@@ -324,7 +324,75 @@ pub fn toggle(cfg: &mut Config, symbol: &str) -> bool {
         return false;
     }
     let shown: Vec<String> = cfg.rows.iter().map(|r| r.symbol.clone()).collect();
-    cfg.rows = menu_list(cfg).into_iter().filter(|r| r.symbol == symbol || shown.contains(&r.symbol)).collect();
+    cfg.rows = in_menu_order(cfg, |s| s == symbol || shown.iter().any(|x| x == s));
+    true
+}
+
+/// The Symbols menu's entries whose symbol `keep` accepts, in menu order.
+fn in_menu_order(cfg: &Config, keep: impl Fn(&str) -> bool) -> Vec<Row> {
+    menu_list(cfg).into_iter().filter(|r| keep(&r.symbol)).collect()
+}
+
+/// Hide a shown symbol. Unlike `toggle`, a symbol that is not shown is never added: the card menu and
+/// the Delete key carry a symbol that may have left the strip while a menu was open. Refuses the last
+/// row. Returns whether anything changed.
+pub fn remove(cfg: &mut Config, symbol: &str) -> bool {
+    is_shown(cfg, symbol) && toggle(cfg, symbol)
+}
+
+/// Move a shown symbol `delta` places along the strip (negative = left, positive = right), by one
+/// place per unit, stopping at the ends. Returns whether the order changed.
+///
+/// The order is a permutation of the catalogue, so it survives later `toggle`s ("rows keep menu
+/// order"): a shown row that is not in the catalogue is first appended to it (which changes nothing
+/// visible: `menu_list` already lists it last), then the symbol swaps places in the catalogue with
+/// the shown neighbour it passes, hidden catalogue entries in between keep their relative place, and
+/// `rows` is rebuilt exactly as `toggle` builds it. A symbol that is not shown, `delta == 0` or a
+/// move past an end changes nothing and returns false (the catalogue is then left as it was).
+pub fn move_row(cfg: &mut Config, symbol: &str, delta: i32) -> bool {
+    let Some(from) = cfg.rows.iter().position(|r| r.symbol == symbol) else {
+        return false;
+    };
+    let to = from as i64 + i64::from(delta);
+    if delta == 0 || to < 0 || to >= cfg.rows.len() as i64 {
+        return false;
+    }
+    move_shown(cfg, from, to as usize)
+}
+
+/// Move a shown symbol to the front of the strip. Same permutation rules as `move_row`. Returns
+/// whether the order changed (false when it is already first, not shown, or the only row).
+pub fn move_first(cfg: &mut Config, symbol: &str) -> bool {
+    match cfg.rows.iter().position(|r| r.symbol == symbol) {
+        Some(from) if from > 0 => move_shown(cfg, from, 0),
+        _ => false,
+    }
+}
+
+/// Put the shown row at `from` at `to`. The shown symbols keep the catalogue positions they hold, and
+/// take them in the new order, so hidden entries stay where they are. Works on a copy and commits
+/// only when every step holds, so a false return leaves `cfg` untouched.
+fn move_shown(cfg: &mut Config, from: usize, to: usize) -> bool {
+    let mut order: Vec<String> = cfg.rows.iter().map(|r| r.symbol.clone()).collect();
+    let moved = order.remove(from);
+    order.insert(to, moved);
+
+    let mut next = cfg.clone();
+    for r in &cfg.rows {
+        if !next.catalog.iter().any(|c| c.symbol == r.symbol) {
+            next.catalog.push(r.clone());
+        }
+    }
+    let slots: Vec<usize> = next.catalog.iter().enumerate().filter(|(_, c)| order.contains(&c.symbol)).map(|(i, _)| i).collect();
+    let picked: Vec<Row> = order.iter().filter_map(|s| next.catalog.iter().find(|c| &c.symbol == s).cloned()).collect();
+    if slots.len() != order.len() || picked.len() != order.len() {
+        return false;
+    }
+    for (pos, row) in slots.into_iter().zip(picked) {
+        next.catalog[pos] = row;
+    }
+    next.rows = in_menu_order(&next, |s| order.iter().any(|x| x == s));
+    *cfg = next;
     true
 }
 
@@ -493,6 +561,107 @@ mod tests {
         assert_eq!(menu_list(&c).last().unwrap().symbol, "SOL=");
         assert!(toggle(&mut c, "ETH.CB="));
         assert_eq!(c.rows.last().unwrap().symbol, "SOL=");
+    }
+
+    /// The shown symbols, strip order.
+    fn order(c: &Config) -> Vec<String> {
+        c.rows.iter().map(|r| r.symbol.clone()).collect()
+    }
+
+    /// The catalogue's symbols, in catalogue order.
+    fn catalog_order(c: &Config) -> Vec<String> {
+        c.catalog.iter().map(|r| r.symbol.clone()).collect()
+    }
+
+    #[test]
+    fn remove_never_adds_and_never_takes_the_last_row() {
+        let mut c = Config::default();
+        assert!(remove(&mut c, "XAU="));
+        assert_eq!(order(&c), ["XAG=", "BTC.CB=", "@DJ.1", "@SP.1", "@ND.1"]);
+        let before = order(&c);
+        assert!(!remove(&mut c, "XAU="), "already hidden: nothing is added back");
+        assert_eq!(order(&c), before);
+        assert!(!remove(&mut c, "XPT="), "never shown");
+        assert_eq!(order(&c), before);
+        c.rows.truncate(1);
+        assert!(!remove(&mut c, "XAG="), "the last row stays");
+        assert_eq!(order(&c), ["XAG="]);
+    }
+
+    #[test]
+    fn move_row_swaps_with_the_shown_neighbour_and_stops_at_the_ends() {
+        let mut c = Config::default();
+        assert_eq!(order(&c), ["XAU=", "XAG=", "BTC.CB=", "@DJ.1", "@SP.1", "@ND.1"]);
+        assert!(move_row(&mut c, "BTC.CB=", -1));
+        assert_eq!(order(&c), ["XAU=", "BTC.CB=", "XAG=", "@DJ.1", "@SP.1", "@ND.1"]);
+
+        let (rows, catalog) = (order(&c), catalog_order(&c));
+        assert!(!move_row(&mut c, "XAU=", -1), "the first row cannot go left");
+        assert!(!move_row(&mut c, "@ND.1", 1), "the last row cannot go right");
+        assert!(!move_row(&mut c, "XAG=", 0), "delta 0 is no move");
+        assert!(!move_row(&mut c, "XPT=", -1), "a hidden symbol does not move");
+        assert!(!move_row(&mut c, "NOT.SHOWN=", 1), "an unknown symbol does not move");
+        assert_eq!((order(&c), catalog_order(&c)), (rows, catalog), "every false leaves the order alone");
+
+        assert!(move_row(&mut c, "@ND.1", -2), "two places in one call");
+        assert_eq!(order(&c), ["XAU=", "BTC.CB=", "XAG=", "@ND.1", "@DJ.1", "@SP.1"]);
+    }
+
+    #[test]
+    fn move_row_passes_over_hidden_catalogue_entries() {
+        let mut c = Config::default();
+        assert!(!is_shown(&c, "XPT="));
+        assert!(move_row(&mut c, "BTC.CB=", -1));
+        assert_eq!(catalog_order(&c)[..4], ["XAU=", "BTC.CB=", "XPT=", "XAG="], "the hidden XPT keeps its place");
+        assert!(toggle(&mut c, "XPT="));
+        assert_eq!(order(&c), ["XAU=", "BTC.CB=", "XPT=", "XAG=", "@DJ.1", "@SP.1", "@ND.1"]);
+    }
+
+    #[test]
+    fn move_row_adopts_a_hand_added_row_into_the_catalogue() {
+        let mut c = Config::default();
+        c.rows.push(row("SOL", "SOL=", 2, ""));
+        assert_eq!(menu_list(&c).last().unwrap().symbol, "SOL=");
+        let catalog = catalog_order(&c);
+        assert!(!move_row(&mut c, "SOL=", 1), "past the end");
+        assert_eq!(catalog_order(&c), catalog, "a false return does not adopt the row");
+        assert!(move_row(&mut c, "SOL=", -1));
+        assert_eq!(order(&c), ["XAU=", "XAG=", "BTC.CB=", "@DJ.1", "@SP.1", "SOL=", "@ND.1"]);
+        assert_eq!(catalog_order(&c).iter().filter(|s| *s == "SOL=").count(), 1, "adopted once");
+        assert_eq!(menu_list(&c).iter().map(|r| r.symbol.clone()).collect::<Vec<_>>(), catalog_order(&c), "no duplicate in the menu");
+    }
+
+    #[test]
+    fn the_order_survives_a_later_toggle() {
+        let mut c = Config::default();
+        assert!(move_first(&mut c, "BTC.CB="));
+        assert_eq!(order(&c)[0], "BTC.CB=");
+        assert!(toggle(&mut c, "ETH.CB="));
+        assert_eq!(order(&c), ["BTC.CB=", "XAU=", "XAG=", "ETH.CB=", "@DJ.1", "@SP.1", "@ND.1"], "BTC stays first");
+        assert!(toggle(&mut c, "XAU="), "hide XAU");
+        assert!(toggle(&mut c, "XAU="), "show XAU again");
+        assert_eq!(order(&c), ["BTC.CB=", "XAU=", "XAG=", "ETH.CB=", "@DJ.1", "@SP.1", "@ND.1"], "the moved order is kept");
+    }
+
+    #[test]
+    fn move_first_puts_the_symbol_at_the_front() {
+        let mut c = Config::default();
+        assert!(move_first(&mut c, "@ND.1"));
+        assert_eq!(order(&c), ["@ND.1", "XAU=", "XAG=", "BTC.CB=", "@DJ.1", "@SP.1"]);
+        let before = (order(&c), catalog_order(&c));
+        assert!(!move_first(&mut c, "@ND.1"), "already first");
+        assert!(!move_first(&mut c, "XPT="), "not shown");
+        assert_eq!((order(&c), catalog_order(&c)), before);
+
+        let mut solo = Config::default();
+        solo.rows.truncate(1);
+        assert!(!move_first(&mut solo, "XAU="), "the only row");
+
+        let mut a = Config::default();
+        let mut b = Config::default();
+        assert!(move_first(&mut a, "@ND.1"));
+        assert!(move_row(&mut b, "@ND.1", -5));
+        assert_eq!((order(&a), catalog_order(&a)), (order(&b), catalog_order(&b)), "agrees with move_row");
     }
 
     #[test]
