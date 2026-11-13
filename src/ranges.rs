@@ -340,6 +340,14 @@ impl Book {
         self.failed.retain(|(k, _)| keep(k));
     }
 
+    /// *Refresh now*: forget every recorded failure, so the next `want` for a failed key asks again at
+    /// once instead of waiting out [`RETRY_AFTER_S`]. The cache and the requests in flight are kept
+    /// (a key in flight is not asked for twice). Without this the menu's refresh woke the quote and
+    /// day-chart loops but left a long range saying "failed" for up to 30 s.
+    pub fn retry_now(&mut self) {
+        self.failed.clear();
+    }
+
     /// How many series are cached.
     #[cfg(test)]
     pub fn len(&self) -> usize {
@@ -419,6 +427,27 @@ mod tests {
         assert!(b.arrived(2, &k, Ok(series(1_610.0, 4)), 1_610.0));
         assert_eq!(b.get(&k).map(|s| s.bars.len()), Some(4));
         assert_eq!(b.len(), 1);
+    }
+
+    /// Audit 1.8, finding 1: *Refresh now* must reach a long range that just failed, not leave the
+    /// pane saying "failed" until the 30 s back-off ends. Cache and in-flight state are untouched.
+    #[test]
+    fn refresh_now_asks_again_for_a_failed_key_and_keeps_the_rest() {
+        let mut b = Book::new();
+        let (bad, good, busy) = (key("A", "5D.json"), key("B", "1Y.json"), key("C", "5Y.json"));
+        let r = b.want(&bad, 0.0).unwrap();
+        assert!(b.arrived(r.generation, &bad, Err("network".into()), 1.0));
+        let g = b.want(&good, 2.0).unwrap();
+        assert!(b.arrived(g.generation, &good, Ok(series(3.0, 2)), 3.0));
+        let flying = b.want(&busy, 4.0).unwrap();
+        assert!(b.want(&bad, 5.0).is_none(), "inside the back-off");
+        b.retry_now();
+        assert_eq!(b.status(&good), Status::Ready, "the cache stays");
+        assert!(b.want(&good, 6.0).is_none(), "a fresh cached series is not refetched");
+        assert!(b.want(&busy, 6.0).is_none(), "a key in flight is not asked for twice");
+        let again = b.want(&bad, 6.0).expect("the failed key is due at once");
+        assert!(again.generation > flying.generation);
+        assert_eq!(b.status(&bad), Status::Loading);
     }
 
     #[test]
