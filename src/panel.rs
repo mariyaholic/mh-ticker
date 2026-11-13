@@ -16,6 +16,7 @@
 //! text uses (`day_open`), so the number and the line can no longer disagree.
 
 use crate::config::Row;
+use crate::chartview::{self, candle_metrics, clock, fitted, nice_ticks, tick_interval, Layout, Pointer};
 use crate::model::{fmt_change, fmt_price, Bar, Board, Cell};
 use crate::theme::{Gradient, Theme};
 use crate::workspace;
@@ -494,6 +495,17 @@ pub struct Chart<'a> {
     pub bars: &'a [Bar],
     pub last: Option<f64>,
     pub unavailable: bool,
+    /// Seconds east of UTC the pane's clock runs on (0 = UTC). Candles are cut and labelled on it.
+    pub tz_offset_s: i32,
+    /// The zone's name as the header shows it ("local" or "UTC"); it is the click target that flips it.
+    pub tz_label: &'a str,
+    /// Previous close, for the dashed reference line. `None` when the quote has none (or sends 0).
+    pub prev: Option<f64>,
+    /// The day's high and low, drawn as short ticks on the axis. `None` as above.
+    pub day_hi: Option<f64>,
+    pub day_lo: Option<f64>,
+    /// The day's change in percent, drawn beside the last price in the up or down colour.
+    pub change_pct: Option<f64>,
 }
 
 /// What the panel needs to draw one frame. Bundled so `draw` has one argument that can grow
@@ -524,6 +536,12 @@ pub struct Scene<'a> {
     pub open_hover: bool,
     /// The pointer is on a chart.
     pub hover: Option<Hover>,
+    /// The pointer is on a candle of the pane: it draws a crosshair, the price tag and the legend.
+    pub chart_at: Option<Pointer>,
+    /// Where the pane stores the `Layout` it drew with (cleared when it drew nothing with bars). The
+    /// `Ui` owns the cell and the pointer code reads it back, so a hit test answers from the pixels
+    /// last painted.
+    pub layout: &'a std::cell::Cell<Option<Layout>>,
     /// `Some` when the picker is open. `None` also hides the toggle: the classic build has no
     /// picker, so it must not draw a dead button.
     pub picker: Option<Picker<'a>>,
@@ -957,6 +975,8 @@ pub fn draw(dc: HDC, w: i32, h: i32, sc: &Scene) {
     if g.scroll_max > 0 {
         text_right(dc, sc.fonts.small, w - g.pad, h - s(27), "Wheel / PgUp / PgDn: scroll", t.label);
     }
+    // Whatever the pane stores below is this frame's; a frame without the pane leaves no layout.
+    sc.layout.set(None);
     if let (Some(c), Some(mut r)) = (&sc.chart, g.chart) {
         // The pane grows with the frame: its bottom is the footer, not the last card row.
         r.bottom = (h - s(34)).max(r.top + s(40));
@@ -1025,11 +1045,15 @@ fn candles(dc: HDC, sc: &Scene, r: RECT, c: &Chart) {
         hi = hi.max(b.h as f64);
     }
     let widest = [lo, hi, last].iter().map(|v| text_width(dc, sc.fonts.small, &fmt_price(*v, c.digits))).max().unwrap_or(0);
-    let plot = RECT { left: r.left + s(12), top: r.top + s(34), right: r.right - widest - s(22), bottom: r.bottom - s(24) };
+    // The header is two lines: the pane's name, the day's change and the last price on the first, and
+    // a line of its own for the hover legend on the second, so the legend never has to share a row
+    // with (or replace) the label, the zone button or the price. The line is reserved even while
+    // nothing is hovered, so the plot does not jump when the pointer arrives.
+    let plot = RECT { left: r.left + s(12), top: r.top + s(50), right: r.right - widest - s(22), bottom: r.bottom - s(24) };
     if plot.right - plot.left < s(40) || plot.bottom - plot.top < s(30) {
         return;
     }
-    let (bars, bucket) = fitted(c.bars, plot.right - plot.left, c.t0);
+    let (bars, bucket) = fitted(c.bars, plot.right - plot.left, c.t0, c.tz_offset_s);
     let span = match bucket as i64 {
         60 => "1 m",
         300 => "5 m",
@@ -1037,9 +1061,6 @@ fn candles(dc: HDC, sc: &Scene, r: RECT, c: &Chart) {
         1_800 => "30 m",
         _ => "1 h",
     };
-    // What is being charted, at what resolution, in which time zone, and where it last traded.
-    text(dc, sc.fonts.small, r.left + s(12), r.top + s(8), &format!("{} \u{b7} {span} UTC", c.label), t.label);
-    text_right(dc, sc.fonts.mid, r.right - s(12), r.top + s(6), &fmt_price(last, c.digits), t.price);
     if hi <= lo {
         // Every bar identical: give it a window anyway, or the division below is by zero. (A bar
         // price is parsed from JSON, so it cannot be NaN; `<=` and `!(> )` mean the same here.)
@@ -1049,51 +1070,86 @@ fn candles(dc: HDC, sc: &Scene, r: RECT, c: &Chart) {
     }
     let pad = (hi - lo) * 0.08;
     let (lo, hi) = (lo - pad, hi + pad);
-    let span_px = (plot.bottom - plot.top) as f64;
-    let price_span = (hi - lo).max(f64::EPSILON);
-    let py = |v: f64| plot.bottom - (((v - lo) / price_span) * span_px).round() as i32;
     let lh = line_height(dc, sc.fonts.small);
+
+    // Header, first line. What is charted, at what resolution, in which time zone (the zone name is
+    // a button: it is underlined, and its rectangle goes into the layout for the click), the day's
+    // change, and where it last traded.
+    let (hx, hy) = (r.left + s(12), r.top + s(8));
+    let hw = text(dc, sc.fonts.small, hx, hy, &format!("{} \u{b7} {span} \u{b7} ", c.label), t.label);
+    let zw = text(dc, sc.fonts.small, hx + hw, hy, c.tz_label, t.accent);
+    fill_rect(dc, RECT { left: hx + hw, top: hy + lh, right: hx + hw + zw, bottom: hy + lh + 1 }, t.accent);
+    let zone_btn = chartview::Rect::new(hx + hw - s(4), r.top + s(4), hx + hw + zw + s(4), hy + lh + s(4));
+    let price_text = fmt_price(last, c.digits);
+    let pw = text_width(dc, sc.fonts.mid, &price_text);
+    text_right(dc, sc.fonts.mid, r.right - s(12), r.top + s(6), &price_text, t.price);
+    if let Some(p) = c.change_pct.filter(|p| p.is_finite()) {
+        let txt = fmt_change(p);
+        let (right, w) = (r.right - s(12) - pw - s(10), text_width(dc, sc.fonts.small, &txt));
+        // Only when it clears the zone button: a narrow pane drops the change, not the zone.
+        if right - w > zone_btn.right + s(10) {
+            text_right(dc, sc.fonts.small, right, hy + s(1), &txt, if p >= 0.0 { t.up } else { t.down });
+        }
+    }
+
+    // The one layout of this frame. Everything in the plot below is placed with it, and it is stored
+    // at the end for the pointer.
+    let n = bars.len();
+    let (step, body, wick) = candle_metrics(plot.right - plot.left, n as i32, sc.dpi);
+    let lay = Layout {
+        pane: chartview::Rect::new(r.left, r.top, r.right, r.bottom),
+        plot: chartview::Rect::new(plot.left, plot.top, plot.right, plot.bottom),
+        step,
+        body,
+        wick,
+        bars: n,
+        lo,
+        hi,
+        bucket_s: bucket,
+        zone_btn,
+    };
+    // Coloured by the day's direction, the same one the header and the card report. Only when the
+    // day's change is unknown does it fall back to the bars: the last close against the first open.
     let up = bars.last().map(|b| b.c).unwrap_or(0.0) as f64 >= bars[0].o as f64;
-    let tone = if up { t.up } else { t.down };
-    let (ylast, tag_h) = (py(last).clamp(plot.top, plot.bottom), lh + s(4));
+    let tone = match c.change_pct.filter(|p| p.is_finite()) {
+        Some(p) if p >= 0.0 => t.up,
+        Some(_) => t.down,
+        None if up => t.up,
+        None => t.down,
+    };
+    let (ylast, tag_h) = (lay.y_of(last).clamp(plot.top, plot.bottom), lh + s(4));
 
     // Price gridlines on round values. A label that would sit under the last-price tag is skipped:
     // two numbers on one line is how a chart gets read wrong.
     let (ticks, decimals) = nice_ticks(lo, hi, 4);
     for v in ticks {
-        let y = py(v);
+        let y = lay.y_of(v);
         fill_rect(dc, RECT { left: plot.left, top: y, right: plot.right, bottom: y + 1 }, t.guide);
         if (y - ylast).abs() >= tag_h {
             text_right(dc, sc.fonts.small, r.right - s(10), y - lh / 2, &fmt_price(v, decimals), t.label);
         }
     }
 
-    // Candles: a whole, odd number of pixels per bar, so every body is the same width and the wick
-    // is exactly the middle pixel. The leftover (under a bar's width per candle) is the open right
-    // edge of a session still in progress.
-    let n = bars.len() as i32;
-    let (step, body, wick) = candle_metrics(plot.right - plot.left, n, sc.dpi);
-    let centre = |i: i32| plot.left + i * step + step / 2;
-
     // Time ticks on round clock times, short marks under the plot and a label centred on each.
     let step_s = bucket;
+    let tz = c.tz_offset_s as f64;
     let label_w = text_width(dc, sc.fonts.small, "00:00");
     let every = tick_interval(step as f64 / step_s, (label_w + s(28)) as f64);
     let mut prev_key = None;
     let mut last_label_right = i32::MIN;
     for (i, b) in bars.iter().enumerate() {
         let tb = b.t(c.t0);
-        let key = (tb / every).floor();
+        let key = ((tb + tz) / every).floor();
         let crossed = prev_key.is_some_and(|k| k != key);
         prev_key = Some(key);
         if !crossed {
             continue;
         }
-        let x = centre(i as i32);
+        let x = lay.x_of(i);
         fill_rect(dc, RECT { left: x, top: plot.bottom, right: x + 1, bottom: plot.bottom + s(4) }, t.guide);
         // The bar's own start, which is the boundary itself except after a break in the session
         // (a market reopening at 23:15 is labelled 23:15, not a 23:00 it did not trade at).
-        let label = clock(tb);
+        let label = clock(tb, c.tz_offset_s);
         let w = text_width(dc, sc.fonts.small, &label);
         let lx = (x - w / 2).clamp(plot.left, (plot.right - w).max(plot.left));
         if lx > last_label_right + s(8) {
@@ -1102,20 +1158,31 @@ fn candles(dc: HDC, sc: &Scene, r: RECT, c: &Chart) {
         }
     }
 
-    // Where it last traded: a dotted line across the plot, under the candles so it never cuts a
-    // body, running into a tag on the price axis. Coloured by the session's direction, like the
-    // cards' lines are.
-    unsafe {
-        let pen = CreatePen(PS_DOT, 1, tone);
-        let old = SelectObject(dc, pen);
-        let seg = [POINT { x: plot.left, y: ylast }, POINT { x: plot.right, y: ylast }];
-        Polyline(dc, seg.as_ptr(), 2);
-        SelectObject(dc, old);
-        DeleteObject(pen);
+    // Everything below up to the candles is under them, so nothing cuts a body.
+    // Session breaks: a faint dotted line on the boundary between the last candle before the break
+    // and the first after it.
+    for i in chartview::gaps(&bars, bucket) {
+        let x = lay.x_of(i) - step / 2;
+        pen_line(dc, PS_DOT, t.guide, (x, plot.top), (x, plot.bottom));
     }
+    // Previous close: a dashed line with a small label at the plot's left edge, above the line (below
+    // it when the line is at the very top). The label is inside the plot and the last-price tag is on
+    // the axis, so the two can never touch.
+    if let Some(p) = chartview::in_window(chartview::positive(c.prev), lo, hi) {
+        let y = lay.y_of(p);
+        pen_line(dc, PS_DASH, t.dim, (plot.left, y), (plot.right, y));
+        let ly = if y - lh > plot.top { y - lh - 1 } else { y + 2 };
+        text(dc, sc.fonts.small, plot.left + s(4), ly, "prev", t.dim);
+    }
+    // Where it last traded: a dotted line across the plot, running into a tag on the price axis.
+    // Coloured by the day's direction, the same one the header and the card report.
+    pen_line(dc, PS_DOT, tone, (plot.left, ylast), (plot.right, ylast));
 
+    // Candles: a whole, odd number of pixels per bar, so every body is the same width and the wick
+    // is exactly the middle pixel. The leftover (under a bar's width per candle) is the open right
+    // edge of a session still in progress.
     for (i, b) in bars.iter().enumerate() {
-        let x = centre(i as i32);
+        let x = lay.x_of(i);
         let col = if (b.c - b.o).abs() <= f32::EPSILON {
             t.dim
         } else if b.c > b.o {
@@ -1123,187 +1190,76 @@ fn candles(dc: HDC, sc: &Scene, r: RECT, c: &Chart) {
         } else {
             t.down
         };
-        let (y0, y1) = (py(b.h as f64), py(b.l as f64));
+        let (y0, y1) = (lay.y_of(b.h as f64), lay.y_of(b.l as f64));
         let wx = x - wick / 2;
         fill_rect(dc, RECT { left: wx, top: y0.min(y1), right: wx + wick, bottom: y1.max(y0 + 1) }, col);
-        let (b0, b1) = (py(b.o.max(b.c) as f64), py(b.o.min(b.c) as f64));
+        let (b0, b1) = (lay.y_of(b.o.max(b.c) as f64), lay.y_of(b.o.min(b.c) as f64));
         let bx = x - body / 2;
         fill_rect(dc, RECT { left: bx, top: b0.min(b1), right: bx + body, bottom: b1.max(b0 + 1) }, col);
     }
 
-    // The tag itself goes on last, over the axis, so nothing can paint across the number.
-    let tag = fmt_price(last, c.digits);
-    let tag_w = text_width(dc, sc.fonts.small, &tag) + s(10);
-    let tag_r = RECT { left: r.right - s(6) - tag_w, top: ylast - tag_h / 2, right: r.right - s(6), bottom: ylast - tag_h / 2 + tag_h };
-    fill_round(dc, tag_r, if t.is_pixel() { 0 } else { s(4) }, tone);
-    text(dc, sc.fonts.small, tag_r.left + s(5), tag_r.top + (tag_h - lh) / 2, &tag, t.card);
-}
-
-/// `(step, body, wick)` in whole pixels for `n` candles across `plot_w`: the slot each candle owns,
-/// the width of its body and the width of its wick. The step and body are odd and the wick is odd, so
-/// the wick is exactly the middle pixel of the body and of the slot; and they are the same for every
-/// candle in the row, which is the whole of the difference between a chart and a bar code.
-fn candle_metrics(plot_w: i32, n: i32, dpi: u32) -> (i32, i32, i32) {
-    let s = |v: i32| v * dpi as i32 / 96;
-    let mut step = (plot_w / n.max(1)).clamp(1, s(15) | 1);
-    if step >= MIN_BAR && step % 2 == 0 {
-        step -= 1;
-    }
-    let wick = s(1) | 1;
-    // About 70 % of the step, made odd so it is symmetric about the wick, and never thinner than it.
-    let mut body = ((step as f32 * 0.7).round() as i32).max(wick);
-    if body % 2 == 0 {
-        body -= 1;
-    }
-    (step, body.clamp(1, step.max(1)), wick)
-}
-
-/// Round gridline values inside `[lo, hi]`, about `want` of them, and how many decimals they need.
-/// The step is 1, 2, 2.5 or 5 times a power of ten — the spacings a reader can subtract in their
-/// head — so a day that runs 6,655 to 6,733 is gridded at 6,680 / 6,700 / 6,720, not at the
-/// arbitrary quarters of its own range.
-fn nice_ticks(lo: f64, hi: f64, want: usize) -> (Vec<f64>, u32) {
-    let span = hi - lo;
-    if span <= 0.0 || !span.is_finite() || want == 0 {
-        return (Vec::new(), 0);
-    }
-    let raw = span / want as f64;
-    let mag = 10f64.powf(raw.log10().floor());
-    let norm = raw / mag;
-    let step = mag * [1.0, 2.0, 2.5, 5.0, 10.0].iter().copied().find(|m| *m >= norm - 1e-9).unwrap_or(10.0);
-    let mut out = Vec::new();
-    let mut v = (lo / step).ceil() * step;
-    while v <= hi + step * 1e-9 && out.len() < 16 {
-        // Strip the float drift (0.30000000000000004) so the label and the line agree.
-        out.push((v / step).round() * step);
-        v += step;
-    }
-    let decimals = (0..=6u32).find(|d| {
-        let f = step * 10f64.powi(*d as i32);
-        (f - f.round()).abs() < 1e-6
-    });
-    (out, decimals.unwrap_or(6))
-}
-
-/// The smallest round clock interval (15 min .. 12 h) whose ticks are at least `min_px` apart when a
-/// second is `px_per_s` wide. A day of 5-minute candles ticks hourly; a pane stretched wide enough
-/// to hold the minute ticks every half hour.
-fn tick_interval(px_per_s: f64, min_px: f64) -> f64 {
-    const LADDER: [f64; 8] = [900.0, 1_800.0, 3_600.0, 7_200.0, 10_800.0, 14_400.0, 21_600.0, 43_200.0];
-    LADDER.iter().copied().find(|s| s * px_per_s >= min_px).unwrap_or(86_400.0)
-}
-
-/// The narrowest candle that still reads as one. Below five pixels a body is a scratch between two
-/// wicks, whatever the colour, and an odd width is what lets the wick be exactly the middle pixel.
-const MIN_BAR: i32 = 5;
-
-/// The bars to draw and the bucket they are drawn at: the finest bucket on the ladder whose candles
-/// still have `MIN_BAR` pixels each.
-fn fitted(bars: &[Bar], plot_w: i32, t0: f64) -> (Vec<Bar>, f64) {
-    const LADDER: [f64; 5] = [60.0, 300.0, 900.0, 1_800.0, 3_600.0];
-    let (mut best, mut bucket) = (fold(bars, LADDER[0], t0), LADDER[0]);
-    // The finest bucket that fits wins; if none does, the coarsest is still better than a comb.
-    if best.len() as i32 * MIN_BAR > plot_w {
-        for b in &LADDER[1..] {
-            best = fold(bars, *b, t0);
-            bucket = *b;
-            if best.len() as i32 * MIN_BAR <= plot_w {
-                break;
-            }
+    // The day's high and low: short ticks on the axis edge of the plot, over the candles, only when
+    // they are inside the window the bars set.
+    for v in [c.day_hi, c.day_lo] {
+        if let Some(p) = chartview::in_window(chartview::positive(v), lo, hi) {
+            let y = lay.y_of(p);
+            fill_rect(dc, RECT { left: plot.right - s(8), top: y, right: plot.right, bottom: y + s(2).max(2) }, t.label);
         }
     }
-    (best, bucket)
-}
 
-/// Fold one-minute bars into `bucket_s`-second candles: the open of the first bar in a bucket, the
-/// extreme high and low of all of them, the close of the last. Buckets are cut on the UTC clock
-/// (`t0` is the absolute time of `dt == 0`), not from the first bar and not by counting bars: a day
-/// that opens at 13:31 still has its five-minute candles start at 13:30, 13:35 ..., which is what the
-/// time axis labels say, and a break in the session stays a gap instead of being papered over.
-fn fold(bars: &[Bar], bucket_s: f64, t0: f64) -> Vec<Bar> {
-    let mut out: Vec<Bar> = Vec::new();
-    let mut key: Option<f64> = None;
-    for b in bars {
-        let k = ((t0 + b.dt as f64) / bucket_s).floor();
-        if key == Some(k) {
-            if let Some(last) = out.last_mut() {
-                last.h = last.h.max(b.h);
-                last.l = last.l.min(b.l);
-                last.c = b.c;
-                continue;
-            }
-        }
-        key = Some(k);
-        out.push(Bar { dt: (k * bucket_s - t0) as f32, o: b.o, h: b.h, l: b.l, c: b.c });
+    // The crosshair, when the pointer is on a candle: a vertical line through it and a horizontal at
+    // the pointer's row. `bar` is clamped because the pointer was taken from the previous frame and
+    // a resize can have refolded the bars since.
+    let hover = sc.chart_at.filter(|p| p.y >= plot.top && p.y < plot.bottom).map(|p| (p.bar.min(n - 1), p.y));
+    if let Some((bar, y)) = hover {
+        let x = lay.x_of(bar);
+        pen_line(dc, PS_DOT, t.accent, (x, plot.top), (x, plot.bottom));
+        pen_line(dc, PS_DOT, t.accent, (plot.left, y), (plot.right, y));
     }
-    out
+
+    // The last-price tag goes on over the axis, so nothing can paint across the number.
+    let tag = |price: f64, y: i32, fill: COLORREF| {
+        let tag = fmt_price(price, c.digits);
+        let tag_w = text_width(dc, sc.fonts.small, &tag) + s(10);
+        let tag_r = RECT { left: r.right - s(6) - tag_w, top: y - tag_h / 2, right: r.right - s(6), bottom: y - tag_h / 2 + tag_h };
+        fill_round(dc, tag_r, if t.is_pixel() { 0 } else { s(4) }, fill);
+        text(dc, sc.fonts.small, tag_r.left + s(5), tag_r.top + (tag_h - lh) / 2, &tag, t.card);
+    };
+    tag(last, ylast, tone);
+    if let Some((bar, y)) = hover {
+        // The hover tag is drawn last and may cover the last-price tag while the pointer is on its
+        // row: it is the transient one, and it is the number being asked about.
+        if let Some(price) = lay.price_at(y) {
+            tag(price, y, t.accent);
+        }
+        // The legend: its own header line, the whole candle. If the pane is too narrow for the full
+        // line the compact one (time, close, change) is used instead.
+        let fmt = |v: f64| fmt_price(v, c.digits);
+        let avail = r.right - r.left - s(24);
+        let mut line = chartview::readout(&bars[bar], c.t0, c.tz_offset_s, &fmt, false);
+        if text_width(dc, sc.fonts.small, &line) > avail {
+            line = chartview::readout(&bars[bar], c.t0, c.tz_offset_s, &fmt, true);
+        }
+        text(dc, sc.fonts.small, r.left + s(12), r.top + s(30), &line, t.price);
+    }
+    sc.layout.set(Some(lay));
 }
 
-/// HH:MM in UTC. The bars are utc seconds, and a local label would need a time-zone database for
-/// twenty-six market hours; the pane's header names the zone instead.
-fn clock(t: f64) -> String {
-    let m = (((t as i64) % 86_400) + 86_400) % 86_400 / 60;
-    format!("{:02}:{:02}", m / 60, m % 60)
+/// A one-pixel straight line in a pen style (dotted, dashed), in `color`.
+fn pen_line(dc: HDC, style: PEN_STYLE, color: COLORREF, a: (i32, i32), b: (i32, i32)) {
+    unsafe {
+        let pen = CreatePen(style, 1, color);
+        let old = SelectObject(dc, pen);
+        let seg = [POINT { x: a.0, y: a.1 }, POINT { x: b.0, y: b.1 }];
+        Polyline(dc, seg.as_ptr(), 2);
+        SelectObject(dc, old);
+        DeleteObject(pen);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_day_of_minutes_folds_into_candles_that_read() {
-        let bars: Vec<Bar> = (0..390)
-            .map(|i| {
-                let o = 100.0 + (i as f32 % 7.0);
-                Bar { dt: (i * 60) as f32, o, h: o + 1.0, l: o - 1.0, c: o + 0.5 }
-            })
-            .collect();
-        // 390 bars in 650 px is 1.6 px a bar: fold to five minutes, 78 of them at 8 px.
-        let (folded, bucket) = fitted(&bars, 650, 0.0);
-        assert_eq!(bucket, 300.0);
-        assert_eq!(folded.len(), 78);
-        // Open from the first bar of the bucket, extremes across the bucket, close from the last.
-        assert_eq!(folded[0].o, bars[0].o);
-        assert_eq!(folded[0].c, bars[4].c);
-        assert_eq!(folded[0].h, bars[0..5].iter().fold(f32::MIN, |m, b| m.max(b.h)));
-        assert_eq!(folded[0].l, bars[0..5].iter().fold(f32::MAX, |m, b| m.min(b.l)));
-        // A pane wide enough for the minute keeps the minute.
-        let (fine, b1) = fitted(&bars, 2_000, 0.0);
-        assert_eq!((b1, fine.len()), (60.0, 390));
-    }
-
-    #[test]
-    fn a_break_in_the_session_is_not_closed_by_folding() {
-        let bars = vec![
-            Bar { dt: 0.0, o: 1.0, h: 1.0, l: 1.0, c: 1.0 },
-            Bar { dt: 60.0, o: 1.0, h: 1.0, l: 1.0, c: 1.0 },
-            // An hour later: the market was shut, and five-minute buckets must not merge across it.
-            Bar { dt: 3_660.0, o: 2.0, h: 2.0, l: 2.0, c: 2.0 },
-        ];
-        let folded = fold(&bars, 300.0, 0.0);
-        assert_eq!(folded.len(), 2);
-        assert_eq!((folded[0].c, folded[1].o), (1.0, 2.0));
-    }
-
-    #[test]
-    fn candles_start_on_the_utc_clock_even_when_the_day_opens_off_it() {
-        // A session that opens at 13:31:00 UTC: `dt` counts from there, `t0` places it on the clock.
-        let t0 = 13.0 * 3_600.0 + 31.0 * 60.0 + 86_400.0 * 20_000.0;
-        let bars: Vec<Bar> = (0..14)
-            .map(|i| Bar { dt: (i * 60) as f32, o: i as f32, h: i as f32 + 1.0, l: i as f32 - 1.0, c: i as f32 })
-            .collect();
-        let folded = fold(&bars, 300.0, t0);
-        // 13:31-13:34 | 13:35-13:39 | 13:40-13:44: three candles, cut at :30 / :35 / :40, not at :31.
-        assert_eq!(folded.len(), 3);
-        for b in &folded {
-            assert_eq!(((t0 + b.dt as f64) % 300.0).abs(), 0.0, "bucket starts on a five-minute boundary");
-        }
-        assert_eq!(clock(folded[0].t(t0)), "13:30");
-        assert_eq!(clock(folded[1].t(t0)), "13:35");
-        // The first candle holds only the four minutes the session actually traded.
-        assert_eq!(folded[0].o, bars[0].o);
-        assert_eq!(folded[0].c, bars[3].c);
-    }
 
     #[test]
     fn a_chart_pane_takes_half_the_frame_and_leaves_the_cards_whole_columns() {
@@ -1607,58 +1563,5 @@ mod tests {
         // And the card is still a card around it: a click beside the button locks, it does not open.
         assert_eq!(card_at(&g, 6, card.left + 20, card.top + 90), Some(2));
         assert!(!open_btn_at(&g, Some(2), 96, card.left + 20, card.top + 90));
-    }
-
-    #[test]
-    fn candles_are_whole_pixels_with_the_wick_in_the_middle() {
-        for dpi in [96, 120, 144, 192] {
-            for plot_w in [296, 400, 650, 720, 1_200, 2_000] {
-                for n in [1, 4, 8, 24, 78, 96, 390] {
-                    let (step, body, wick) = candle_metrics(plot_w, n, dpi);
-                    assert!(step >= 1 && body >= 1 && wick >= 1);
-                    // Same parity all round: the wick is the middle pixel of the body and the slot.
-                    assert_eq!(body % 2, 1, "dpi {dpi} w {plot_w} n {n}: body {body} not odd");
-                    assert_eq!(wick % 2, 1, "wick {wick} not odd");
-                    assert!(body <= step, "a body wider than its slot overlaps the next candle");
-                    if step >= MIN_BAR {
-                        assert_eq!(step % 2, 1, "step {step} not odd");
-                        assert!(body < step, "candles that fit keep a gap between bodies");
-                        assert!(n * step <= plot_w, "{n} candles of {step}px overflow {plot_w}");
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn gridlines_land_on_round_prices() {
-        // The case from the screenshot: S&P over 6,655 .. 6,733 used to grid at 6,709.47 / 6,686.35.
-        let (ticks, decimals) = nice_ticks(6_655.0, 6_733.0, 4);
-        assert_eq!(ticks, [6_660.0, 6_680.0, 6_700.0, 6_720.0]);
-        assert_eq!(decimals, 0);
-        // A narrow range steps in quarters and says so in the label.
-        let (q, d) = nice_ticks(0.0, 1.0, 4);
-        assert_eq!((q.len(), d), (5, 2));
-        assert!((q[1] - 0.25).abs() < 1e-12 && (q[4] - 1.0).abs() < 1e-12);
-        // Spot gold: two decimals only when the step needs them.
-        let (g, gd) = nice_ticks(4_150.0, 4_162.0, 4);
-        assert!(g.iter().all(|v| *v >= 4_150.0 && *v <= 4_162.0), "{g:?}");
-        assert_eq!(gd, 0, "a 2-dollar step prints whole dollars");
-        // Nothing to grid: no span, no ticks, and no panic.
-        assert_eq!(nice_ticks(5.0, 5.0, 4).0.len(), 0);
-        assert_eq!(nice_ticks(f64::NAN, 1.0, 4).0.len(), 0);
-    }
-
-    #[test]
-    fn time_ticks_are_round_clock_times_that_do_not_collide() {
-        // Five-minute candles 9 px wide: 0.03 px a second, so an hourly tick is ~108 px apart.
-        assert_eq!(tick_interval(9.0 / 300.0, 80.0), 3_600.0);
-        // A wide pane of one-minute candles can afford every quarter hour.
-        assert_eq!(tick_interval(15.0 / 60.0, 80.0), 900.0);
-        // A hopelessly narrow one falls back to a day rather than dividing by nothing.
-        assert_eq!(tick_interval(0.0, 80.0), 86_400.0);
-        // The clock labels are what they say, in UTC, wrapping past midnight.
-        assert_eq!(clock(13.0 * 3_600.0), "13:00");
-        assert_eq!(clock(86_400.0 + 30.0 * 60.0), "00:30");
     }
 }

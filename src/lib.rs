@@ -25,6 +25,7 @@ pub mod config;
 #[cfg(feature = "shots")]
 pub mod shot;
 pub(crate) mod alerts;
+pub(crate) mod chartview;
 pub(crate) mod dock;
 pub(crate) mod model;
 pub(crate) mod menu_commands;

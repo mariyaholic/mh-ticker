@@ -7,6 +7,8 @@
 //! ```text
 //! cargo run --release --example chart --features shots -- shots-chart/ midnight 96 1488
 //! cargo run --release --example chart --features shots -- shots-chart/ midnight 96 1488 4   # lock card 4
+//! cargo run --release --example chart --features shots -- shots-chart/ midnight 96 1488 4 40  # and hover candle 40
+//! cargo run --release --example chart --features shots -- shots-chart/ midnight 96 1488 1 40 refs  # reference lines and a break
 //! ```
 
 use mh_ticker::shot;
@@ -19,7 +21,11 @@ fn main() {
     let width: i32 = args.next().and_then(|v| v.parse().ok()).unwrap_or(1488);
     // Optional 5th argument: lock card N, as clicking it would (the chart follows the lock).
     let hover: Option<usize> = args.next().and_then(|v| v.parse().ok());
-    match shot::write_chart_named_at(&dir, name.as_str(), dpi, width, hover) {
+    // Optional 6th argument: hover candle N (0 = leftmost as drawn), which draws the crosshair and legend.
+    let bar: Option<usize> = args.next().and_then(|v| v.parse().ok());
+    // Optional 7th argument: the word `refs` draws the pane's reference lines and one session break.
+    let refs = args.next().as_deref() == Some("refs");
+    match shot::write_chart_named_at(&dir, name.as_str(), dpi, width, hover, bar, refs) {
         Ok(p) => println!("{}", p.display()),
         Err(e) => {
             eprintln!("{e}");
