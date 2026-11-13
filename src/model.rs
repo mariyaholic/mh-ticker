@@ -98,6 +98,9 @@ pub struct Board {
     /// Seconds between quote requests. The UI owns it (`Poll every` in the menu) and the feed
     /// thread reads it each pass, so a change takes effect on the next tick without a restart.
     pub poll_s: f64,
+    /// *Refresh now* counter. The UI bumps it with `wrapping_add(1)`; `Feed::wait` captures it on
+    /// entry and returns when it differs, and the chart thread makes rows with no bars due at once.
+    pub kick: u64,
 }
 
 fn empty_cell(r: &Row) -> Cell {
@@ -120,6 +123,7 @@ impl Board {
             bars_t0: Vec::new(),
             bars_gen: 0,
             poll_s: 3.0,
+            kick: 0,
         }
     }
 
@@ -220,9 +224,51 @@ pub fn fmt_change(pct: f64) -> String {
     format!("{}{:.2}%", if pct >= 0.0 { "+" } else { "" }, pct)
 }
 
+/// The whole board as text for the clipboard: one line per cell, `label<TAB>price<TAB>change`,
+/// joined with `\n`, no trailing newline. A stale cell (`Cell::stale`) with a quote gets a fourth
+/// field, `stale`, so a pasted list cannot pass an old price off as current. Price is `fmt_price(price, digits)`, change is
+/// `fmt_change(change_pct)`; a cell with no quote is `label<TAB>--<TAB>--`, and a quote with no
+/// `change_pct` has `--` for the change only. No cells = empty string.
+pub fn board_text(cells: &[Cell]) -> String {
+    cells
+        .iter()
+        .map(|cell| match &cell.quote {
+            None => format!("{}\t--\t--", cell.label),
+            Some(q) => {
+                let change = q.change_pct.map_or_else(|| "--".to_string(), fmt_change);
+                let line = format!("{}\t{}\t{}", cell.label, fmt_price(q.price, cell.digits), change);
+                if cell.stale { format!("{line}\tstale") } else { line }
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn board_text_is_tab_separated_with_dashes_for_gaps() {
+        let cell = |label: &str, digits: u32, quote: Option<Quote>| Cell { label: label.into(), digits, quote, stale: false };
+        let xau = Quote { price: 4154.456, change_pct: Some(0.32), ..Quote::default() };
+        let btc = Quote { price: 81176.4, ..Quote::default() };
+        let cells = [cell("XAU", 2, Some(xau)), cell("DOW", 0, None), cell("BTC", 0, Some(btc))];
+        assert_eq!(board_text(&cells), "XAU\t4,154.46\t+0.32%\nDOW\t--\t--\nBTC\t81,176\t--");
+        assert!(!board_text(&cells).ends_with('\n'));
+        // No cells is the empty string.
+        assert_eq!(board_text(&[]), "");
+        // One cell, with a quote and without one.
+        assert_eq!(board_text(&cells[..1]), "XAU\t4,154.46\t+0.32%");
+        assert_eq!(board_text(&[cell("DOW", 0, None)]), "DOW\t--\t--");
+        // A zero change uses fmt_change's rule: a plus sign, as elsewhere in the app.
+        let flat = Quote { price: 2.0, change_pct: Some(0.0), ..Quote::default() };
+        assert_eq!(board_text(&[cell("X", 2, Some(flat.clone()))]), "X\t2.00\t+0.00%");
+        let old = Cell { stale: true, ..cell("Y", 2, Some(flat)) };
+        assert_eq!(board_text(&[old]), "Y\t2.00\t+0.00%\tstale");
+        let gone = Cell { stale: true, ..cell("Z", 2, None) };
+        assert_eq!(board_text(&[gone]), "Z\t--\t--");
+    }
 
     fn q(sym: &str, ts: Option<f64>, realtime: bool) -> Quote {
         Quote { symbol: sym.into(), price: 1.0, ts, realtime, ..Quote::default() }

@@ -35,6 +35,9 @@ pub(crate) mod theme;
 pub(crate) mod ui;
 pub(crate) mod workspace;
 pub(crate) mod webhook_host;
+pub(crate) mod autostart;
+pub(crate) mod hotkey;
+pub(crate) mod update;
 
 use std::sync::{Arc, Mutex};
 

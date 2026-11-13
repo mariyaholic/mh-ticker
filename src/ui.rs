@@ -26,7 +26,10 @@
 //! `wndproc`, so the `UI` RefCell is never borrowed across those calls.
 
 use crate::alerts;
+use crate::autostart;
 use crate::chartview;
+use crate::hotkey;
+use crate::update;
 use crate::config::{self, Config, Placement, Profile};
 use crate::dock;
 use crate::panel;
@@ -46,7 +49,7 @@ use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_ESCAPE, VK_PRIOR, VK_NEXT, VK_HOME, VK_END};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_ESCAPE, VK_PRIOR, VK_NEXT, VK_HOME, VK_END};
 use windows_sys::Win32::UI::HiDpi::{GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
 use windows_sys::Win32::UI::Shell::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
@@ -130,6 +133,104 @@ const ANIM_MS: u32 = 100;
 const TIP_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
 /// A second tray click inside this window (a double-click) is ignored.
 const TRAY_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(600);
+
+// --- P3 "Everyday": reserved menu IDs 5400..5499, WM_APP + 9 and + 10, timer 6. ---
+/// The update check finished off-thread (its outcome is in `Ui::update_result`). `WM_APP + 10` and
+/// timer 6 are reserved for this package and unused.
+const WM_UPDATE: u32 = WM_APP + 9;
+/// The one global hotkey's id for `RegisterHotKey` / `WM_HOTKEY`'s `wparam`.
+const HOTKEY_ID: i32 = 1;
+const CMD_REFRESH: usize = 5400;
+const CMD_COPY_ALL: usize = 5401;
+const CMD_AUTOSTART: usize = 5402;
+const CMD_VERSION: usize = 5403;
+const CMD_UPDATE: usize = 5404;
+const CMD_SAVE_STATUS: usize = 5405;
+/// Hotkey submenu: Off, `hotkey::PRESETS` at `CMD_HOTKEY + 1 + i`, and `CMD_HOTKEY_CUSTOM` for a
+/// configured combo that is none of them.
+const CMD_HOTKEY: usize = 5410;
+const CMD_HOTKEY_CUSTOM: usize = 5415;
+/// Strip submenu: rows, text size and opacity, index into `STRIP_ROWS` / `TEXT_STEPS` / `OPACITY_STEPS`.
+const CMD_STRIP_ROWS: usize = 5420;
+const CMD_STRIP_TEXT: usize = 5430;
+const CMD_STRIP_OPACITY: usize = 5440;
+
+/// Rows in the taskbar grid offered by the Strip submenu (`cfg.dock_rows`).
+const STRIP_ROWS: [u32; 3] = [1, 2, 3];
+/// Text sizes: `(dock_font_pt, font_pt, label)`. The second step is today's default (9, 10).
+const TEXT_STEPS: [(i32, i32, &str); 4] = [(8, 9, "Small"), (9, 10, "Default"), (10, 11, "Large"), (11, 12, "Larger")];
+/// Opacities: `(cfg.opacity, label)`. The second step is today's default (235).
+const OPACITY_STEPS: [(u8, &str); 5] = [(255, "100 %"), (235, "92 %"), (205, "80 %"), (180, "70 %"), (155, "60 %")];
+
+/// Index into `STRIP_ROWS` closest to `rows` (ties go to the lower index; 0 and anything above 3
+/// clamp to the ends).
+fn nearest_rows(rows: u32) -> usize {
+    // Strictly closer wins, so a tie keeps the lower index.
+    (1..STRIP_ROWS.len()).fold(0, |best, i| if rows.abs_diff(STRIP_ROWS[i]) < rows.abs_diff(STRIP_ROWS[best]) { i } else { best })
+}
+
+/// Index into `TEXT_STEPS` closest to the config's `(dock_font_pt, font_pt)`: the smallest sum of
+/// absolute differences of both numbers; ties go to the lower index. The pair (9, 10) is index 1.
+fn nearest_text(dock_pt: i32, pt: i32) -> usize {
+    let distance = |i: usize| {
+        let (d, p, _) = TEXT_STEPS[i];
+        (i64::from(dock_pt) - i64::from(d)).abs() + (i64::from(pt) - i64::from(p)).abs()
+    };
+    (1..TEXT_STEPS.len()).fold(0, |best, i| if distance(i) < distance(best) { i } else { best })
+}
+
+/// Index into `OPACITY_STEPS` closest to `opacity` (ties go to the lower index, the more opaque
+/// step). 235 is index 1; 0 gives the last index; 255 gives 0.
+fn nearest_opacity(opacity: u8) -> usize {
+    let distance = |i: usize| (i32::from(opacity) - i32::from(OPACITY_STEPS[i].0)).abs();
+    (1..OPACITY_STEPS.len()).fold(0, |best, i| if distance(i) < distance(best) { i } else { best })
+}
+
+#[cfg(test)]
+mod strip_step_tests {
+    use super::*;
+
+    #[test]
+    fn rows_pick_the_nearest_step() {
+        assert_eq!(nearest_rows(1), 0);
+        assert_eq!(nearest_rows(2), 1);
+        assert_eq!(nearest_rows(3), 2);
+        assert_eq!(nearest_rows(0), 0);
+        assert_eq!(nearest_rows(9), 2);
+        assert_eq!(nearest_rows(u32::MAX), 2);
+        // The default two rows is the middle step, and it is today's dock_rows.
+        assert_eq!(STRIP_ROWS[1], config::Config::default().dock_rows);
+        assert_eq!(STRIP_ROWS[nearest_rows(config::Config::default().dock_rows)], 2);
+    }
+
+    #[test]
+    fn text_picks_the_nearest_step_and_defaults_are_the_default() {
+        let default = config::Config::default();
+        assert_eq!(nearest_text(9, 10), 1);
+        assert_eq!((TEXT_STEPS[1].0, TEXT_STEPS[1].1), (default.dock_font_pt, default.font_pt));
+        assert_eq!(nearest_text(default.dock_font_pt, default.font_pt), 1);
+        assert_eq!(nearest_text(8, 9), 0);
+        assert_eq!(nearest_text(11, 12), 3);
+        assert_eq!(nearest_text(14, 16), 3, "past the largest step stays at the largest");
+        assert_eq!(nearest_text(-5, 0), 0, "below the smallest stays at the smallest");
+        // (9, 12) is equally far from steps 1, 2 and 3: the lower index wins.
+        assert_eq!(nearest_text(9, 12), 1);
+        for (i, &(d, p, _)) in TEXT_STEPS.iter().enumerate() {
+            assert_eq!(nearest_text(d, p), i, "step {i} maps to itself");
+        }
+    }
+
+    #[test]
+    fn opacity_picks_the_nearest_step_and_235_is_the_default() {
+        assert_eq!(nearest_opacity(config::Config::default().opacity), 1);
+        assert_eq!(nearest_opacity(255), 0);
+        assert_eq!(nearest_opacity(0), 4);
+        assert_eq!(nearest_opacity(220), 1, "235 and 205 are both 15 away: the lower index");
+        for (i, &(value, _)) in OPACITY_STEPS.iter().enumerate() {
+            assert_eq!(nearest_opacity(value), i, "step {i} maps to itself");
+        }
+    }
+}
 
 const fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
     r as u32 | (g as u32) << 8 | (b as u32) << 16
@@ -257,6 +358,15 @@ struct Ui {
     /// Last tray tooltip refresh.
     tip_at: Option<Instant>,
     tray_click_at: Option<Instant>,
+    /// The last `RegisterHotKey` for `cfg.hotkey` failed (another app owns the combo) or the
+    /// configured text does not parse. Reset by every `register_hotkey` (start-up and each menu
+    /// change); false when no hotkey is configured.
+    hotkey_failed: bool,
+    /// An update check is in flight. Set by `start_update_check`, cleared by the `WM_UPDATE`
+    /// handler in every outcome (answer, failure, failed spawn).
+    update_running: bool,
+    /// Where the worker leaves its `update::Outcome` before posting `WM_UPDATE`; taken by the handler.
+    update_result: Arc<Mutex<Option<update::Outcome>>>,
     /// The cached back buffer, rebuilt only when the window changes size.
     back: Option<Back>,
     /// When the current background cycle started, so its phase is continuous across repaints.
@@ -1667,6 +1777,8 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
         let fallback = with_ui(|u| u.cfg.fallback_enabled).unwrap_or(false);
         add(sources, MF_STRING | if fallback { MF_CHECKED } else { 0 }, CMD_FALLBACK, "Allow fallback sources");
         add(m, MF_POPUP, sources as usize, "Data sources");
+        item(MF_STRING, CMD_REFRESH, "Refresh now");
+        item(MF_STRING, CMD_COPY_ALL, "Copy all prices");
         if ultra {
             // Theme: four tier submenus, because 25 entries in one popup is a wall. The tier is a
             // rendering rule (`theme::Kind`), so the menu cannot disagree with the painter.
@@ -1817,9 +1929,77 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
         }
         add(m, MF_POPUP | if open { MF_GRAYED } else { 0 }, pos as usize, "Position");
         item(MF_STRING | if top || docked { MF_CHECKED } else { 0 } | if docked { MF_GRAYED } else { 0 }, CMD_TOP, "Always on top");
+        // Strip: rows, text size and opacity, applied live. Radio marks show the nearest step.
+        {
+            let (rows, dock_pt, pt, opacity) =
+                with_ui(|u| (u.cfg.dock_rows, u.cfg.dock_font_pt, u.cfg.font_pt, u.cfg.opacity)).unwrap_or((2, 9, 10, 235));
+            let st = CreatePopupMenu();
+            let sub_rows = CreatePopupMenu();
+            for (i, n) in STRIP_ROWS.iter().enumerate() {
+                add(sub_rows, MF_STRING, CMD_STRIP_ROWS + i, &format!("{n} row{}", if *n == 1 { "" } else { "s" }));
+            }
+            CheckMenuRadioItem(sub_rows, CMD_STRIP_ROWS as u32, (CMD_STRIP_ROWS + STRIP_ROWS.len() - 1) as u32,
+                (CMD_STRIP_ROWS + nearest_rows(rows)) as u32, MF_BYCOMMAND);
+            add(st, MF_POPUP | if docked { 0 } else { MF_GRAYED }, sub_rows as usize, "Rows in the taskbar");
+            let sub_text = CreatePopupMenu();
+            for (i, (_, _, label)) in TEXT_STEPS.iter().enumerate() {
+                add(sub_text, MF_STRING, CMD_STRIP_TEXT + i, label);
+            }
+            CheckMenuRadioItem(sub_text, CMD_STRIP_TEXT as u32, (CMD_STRIP_TEXT + TEXT_STEPS.len() - 1) as u32,
+                (CMD_STRIP_TEXT + nearest_text(dock_pt, pt)) as u32, MF_BYCOMMAND);
+            add(st, MF_POPUP, sub_text as usize, "Text size");
+            let sub_op = CreatePopupMenu();
+            for (i, (_, label)) in OPACITY_STEPS.iter().enumerate() {
+                add(sub_op, MF_STRING, CMD_STRIP_OPACITY + i, label);
+            }
+            CheckMenuRadioItem(sub_op, CMD_STRIP_OPACITY as u32, (CMD_STRIP_OPACITY + OPACITY_STEPS.len() - 1) as u32,
+                (CMD_STRIP_OPACITY + nearest_opacity(opacity)) as u32, MF_BYCOMMAND);
+            add(st, MF_POPUP, sub_op as usize, "Opacity");
+            add(m, MF_POPUP, st as usize, "Strip");
+        }
+        // Start with Windows: the registry is the source of truth, read each time the menu opens.
+        item(MF_STRING | if autostart::enabled(config::profile().id) { MF_CHECKED } else { 0 }, CMD_AUTOSTART, "Start with Windows");
+        // Hotkey: Off, the presets, and the configured combo when it is none of them.
+        {
+            let (cfg_key, failed) = with_ui(|u| (u.cfg.hotkey.clone(), u.hotkey_failed)).unwrap_or((None, false));
+            let hk = CreatePopupMenu();
+            let parsed = cfg_key.as_deref().and_then(hotkey::parse);
+            let preset = cfg_key.as_deref().and_then(hotkey::preset_index);
+            let custom = cfg_key.as_ref().filter(|_| preset.is_none());
+            let note = if !failed { "" } else if parsed.is_some() { " (in use by another app)" } else { " (not a valid hotkey)" };
+            add(hk, MF_STRING, CMD_HOTKEY, "Off");
+            for (i, p) in hotkey::PRESETS.iter().enumerate() {
+                let tail = if preset == Some(i) { note } else { "" };
+                add(hk, MF_STRING, CMD_HOTKEY + 1 + i, &format!("{p}{tail}"));
+            }
+            if let Some(text) = custom {
+                let shown = parsed.map(|c| hotkey::label(&c)).unwrap_or_else(|| text.chars().take(24).collect());
+                add(hk, MF_STRING, CMD_HOTKEY_CUSTOM, &format!("{shown}{note}"));
+            }
+            let selected = match (&cfg_key, preset) {
+                (None, _) => CMD_HOTKEY,
+                (Some(_), Some(i)) => CMD_HOTKEY + 1 + i,
+                (Some(_), None) => CMD_HOTKEY_CUSTOM,
+            };
+            CheckMenuRadioItem(hk, CMD_HOTKEY as u32, CMD_HOTKEY_CUSTOM as u32, selected as u32, MF_BYCOMMAND);
+            let head = match &cfg_key {
+                None => "Hotkey \u{b7} off".to_string(),
+                Some(text) => format!("Hotkey \u{b7} {}{note}", parsed.map(|c| hotkey::label(&c)).unwrap_or_else(|| text.chars().take(24).collect())),
+            };
+            add(m, MF_POPUP, hk as usize, &head);
+        }
         AppendMenuW(m, MF_SEPARATOR, 0, null());
         let status: String = status.chars().take(90).collect();
         item(MF_STRING | MF_GRAYED, CMD_STATUS, &status);
+        if config::save_failed() {
+            item(MF_STRING | MF_GRAYED, CMD_SAVE_STATUS, "Settings could not be saved (changes last until you quit)");
+        }
+        item(MF_STRING | MF_GRAYED, CMD_VERSION, &format!("{} {}", config::profile().title(), env!("CARGO_PKG_VERSION")));
+        if with_ui(|u| u.update_running).unwrap_or(false) {
+            item(MF_STRING | MF_GRAYED, CMD_UPDATE, "Checking...");
+        } else {
+            item(MF_STRING, CMD_UPDATE, "Check for updates");
+        }
         item(MF_STRING, CMD_FOLDER, "Open config folder");
         AppendMenuW(m, MF_SEPARATOR, 0, null());
         item(MF_STRING, CMD_EXIT, "Quit");
@@ -1994,6 +2174,55 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
                 open_cnbc(hwnd, &sym);
             }
         }
+        CMD_REFRESH => {
+            // Wakes the quote loop and makes chart rows with no bars due now. The backoff counter
+            // is untouched: a still-failing source backs off again after this one attempt.
+            with_ui(|u| {
+                if let Ok(mut b) = u.board.lock() {
+                    b.kick = b.kick.wrapping_add(1);
+                }
+            });
+        }
+        CMD_COPY_ALL => {
+            let text = with_ui(|u| crate::model::board_text(&u.view.cells));
+            if let Some(text) = text.filter(|t| !t.is_empty()) {
+                copy_text(&text);
+            }
+        }
+        CMD_AUTOSTART => {
+            let id = config::profile().id;
+            if autostart::set(id, !autostart::enabled(id)).is_err() {
+                let text = wide("Could not change the Start with Windows setting.");
+                let title = wide("Start with Windows");
+                unsafe { MessageBoxW(hwnd, text.as_ptr(), title.as_ptr(), MB_OK | MB_ICONWARNING) };
+            }
+        }
+        CMD_UPDATE => start_update_check(hwnd),
+        CMD_HOTKEY => set_hotkey(hwnd, None),
+        c if (CMD_HOTKEY + 1..CMD_HOTKEY + 1 + hotkey::PRESETS.len()).contains(&c) => {
+            set_hotkey(hwnd, Some(hotkey::PRESETS[c - CMD_HOTKEY - 1].to_string()));
+        }
+        // Choosing the configured combo again retries its registration.
+        CMD_HOTKEY_CUSTOM => {
+            let keep = with_ui(|u| u.cfg.hotkey.clone()).flatten();
+            set_hotkey(hwnd, keep);
+        }
+        c if (CMD_STRIP_ROWS..CMD_STRIP_ROWS + STRIP_ROWS.len()).contains(&c) => {
+            with_ui(|u| u.cfg.dock_rows = STRIP_ROWS[c - CMD_STRIP_ROWS]);
+            apply_strip(hwnd);
+        }
+        c if (CMD_STRIP_TEXT..CMD_STRIP_TEXT + TEXT_STEPS.len()).contains(&c) => {
+            let (dock_pt, pt, _) = TEXT_STEPS[c - CMD_STRIP_TEXT];
+            with_ui(|u| {
+                u.cfg.dock_font_pt = dock_pt;
+                u.cfg.font_pt = pt;
+            });
+            apply_strip(hwnd);
+        }
+        c if (CMD_STRIP_OPACITY..CMD_STRIP_OPACITY + OPACITY_STEPS.len()).contains(&c) => {
+            with_ui(|u| u.cfg.opacity = OPACITY_STEPS[c - CMD_STRIP_OPACITY].0);
+            apply_strip(hwnd);
+        }
         CMD_PICK if ultra => apply_picker(hwnd, !picked),
         c if ultra && (CMD_ALERT_ONCE..=CMD_LOG_CLEAR).contains(&c) => alert_command(hwnd, c),
         _ => {}
@@ -2162,6 +2391,126 @@ fn alert_command(hwnd: HWND, cmd: usize) {
         }
         _ => {}
     }
+}
+
+/// (Re)register the configured global hotkey. Always unregisters first, so it is safe to call at
+/// any time and when nothing was registered. Records the outcome in `Ui::hotkey_failed`: true when
+/// `cfg.hotkey` is set and either does not parse or `RegisterHotKey` refused it (the combo belongs
+/// to another app); false when it is unset or registered. Uses `MOD_NOREPEAT`.
+fn register_hotkey(hwnd: HWND) {
+    let want = with_ui(|u| u.cfg.hotkey.clone()).flatten();
+    unsafe { UnregisterHotKey(hwnd, HOTKEY_ID) };
+    let failed = match want {
+        None => false,
+        Some(text) => match hotkey::parse(&text) {
+            Some(c) => (unsafe { RegisterHotKey(hwnd, HOTKEY_ID, c.mods | hotkey::MOD_NOREPEAT, c.vk) }) == 0,
+            None => true,
+        },
+    };
+    with_ui(|u| u.hotkey_failed = failed);
+}
+
+/// The Hotkey submenu changed the combo: store it, save, register it.
+fn set_hotkey(hwnd: HWND, combo: Option<String>) {
+    let cfg = with_ui(|u| {
+        u.cfg.hotkey = combo;
+        u.cfg.clone()
+    });
+    if let Some(cfg) = cfg {
+        config::save(&cfg);
+    }
+    register_hotkey(hwnd);
+}
+
+/// The Strip submenu changed `dock_rows`, the text size or the opacity (already in `cfg`): save,
+/// rebuild the strip font and re-lay-out like `apply_placement` does.
+///
+/// Opacity: `expand` fades the window from `cfg.opacity` up to 255, and `collapse` reads
+/// `cfg.opacity` again when it fades back down, so while the panel is open the window must stay
+/// at 255 and the new value is simply picked up on collapse. The layered alpha is therefore set
+/// here only in `Mode::Strip`; setting it in `Mode::Panel` would make the panel see-through, and
+/// `Mode::Morph` cannot be observed (morphs block this thread).
+fn apply_strip(hwnd: HWND) {
+    let Some((cfg, strip)) = with_ui(|u| {
+        unsafe { DeleteObject(u.font) };
+        u.font = make_font(&u.cfg, u.dpi);
+        (u.cfg.clone(), u.mode == Mode::Strip)
+    }) else {
+        return;
+    };
+    config::save(&cfg);
+    if strip {
+        unsafe { SetLayeredWindowAttributes(hwnd, 0, cfg.opacity, LWA_ALPHA) };
+        relayout_and_place(hwnd);
+    }
+}
+
+/// *Check for updates*: one GET on a worker thread, refused while another is running. The worker
+/// leaves an `update::Outcome` in `Ui::update_result` and posts `WM_UPDATE`. A failed spawn takes
+/// the same road (a `Failed` outcome posted from here), so the flag always gets cleared.
+fn start_update_check(hwnd: HWND) {
+    let Some(slot) = with_ui(|u| {
+        if u.update_running {
+            None
+        } else {
+            u.update_running = true;
+            Some(u.update_result.clone())
+        }
+    })
+    .flatten() else {
+        return;
+    };
+    let target = hwnd as isize;
+    let worker_slot = slot.clone();
+    let spawned = std::thread::Builder::new().name("update".into()).spawn(move || {
+        let outcome = match crate::source::get_release(update::API_URL) {
+            Ok(body) => update::decide(env!("CARGO_PKG_VERSION"), &body),
+            Err(e) => update::Outcome::Failed(e),
+        };
+        if let Ok(mut g) = worker_slot.lock() {
+            *g = Some(outcome);
+        }
+        unsafe { PostMessageW(target as HWND, WM_UPDATE, 0, 0) };
+    });
+    if spawned.is_err() {
+        if let Ok(mut g) = slot.lock() {
+            *g = Some(update::Outcome::Failed("could not start".into()));
+        }
+        unsafe { PostMessageW(hwnd, WM_UPDATE, 0, 0) };
+    }
+}
+
+/// `WM_UPDATE`: show the outcome in a message box. "Open the download page" opens the constant
+/// `update::RELEASES_URL` and nothing from the response. `update_running` is cleared last, after
+/// the box closes, so a second check cannot start underneath it.
+fn on_update(hwnd: HWND) {
+    let outcome = with_ui(|u| u.update_result.lock().ok().and_then(|mut g| g.take())).flatten()
+        .unwrap_or_else(|| update::Outcome::Failed("no answer".into()));
+    let title = wide("Check for updates");
+    let current = env!("CARGO_PKG_VERSION");
+    unsafe {
+        match outcome {
+            update::Outcome::UpToDate => {
+                let text = wide(&format!("MH Ticker {current} is the latest version."));
+                MessageBoxW(hwnd, text.as_ptr(), title.as_ptr(), MB_OK | MB_ICONINFORMATION);
+            }
+            update::Outcome::Newer(tag) => {
+                let tag: String = tag.chars().filter(|c| !c.is_control()).take(40).collect();
+                let text = wide(&format!("Version {tag} is available. You have {current}.\n\nOpen the download page?"));
+                if MessageBoxW(hwnd, text.as_ptr(), title.as_ptr(), MB_YESNO | MB_ICONINFORMATION) == IDYES {
+                    let url = wide(update::RELEASES_URL);
+                    let op = wide("open");
+                    ShellExecuteW(hwnd, op.as_ptr(), url.as_ptr(), null(), null(), SW_SHOWNORMAL);
+                }
+            }
+            update::Outcome::Failed(why) => {
+                let why: String = why.chars().filter(|c| !c.is_control()).take(40).collect();
+                let text = wide(&format!("Could not check for updates ({why}). Try again later."));
+                MessageBoxW(hwnd, text.as_ptr(), title.as_ptr(), MB_OK | MB_ICONWARNING);
+            }
+        }
+    }
+    with_ui(|u| u.update_running = false);
 }
 
 /// The Position menu moved the strip: new font (the taskbar grid uses `dock_font_pt`), topmost
@@ -2450,6 +2799,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             if with_ui(|u| u.mode == Mode::Panel).unwrap_or(false) {
                 InvalidateRect(hwnd, null(), 0);
             }
+            0
+        }
+        // The global hotkey: expand when the strip is showing, collapse when the panel is, nothing
+        // during a morph (which blocks this thread, so only a stale mode could say Morph here).
+        m if m == hotkey::WM_HOTKEY => {
+            if wp as i32 == HOTKEY_ID {
+                match with_ui(|u| u.mode) {
+                    Some(Mode::Strip) => expand(hwnd),
+                    Some(Mode::Panel) => collapse(hwnd),
+                    _ => {}
+                }
+            }
+            0
+        }
+        WM_UPDATE => {
+            on_update(hwnd);
             0
         }
         // The client area is the whole window: no caption, no border, no offset for the hit tests.
@@ -2858,6 +3223,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_DESTROY => {
             STRIP.store(0, Ordering::Relaxed);
+            UnregisterHotKey(hwnd, HOTKEY_ID);
             tray_delete(hwnd);
             with_ui(|u| config::save(&u.cfg));
             PostQuitMessage(0);
@@ -2968,6 +3334,9 @@ pub fn run(cfg: Config, board: Arc<Mutex<Board>>) {
             prev_fg: null_mut(),
             tip_at: None,
             tray_click_at: None,
+            hotkey_failed: false,
+            update_running: false,
+            update_result: Arc::new(Mutex::new(None)),
             back: None,
             anim: None,
             motion: allow_motion(),
@@ -2978,6 +3347,7 @@ pub fn run(cfg: Config, board: Arc<Mutex<Board>>) {
         relayout_and_place(hwnd);
         tray(hwnd, NIM_ADD, icon, &tip);
         apply_visibility(hwnd);
+        register_hotkey(hwnd);
 
         SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, null_mut(), Some(on_win_event), 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
         SetTimer(hwnd, TIMER_DOCK, 500, None);

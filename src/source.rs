@@ -187,6 +187,34 @@ pub fn post(url: &str, body: &str, content_type: &str, timeout_s: u64) -> Result
     }
 }
 
+/// The update check's one request: GET `url` with a dedicated short-lived agent (native-tls, the
+/// same UA, 10 s timeout, no redirects) and `Accept: application/vnd.github+json`, reading at most
+/// `update::MAX_BODY` bytes. Returns the body text, or a fixed `update::Outcome::Failed` text
+/// (`"network"`, `"HTTP <code>"`, `"too large"`, `"unreadable answer"`): `ureq`'s own messages
+/// are not passed on. Blocking; call it from a worker thread only.
+pub fn get_release(url: &str) -> Result<String, String> {
+    use std::io::Read;
+    let tls = native_tls::TlsConnector::new().map_err(|_| "network".to_string())?;
+    let agent = ureq::AgentBuilder::new()
+        .tls_connector(Arc::new(tls))
+        .user_agent(UA)
+        .timeout(Duration::from_secs(10))
+        .redirects(0)
+        .build();
+    let resp = match agent.get(url).set("Accept", "application/vnd.github+json").call() {
+        Ok(r) => r,
+        Err(ureq::Error::Status(code, _)) => return Err(format!("HTTP {code}")),
+        Err(_) => return Err("network".into()),
+    };
+    let limit = crate::update::MAX_BODY;
+    let mut body = Vec::new();
+    resp.into_reader().take((limit + 1) as u64).read_to_end(&mut body).map_err(|_| "network".to_string())?;
+    if body.len() > limit {
+        return Err("too large".into());
+    }
+    String::from_utf8(body).map_err(|_| "unreadable answer".to_string())
+}
+
 fn encode(s: &str) -> String {
     s.bytes()
         .map(|b| match b {
@@ -452,15 +480,35 @@ impl Feed {
     }
 
     /// Sleep until the next poll, waking early when the Symbols menu changes the rows so a new
-    /// symbol shows up within a fraction of a second.
-    fn wait(&self, d: Duration) {
+    /// symbol shows up within a fraction of a second, or when *Refresh now* bumps `Board::kick`.
+    /// `acted` is the `kick` value the caller last acted on, read BEFORE it started the work that
+    /// precedes this wait (a quote request can take 10 s, a chart fetch 45 s). A kick that lands
+    /// during that work therefore differs from `acted` and ends the wait at once, instead of being
+    /// taken as the baseline and lost. Polled every `ROWS_CHECK`.
+    fn wait(&self, d: Duration, acted: u64) {
         let until = Instant::now() + d;
         while Instant::now() < until {
             thread::sleep(ROWS_CHECK.min(until.saturating_duration_since(Instant::now())));
-            if self.shared.lock().map(|b| b.rows_gen != self.rows_gen).unwrap_or(false) {
+            if self.shared.lock().map(|b| b.rows_gen != self.rows_gen || b.kick != acted).unwrap_or(false) {
                 return;
             }
         }
+    }
+
+    /// *Refresh now* for the chart thread: every row whose bars are empty (never fetched, or the
+    /// last fetch failed and is waiting out `BARS_RETRY`) becomes due at once. Rows that have bars
+    /// keep their schedule.
+    fn kick_bars(&mut self) {
+        let now = Instant::now();
+        if self.bars_due.len() != self.rows.len() {
+            self.bars_due = vec![now; self.rows.len()];
+        }
+        for (i, due) in self.bars_due.iter_mut().enumerate() {
+            if self.chart.get(i).map(|(_, bars)| bars.is_empty()).unwrap_or(true) {
+                *due = now;
+            }
+        }
+        self.bars_next = self.bars_due.iter().copied().min().unwrap_or(now).min(self.bars_next);
     }
 
     /// Fetch the hour of 1-minute bars when due; true when a fresh set arrived.
@@ -525,6 +573,8 @@ impl Feed {
     fn run(mut self) {
         loop {
             self.sync_rows();
+            // Read before the request: a kick that lands while it is in flight ends the wait below.
+            let acted = self.shared.lock().map(|b| b.kick).unwrap_or(0);
             let (link, note) = match self.client.quotes(&self.rows) {
                 Ok(qs) => {
                     self.fails = 0;
@@ -557,7 +607,7 @@ impl Feed {
             } else {
                 (cadence * 2f64.powi(self.fails.min(6) as i32)).min(60.0)
             };
-            self.wait(Duration::from_secs_f64(wait));
+            self.wait(Duration::from_secs_f64(wait), acted);
         }
     }
 }
@@ -605,11 +655,19 @@ pub fn spawn(cfg: Config, shared: Arc<Mutex<Board>>, notify: Box<dyn Fn() + Send
         notify: notify.clone(), client: chart_client, quotes: HashMap::new(), chart: Vec::new(),
         backfill: Vec::new(), backfill_gen: 0, bars_next: Instant::now(), bars_due: Vec::new(), fails: 0,
     };
-    thread::Builder::new().name("chart".into()).spawn(move || loop {
+    thread::Builder::new().name("chart".into()).spawn(move || {
+        let mut seen_kick = chart_feed.shared.lock().map(|b| b.kick).unwrap_or(0);
+        loop {
         chart_feed.sync_rows();
+        let kick = chart_feed.shared.lock().map(|b| b.kick).unwrap_or(seen_kick);
+        if kick != seen_kick {
+            seen_kick = kick;
+            chart_feed.kick_bars();
+        }
         if chart_feed.maybe_bars() { chart_feed.publish_bars(); }
         let wait = chart_feed.bars_next.saturating_duration_since(Instant::now());
-        chart_feed.wait(wait);
+        chart_feed.wait(wait, seen_kick);
+        }
     }).expect("spawn chart thread");
     let feed = Feed {
         cfg,
@@ -1162,5 +1220,60 @@ mod tests {
     #[test]
     fn encodes_cnbc_symbols() {
         assert_eq!(encode("XAU=|@DJ.1"), "XAU%3D%7C%40DJ.1");
+    }
+
+    #[test]
+    fn a_kick_wakes_wait_early() {
+        let cfg = Config::default();
+        let rows = cfg.rows[..2].to_vec();
+        let shared = Arc::new(Mutex::new(Board::new(&rows)));
+        let feed = Feed { cfg, rows, rows_gen: 0, shared: shared.clone(), notify: Arc::new(|| {}),
+            client: Client::new().unwrap(), quotes: HashMap::new(), chart: Vec::new(),
+            backfill: Vec::new(), backfill_gen: 0, bars_next: Instant::now(), bars_due: Vec::new(), fails: 0 };
+        let bumper = shared.clone();
+        let started = Instant::now();
+        let t = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            let mut b = bumper.lock().unwrap();
+            b.kick = b.kick.wrapping_add(1);
+        });
+        feed.wait(Duration::from_secs(30), 0);
+        t.join().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(2), "wait ignored the kick: {:?}", started.elapsed());
+    }
+
+    #[test]
+    fn a_kick_makes_rows_without_bars_due_now_and_leaves_the_rest() {
+        let cfg = Config::default();
+        let rows = cfg.rows[..2].to_vec();
+        let shared = Arc::new(Mutex::new(Board::new(&rows)));
+        let bar = Bar { dt: 0.0, o: 1.0, h: 1.0, l: 1.0, c: 1.0 };
+        let later = Instant::now() + BARS_REFRESH;
+        let mut feed = Feed { cfg, rows, rows_gen: 0, shared, notify: Arc::new(|| {}),
+            client: Client::new().unwrap(), quotes: HashMap::new(),
+            chart: vec![(100.0, vec![bar]), (100.0, Vec::new())],
+            backfill: Vec::new(), backfill_gen: 0, bars_next: later, bars_due: vec![later; 2], fails: 0 };
+        feed.kick_bars();
+        assert_eq!(feed.bars_due[0], later, "a row with bars keeps its schedule");
+        assert!(feed.bars_due[1] <= Instant::now(), "an empty row is due at once");
+        assert!(feed.bars_next <= Instant::now());
+    }
+
+    #[test]
+    fn a_kick_during_work_ends_the_next_wait_at_once() {
+        let cfg = Config::default();
+        let rows = cfg.rows[..2].to_vec();
+        let shared = Arc::new(Mutex::new(Board::new(&rows)));
+        let feed = Feed { cfg, rows, rows_gen: 0, shared: shared.clone(), notify: Arc::new(|| {}),
+            client: Client::new().unwrap(), quotes: HashMap::new(), chart: Vec::new(),
+            backfill: Vec::new(), backfill_gen: 0, bars_next: Instant::now(), bars_due: Vec::new(), fails: 0 };
+        let acted = shared.lock().unwrap().kick; // baseline read before the "request"
+        {
+            let mut b = shared.lock().unwrap(); // the kick lands while the request is in flight
+            b.kick = b.kick.wrapping_add(1);
+        }
+        let started = Instant::now();
+        feed.wait(Duration::from_secs(30), acted);
+        assert!(started.elapsed() < Duration::from_secs(1), "lost wake-up: {:?}", started.elapsed());
     }
 }

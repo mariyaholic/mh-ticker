@@ -8,6 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
 /// The strip, dock grid and panel stay readable up to this many symbols.
@@ -138,6 +139,9 @@ pub struct Config {
     pub opacity: u8,
     pub strip_visible: bool,
     pub topmost: bool,
+    /// Global hotkey that opens and closes the panel, in `hotkey::parse` grammar
+    /// (`Ctrl+Alt+M`). None = no hotkey.
+    pub hotkey: Option<String>,
     /// Where the strip sits. Unset in configs from before the Position menu: then `dock`
     /// decides (true = Auto, false = Floating).
     pub placement: Option<Placement>,
@@ -258,6 +262,7 @@ impl Default for Config {
             opacity: 235,
             strip_visible: true,
             topmost: true,
+            hotkey: None,
             placement: None,
             monitor: None,
             dock: true,
@@ -358,12 +363,29 @@ fn load_from(p: &Path) -> Result<Config, String> {
     }
 }
 
+/// Whether the last `save` / `save_checked` failed. Starts false; a success clears it again.
+static SAVE_FAILED: AtomicBool = AtomicBool::new(false);
+
+/// True while the most recent save through `save` or `save_checked` failed (read-only folder,
+/// full disk, antivirus lock). The menu's status line says so. `save_checked_to` itself does not
+/// record, so tests of the low-level writer cannot race with a test of this flag.
+pub fn save_failed() -> bool {
+    SAVE_FAILED.load(Ordering::Relaxed)
+}
+
+/// Record a save outcome in the flag read by `save_failed`. Returns the result unchanged.
+fn record_save(result: std::io::Result<()>) -> std::io::Result<()> {
+    SAVE_FAILED.store(result.is_err(), Ordering::Relaxed);
+    result
+}
+
+/// Write the settings. Signature unchanged; the outcome is recorded for `save_failed`.
 pub fn save(cfg: &Config) {
     save_to(&path(), cfg);
 }
 
 pub fn save_checked(cfg: &Config) -> std::io::Result<()> {
-    save_checked_to(&path(), cfg)
+    record_save(save_checked_to(&path(), cfg))
 }
 
 fn save_checked_to(p: &Path, cfg: &Config) -> std::io::Result<()> {
@@ -379,7 +401,7 @@ fn save_checked_to(p: &Path, cfg: &Config) -> std::io::Result<()> {
 }
 
 fn save_to(p: &Path, cfg: &Config) {
-    let _ = save_checked_to(p, cfg);
+    let _ = record_save(save_checked_to(p, cfg));
 }
 
 #[cfg(test)]
@@ -483,6 +505,28 @@ mod tests {
         assert!(free.dock);
         let text = serde_json::to_string(&free).unwrap();
         assert!(text.contains(r#""placement":"taskbar_right""#), "{text}");
+    }
+
+    #[test]
+    fn save_failed_flag_sets_and_clears_with_the_last_save() {
+        // Only record_save touches the flag in this test; no test drives a successful save_to
+        // or load_from on a missing file, so the static cannot change under this test.
+        let failed = record_save(Err(std::io::Error::other("x")));
+        assert!(save_failed());
+        assert_eq!(failed.unwrap_err().to_string(), "x", "the error passes through unchanged");
+        assert!(record_save(Ok(())).is_ok());
+        assert!(!save_failed());
+    }
+
+    #[test]
+    fn hotkey_defaults_to_none_and_old_configs_parse() {
+        let old: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(old.hotkey, None);
+        let set: Config = serde_json::from_str(r#"{"hotkey":"Ctrl+Alt+M"}"#).unwrap();
+        assert_eq!(set.hotkey.as_deref(), Some("Ctrl+Alt+M"));
+        let text = serde_json::to_string(&set).unwrap();
+        let back: Config = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.hotkey.as_deref(), Some("Ctrl+Alt+M"));
     }
 
     #[test]
