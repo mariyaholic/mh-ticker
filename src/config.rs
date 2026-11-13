@@ -153,6 +153,9 @@ pub struct Config {
     /// The panel's last frame, `[x, y, w, h]`. None = size it to its content and centre it, which
     /// is what every config written before a panel became resizable gets.
     pub panel: Option<[i32; 4]>,
+    /// The candle pane's clock: false (default) cuts candles and labels times on the machine's local
+    /// time, true keeps them in UTC. Flipped by clicking the zone name in the pane's header.
+    pub chart_utc: bool,
 
     // --- Ultra only. `serde(default)` keeps a classic config parsing unchanged. ---
     /// Theme name (`theme::ALL`). Ignored by the classic build, which has exactly one.
@@ -263,6 +266,7 @@ impl Default for Config {
             x: None,
             y: None,
             panel: None,
+            chart_utc: false,
             theme: "midnight".into(),
             theme_font: None,
             alerts: Vec::new(),
@@ -423,6 +427,15 @@ mod tests {
         assert!(parse_settings("{invalid json").is_err());
         assert!(parse_settings(r#"{"placement":"not-a-placement"}"#).is_err());
         assert!(parse_settings("{}").is_ok());
+    }
+
+    #[test]
+    fn the_chart_clock_defaults_to_local_and_persists_utc() {
+        let c: Config = serde_json::from_str("{}").unwrap();
+        assert!(!c.chart_utc, "an old config gets local time");
+        let utc: Config = serde_json::from_str(r#"{"chart_utc":true}"#).unwrap();
+        assert!(utc.chart_utc);
+        assert!(serde_json::to_string(&utc).unwrap().contains(r#""chart_utc":true"#));
     }
 
     #[test]

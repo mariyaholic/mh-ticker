@@ -26,6 +26,7 @@
 //! `wndproc`, so the `UI` RefCell is never borrowed across those calls.
 
 use crate::alerts;
+use crate::chartview;
 use crate::config::{self, Config, Placement, Profile};
 use crate::dock;
 use crate::panel;
@@ -119,6 +120,9 @@ const COLLAPSE_MS: f64 = 190.0;
 /// The window gliding wider for the chart, or back. Shorter than a strip <-> panel morph: the content
 /// is the same panel, only the frame changes.
 const CHART_MS: f64 = 210.0;
+/// The candle pane's crosshair moves in bands this tall (96-dpi px, scaled by DPI), so a mouse move
+/// inside one band repaints nothing.
+const CHART_Y_BAND: i32 = 2;
 /// The fallback cycle length, and how often a moving background is advanced. Each palette names its
 /// own cycle in `theme::ALL`; this only covers a theme that somehow has none.
 const ANIM_CYCLE_S: f64 = 9.0;
@@ -213,6 +217,13 @@ struct Ui {
     gear_hover: bool,
     /// The Open button on the locked card is hovered.
     open_hover: bool,
+    /// The pointer on a candle of the pane (bar and quantised row), `None` when it is off the plot.
+    /// Reset: pointer leaves, chart opens or closes (`set_chart`), the lock moves (`Act::Select`), the
+    /// rows change (`apply_rows`), the zone flips (`Act::Zone`), the panel expands or collapses.
+    chart_at: Option<chartview::Pointer>,
+    /// The layout the pane was last painted with (`Scene::layout`); the pointer is answered from it.
+    /// Cleared by the painter whenever the pane draws no bars, and with every reset of `chart_at`.
+    chart_layout: std::cell::Cell<Option<chartview::Layout>>,
     /// The picker strip is open (Ultra only).
     pick_open: bool,
     picker_scroll: i32,
@@ -688,6 +699,8 @@ fn draw_panel(u: &mut Ui, dc: HDC, w: i32, h: i32) {
         selected: selected_row(u),
         open_hover: u.open_hover,
         hover: u.hover_at,
+        chart_at: u.chart_at,
+        layout: &u.chart_layout,
         picker: picker_open(u).then(|| panel::Picker { list: &list, shown: &shown }),
         picker_scroll: u.picker_scroll,
         picker_btn: u.profile.ultra,
@@ -699,7 +712,14 @@ fn draw_panel(u: &mut Ui, dc: HDC, w: i32, h: i32) {
         chart: u.chart.then(|| match selected_row(u) {
             Some(row) => {
                 let fallback = u.view.cells.get(row).and_then(|c| c.quote.as_ref()).is_some_and(|q| !q.source.is_empty());
+                let quote = u.view.cells.get(row).and_then(|c| c.quote.as_ref());
                 panel::Chart {
+                    tz_offset_s: if u.cfg.chart_utc { 0 } else { local_offset_s() },
+                    tz_label: chartview::zone_label(u.cfg.chart_utc),
+                    prev: chartview::positive(quote.and_then(|q| q.prev_close)),
+                    day_hi: chartview::positive(quote.and_then(|q| q.high)),
+                    day_lo: chartview::positive(quote.and_then(|q| q.low)),
+                    change_pct: quote.and_then(|q| q.change_pct),
                     unavailable: fallback,
                     label: u.view.cells.get(row).map(|c| c.label.as_str()).unwrap_or(""),
                     digits: u.view.cells.get(row).map(|c| c.digits).unwrap_or(2),
@@ -708,12 +728,63 @@ fn draw_panel(u: &mut Ui, dc: HDC, w: i32, h: i32) {
                     last: u.view.cells.get(row).and_then(|c| c.quote.as_ref()).map(|q| q.price),
                 }
             }
-            None => panel::Chart { label: "", digits: 2, t0: 0.0, bars: &[], last: None, unavailable: false },
+            None => panel::Chart {
+                label: "",
+                digits: 2,
+                t0: 0.0,
+                bars: &[],
+                last: None,
+                unavailable: false,
+                tz_offset_s: 0,
+                tz_label: "UTC",
+                prev: None,
+                day_hi: None,
+                day_lo: None,
+                change_pct: None,
+            },
         }),
         alert: u.alert_note.as_deref(),
         phase,
     };
     panel::draw(dc, w, h, &scene);
+}
+
+/// Seconds east of UTC the machine's clock runs on right now (daylight time included): the pane's
+/// "local". 0 if Windows cannot say.
+fn local_offset_s() -> i32 {
+    use windows_sys::Win32::System::Time::{GetTimeZoneInformation, TIME_ZONE_INFORMATION};
+    let mut tz: TIME_ZONE_INFORMATION = unsafe { std::mem::zeroed() };
+    let id = unsafe { GetTimeZoneInformation(&mut tz) };
+    offset_from_bias(id, tz.Bias, tz.StandardBias, tz.DaylightBias)
+}
+
+/// The offset east of UTC from `GetTimeZoneInformation`'s answer. `id` 2 (`TIME_ZONE_ID_DAYLIGHT`)
+/// means daylight time is in force; 0 and 1 are standard time (unknown / standard); anything else
+/// (`TIME_ZONE_ID_INVALID`) is "cannot say" and gives 0. Biases are minutes WEST of UTC.
+fn offset_from_bias(id: u32, bias: i32, standard_bias: i32, daylight_bias: i32) -> i32 {
+    match id {
+        0 | 1 => -(bias + standard_bias) * 60,
+        2 => -(bias + daylight_bias) * 60,
+        _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod offset_tests {
+    use super::offset_from_bias;
+
+    #[test]
+    fn the_bias_becomes_seconds_east_with_daylight_time_applied() {
+        // New York: 300 minutes west, daylight bias -60.
+        assert_eq!(offset_from_bias(1, 300, 0, -60), -5 * 3_600);
+        assert_eq!(offset_from_bias(2, 300, 0, -60), -4 * 3_600);
+        // India has no daylight time: +05:30.
+        assert_eq!(offset_from_bias(0, -330, 0, 0), 19_800);
+        // Newfoundland in summer: -02:30.
+        assert_eq!(offset_from_bias(2, 210, 0, -60), -9_000);
+        // TIME_ZONE_ID_INVALID is 0xFFFFFFFF: say nothing rather than guess.
+        assert_eq!(offset_from_bias(u32::MAX, 300, 0, -60), 0);
+    }
 }
 
 /// Render into a fresh w x h bitmap compatible with the window.
@@ -1320,6 +1391,8 @@ fn set_chart(hwnd: HWND, on: bool) {
         u.chart = on;
         u.open_hover = false;
         u.chart_hover = false;
+        u.chart_at = None;
+        u.chart_layout.set(None);
         if on {
             u.pick_open = false;
             // Nothing locked yet: lock the first card, so the pane opens on a chart instead of an
@@ -1389,6 +1462,8 @@ fn expand(hwnd: HWND) {
         u.gear_hover = false;
         u.open_hover = false;
         u.hover_at = None;
+        u.chart_at = None;
+        u.chart_layout.set(None);
         u.prev_fg = unsafe { GetForegroundWindow() };
         let a = u.strip_rect;
         let natural = panel_geo(u);
@@ -1439,6 +1514,7 @@ fn collapse(hwnd: HWND) {
         u.last_panel = Some(a);
         let psz = ((a.right - a.left).max(1), (a.bottom - a.top).max(1));
         u.hover = false;
+        u.chart_at = None;
         let from = snapshot(hwnd, psz.0, psz.1, |dc| draw_panel(u, dc, psz.0, psz.1));
         u.strip_rect = strip_place(u);
         let fsz = (u.frame.w.max(1), u.frame.h.max(1));
@@ -1449,7 +1525,12 @@ fn collapse(hwnd: HWND) {
         return;
     };
     run_morph(hwnd, a, b, from, to, (255, op), COLLAPSE_MS, ease_in_out);
-    with_ui(|u| u.mode = Mode::Strip);
+    with_ui(|u| {
+        u.mode = Mode::Strip;
+        // The snapshots above painted the pane at the morph's sizes; none of them is the frame the
+        // pointer would be answered from.
+        u.chart_layout.set(None);
+    });
     sync_anim(hwnd);
     unsafe {
         SetWindowPos(hwnd, null_mut(), b.left, b.top, b.right - b.left, b.bottom - b.top, SWP_NOZORDER | SWP_NOACTIVATE);
@@ -2111,6 +2192,8 @@ fn apply_rows(hwnd: HWND) {
             u.view = b.clone();
         }
         u.hist.record(&u.view, crate::source::now_s());
+        u.chart_at = None;
+        u.chart_layout.set(None);
         if u.profile.ultra {
             let labels: Vec<&str> = u.view.cells.iter().map(|c| c.label.as_str()).collect();
             u.selected = settle_lock(u.selected.as_deref(), &labels, u.chart);
@@ -2493,6 +2576,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 Collapse,
                 TogglePicker,
                 ToggleChart,
+                /// The zone name in the chart pane's header: local time <-> UTC.
+                Zone,
                 /// Open the settings menu from under its button.
                 Settings,
                 Symbol(String),
@@ -2514,6 +2599,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     Mode::Panel if u.profile.ultra && panel::in_rect(&g.gear_btn, x, y) => Act::Settings,
                     Mode::Panel if u.profile.ultra && panel::in_rect(&g.pick_btn, x, y) => Act::TogglePicker,
                     Mode::Panel if u.profile.ultra && panel::in_rect(&g.chart_btn, x, y) => Act::ToggleChart,
+                    // The zone name is inside the pane, which is beside the cards, never over them; it
+                    // is still answered before the card hit test so no later arm can claim the click.
+                    // The layout exists only while the pane drew bars, so a stale button cannot be hit.
+                    Mode::Panel if u.profile.ultra && u.chart && u.chart_layout.get().is_some_and(|l| l.zone_btn.contains(x, y)) => Act::Zone,
                     // A chip, when the picker is open and the pointer is on one.
                     Mode::Panel if picker_open(u) && panel::pick_hit(&g, x, y).is_some() => {
                         let list = config::menu_list(&u.cfg);
@@ -2560,11 +2649,27 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     let on = !with_ui(|u| u.chart).unwrap_or(false);
                     set_chart(hwnd, on);
                 }
+                Some(Act::Zone) => {
+                    // Saved outside the closure: `with_ui` does no I/O.
+                    let cfg = with_ui(|u| {
+                        u.cfg.chart_utc = !u.cfg.chart_utc;
+                        // Candles refold on the new clock, so the pointer's bar index no longer means
+                        // the same candle.
+                        u.chart_at = None;
+                        u.cfg.clone()
+                    });
+                    if let Some(cfg) = cfg {
+                        config::save(&cfg);
+                    }
+                    InvalidateRect(hwnd, null(), 0);
+                }
                 Some(Act::Select(label)) => {
                     with_ui(|u| {
                         // The same card again unlocks it: a lock that cannot be undone is a trap.
                         u.selected = toggle_lock(u.selected.as_deref(), label);
                         u.open_hover = false;
+                        u.chart_at = None;
+                        u.chart_layout.set(None);
                     });
                     InvalidateRect(hwnd, null(), 0);
                 }
@@ -2593,6 +2698,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 let chart_btn = u.profile.ultra && panel::in_rect(&g.chart_btn, x, y);
                 let gear = u.profile.ultra && panel::in_rect(&g.gear_btn, x, y);
                 let open = panel::open_btn_at(&g, selected_row(u), u.dpi, x, y);
+                // Answered from the layout the last paint stored, so it cannot disagree with the pixels.
+                let band = (CHART_Y_BAND * u.dpi as i32 / 96).max(1);
+                let aim = if u.profile.ultra && u.chart { u.chart_layout.get().and_then(|l| l.pointer_at(x, y, band)) } else { None };
                 let track = !u.tracking;
                 u.tracking = true;
                 // Hover moves the crosshair and lights buttons, and nothing else. In particular it no
@@ -2602,12 +2710,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     || chart_btn != u.chart_hover
                     || gear != u.gear_hover
                     || open != u.open_hover
+                    || aim != u.chart_at
                     || at != u.hover_at.unwrap_or(away);
                 u.hover = btn;
                 u.pick_hover = pick;
                 u.chart_hover = chart_btn;
                 u.gear_hover = gear;
                 u.open_hover = open;
+                u.chart_at = aim;
                 u.hover_at = (at.row != usize::MAX).then_some(at);
                 (changed, track)
             });
@@ -2625,13 +2735,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_MOUSELEAVE => {
             let was = with_ui(|u| {
                 u.tracking = false;
-                let was = u.hover || u.pick_hover || u.chart_hover || u.gear_hover || u.open_hover || u.hover_at.is_some();
+                let was = u.hover || u.pick_hover || u.chart_hover || u.gear_hover || u.open_hover || u.hover_at.is_some() || u.chart_at.is_some();
                 u.hover = false;
                 u.pick_hover = false;
                 u.chart_hover = false;
                 u.gear_hover = false;
                 u.open_hover = false;
                 u.hover_at = None;
+                u.chart_at = None;
                 was
             });
             if was == Some(true) {
@@ -2840,6 +2951,8 @@ pub fn run(cfg: Config, board: Arc<Mutex<Board>>) {
             chart_hover: false,
             gear_hover: false,
             open_hover: false,
+            chart_at: None,
+            chart_layout: std::cell::Cell::new(None),
             pick_open: false,
             picker_scroll: 0,
             wheel_remainder: 0,

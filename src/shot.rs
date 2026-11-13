@@ -116,6 +116,8 @@ fn render(t: &Theme, phase: f64, now: f64, b: &Board, h: &History, dpi: u32) -> 
     let (w, hh) = (g.w, g.h);
     let fonts = Fonts::new(theme::font_of(t, None), dpi, t.is_pixel());
     let grad = Gradient::new(t);
+    // Stills never draw the pane, so the cell stays empty.
+    let layout = std::cell::Cell::new(None);
     let sc = Scene {
         title: "MH Ticker Ultra",
         board: b,
@@ -135,6 +137,8 @@ fn render(t: &Theme, phase: f64, now: f64, b: &Board, h: &History, dpi: u32) -> 
         select: false,
         selected: None,
         hover: None,
+        chart_at: None,
+        layout: &layout,
         picker: None,
         picker_scroll: 0,
         picker_btn: true,
@@ -195,21 +199,28 @@ fn write_png(path: &Path, w: u32, h: u32, px: &[u8]) -> Result<(), String> {
 
 /// `write_chart` by palette name: the example should not need `theme` to be public.
 pub fn write_chart_named(dir: &Path, name: &str, dpi: u32, w: i32) -> Result<PathBuf, String> {
-    write_chart_named_at(dir, name, dpi, w, None)
+    write_chart_named_at(dir, name, dpi, w, None, None, false)
 }
 
-/// `write_chart_named` with card `hover` locked (and its crosshair drawn), so a review can see the
-/// pane, the border and the Open button on any of the six.
+/// `write_chart_named` with card `hover` locked, so a review can see the pane, the border and the
+/// Open button on any of the six, and candle `bar` hovered (an index into the candles as drawn, 0 at
+/// the left; clamped to the last), so the crosshair, the price tag and the legend can be reviewed.
+/// The pointer sits at the candle's close.
 pub fn write_chart_named_at(
     dir: &Path,
     name: &str,
     dpi: u32,
     w: i32,
     hover: Option<usize>,
+    bar: Option<usize>,
+    refs: bool,
 ) -> Result<PathBuf, String> {
     let t = theme::ALL.iter().find(|t| t.name == name).ok_or_else(|| format!("no theme named {name}"))?;
-    write_chart_at(dir, t, dpi, w, hover)
+    write_chart_fixture(dir, t, dpi, w, hover, bar, refs)
 }
+
+/// The fixture's clock: UTC-4, a US equity day in summer.
+const TZ_S: i32 = -4 * 3_600;
 
 /// One rendered panel with the candle pane open, from deterministic bars.
 ///
@@ -218,16 +229,33 @@ pub fn write_chart_named_at(
 /// painter, the axes and the layout. The six cards are the catalogue's own fixture, so the pane is
 /// always seen beside the prices it will be read with.
 pub fn write_chart(dir: &Path, t: &Theme, dpi: u32, w: i32) -> Result<PathBuf, String> {
-    write_chart_at(dir, t, dpi, w, None)
+    write_chart_at(dir, t, dpi, w, None, None)
 }
 
-/// `write_chart` with a card locked.
+/// `write_chart` with a card locked and, optionally, a candle hovered.
 pub fn write_chart_at(
     dir: &Path,
     t: &Theme,
     dpi: u32,
     w: i32,
     hover: Option<usize>,
+    bar: Option<usize>,
+) -> Result<PathBuf, String> {
+    write_chart_fixture(dir, t, dpi, w, hover, bar, false)
+}
+
+/// The fixture behind `write_chart_at` and `write_chart_named_at`. With `refs`, the pane alone gets
+/// the reference lines and one session break, so both can be reviewed from a picture: the previous
+/// close at the midpoint of the day's range, the day's high and low at its extremes, and about forty
+/// minutes cut from the middle of the bars. The cards keep the untouched bars.
+fn write_chart_fixture(
+    dir: &Path,
+    t: &Theme,
+    dpi: u32,
+    w: i32,
+    hover: Option<usize>,
+    bar: Option<usize>,
+    refs: bool,
 ) -> Result<PathBuf, String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let now = 1_792_052_981.0;
@@ -246,14 +274,31 @@ pub fn write_chart_at(
     let label = b.cells.get(row).map(|c| c.label.clone()).unwrap_or_default();
     let digits = b.cells.get(row).map(|c| c.digits).unwrap_or(2);
     let last = b.cells.get(row).and_then(|c| c.quote.as_ref()).map(|q| q.price);
-    let charted = bars.get(row).cloned().unwrap_or_default();
+    let mut charted = bars.get(row).cloned().unwrap_or_default();
+    let quote = b.cells.get(row).and_then(|c| c.quote.as_ref());
+    let (mut prev, mut day_hi, mut day_lo, change_pct) = (
+        quote.and_then(|q| q.prev_close),
+        quote.and_then(|q| q.high),
+        quote.and_then(|q| q.low),
+        quote.and_then(|q| q.change_pct),
+    );
+    if refs && charted.len() > 200 {
+        let mid = charted.len() / 2;
+        charted.drain(mid - 20..mid + 20);
+        let hi = charted.iter().fold(f32::MIN, |m, b| m.max(b.h)) as f64;
+        let lo = charted.iter().fold(f32::MAX, |m, b| m.min(b.l)) as f64;
+        prev = Some((hi + lo) / 2.0);
+        day_hi = Some(hi);
+        day_lo = Some(lo);
+    }
     // The sparklines seed from the hour of bars, exactly as they do on a live board.
     let mut hist = History::new();
     hist.record(&b, now);
     let g = panel::geometry_in(w, b.cells.len(), 0, dpi, false, true);
     let fonts = Fonts::new(theme::font_of(t, None), dpi, t.is_pixel());
     let grad = Gradient::new(t);
-    let sc = Scene {
+    let layout = std::cell::Cell::new(None);
+    let mut sc = Scene {
         title: "MH Ticker Ultra",
         board: &b,
         hist: &hist,
@@ -272,15 +317,43 @@ pub fn write_chart_at(
         select: true,
         selected: Some(row),
         hover: hover.map(|row| panel::Hover { row, t: snap_t(now) }),
+        chart_at: None,
+        layout: &layout,
         picker: None,
         picker_scroll: 0,
         picker_btn: true,
-        chart: Some(Chart { label: &label, digits, t0, bars: &charted, last, unavailable: false }),
+        // A fixed zone (UTC-4, a US equity day in summer) so the picture is the same on every machine.
+        chart: Some(Chart {
+            label: &label,
+            digits,
+            t0,
+            bars: &charted,
+            last,
+            unavailable: false,
+            tz_offset_s: TZ_S,
+            tz_label: "local",
+            prev,
+            day_hi,
+            day_lo,
+            change_pct,
+        }),
         chart_btn: true,
         settings_btn: true,
         alert: None,
         phase: 0.0,
     };
+    if let Some(bar) = bar {
+        // The pointer comes from the layout a first paint stored, exactly as the app gets it from the
+        // last frame: paint once, read the layout, aim at the candle's close, paint again.
+        capture(g.w, g.h, &sc);
+        if let Some(lay) = layout.get() {
+            let i = bar.min(lay.bars.saturating_sub(1));
+            let (drawn, _) = crate::chartview::fitted(&charted, lay.plot.right - lay.plot.left, t0, TZ_S);
+            let close = drawn.get(i).map_or(last.unwrap_or(0.0), |b| b.c as f64);
+            let close = lay.y_of(close).clamp(lay.plot.top, lay.plot.bottom - 1);
+            sc.chart_at = lay.pointer_at(lay.x_of(i), close, 2);
+        }
+    }
     let (pw, ph, px8) = capture(g.w, g.h, &sc);
     let path = dir.join(format!("chart-{}.png", t.name));
     write_png(&path, pw, ph, &px8)?;
