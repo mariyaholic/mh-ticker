@@ -37,8 +37,9 @@ use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use windows_sys::Win32::Foundation::*;
-use windows_sys::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData};
-use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+use windows_sys::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData};
+use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE};
+use windows_sys::Win32::System::SystemInformation::GetLocalTime;
 use windows_sys::Win32::Graphics::Dwm::{DwmFlush, DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND};
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -88,9 +89,23 @@ const CMD_COPY: usize = 5600;
 const CMD_OPEN: usize = 5700;
 /// The Ultra symbol picker open/closed toggle.
 const CMD_PICK: usize = 5800;
-/// Offsets offered by the Alerts submenu, in percent from the current price. Arbitrary levels are
-/// a config edit for now; these are the ones a glance-at-the-strip user actually reaches for.
-const ALERT_STEPS: [(f64, bool); 4] = [(1.0, true), (2.0, true), (1.0, false), (2.0, false)];
+/// Alerts submenu, fixed entries (Ultra only): 5200..=5299 is this range's whole allotment.
+/// The per-symbol presets are dynamic (`Action::Alert`), indexing `alerts::PRESETS`.
+const CMD_ALERT_ONCE: usize = 5200;
+const CMD_MUTE_1H: usize = 5201;
+const CMD_MUTE_8H: usize = 5202;
+const CMD_MUTE_INDEF: usize = 5203;
+const CMD_UNMUTE: usize = 5204;
+const CMD_QUIET_OFF: usize = 5205;
+/// Quiet hours: CMD_QUIET + index into `alerts::QUIET_CHOICES`.
+const CMD_QUIET: usize = 5206;
+const CMD_HOOK_HOST: usize = 5210;
+const CMD_HOOK_PASTE: usize = 5211;
+const CMD_HOOK_TEST: usize = 5212;
+const CMD_HOOK_REMOVE: usize = 5213;
+const CMD_LOG_CLEAR: usize = 5214;
+/// A second "Send a test alert" inside this many seconds is refused (one request in flight).
+const TEST_ALERT_GAP_S: u64 = 15;
 
 /// Poll intervals offered in the menu, in seconds. 1 s is aggressive; 60 s is a working-day glance.
 const POLL_CHOICES: [f64; 7] = [1.0, 2.0, 3.0, 5.0, 10.0, 30.0, 60.0];
@@ -167,7 +182,8 @@ struct Ui {
     face: &'static str,
     grad: Gradient,
     icon: HICON,
-    icon_link: Option<Link>,
+    /// What the current tray icon was drawn for: the link colour and the alert marker.
+    icon_link: Option<(Link, bool)>,
     dpi: u32,
     cfg: Config,
     board: Arc<Mutex<Board>>,
@@ -215,6 +231,15 @@ struct Ui {
     hover_at: Option<panel::Hover>,
     /// Last alert outcome, shown in the footer so a swallowed balloon is not silent.
     alert_note: Option<String>,
+    /// The title of the latest alert nobody has looked at yet: the tray icon carries a marker and
+    /// the tooltip leads with it. Set by every fired alert (silenced or not); cleared by `expand`
+    /// and by opening any menu (`clear_pending`).
+    alert_pending: Option<String>,
+    /// The last 10 alerts and what became of them (memory only). Cleared by its menu entry.
+    alert_log: alerts::Log,
+    /// When "Send a test alert" last started a POST; a second click inside `TEST_ALERT_GAP_S` is
+    /// refused. Time-based on purpose: no result message can leave it stuck.
+    test_alert_at: Option<Instant>,
     tracking: bool,
     /// Foreground window before the panel opened; it gets focus back on collapse.
     prev_fg: HWND,
@@ -423,8 +448,9 @@ fn make_font(cfg: &Config, dpi: u32) -> HFONT {
 }
 
 /// The tray icon: a small rising chart line in the link colour (green live, amber partly stale,
-/// red offline) on a dark rounded tile, so it is easy to spot among the hidden icons.
-fn make_icon(color: COLORREF) -> HICON {
+/// red offline) on a dark rounded tile, so it is easy to spot among the hidden icons. With
+/// `pending`, a white disc with a dark rim sits bottom right: it reads against all three colours.
+fn make_icon(color: COLORREF, pending: bool) -> HICON {
     unsafe {
         let n = GetSystemMetrics(SM_CXSMICON).max(16);
         let screen = GetDC(null_mut());
@@ -449,6 +475,17 @@ fn make_icon(color: COLORREF) -> HICON {
         let pen = CreatePen(PS_SOLID, (n / 8).max(2), color);
         SelectObject(dc, pen);
         Polyline(dc, line.as_ptr(), line.len() as i32);
+        if pending {
+            let rim = CreatePen(PS_SOLID, 1, rgb(30, 33, 40));
+            let disc = CreateSolidBrush(rgb(255, 255, 255));
+            SelectObject(dc, rim);
+            SelectObject(dc, disc);
+            Ellipse(dc, f(8), f(8), f(15), f(15));
+            SelectObject(dc, GetStockObject(BLACK_PEN));
+            SelectObject(dc, GetStockObject(BLACK_BRUSH));
+            DeleteObject(rim);
+            DeleteObject(disc);
+        }
         SelectObject(dc, old);
         let info = ICONINFO { fIcon: 1, xHotspot: 0, yHotspot: 0, hbmMask: mask, hbmColor: colour };
         let icon = CreateIconIndirect(&info);
@@ -736,8 +773,13 @@ fn paint(u: &mut Ui) {
     }
 }
 
-fn tooltip(view: &Board) -> String {
-    let mut s = format!("{} - {}", config::profile().title(), theme::link_name(view.link));
+/// The tray tooltip. A pending alert leads: `Alert: XAU above 4,100.00`.
+fn tooltip(view: &Board, pending: Option<&str>) -> String {
+    let mut s = String::new();
+    if let Some(title) = pending {
+        s.push_str(&format!("Alert: {title}\n"));
+    }
+    s.push_str(&format!("{} - {}", config::profile().title(), theme::link_name(view.link)));
     for c in &view.cells {
         if let Some(q) = &c.quote {
             s.push_str(&format!("\n{} {}", c.label, fmt_price(q.price, c.digits)));
@@ -746,6 +788,64 @@ fn tooltip(view: &Board) -> String {
         }
     }
     s
+}
+
+#[cfg(test)]
+mod tooltip_tests {
+    use super::*;
+
+    #[test]
+    fn a_pending_alert_leads_the_tooltip_and_nothing_else_changes() {
+        let b = Board::new(&[]);
+        let plain = tooltip(&b, None);
+        assert!(!plain.contains("Alert"));
+        let lit = tooltip(&b, Some("XAU above 4,100.00"));
+        assert_eq!(lit.lines().next(), Some("Alert: XAU above 4,100.00"));
+        assert_eq!(lit.strip_prefix("Alert: XAU above 4,100.00\n"), Some(plain.as_str()));
+    }
+}
+
+/// Rebuild the tray icon when the link colour or the alert marker differs from what it was drawn
+/// for. True when it was rebuilt (the caller then pushes it to the tray).
+fn sync_icon(u: &mut Ui) -> bool {
+    let key = (u.view.link, u.alert_pending.is_some());
+    if u.icon_link == Some(key) {
+        return false;
+    }
+    let fresh = make_icon(theme::link_color(u.theme, key.0), key.1);
+    if !u.icon.is_null() {
+        unsafe { DestroyIcon(u.icon) };
+    }
+    u.icon = fresh;
+    u.icon_link = Some(key);
+    true
+}
+
+/// Push the icon and tooltip as they now stand to the tray.
+fn refresh_tray(hwnd: HWND) {
+    let Some((icon, tip)) = with_ui(|u| {
+        sync_icon(u);
+        u.tip_at = Some(Instant::now());
+        (u.icon, tooltip(&u.view, u.alert_pending.as_deref()))
+    }) else {
+        return;
+    };
+    tray(hwnd, NIM_MODIFY, icon, &tip);
+}
+
+/// The user is looking: drop the alert marker and the tooltip line. Called when the panel expands
+/// and when any menu opens. Must not be called from inside `with_ui`.
+fn clear_pending(hwnd: HWND) {
+    if with_ui(|u| u.alert_pending.take().is_some()).unwrap_or(false) {
+        refresh_tray(hwnd);
+    }
+}
+
+/// Minutes since local midnight, for quiet hours and clock labels in the menu.
+fn local_minute() -> u16 {
+    let mut st: SYSTEMTIME = unsafe { std::mem::zeroed() };
+    unsafe { GetLocalTime(&mut st) };
+    (st.wHour % 24) * 60 + st.wMinute % 60
 }
 
 fn tray(hwnd: HWND, msg: u32, icon: HICON, tip: &str) {
@@ -878,6 +978,19 @@ fn relayout_and_place(hwnd: HWND) {
     }
 }
 
+/// Start the webhook POST for log entry `seq`. The result comes back as `WM_ALERT` with `wparam`
+/// 1 = failed and `lparam` = `seq`, so it updates the right log line. If the thread cannot even
+/// start, the failure is posted the same way.
+fn post_alert(hwnd: HWND, url: String, title: String, body: String, seq: u64) {
+    let target = hwnd as isize;
+    let started = alerts::spawn_post(url, title, body, Box::new(move |err| unsafe {
+        PostMessageW(target as HWND, WM_ALERT, err.is_some() as usize, seq as LPARAM);
+    }));
+    if !started {
+        unsafe { PostMessageW(hwnd, WM_ALERT, 1, seq as LPARAM) };
+    }
+}
+
 /// Pull the latest board, refresh the tray icon colour and tooltip, redraw. The tray tooltip (an
 /// Explorer round trip) refreshes at most every 5 s unless the link colour changed, and a hidden
 /// strip is not re-measured.
@@ -900,29 +1013,40 @@ fn on_feed(hwnd: HWND) {
         // Alerts run after the view is current, so a balloon names the price the strip is showing.
         // The checker drops stale quotes itself: a closed market frozen at a level must not
         // retrigger on every cooldown.
-        let fired = if u.profile.ultra && !u.cfg.alerts.is_empty() {
-            let f = alerts::check(&mut u.cfg, &u.view, now);
-            if !f.is_empty() {
+        // Each fired alert is classified here, in one place: logged, and either silenced (no
+        // balloon, no POST) or handed back with its log sequence number for delivery. A silenced
+        // alert has already burnt its cooldown inside `check`.
+        let mut deliver: Vec<(alerts::Fired, u64)> = Vec::new();
+        if u.profile.ultra && !u.cfg.alerts.is_empty() {
+            let fired = alerts::check(&mut u.cfg, &u.view, now);
+            if !fired.is_empty() {
                 config::save(&u.cfg);
+                let minute = local_minute();
+                for f in fired {
+                    let silence = alerts::silence(&u.cfg, now, minute);
+                    let outcome = match silence {
+                        None => alerts::Outcome::Shown,
+                        Some(alerts::Silence::Quiet) => alerts::Outcome::Quiet,
+                        Some(_) => alerts::Outcome::Muted,
+                    };
+                    let seq = u.alert_log.push(f.at, f.title.clone(), outcome);
+                    u.alert_pending = Some(f.title.clone());
+                    if silence.is_none() {
+                        u.alert_note = Some(format!("alert: {}", f.title));
+                        deliver.push((f, seq));
+                    } else {
+                        u.alert_note = Some(format!("alert silenced: {}", f.title));
+                    }
+                }
             }
-            f
-        } else {
-            Vec::new()
-        };
-        let relinked = u.icon_link != Some(u.view.link);
-        if relinked {
-            let fresh = make_icon(theme::link_color(u.theme, u.view.link));
-            if !u.icon.is_null() {
-                unsafe { DestroyIcon(u.icon) };
-            }
-            u.icon = fresh;
-            u.icon_link = Some(u.view.link);
         }
+        let relinked = sync_icon(u);
         let due = relinked || u.tip_at.is_none_or(|t| t.elapsed() >= TIP_EVERY);
         let tray_update = due.then(|| {
             u.tip_at = Some(Instant::now());
-            (u.icon, tooltip(&u.view))
+            (u.icon, tooltip(&u.view, u.alert_pending.as_deref()))
         });
+        let fired = deliver;
         (tray_update, fired, u.cfg.webhook.clone())
     }) else {
         return;
@@ -930,16 +1054,10 @@ fn on_feed(hwnd: HWND) {
     if let Some((icon, tip)) = tray_update {
         tray(hwnd, NIM_MODIFY, icon, &tip);
     }
-    for f in fired {
+    for (f, seq) in fired {
         alerts::balloon(hwnd, TRAY_ID, &f.title, &f.body);
-        with_ui(|u| u.alert_note = Some(format!("alert: {}", f.title)));
         if let Some(url) = hook.clone() {
-            let target = hwnd as isize;
-            // The posting thread reports back by message: `Ui` is thread-local, so it cannot
-            // touch it directly.
-            alerts::spawn_post(url, f.title.clone(), f.body.clone(), Box::new(move |err| unsafe {
-                PostMessageW(target as HWND, WM_ALERT, err.is_some() as usize, 0);
-            }));
+            post_alert(hwnd, url, f.title, f.body, seq);
         }
     }
     match with_ui(|u| u.mode) {
@@ -1255,6 +1373,7 @@ fn fit_panel(r: RECT) -> RECT {
 
 /// Strip -> panel.
 fn expand(hwnd: HWND) {
+    clear_pending(hwnd);
     let Some((a, b, from, to, op)) = with_ui(|u| {
         if u.mode != Mode::Strip {
             return None;
@@ -1369,6 +1488,7 @@ fn settings_menu(hwnd: HWND) {
 
 /// `anchor` is a screen point to drop the menu from; `None` drops it at the cursor.
 fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
+    clear_pending(hwnd);
     #[allow(clippy::type_complexity)]
     let Some((visible, top, docked, status, open, list, shown, theme_name, theme_font, poll_s, ultra, picked, alerted)) = with_ui(|u| {
         let list = config::menu_list(&u.cfg);
@@ -1378,7 +1498,7 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
             .cfg
             .alerts
             .iter()
-            .filter(|a| a.above.is_some() || a.below.is_some())
+            .filter(|a| a.above.is_some() || a.below.is_some() || a.day_move.is_some())
             .map(|a| a.label.clone())
             .collect();
         (
@@ -1503,30 +1623,86 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
             }
             add(m, MF_POPUP, ft as usize, &format!("Font \u{b7} {face}"));
             item(MF_STRING | if picked { MF_CHECKED } else { 0 }, CMD_PICK, "Symbol picker");
-            // Alerts at a move from the current price. Arbitrary levels are a config edit for now.
+            // Alerts: per symbol the presets, what is set and Clear; then the settings that apply
+            // to every alert. The state is read in one separate `with_ui` call (`alerts_view`).
+            let av = alerts_view(&list, &shown).unwrap_or_default();
             let al = CreatePopupMenu();
-            let mut any = false;
-            for (i, r) in list.iter().enumerate() {
-                if !shown[i] {
-                    continue;
-                }
-                any = true;
+            for row in &av.rows {
                 let sub = CreatePopupMenu();
-                let can_base_alert = with_ui(|u| u.view.cells.iter().find(|c| c.label == r.label)
-                    .and_then(|c| alerts::reference_price(c, &u.cfg, crate::source::now_s())).is_some()).unwrap_or(false);
-                for (k, (pct, up)) in ALERT_STEPS.iter().enumerate() {
-                    let text = format!("{} {pct:.0} %", if *up { "above" } else { "below" });
-                    dynamic(sub, MF_STRING | if can_base_alert { 0 } else { MF_GRAYED }, &mut commands, crate::menu_commands::Action::Alert(r.label.clone(), k), &text);
+                let mut group = None;
+                for (k, p) in alerts::PRESETS.iter().enumerate() {
+                    if group.is_some_and(|g| g != p.group) {
+                        AppendMenuW(sub, MF_SEPARATOR, 0, null());
+                    }
+                    group = Some(p.group);
+                    let on = row.enabled.get(k).copied().unwrap_or(false);
+                    dynamic(sub, MF_STRING | if on { 0 } else { MF_GRAYED }, &mut commands, crate::menu_commands::Action::Alert(row.label.clone(), k), p.label);
                 }
-                if alerted.contains(&r.label) {
-                    AppendMenuW(sub, MF_SEPARATOR, 0, null());
-                    dynamic(sub, MF_STRING, &mut commands, crate::menu_commands::Action::ClearAlert(r.label.clone()), "Clear this symbol's alerts");
+                AppendMenuW(sub, MF_SEPARATOR, 0, null());
+                let line = row.alert.as_ref().map(|a| alerts::describe(a, row.digits)).filter(|d| !d.is_empty());
+                add(sub, MF_STRING | MF_GRAYED, 0, &line.unwrap_or_else(|| "nothing set".into()));
+                if alerted.contains(&row.label) {
+                    dynamic(sub, MF_STRING, &mut commands, crate::menu_commands::Action::ClearAlert(row.label.clone()), "Clear this symbol's alerts");
                 }
-                add(al, MF_POPUP, sub as usize, &r.label);
+                add(al, MF_POPUP, sub as usize, &row.label);
             }
-            if !any {
+            if av.rows.is_empty() {
                 add(al, MF_GRAYED, 0, "(no symbols shown)");
             }
+            AppendMenuW(al, MF_SEPARATOR, 0, null());
+            add(al, MF_STRING | if av.once { MF_CHECKED } else { 0 }, CMD_ALERT_ONCE, "Fire once, then clear");
+            // Mute. A timed mute ends by the clock; the label says when, in this PC's local time.
+            let mute = CreatePopupMenu();
+            add(mute, MF_STRING, CMD_MUTE_1H, "For 1 hour");
+            add(mute, MF_STRING, CMD_MUTE_8H, "For 8 hours");
+            add(mute, MF_STRING, CMD_MUTE_INDEF, "Until I turn it back on");
+            AppendMenuW(mute, MF_SEPARATOR, 0, null());
+            let (mute_title, is_muted) = match av.silence {
+                Some(alerts::Silence::Muted) => ("Muted".to_string(), true),
+                Some(alerts::Silence::MutedUntil(t)) => (format!("Muted until {}", alerts::local_hhmm(av.minute, av.now, t)), true),
+                _ => ("Mute".to_string(), false),
+            };
+            add(mute, MF_STRING | if is_muted { 0 } else { MF_GRAYED }, CMD_UNMUTE, "Unmute");
+            add(al, MF_POPUP, mute as usize, &mute_title);
+            // Quiet hours (local time).
+            let quiet = CreatePopupMenu();
+            add(quiet, MF_STRING, CMD_QUIET_OFF, "Off");
+            for (i, [from, to]) in alerts::QUIET_CHOICES.iter().enumerate() {
+                add(quiet, MF_STRING, CMD_QUIET + i, &format!("{} to {}", alerts::hhmm(*from), alerts::hhmm(*to)));
+            }
+            let cur_quiet = match av.quiet {
+                None => Some(CMD_QUIET_OFF),
+                Some(w) => alerts::QUIET_CHOICES.iter().position(|c| *c == w).map(|i| CMD_QUIET + i),
+            };
+            if let Some(c) = cur_quiet {
+                CheckMenuRadioItem(quiet, CMD_QUIET_OFF as u32, (CMD_QUIET + alerts::QUIET_CHOICES.len() - 1) as u32, c as u32, MF_BYCOMMAND);
+            }
+            let quiet_title = match av.quiet {
+                Some([f, t]) if f != t => format!("Quiet hours \u{b7} {} to {}", alerts::hhmm(f), alerts::hhmm(t)),
+                _ => "Quiet hours".to_string(),
+            };
+            add(al, MF_POPUP, quiet as usize, &quiet_title);
+            // Webhook: only the host is ever shown.
+            let hook = CreatePopupMenu();
+            let hook_text = av.host.as_ref().map_or("(no webhook set)".to_string(), |h| format!("Sends to {h}"));
+            add(hook, MF_STRING | MF_GRAYED, CMD_HOOK_HOST, &hook_text);
+            AppendMenuW(hook, MF_SEPARATOR, 0, null());
+            add(hook, MF_STRING, CMD_HOOK_PASTE, "Paste URL from clipboard");
+            let has_hook = av.host.is_some();
+            add(hook, MF_STRING | if has_hook { 0 } else { MF_GRAYED }, CMD_HOOK_TEST, "Send a test alert");
+            add(hook, MF_STRING | if has_hook { 0 } else { MF_GRAYED }, CMD_HOOK_REMOVE, "Remove");
+            add(al, MF_POPUP, hook as usize, "Webhook");
+            // Recent alerts, newest first.
+            let recent = CreatePopupMenu();
+            if av.log.is_empty() {
+                add(recent, MF_STRING | MF_GRAYED, 0, "(nothing yet)");
+            }
+            for e in &av.log {
+                add(recent, MF_STRING | MF_GRAYED, 0, &alerts::entry_line(e, av.minute, av.now));
+            }
+            AppendMenuW(recent, MF_SEPARATOR, 0, null());
+            add(recent, MF_STRING | if av.log.is_empty() { MF_GRAYED } else { 0 }, CMD_LOG_CLEAR, "Clear list");
+            add(al, MF_POPUP, recent as usize, &format!("Recent ({})", av.log.len()));
             add(m, MF_POPUP, al as usize, &format!("Alerts ({})", alerted.len()));
         }
         AppendMenuW(m, MF_SEPARATOR, 0, null());
@@ -1589,30 +1765,27 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
                     apply_rows(hwnd);
                 }
             }
-            Action::Alert(label, step) => {
-                let price = with_ui(|u| {
-                    u.view.cells.iter().find(|c| &c.label == label)
-                        .and_then(|c| alerts::reference_price(c, &u.cfg, crate::source::now_s()))
-                }).flatten();
-                if let Some(price) = price {
-                    let (pct, up) = ALERT_STEPS[*step];
-                    let level = price * (1.0 + if up { pct } else { -pct } / 100.0);
-                    with_ui(|u| {
-                        if !u.cfg.alerts.iter().any(|a| &a.label == label) {
-                            u.cfg.alerts.push(config::Alert { label: label.clone(), ..Default::default() });
-                        }
-                        if let Some(a) = u.cfg.alerts.iter_mut().find(|a| &a.label == label) {
-                            if up { a.above = Some(level); } else { a.below = Some(level); }
-                            a.last = 0.0;
-                        }
-                        config::save(&u.cfg);
-                    });
+            Action::Alert(label, k) => {
+                let changed = with_ui(|u| {
+                    let def = alerts::PRESETS.get(*k)?;
+                    let cell = u.view.cells.iter().find(|c| &c.label == label)?;
+                    let reference = alerts::reference_price(cell, &u.cfg, crate::source::now_s())?;
+                    let level = alerts::preset_level(def.preset, cell, reference)?;
+                    if !u.cfg.alerts.iter().any(|a| &a.label == label) {
+                        u.cfg.alerts.push(config::Alert { label: label.clone(), once: u.cfg.alert_once, ..Default::default() });
+                    }
+                    let a = u.cfg.alerts.iter_mut().find(|a| &a.label == label)?;
+                    alerts::apply_level(a, level);
+                    Some(())
+                }).flatten().is_some();
+                if changed {
+                    save_cfg();
                 }
             }
-            Action::ClearAlert(label) => with_ui(|u| {
-                u.cfg.alerts.retain(|a| &a.label != label);
-                config::save(&u.cfg);
-            }).unwrap_or(()),
+            Action::ClearAlert(label) => {
+                with_ui(|u| u.cfg.alerts.retain(|a| &a.label != label));
+                save_cfg();
+            }
             Action::Monitor(device) => {
                 // The modal menu pumps messages: use the current mode, not its opening snapshot.
                 if with_ui(|u| u.mode == Mode::Strip).unwrap_or(false) {
@@ -1741,6 +1914,171 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
             }
         }
         CMD_PICK if ultra => apply_picker(hwnd, !picked),
+        c if ultra && (CMD_ALERT_ONCE..=CMD_LOG_CLEAR).contains(&c) => alert_command(hwnd, c),
+        _ => {}
+    }
+}
+
+/// What the Alerts submenu needs, read in one `with_ui` call so the menu build never nests.
+#[derive(Default)]
+struct AlertsView {
+    /// UTC seconds and the local minute of the day, taken together.
+    now: f64,
+    minute: u16,
+    once: bool,
+    quiet: Option<[u16; 2]>,
+    /// Whether alerts are silenced right now, and why.
+    silence: Option<alerts::Silence>,
+    /// The webhook's host (never the URL), when one is set.
+    host: Option<String>,
+    /// Newest first.
+    log: Vec<alerts::Entry>,
+    /// One per shown symbol.
+    rows: Vec<AlertsRow>,
+}
+
+struct AlertsRow {
+    label: String,
+    digits: u32,
+    /// Per `alerts::PRESETS` entry: can it be set now?
+    enabled: Vec<bool>,
+    alert: Option<config::Alert>,
+}
+
+fn alerts_view(list: &[config::Row], shown: &[bool]) -> Option<AlertsView> {
+    with_ui(|u| {
+        let now = crate::source::now_s();
+        let minute = local_minute();
+        let rows = list
+            .iter()
+            .zip(shown)
+            .filter(|(_, on)| **on)
+            .map(|(r, _)| {
+                let cell = u.view.cells.iter().find(|c| c.label == r.label);
+                let reference = cell.and_then(|c| alerts::reference_price(c, &u.cfg, now));
+                let enabled = alerts::PRESETS
+                    .iter()
+                    .map(|p| match (cell, reference) {
+                        (Some(c), Some(r)) => alerts::preset_level(p.preset, c, r).is_some(),
+                        _ => false,
+                    })
+                    .collect();
+                AlertsRow {
+                    label: r.label.clone(),
+                    digits: r.digits,
+                    enabled,
+                    alert: u.cfg.alerts.iter().find(|a| a.label == r.label).cloned(),
+                }
+            })
+            .collect();
+        AlertsView {
+            now,
+            minute,
+            once: u.cfg.alert_once,
+            quiet: u.cfg.quiet_hours,
+            silence: alerts::mute_state(&u.cfg, now),
+            host: u.cfg.webhook.as_deref().map(crate::webhook_host::redact),
+            log: u.alert_log.newest_first(),
+            rows,
+        }
+    })
+}
+
+/// Write the config as it now stands. Kept out of `with_ui` closures: no I/O inside them.
+fn save_cfg() {
+    if let Some(cfg) = with_ui(|u| u.cfg.clone()) {
+        config::save(&cfg);
+    }
+}
+
+fn alert_box(hwnd: HWND, title: &str, text: &str, flags: u32) -> i32 {
+    let (t, x) = (wide(title), wide(text));
+    unsafe { MessageBoxW(hwnd, x.as_ptr(), t.as_ptr(), flags) }
+}
+
+/// The fixed entries of the Alerts submenu (`CMD_ALERT_ONCE..=CMD_LOG_CLEAR`). No text here may
+/// contain the webhook URL: messages name the host (`redact`) or nothing.
+fn alert_command(hwnd: HWND, cmd: usize) {
+    let now = crate::source::now_s();
+    match cmd {
+        CMD_ALERT_ONCE => {
+            with_ui(|u| {
+                u.cfg.alert_once = !u.cfg.alert_once;
+                let once = u.cfg.alert_once;
+                u.cfg.alerts.iter_mut().for_each(|a| a.once = once);
+            });
+            save_cfg();
+        }
+        CMD_MUTE_1H | CMD_MUTE_8H | CMD_MUTE_INDEF | CMD_UNMUTE => {
+            with_ui(|u| {
+                let (muted, until) = match cmd {
+                    CMD_MUTE_1H => (false, now + 3600.0),
+                    CMD_MUTE_8H => (false, now + 8.0 * 3600.0),
+                    CMD_MUTE_INDEF => (true, 0.0),
+                    _ => (false, 0.0),
+                };
+                u.cfg.alerts_muted = muted;
+                u.cfg.alerts_mute_until = until;
+            });
+            save_cfg();
+        }
+        CMD_QUIET_OFF => {
+            with_ui(|u| u.cfg.quiet_hours = None);
+            save_cfg();
+        }
+        c if (CMD_QUIET..CMD_QUIET + alerts::QUIET_CHOICES.len()).contains(&c) => {
+            with_ui(|u| u.cfg.quiet_hours = Some(alerts::QUIET_CHOICES[c - CMD_QUIET]));
+            save_cfg();
+        }
+        CMD_HOOK_PASTE => {
+            // Read on this click only, validated, confirmed by host, then saved.
+            let Some(text) = clipboard_text() else {
+                alert_box(hwnd, "Webhook", "The clipboard holds no text.", MB_OK | MB_ICONINFORMATION);
+                return;
+            };
+            match alerts::accept_webhook(&text) {
+                Ok(url) => {
+                    let host = crate::webhook_host::redact(&url);
+                    let ask = format!("Send alerts to {host}?\n\nOnly the host is shown here; the rest of the address stays private.");
+                    if alert_box(hwnd, "Use this webhook?", &ask, MB_YESNO | MB_ICONQUESTION) == IDYES {
+                        with_ui(|u| u.cfg.webhook = Some(url));
+                        save_cfg();
+                    }
+                }
+                Err(why) => {
+                    alert_box(hwnd, "Webhook", why, MB_OK | MB_ICONINFORMATION);
+                }
+            }
+        }
+        CMD_HOOK_TEST => {
+            // An explicit click, so it works while muted. One in flight: a second click inside
+            // `TEST_ALERT_GAP_S` is refused.
+            let Some(url) = with_ui(|u| u.cfg.webhook.clone()).flatten() else { return };
+            let host = crate::webhook_host::redact(&url);
+            let seq = with_ui(|u| {
+                if u.test_alert_at.is_some_and(|t| t.elapsed().as_secs() < TEST_ALERT_GAP_S) {
+                    u.alert_note = Some("test alert: the last one is still being sent".into());
+                    return None;
+                }
+                u.test_alert_at = Some(Instant::now());
+                u.alert_note = Some(format!("test alert: sending to {host}"));
+                Some(u.alert_log.push(now, alerts::TEST_TITLE.into(), alerts::Outcome::Shown))
+            })
+            .flatten();
+            if let Some(seq) = seq {
+                post_alert(hwnd, url, alerts::TEST_TITLE.into(), "If you can read this, the webhook works.".into(), seq);
+            }
+            if with_ui(|u| u.mode == Mode::Panel).unwrap_or(false) {
+                unsafe { InvalidateRect(hwnd, null(), 0) };
+            }
+        }
+        CMD_HOOK_REMOVE => {
+            with_ui(|u| u.cfg.webhook = None);
+            save_cfg();
+        }
+        CMD_LOG_CLEAR => {
+            with_ui(|u| u.alert_log.clear());
+        }
         _ => {}
     }
 }
@@ -1839,14 +2177,14 @@ fn apply_theme(hwnd: HWND) {
         u.font = make_font(&u.cfg, u.dpi);
         u.grad = Gradient::new(t);
         u.fonts = u.fonts.take().map(|_| panel::Fonts::new(face, u.dpi, t.is_pixel()));
-        let fresh = make_icon(theme::link_color(t, u.view.link));
+        let fresh = make_icon(theme::link_color(t, u.view.link), u.alert_pending.is_some());
         if !u.icon.is_null() {
             unsafe { DestroyIcon(u.icon) };
         }
         u.icon = fresh;
-        u.icon_link = Some(u.view.link);
+        u.icon_link = Some((u.view.link, u.alert_pending.is_some()));
         config::save(&u.cfg);
-        Some((u.icon, tooltip(&u.view)))
+        Some((u.icon, tooltip(&u.view, u.alert_pending.as_deref())))
     })
     .flatten()
     else {
@@ -1921,6 +2259,34 @@ fn copy_text(s: &str) {
     }
 }
 
+/// The clipboard's text (CF_UNICODETEXT), at most 4,096 UTF-16 units, or `None` when there is
+/// none or the clipboard is busy. Never reads past the block's size, and always closes the
+/// clipboard. Only called on an explicit click.
+fn clipboard_text() -> Option<String> {
+    const CF_UNICODETEXT: u32 = 13;
+    const MAX_UNITS: usize = 4096;
+    unsafe {
+        if OpenClipboard(null_mut()) == 0 {
+            return None;
+        }
+        let mut text = None;
+        let h = GetClipboardData(CF_UNICODETEXT);
+        if !h.is_null() {
+            let bytes = GlobalSize(h);
+            let p = GlobalLock(h) as *const u16;
+            if !p.is_null() {
+                let cap = (bytes / 2).min(MAX_UNITS);
+                let units = std::slice::from_raw_parts(p, cap);
+                let end = units.iter().position(|u| *u == 0).unwrap_or(cap);
+                text = Some(String::from_utf16_lossy(&units[..end]));
+                GlobalUnlock(h);
+            }
+        }
+        CloseClipboard();
+        text
+    }
+}
+
 /// Open a symbol's page on CNBC. The canonical symbol (`XAU=`, `@DJ.1`) is what the quote URL wants.
 fn open_cnbc(hwnd: HWND, symbol: &str) {
     let url = wide(&format!("https://www.cnbc.com/quotes/{symbol}"));
@@ -1960,8 +2326,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_ALERT => {
             let failed = wp != 0;
+            let seq = lp as u64;
             with_ui(|u| {
-                u.alert_note = Some(if failed { "alert kept here: webhook failed" } else { "alert: webhook sent" }.into())
+                let outcome = if failed { alerts::Outcome::SendFailed } else { alerts::Outcome::Sent };
+                u.alert_log.set_outcome(seq, outcome);
+                let test = u.alert_log.newest_first().iter().any(|e| e.seq == seq && e.title == alerts::TEST_TITLE);
+                let what = if test { "test alert" } else { "alert" };
+                u.alert_note = Some(match (failed, test) {
+                    (true, true) => "test alert: webhook failed".to_string(),
+                    (true, false) => "alert kept here: webhook failed".to_string(),
+                    (false, _) => format!("{what}: webhook sent"),
+                });
             });
             if with_ui(|u| u.mode == Mode::Panel).unwrap_or(false) {
                 InvalidateRect(hwnd, null(), 0);
@@ -2379,7 +2754,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         _ => {
             // Explorer restarted: the tray icon is gone and must be re-added, and the taskbar moved.
-            let recreated = with_ui(|u| (u.taskbar_created, u.icon, tooltip(&u.view)));
+            let recreated = with_ui(|u| (u.taskbar_created, u.icon, tooltip(&u.view, u.alert_pending.as_deref())));
             if let Some((tc, icon, tip)) = recreated {
                 if tc != 0 && msg == tc {
                     tray(hwnd, NIM_ADD, icon, &tip);
@@ -2444,8 +2819,8 @@ pub fn run(cfg: Config, board: Arc<Mutex<Board>>) {
             theme,
             face: face_of(theme, &cfg, profile.ultra),
             grad: Gradient::new(theme),
-            icon: make_icon(theme::link_color(theme, Link::Down)),
-            icon_link: Some(Link::Down),
+            icon: make_icon(theme::link_color(theme, Link::Down), false),
+            icon_link: Some((Link::Down, false)),
             dpi,
             cfg: cfg.clone(),
             board: board.clone(),
@@ -2473,6 +2848,9 @@ pub fn run(cfg: Config, board: Arc<Mutex<Board>>) {
             chart_grew: None,
             hover_at: None,
             alert_note: None,
+            alert_pending: None,
+            alert_log: alerts::Log::default(),
+            test_alert_at: None,
             tracking: false,
             prev_fg: null_mut(),
             tip_at: None,
@@ -2481,7 +2859,7 @@ pub fn run(cfg: Config, board: Arc<Mutex<Board>>) {
             anim: None,
             motion: allow_motion(),
         };
-        let (icon, tip) = (ui.icon, tooltip(&ui.view));
+        let (icon, tip) = (ui.icon, tooltip(&ui.view, None));
         UI.with(|c| *c.borrow_mut() = Some(ui));
 
         relayout_and_place(hwnd);

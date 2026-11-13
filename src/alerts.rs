@@ -19,22 +19,42 @@ use std::thread;
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::Shell::{Shell_NotifyIconW, NIF_INFO, NIIF_INFO, NIM_MODIFY, NOTIFYICONDATAW};
 
-/// One alert that fired on this pass. The label is already inside `title`, so there is no third
-/// copy of it to keep in step.
+/// One alert that fired on this pass. The label is also inside `title`; it is kept separately so
+/// the log and the menu never parse the title.
 pub struct Fired {
+    #[allow(dead_code)] // read by the later per-symbol work (P6); kept so nothing parses `title`
+    pub label: String,
     pub title: String,
     pub body: String,
+    /// UTC seconds, the `now` that `check` was given.
+    pub at: f64,
 }
 
 /// How long to say nothing rather than repeat the same alert.
 const POST_TIMEOUT_S: u64 = 10;
 
-/// Which side of its level a quote is on, or `None` when it has not reached one.
-fn side(a: &Alert, price: f64) -> Option<(bool, f64)> {
-    if let Some(above) = a.above.filter(|_| price >= a.above.unwrap_or(f64::MAX)) {
-        return Some((true, above));
+/// Which kind of level an alert tripped on.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Kind {
+    Above,
+    Below,
+    DayMove,
+}
+
+/// The title used for the "Send a test alert" log entry and note.
+pub const TEST_TITLE: &str = "Test alert";
+
+/// Which level a quote has reached, or `None`. A price level wins over a day move when both are
+/// reached, so one alert fires at most once per pass and burns one cooldown.
+fn tripped(a: &Alert, price: f64, change_pct: Option<f64>) -> Option<(Kind, f64)> {
+    if let Some(above) = a.above.filter(|l| price >= *l) {
+        return Some((Kind::Above, above));
     }
-    a.below.filter(|below| price <= *below).map(|below| (false, below))
+    if let Some(below) = a.below.filter(|l| price <= *l) {
+        return Some((Kind::Below, below));
+    }
+    let (d, c) = (a.day_move?, change_pct?);
+    (d.is_finite() && d > 0.0 && c.is_finite() && c.abs() >= d).then_some((Kind::DayMove, d))
 }
 
 /// Only a fresh CNBC price may establish a CNBC alert threshold.
@@ -47,27 +67,374 @@ pub fn reference_price(cell: &crate::model::Cell, cfg: &Config, now: f64) -> Opt
 }
 
 /// Check every alert and mark the ones that fire. The caller saves the config.
+///
+/// Contract: fresh quotes only; an alert fires when its price level or its day move is reached
+/// and `cooldown_s` (at least 30 s) has passed; one `Fired` per alert per pass. Silencing is NOT
+/// decided here: a muted alert still fires, burns its cooldown and loses its `once` level, and the
+/// caller asks [`silence`]. A `once` alert clears the level that fired, and an alert that fired and
+/// has no level left is removed from `cfg.alerts`.
 pub fn check(cfg: &mut Config, board: &Board, now: f64) -> Vec<Fired> {
     let mut out = Vec::new();
+    let mut spent = Vec::new();
     for cell in &board.cells {
         let Some(q) = cell.quote.as_ref() else { continue };
         if cell.stale || crate::model::is_stale(q, now, cfg.stale_after_s, cfg.delayed_grace_s) {
             continue;
         }
-        for a in cfg.alerts.iter_mut().filter(|a| a.label == cell.label) {
-            let Some((rise, level)) = side(a, q.price) else { continue };
+        for (i, a) in cfg.alerts.iter_mut().enumerate().filter(|(_, a)| a.label == cell.label) {
+            let Some((kind, level)) = tripped(a, q.price, q.change_pct) else { continue };
             if now - a.last < a.cooldown_s.max(30.0) {
                 continue;
             }
             a.last = now;
-            let dir = if rise { "above" } else { "below" };
-            out.push(Fired {
-                title: format!("{} {dir} {}", cell.label, fmt_price(level, cell.digits)),
-                body: format!("{} is {} {} (was {})", cell.label, fmt_price(q.price, cell.digits), dir, fmt_price(level, cell.digits)),
-            });
+            let price = fmt_price(q.price, cell.digits);
+            let (title, body) = match kind {
+                Kind::Above | Kind::Below => {
+                    let dir = if kind == Kind::Above { "above" } else { "below" };
+                    let lv = fmt_price(level, cell.digits);
+                    (format!("{} {dir} {lv}", cell.label), format!("{} is {price} {dir} {lv}", cell.label))
+                }
+                Kind::DayMove => {
+                    let c = q.change_pct.unwrap_or(0.0);
+                    (
+                        format!("{} day {c:+.1} %", cell.label),
+                        format!("{} is {price}, {c:+.2} % on the day (alert at \u{b1}{level} %)", cell.label),
+                    )
+                }
+            };
+            out.push(Fired { label: cell.label.clone(), title, body, at: now });
+            if a.once {
+                match kind {
+                    Kind::Above => a.above = None,
+                    Kind::Below => a.below = None,
+                    Kind::DayMove => a.day_move = None,
+                }
+                if a.above.is_none() && a.below.is_none() && a.day_move.is_none() {
+                    spent.push(i);
+                }
+            }
         }
     }
+    if !spent.is_empty() {
+        let mut i = 0;
+        cfg.alerts.retain(|_| {
+            i += 1;
+            !spent.contains(&(i - 1))
+        });
+    }
     out
+}
+
+// ---------------------------------------------------------------------------------------------
+// Presets
+// ---------------------------------------------------------------------------------------------
+
+/// What a menu preset asks for.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Preset {
+    /// Signed percent away from the reference price (positive = above).
+    Pct(f64),
+    DayHigh,
+    DayLow,
+    /// The previous close, on whichever side the reference price is not.
+    PrevClose,
+    /// Absolute percent move on the day, either sign.
+    DayMove(f64),
+}
+
+/// One menu entry. `group` changes where the menu draws a separator.
+pub struct PresetDef {
+    pub label: &'static str,
+    pub group: u8,
+    pub preset: Preset,
+}
+
+const fn pd(label: &'static str, group: u8, preset: Preset) -> PresetDef {
+    PresetDef { label, group, preset }
+}
+
+/// The Alerts submenu entries, in menu order. `Action::Alert(label, k)` indexes this table.
+pub const PRESETS: [PresetDef; 15] = [
+    pd("above 0.5 %", 0, Preset::Pct(0.5)),
+    pd("above 1 %", 0, Preset::Pct(1.0)),
+    pd("above 2 %", 0, Preset::Pct(2.0)),
+    pd("above 5 %", 0, Preset::Pct(5.0)),
+    pd("below 0.5 %", 0, Preset::Pct(-0.5)),
+    pd("below 1 %", 0, Preset::Pct(-1.0)),
+    pd("below 2 %", 0, Preset::Pct(-2.0)),
+    pd("below 5 %", 0, Preset::Pct(-5.0)),
+    pd("past today's high", 1, Preset::DayHigh),
+    pd("past today's low", 1, Preset::DayLow),
+    pd("back to the previous close", 1, Preset::PrevClose),
+    pd("day move \u{b1}1 %", 2, Preset::DayMove(1.0)),
+    pd("day move \u{b1}2 %", 2, Preset::DayMove(2.0)),
+    pd("day move \u{b1}3 %", 2, Preset::DayMove(3.0)),
+    pd("day move \u{b1}5 %", 2, Preset::DayMove(5.0)),
+];
+
+/// What a preset sets on an alert.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Level {
+    Above(f64),
+    Below(f64),
+    /// Absolute percent.
+    DayMove(f64),
+}
+
+/// The level a preset means for this cell, or `None` when it cannot be known: the field is
+/// missing, zero, negative or not finite (CNBC sends `0.00` for symbols with no high or low), or
+/// `reference` is not a positive finite price. `reference` comes from [`reference_price`].
+/// "Past today's high" is `Above(high + tick)` and "past today's low" is `Below(low - tick)`, where
+/// `tick` is one unit of the last displayed digit (`10^-digits`, so 1.0 for digits 0). The price has
+/// to go past the day's extreme, not just reach it: a price exactly at the high does not trip the
+/// level, one tick above does. `None` when `low - tick` is not positive. The previous close is `Above`
+/// when `reference` is below it, `Below` when above it, and `None` when equal.
+pub fn preset_level(preset: Preset, cell: &crate::model::Cell, reference: f64) -> Option<Level> {
+    let good = |v: Option<f64>| v.filter(|v| v.is_finite() && *v > 0.0);
+    let q = cell.quote.as_ref();
+    let reference = good(Some(reference));
+    let tick = 10f64.powi(-(cell.digits as i32));
+    match preset {
+        Preset::Pct(p) => {
+            let r = reference?;
+            if !p.is_finite() || p == 0.0 {
+                return None;
+            }
+            let level = r * (1.0 + p / 100.0);
+            Some(if p > 0.0 { Level::Above(level) } else { Level::Below(level) })
+        }
+        Preset::DayHigh => good(q?.high).map(|h| Level::Above(h + tick)),
+        Preset::DayLow => good(q?.low).and_then(|l| Some(l - tick).filter(|v| *v > 0.0)).map(Level::Below),
+        Preset::PrevClose => {
+            let (pc, r) = (good(q?.prev_close)?, reference?);
+            if r < pc {
+                Some(Level::Above(pc))
+            } else if r > pc {
+                Some(Level::Below(pc))
+            } else {
+                None
+            }
+        }
+        Preset::DayMove(n) => (n.is_finite() && n > 0.0).then_some(Level::DayMove(n)),
+    }
+}
+
+/// Set `level` on `a` and re-arm it (`last = 0`). Nothing else changes.
+pub fn apply_level(a: &mut Alert, level: Level) {
+    match level {
+        Level::Above(v) => a.above = Some(v),
+        Level::Below(v) => a.below = Some(v),
+        Level::DayMove(v) => a.day_move = Some(v),
+    }
+    a.last = 0.0;
+}
+
+/// One line for the menu, greyed: what is set on this alert. Levels are formatted with
+/// `fmt_price(level, digits)`, joined by " \u{b7} ", in the order above, below, day move, once:
+/// `above 4,200.00 \u{b7} below 3,900.00 \u{b7} day \u{b1}2 % \u{b7} once`. An alert with nothing set
+/// gives `nothing set`.
+pub fn describe(alert: &Alert, digits: u32) -> String {
+    // Only levels that can actually trip are listed: a NaN or infinite level, or a day move that
+    // is not a positive finite number, never fires in `tripped`, so it is not "set" either.
+    let mut parts = Vec::new();
+    if let Some(v) = alert.above.filter(|v| v.is_finite()) {
+        parts.push(format!("above {}", fmt_price(v, digits)));
+    }
+    if let Some(v) = alert.below.filter(|v| v.is_finite()) {
+        parts.push(format!("below {}", fmt_price(v, digits)));
+    }
+    if let Some(d) = alert.day_move.filter(|d| d.is_finite() && *d > 0.0) {
+        parts.push(format!("day \u{b1}{d} %"));
+    }
+    if parts.is_empty() {
+        return "nothing set".into();
+    }
+    if alert.once {
+        parts.push("once".into());
+    }
+    parts.join(" \u{b7} ")
+}
+
+// ---------------------------------------------------------------------------------------------
+// Silence
+// ---------------------------------------------------------------------------------------------
+
+/// Why an alert is not shown or posted.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Silence {
+    /// Muted until the user turns it back on.
+    Muted,
+    /// Muted until this UTC time.
+    MutedUntil(f64),
+    Quiet,
+}
+
+/// The quiet-hours presets in the menu, `[from, to)` in minutes of the local day.
+pub const QUIET_CHOICES: [[u16; 2]; 3] = [[22 * 60, 7 * 60], [23 * 60, 8 * 60], [0, 9 * 60]];
+
+/// Is `local_minute` (0..1440) inside `window = [from, to)`? `from == to` is off (never inside);
+/// `from > to` wraps midnight; `to` itself is outside.
+pub fn quiet(local_minute: u16, window: [u16; 2]) -> bool {
+    let [from, to] = window;
+    if from == to {
+        false
+    } else if from < to {
+        from <= local_minute && local_minute < to
+    } else {
+        local_minute >= from || local_minute < to
+    }
+}
+
+/// Whether an alert firing now should stay quiet. Order: `alerts_muted` is `Muted`; then a
+/// `alerts_mute_until` still ahead of `now_utc` is `MutedUntil(t)` (a timed mute ends by the
+/// clock, nothing resets it); then `quiet_hours` containing `local_minute` is `Quiet`.
+pub fn silence(cfg: &Config, now_utc: f64, local_minute: u16) -> Option<Silence> {
+    if let Some(m) = mute_state(cfg, now_utc) {
+        return Some(m);
+    }
+    cfg.quiet_hours.filter(|w| quiet(local_minute, *w)).map(|_| Silence::Quiet)
+}
+
+/// The mute part of [`silence`] only: `Muted`, `MutedUntil(t)` or `None`. Never `Quiet`, so the
+/// menu can show the mute state without needing the local clock.
+pub fn mute_state(cfg: &Config, now_utc: f64) -> Option<Silence> {
+    if cfg.alerts_muted {
+        return Some(Silence::Muted);
+    }
+    if cfg.alerts_mute_until.is_finite() && cfg.alerts_mute_until > now_utc {
+        return Some(Silence::MutedUntil(cfg.alerts_mute_until));
+    }
+    None
+}
+
+/// `HH:MM` for a minute of the day (24-hour). Out-of-range values wrap.
+pub fn hhmm(minute: u16) -> String {
+    let m = minute % 1440;
+    format!("{:02}:{:02}", m / 60, m % 60)
+}
+
+/// The local clock time of the UTC instant `at`, given the local minute of the day at `now_utc`.
+/// Uses the offset implied by `local_minute_now`, so a DST change in between is off by an hour.
+pub fn local_hhmm(local_minute_now: u16, now_utc: f64, at: f64) -> String {
+    let delta = ((at - now_utc) / 60.0).floor();
+    let delta = if delta.is_finite() { delta.clamp(-1_000_000.0, 1_000_000.0) as i64 } else { 0 };
+    hhmm((local_minute_now as i64 + delta).rem_euclid(1440) as u16)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Recent alerts
+// ---------------------------------------------------------------------------------------------
+
+/// What became of an alert.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    /// Balloon shown (and a POST started, if a webhook is set).
+    Shown,
+    Muted,
+    Quiet,
+    Sent,
+    SendFailed,
+}
+
+/// One line of the log. `seq` is unique for the life of the process and is what a webhook result
+/// carries back, so a late answer updates the right line (or nothing, if it was cleared).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Entry {
+    pub seq: u64,
+    /// UTC seconds.
+    pub at: f64,
+    pub title: String,
+    pub outcome: Outcome,
+}
+
+/// The last [`LOG_CAP`] alerts, in memory only.
+#[derive(Default)]
+pub struct Log {
+    entries: std::collections::VecDeque<Entry>,
+    next: u64,
+}
+
+pub const LOG_CAP: usize = 10;
+
+impl Log {
+    /// Add an entry (oldest dropped beyond `LOG_CAP`) and return its sequence number (from 1).
+    pub fn push(&mut self, at: f64, title: String, outcome: Outcome) -> u64 {
+        self.next += 1;
+        self.entries.push_back(Entry { seq: self.next, at, title, outcome });
+        while self.entries.len() > LOG_CAP {
+            self.entries.pop_front();
+        }
+        self.next
+    }
+
+    /// Change the outcome of entry `seq`; false when it is gone (cleared or pushed out).
+    pub fn set_outcome(&mut self, seq: u64, outcome: Outcome) -> bool {
+        match self.entries.iter_mut().find(|e| e.seq == seq) {
+            Some(e) => {
+                e.outcome = outcome;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Newest first.
+    pub fn newest_first(&self) -> Vec<Entry> {
+        self.entries.iter().rev().cloned().collect()
+    }
+
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Empty the list. Sequence numbers keep counting, so a late webhook result cannot land on a
+    /// new entry.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
+/// The menu text for one log entry: `14:30  XAU above 4,200.00 \u{b7} muted`. Time via
+/// [`local_hhmm`]; the outcome words are `shown`, `muted`, `quiet hours`, `sent`, `send failed`.
+pub fn entry_line(e: &Entry, local_minute_now: u16, now_utc: f64) -> String {
+    let word = match e.outcome {
+        Outcome::Shown => "shown",
+        Outcome::Muted => "muted",
+        Outcome::Quiet => "quiet hours",
+        Outcome::Sent => "sent",
+        Outcome::SendFailed => "send failed",
+    };
+    format!("{}  {} \u{b7} {word}", local_hhmm(local_minute_now, now_utc, e.at), e.title)
+}
+
+/// Validate a webhook URL taken from the clipboard. Trimmed; `http` or `https` only (via
+/// `webhook_host::redact`, which must not answer "invalid webhook URL"); no whitespace and no
+/// control characters inside; at most 2,048 bytes. `Ok` is the trimmed URL. `Err` is a fixed
+/// sentence that never contains any part of the input.
+pub fn accept_webhook(clipboard_text: &str) -> Result<String, &'static str> {
+    // Every error is a fixed sentence. None of them may ever quote `clipboard_text`: it is a secret.
+    const NOT_A_URL: &str = "The clipboard does not hold a web address.";
+    const MAX_BYTES: usize = 2_048;
+    let url = clipboard_text.trim();
+    if url.is_empty() {
+        return Err("The clipboard is empty.");
+    }
+    if url.len() > MAX_BYTES {
+        return Err("The address is longer than 2,048 bytes.");
+    }
+    if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err("The address has spaces or control characters in it.");
+    }
+    let lower = url.to_ascii_lowercase();
+    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+        return Err(NOT_A_URL);
+    }
+    // `redact` answers with this sentinel for anything it cannot parse as an http(s) URL with a host.
+    if redact(url) == "invalid webhook URL" {
+        return Err(NOT_A_URL);
+    }
+    Ok(url.to_string())
 }
 
 /// Show a balloon on the tray icon. Focus Assist silently swallows these, which is why the panel
@@ -109,7 +476,9 @@ fn payload(url: &str, title: &str, body: &str) -> (String, &'static str) {
 
 /// POST one alert on a detached thread. `on_done` gets a redacted error, or nothing, so the UI can
 /// say "webhook failed" without ever holding the URL.
-pub fn spawn_post(url: String, title: String, body: String, on_done: Box<dyn Fn(Option<String>) + Send>) {
+///
+/// Returns false when the thread could not be started; `on_done` is then never called.
+pub fn spawn_post(url: String, title: String, body: String, on_done: Box<dyn Fn(Option<String>) + Send>) -> bool {
     thread::Builder::new()
         .name("alert-post".into())
         .spawn(move || {
@@ -117,7 +486,7 @@ pub fn spawn_post(url: String, title: String, body: String, on_done: Box<dyn Fn(
             let result = crate::source::post(&url, &json, ctype, POST_TIMEOUT_S);
             on_done(result.err().map(|e| format!("{}: {e}", redact(&url))));
         })
-        .ok();
+        .is_ok()
 }
 
 #[cfg(test)]
@@ -137,7 +506,7 @@ mod tests {
     }
 
     fn alert(above: Option<f64>, below: Option<f64>) -> Alert {
-        Alert { label: "XAU".into(), above, below, cooldown_s: 900.0, last: 0.0 }
+        Alert { label: "XAU".into(), above, below, ..Alert::default() }
     }
 
     #[test]
@@ -190,6 +559,383 @@ mod tests {
         // no level at all: never fires
         cfg.alerts = vec![alert(None, None)];
         assert!(check(&mut cfg, &board(3900.0, false), 50_000.0).is_empty());
+    }
+
+    fn fresh_cfg(alerts: Vec<Alert>) -> Config {
+        Config { alerts, stale_after_s: 1_000_000.0, ..Config::default() }
+    }
+
+    fn board_chg(price: f64, chg: Option<f64>) -> Board {
+        let mut b = board(price, false);
+        b.cells[0].quote.as_mut().unwrap().change_pct = chg;
+        b
+    }
+
+    #[test]
+    fn day_move_fires_on_both_signs_and_only_on_a_fresh_quote() {
+        let mut cfg = fresh_cfg(vec![Alert { day_move: Some(2.0), ..alert(None, None) }]);
+        assert!(check(&mut cfg, &board_chg(4000.0, Some(1.9)), 10_000.0).is_empty());
+        assert!(check(&mut cfg, &board_chg(4000.0, None), 10_000.0).is_empty());
+        let up = check(&mut cfg, &board_chg(4000.0, Some(2.0)), 10_000.0);
+        assert_eq!(up.len(), 1);
+        assert_eq!(up[0].label, "XAU");
+        assert_eq!(up[0].at, 10_000.0);
+        assert!(up[0].title.contains("+2.0"), "{}", up[0].title);
+        let down = check(&mut cfg, &board_chg(4000.0, Some(-3.5)), 20_000.0);
+        assert_eq!(down.len(), 1);
+        assert!(down[0].title.contains("-3.5"), "{}", down[0].title);
+        // inside the cooldown: silent
+        assert!(check(&mut cfg, &board_chg(4000.0, Some(-3.5)), 20_100.0).is_empty());
+        // stale: silent, and the cooldown is not burnt
+        cfg.alerts[0].last = 0.0;
+        let mut stale = board_chg(4000.0, Some(5.0));
+        stale.cells[0].stale = true;
+        assert!(check(&mut cfg, &stale, 30_000.0).is_empty());
+        assert_eq!(cfg.alerts[0].last, 0.0);
+    }
+
+    #[test]
+    fn a_price_level_and_a_day_move_together_fire_once() {
+        let mut cfg = fresh_cfg(vec![Alert { day_move: Some(1.0), ..alert(Some(4100.0), None) }]);
+        assert_eq!(check(&mut cfg, &board_chg(4200.0, Some(3.0)), 10_000.0).len(), 1);
+    }
+
+    #[test]
+    fn once_clears_the_level_that_fired_and_prunes_an_empty_alert() {
+        let mut cfg = fresh_cfg(vec![Alert { once: true, ..alert(Some(4100.0), Some(3000.0)) }]);
+        assert_eq!(check(&mut cfg, &board(4200.0, false), 10_000.0).len(), 1);
+        assert_eq!((cfg.alerts[0].above, cfg.alerts[0].below), (None, Some(3000.0)));
+        // the other level fires later and takes the alert with it
+        assert_eq!(check(&mut cfg, &board(2900.0, false), 20_000.0).len(), 1);
+        assert!(cfg.alerts.is_empty());
+        // an alert that is not `once` keeps its level
+        let mut cfg = fresh_cfg(vec![alert(Some(4100.0), None)]);
+        check(&mut cfg, &board(4200.0, false), 10_000.0);
+        assert_eq!(cfg.alerts[0].above, Some(4100.0));
+        // `once` on a day move, and another symbol's alert is untouched
+        let other = Alert { label: "BTC".into(), ..alert(Some(1.0), None) };
+        let mut cfg = fresh_cfg(vec![other.clone(), Alert { once: true, day_move: Some(1.0), ..alert(None, None) }]);
+        assert_eq!(check(&mut cfg, &board_chg(4000.0, Some(1.5)), 10_000.0).len(), 1);
+        assert_eq!(cfg.alerts, vec![other]);
+    }
+
+    #[test]
+    fn silence_order_and_the_clock_ending_a_timed_mute() {
+        let mut cfg = Config::default();
+        assert_eq!(silence(&cfg, 1000.0, 600), None);
+        cfg.quiet_hours = Some([22 * 60, 7 * 60]);
+        assert_eq!(silence(&cfg, 1000.0, 60), Some(Silence::Quiet), "01:00 is inside 22:00 to 07:00");
+        assert_eq!(silence(&cfg, 1000.0, 600), None, "10:00 is outside it");
+        cfg.quiet_hours = None;
+        cfg.alerts_mute_until = 2000.0;
+        assert_eq!(silence(&cfg, 1000.0, 600), Some(Silence::MutedUntil(2000.0)));
+        assert_eq!(silence(&cfg, 2000.0, 600), None, "the mute ends at its time, no timer");
+        assert_eq!(silence(&cfg, 3000.0, 600), None);
+        cfg.alerts_muted = true;
+        assert_eq!(silence(&cfg, 3000.0, 600), Some(Silence::Muted));
+        cfg.alerts_mute_until = f64::NAN;
+        cfg.alerts_muted = false;
+        assert_eq!(silence(&cfg, 1.0, 0), None);
+    }
+
+    #[test]
+    fn a_silenced_alert_still_burns_its_cooldown() {
+        let mut cfg = fresh_cfg(vec![alert(Some(4100.0), None)]);
+        cfg.alerts_muted = true;
+        let f = check(&mut cfg, &board(4200.0, false), 10_000.0);
+        assert_eq!(f.len(), 1, "check still reports it; the caller logs it as silenced");
+        assert_eq!(silence(&cfg, 10_000.0, 0), Some(Silence::Muted));
+        // lifting the mute does not release a burst
+        cfg.alerts_muted = false;
+        assert!(check(&mut cfg, &board(4200.0, false), 10_100.0).is_empty());
+    }
+
+    fn cell_with(high: Option<f64>, low: Option<f64>, prev: Option<f64>) -> Cell {
+        let mut c = Cell { label: "XAU".into(), digits: 2, quote: Some(quote(4000.0)), stale: false };
+        let q = c.quote.as_mut().unwrap();
+        (q.high, q.low, q.prev_close) = (high, low, prev);
+        c
+    }
+
+    #[test]
+    fn presets_refuse_missing_and_zero_fields() {
+        let none = cell_with(None, None, None);
+        let zero = cell_with(Some(0.0), Some(0.0), Some(0.0));
+        let nan = cell_with(Some(f64::NAN), Some(f64::INFINITY), Some(-1.0));
+        for c in [&none, &zero, &nan] {
+            for p in [Preset::DayHigh, Preset::DayLow, Preset::PrevClose] {
+                assert_eq!(preset_level(p, c, 4000.0), None);
+            }
+        }
+        assert_eq!(preset_level(Preset::Pct(1.0), &none, 0.0), None);
+        assert_eq!(preset_level(Preset::Pct(1.0), &none, f64::NAN), None);
+        let c = cell_with(Some(4100.0), Some(3900.0), Some(3950.0));
+        // "past" the extremes: one tick beyond it (digits 2, so a tick is 0.01)
+        assert_eq!(preset_level(Preset::DayHigh, &c, 4000.0), Some(Level::Above(4100.0 + 0.01)));
+        assert_eq!(preset_level(Preset::DayLow, &c, 4000.0), Some(Level::Below(3900.0 - 0.01)));
+        assert_eq!(preset_level(Preset::PrevClose, &c, 4000.0), Some(Level::Below(3950.0)));
+        assert_eq!(preset_level(Preset::PrevClose, &c, 3900.0), Some(Level::Above(3950.0)));
+        assert_eq!(preset_level(Preset::PrevClose, &c, 3950.0), None);
+        assert_eq!(preset_level(Preset::DayMove(2.0), &none, 4000.0), Some(Level::DayMove(2.0)));
+        match preset_level(Preset::Pct(-1.0), &none, 4000.0) {
+            Some(Level::Below(v)) => assert!((v - 3960.0).abs() < 1e-9),
+            other => panic!("{other:?}"),
+        }
+        // every table entry is usable on a complete cell
+        for p in &PRESETS {
+            assert!(preset_level(p.preset, &c, 4000.0).is_some(), "{}", p.label);
+        }
+    }
+
+    #[test]
+    fn the_log_caps_at_ten_keeps_order_and_routes_late_results() {
+        let mut log = Log::default();
+        let seqs: Vec<u64> = (0..12).map(|i| log.push(i as f64, format!("a{i}"), Outcome::Shown)).collect();
+        assert_eq!(log.len(), LOG_CAP);
+        let titles: Vec<String> = log.newest_first().into_iter().map(|e| e.title).collect();
+        assert_eq!(titles.first().map(String::as_str), Some("a11"));
+        assert_eq!(titles.last().map(String::as_str), Some("a2"));
+        assert!(!log.set_outcome(seqs[0], Outcome::Sent), "pushed out");
+        assert!(log.set_outcome(seqs[11], Outcome::SendFailed));
+        assert_eq!(log.newest_first()[0].outcome, Outcome::SendFailed);
+        log.clear();
+        assert_eq!(log.len(), 0);
+        let fresh = log.push(0.0, "x".into(), Outcome::Shown);
+        assert!(fresh > seqs[11], "sequence numbers survive a clear");
+    }
+
+    #[test]
+    fn local_clock_labels() {
+        assert_eq!(hhmm(0), "00:00");
+        assert_eq!(hhmm(14 * 60 + 5), "14:05");
+        assert_eq!(local_hhmm(13 * 60 + 30, 1000.0, 1000.0 + 3600.0), "14:30");
+        assert_eq!(local_hhmm(23 * 60 + 30, 1000.0, 1000.0 + 3600.0), "00:30");
+        assert_eq!(local_hhmm(0, 1000.0, 1000.0 - 60.0), "23:59");
+    }
+
+    #[test]
+    fn apply_level_sets_one_side_and_rearms() {
+        let mut a = Alert { last: 5.0, below: Some(1.0), ..alert(None, None) };
+        apply_level(&mut a, Level::Above(9.0));
+        assert_eq!((a.above, a.below, a.last), (Some(9.0), Some(1.0), 0.0));
+        apply_level(&mut a, Level::DayMove(2.0));
+        assert_eq!(a.day_move, Some(2.0));
+    }
+
+    #[test]
+    fn edge_cases_for_check_presets_clock_and_log() {
+        // check: nothing configured, nothing fires.
+        let mut empty = fresh_cfg(vec![]);
+        assert!(check(&mut empty, &Board::new(&[]), 10_000.0).is_empty());
+        // check: a NaN price fires nothing and burns no cooldown.
+        let mut cfg = fresh_cfg(vec![alert(Some(4100.0), Some(3900.0))]);
+        assert!(check(&mut cfg, &board(f64::NAN, false), 10_000.0).is_empty());
+        assert_eq!(cfg.alerts[0].last, 0.0);
+        // check: a price exactly on a level fires (both sides are inclusive).
+        assert_eq!(check(&mut cfg, &board(4100.0, false), 10_000.0).len(), 1);
+        let mut cfg = fresh_cfg(vec![alert(None, Some(3900.0))]);
+        assert_eq!(check(&mut cfg, &board(3900.0, false), 10_000.0).len(), 1);
+        // check: a NaN or zero day move, or a NaN change, never fires.
+        let mut cfg = fresh_cfg(vec![Alert { day_move: Some(f64::NAN), ..alert(None, None) }]);
+        assert!(check(&mut cfg, &board_chg(4000.0, Some(50.0)), 10_000.0).is_empty());
+        let mut cfg = fresh_cfg(vec![Alert { day_move: Some(0.0), ..alert(None, None) }]);
+        assert!(check(&mut cfg, &board_chg(4000.0, Some(0.0)), 10_000.0).is_empty());
+        let mut cfg = fresh_cfg(vec![Alert { day_move: Some(2.0), ..alert(None, None) }]);
+        assert!(check(&mut cfg, &board_chg(4000.0, Some(f64::NAN)), 10_000.0).is_empty());
+        // check: a cooldown of 0 or NaN is floored to 30 s.
+        for cd in [0.0, f64::NAN] {
+            let mut cfg = fresh_cfg(vec![Alert { cooldown_s: cd, ..alert(Some(4100.0), None) }]);
+            assert_eq!(check(&mut cfg, &board(4200.0, false), 10_000.0).len(), 1, "cooldown {cd}");
+            assert!(check(&mut cfg, &board(4200.0, false), 10_029.0).is_empty(), "cooldown {cd}");
+            assert_eq!(check(&mut cfg, &board(4200.0, false), 10_030.0).len(), 1, "cooldown {cd}");
+        }
+        // presets: a negative or NaN reference gives no percentage level. Today's high and low do
+        // not depend on the reference, and a day move needs no level at all.
+        let c = cell_with(Some(4100.0), Some(3900.0), Some(3950.0));
+        assert_eq!(preset_level(Preset::Pct(1.0), &c, -4000.0), None);
+        assert_eq!(preset_level(Preset::PrevClose, &c, f64::NAN), None);
+        assert_eq!(preset_level(Preset::DayHigh, &c, -4000.0), Some(Level::Above(4100.0 + 0.01)));
+        assert_eq!(preset_level(Preset::DayMove(2.0), &c, -4000.0), Some(Level::DayMove(2.0)));
+        assert_eq!(preset_level(Preset::Pct(0.0), &c, 4000.0), None, "zero percent is no level");
+        assert_eq!(preset_level(Preset::Pct(f64::NAN), &c, 4000.0), None);
+        assert_eq!(preset_level(Preset::DayMove(0.0), &c, 4000.0), None);
+        assert_eq!(preset_level(Preset::DayMove(f64::NAN), &c, 4000.0), None);
+        // clock: a NaN time is treated as "now"; minute 1440 wraps to midnight.
+        assert_eq!(local_hhmm(600, 1000.0, f64::NAN), "10:00");
+        assert_eq!(hhmm(1440), "00:00");
+        assert_eq!(hhmm(1439), "23:59");
+        // log: an empty log is empty; exactly 10 entries keep all of them; the 11th drops the oldest.
+        let titles = |log: &Log| -> Vec<String> { log.newest_first().into_iter().map(|e| e.title).collect() };
+        let mut log = Log::default();
+        assert!(log.newest_first().is_empty());
+        for i in 0..10 {
+            log.push(i as f64, format!("a{i}"), Outcome::Shown);
+        }
+        assert_eq!(log.len(), 10);
+        assert_eq!(titles(&log).first().map(String::as_str), Some("a9"));
+        assert_eq!(titles(&log).last().map(String::as_str), Some("a0"));
+        let eleventh = log.push(10.0, "a10".into(), Outcome::Shown);
+        assert_eq!(log.len(), 10);
+        assert_eq!(titles(&log).first().map(String::as_str), Some("a10"));
+        assert_eq!(titles(&log).last().map(String::as_str), Some("a1"));
+        // set_outcome on sequence 0, on the dropped first entry (seq 1), or on a live one.
+        assert!(!log.set_outcome(0, Outcome::Sent));
+        assert!(!log.set_outcome(1, Outcome::Sent), "the first entry was dropped");
+        assert!(log.set_outcome(eleventh, Outcome::Sent));
+        // a single entry is listed and can be changed.
+        let mut one = Log::default();
+        let s = one.push(0.0, "only".into(), Outcome::Quiet);
+        assert_eq!(one.newest_first().len(), 1);
+        assert!(one.set_outcome(s, Outcome::Muted));
+        assert_eq!(one.newest_first()[0].outcome, Outcome::Muted);
+    }
+
+    #[test]
+    fn mute_state_never_reports_quiet() {
+        let cfg = Config { quiet_hours: Some([1320, 420]), ..Config::default() };
+        // inside the quiet window, nothing muted: no state at all, not Quiet
+        assert_eq!(mute_state(&cfg, 1000.0), None);
+        assert_eq!(silence(&cfg, 1000.0, 60), Some(Silence::Quiet));
+        let timed = Config { alerts_mute_until: 2000.0, ..cfg.clone() };
+        assert_eq!(mute_state(&timed, 1000.0), Some(Silence::MutedUntil(2000.0)));
+        assert_eq!(mute_state(&timed, 2000.0), None, "the mute ends at its time");
+        let muted = Config { alerts_muted: true, ..cfg };
+        assert_eq!(mute_state(&muted, 1000.0), Some(Silence::Muted));
+    }
+
+    #[test]
+    fn past_the_day_extremes_needs_one_tick_more() {
+        let c = cell_with(Some(4100.0), Some(3900.0), None);
+        // High: a price exactly at the high does not trip the level; the level itself (one tick
+        // above the high) does.
+        let Some(Level::Above(hi)) = preset_level(Preset::DayHigh, &c, 4000.0) else { panic!("no high level") };
+        assert!((hi - 4100.01).abs() < 1e-9, "{hi}");
+        let mut cfg = fresh_cfg(vec![alert(Some(hi), None)]);
+        assert!(check(&mut cfg, &board(4100.0, false), 10_000.0).is_empty(), "at the high is not past it");
+        assert_eq!(check(&mut cfg, &board(hi, false), 10_000.0).len(), 1, "one tick past fires");
+        // Low: the mirror image.
+        let Some(Level::Below(lo)) = preset_level(Preset::DayLow, &c, 4000.0) else { panic!("no low level") };
+        assert!((lo - 3899.99).abs() < 1e-9, "{lo}");
+        let mut cfg = fresh_cfg(vec![alert(None, Some(lo))]);
+        assert!(check(&mut cfg, &board(3900.0, false), 10_000.0).is_empty(), "at the low is not past it");
+        assert_eq!(check(&mut cfg, &board(lo, false), 10_000.0).len(), 1, "one tick past fires");
+        // Digits 0: a tick is one whole unit.
+        let mut c0 = cell_with(Some(4100.0), Some(3900.0), None);
+        c0.digits = 0;
+        assert_eq!(preset_level(Preset::DayHigh, &c0, 4000.0), Some(Level::Above(4101.0)));
+        assert_eq!(preset_level(Preset::DayLow, &c0, 4000.0), Some(Level::Below(3899.0)));
+        // A low so small that one tick below it is not positive has no level.
+        let tiny = cell_with(Some(4100.0), Some(0.01), None);
+        assert_eq!(preset_level(Preset::DayLow, &tiny, 4000.0), None);
+        let zero_digits_tiny = Cell { digits: 0, ..cell_with(Some(4100.0), Some(1.0), None) };
+        assert_eq!(preset_level(Preset::DayLow, &zero_digits_tiny, 4000.0), None, "1 - 1 is not positive");
+    }
+
+    #[test]
+    fn quiet_window_inside_outside_wrapping_and_empty() {
+        // A window that does not wrap midnight: `from` is inside, `to` is outside.
+        assert!(quiet(600, [540, 1020]));
+        assert!(quiet(540, [540, 1020]), "from is inside");
+        assert!(!quiet(1020, [540, 1020]), "to is outside");
+        assert!(!quiet(539, [540, 1020]));
+        // A window that wraps midnight.
+        assert!(quiet(0, [1320, 420]));
+        assert!(quiet(1380, [1320, 420]), "from is inside");
+        assert!(quiet(419, [1320, 420]));
+        assert!(!quiet(420, [1320, 420]), "to is outside");
+        assert!(!quiet(720, [1320, 420]));
+        assert!(!quiet(1319, [1320, 420]));
+        // Empty: from == to is off, whatever the time.
+        for x in [0u16, 600, 1439] {
+            assert!(!quiet(x, [600, 600]), "minute {x}");
+        }
+        // The last minute of the day, and a window that ends exactly at midnight.
+        assert!(quiet(1439, [1320, 0]), "the last minute before the window ends is inside");
+        assert!(!quiet(0, [1320, 0]), "midnight is the end, so it is outside");
+        // silence() with quiet hours: inside is Quiet, outside is None, and a mute wins over quiet.
+        let mut cfg = Config { quiet_hours: Some([1320, 420]), ..Config::default() };
+        assert_eq!(silence(&cfg, 1000.0, 60), Some(Silence::Quiet));
+        assert_eq!(silence(&cfg, 1000.0, 720), None);
+        cfg.alerts_muted = true;
+        assert_eq!(silence(&cfg, 1000.0, 60), Some(Silence::Muted), "a mute wins over quiet hours");
+        cfg.alerts_muted = false;
+        cfg.alerts_mute_until = 2000.0;
+        assert_eq!(silence(&cfg, 1000.0, 60), Some(Silence::MutedUntil(2000.0)));
+    }
+
+    #[test]
+    fn describe_lists_what_is_set() {
+        assert_eq!(describe(&alert(Some(4200.0), None), 2), "above 4,200.00");
+        let day = |d: f64| Alert { day_move: Some(d), ..alert(Some(4200.0), None) };
+        assert_eq!(describe(&day(2.0), 2), "above 4,200.00 \u{b7} day \u{b1}2 %");
+        let all = Alert { once: true, day_move: Some(2.0), ..alert(Some(4200.0), Some(3900.0)) };
+        assert_eq!(describe(&all, 2), "above 4,200.00 \u{b7} below 3,900.00 \u{b7} day \u{b1}2 % \u{b7} once");
+        assert_eq!(describe(&alert(None, None), 2), "nothing set");
+        assert_eq!(describe(&alert(Some(4200.0), None), 0), "above 4,200");
+        assert_eq!(describe(&day(2.5), 2), "above 4,200.00 \u{b7} day \u{b1}2.5 %");
+        // Edge cases: a level or day move that can never fire is not listed as set.
+        assert_eq!(describe(&alert(Some(f64::NAN), None), 2), "nothing set");
+        assert_eq!(describe(&alert(Some(f64::INFINITY), None), 2), "nothing set");
+        assert_eq!(describe(&Alert { day_move: Some(0.0), ..alert(None, None) }, 2), "nothing set");
+        assert_eq!(describe(&Alert { day_move: Some(f64::NAN), ..alert(None, None) }, 2), "nothing set");
+        // `once` on its own says nothing about a level, so it is not a setting either.
+        assert_eq!(describe(&Alert { once: true, ..alert(None, None) }, 2), "nothing set");
+        // A negative level is written with its sign.
+        assert_eq!(describe(&alert(None, Some(-5.0)), 2), "below -5.00");
+    }
+
+    #[test]
+    fn entry_line_names_time_title_and_outcome() {
+        let e = |outcome| Entry { seq: 1, at: 1000.0 + 3600.0, title: "XAU above 4,200.00".into(), outcome };
+        assert_eq!(entry_line(&e(Outcome::Muted), 13 * 60 + 30, 1000.0), "14:30  XAU above 4,200.00 \u{b7} muted");
+        assert_eq!(entry_line(&e(Outcome::Shown), 13 * 60 + 30, 1000.0), "14:30  XAU above 4,200.00 \u{b7} shown");
+        assert_eq!(entry_line(&e(Outcome::Quiet), 13 * 60 + 30, 1000.0), "14:30  XAU above 4,200.00 \u{b7} quiet hours");
+        assert_eq!(entry_line(&e(Outcome::Sent), 13 * 60 + 30, 1000.0), "14:30  XAU above 4,200.00 \u{b7} sent");
+        assert_eq!(entry_line(&e(Outcome::SendFailed), 13 * 60 + 30, 1000.0), "14:30  XAU above 4,200.00 \u{b7} send failed");
+        // An entry from before now, and a NaN time, fall back to safe text.
+        let old = Entry { at: 1000.0 - 60.0, ..e(Outcome::Sent) };
+        assert!(entry_line(&old, 0, 1000.0).starts_with("23:59  "));
+        let nan = Entry { at: f64::NAN, ..e(Outcome::Sent) };
+        assert!(entry_line(&nan, 600, 1000.0).starts_with("10:00  "));
+    }
+
+    #[test]
+    fn accept_webhook_takes_good_urls_and_refuses_bad_ones_silently() {
+        assert_eq!(
+            accept_webhook("  https://discord.com/api/webhooks/1/SECRET\r\n"),
+            Ok("https://discord.com/api/webhooks/1/SECRET".to_string())
+        );
+        assert_eq!(accept_webhook("http://localhost:8080/x"), Ok("http://localhost:8080/x".to_string()));
+        assert_eq!(accept_webhook("HTTPS://a.com/x"), Ok("HTTPS://a.com/x".to_string()));
+        // Exactly 2,048 bytes is accepted, 2,049 is not.
+        let at_cap = format!("https://a.com/{}", "S".repeat(2048 - 14));
+        assert_eq!(at_cap.len(), 2048);
+        assert!(accept_webhook(&at_cap).is_ok());
+        let over = format!("https://a.com/{}", "S".repeat(2049 - 14));
+        assert_eq!(over.len(), 2049);
+        // Every refusal is a fixed, short sentence that never contains the input.
+        let bad = [
+            "",
+            "   ",
+            "ftp://x/SECRET",
+            "https:SECRET",
+            "https://a.com/SE CRET",
+            "https://a.com/SE\tCRET",
+            "https://a.com/\u{7}SECRET",
+            "javascript:SECRET",
+            "https://",
+            "SECRET",
+            over.as_str(),
+        ];
+        for raw in bad {
+            match accept_webhook(raw) {
+                Ok(v) => panic!("accepted {raw:?} as {v:?}"),
+                Err(e) => {
+                    assert!(!e.contains("SECRET"), "error echoed the secret: {e}");
+                    assert!(e.len() < 100, "{e}");
+                }
+            }
+        }
     }
 
     #[test]
