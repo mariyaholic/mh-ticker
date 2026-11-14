@@ -662,12 +662,12 @@ pub fn write_all(dir: &Path) -> Result<usize, String> {
 
 /// The labels of the 24-symbol board, in the order a user might add them.
 const LABELS_24: [&str; 24] = [
-    "XAU", "XAG", "BTC", "ETH", "DOW", "S&P", "NAS", "RUT", "VIX", "OIL", "GAS", "EUR", "GBP", "JPY", "TNX", "AAPL", "MSFT", "NVDA",
+    "XAU", "XAG", "BTC", "ETH", "DOW", "S&P", "NAS", "NATGAS", "VIX", "OIL", "GAS", "EUR", "GBP", "JPY", "TNX", "AAPL", "MSFT", "NVDA",
     "TSLA", "AMZN", "META", "GOOG", "AMD", "INTC",
 ];
 
 /// `n` (at most 24) symbols: the fixture's six cycled, each round a little dearer, with one stale
-/// cell and one with no quote among them, so the wide pictures show the awkward cards as well.
+/// cell (a closed market, 52 hours old) and one with no quote among them, so the wide pictures show the awkward cards as well.
 fn board_n(now: f64, n: usize) -> Board {
     let base = board(now);
     let n = n.clamp(1, LABELS_24.len());
@@ -694,6 +694,13 @@ fn board_n(now: f64, n: usize) -> Board {
                 q.change_pct = q.change_pct.map(|p| p * (1.0 + (i % 4) as f64 * 0.8) * if i % 3 == 1 { -1.0 } else { 1.0 });
             }
             cell.stale = i == 7;
+            if i == 7 {
+                // A weekend: the quote is 52 hours old, so the card reads "closed 52h" beside a long label.
+                if let Some(q) = cell.quote.as_mut() {
+                    q.ts = Some(now - 52.0 * 3600.0);
+                    q.realtime = false;
+                }
+            }
             if i == 13 {
                 cell.quote = None;
             }
@@ -1088,6 +1095,16 @@ mod tests {
             }
             assert!(moved.len() < 120, "card {card}: a dot, not a repaint ({} px)", moved.len());
         }
+    }
+
+    /// The 24-card board carries one closed market, so its picture shows the "closed 52h" tag.
+    #[test]
+    fn the_wide_board_has_a_closed_market_card() {
+        let now = 1_800_000_000.0;
+        let b = board_n(now, 24);
+        assert!(crate::model::market_closed(&b.cells[7], b.link, now));
+        assert_eq!(b.cells[7].label, "NATGAS");
+        assert!((0..24).filter(|&i| crate::model::market_closed(&b.cells[i], b.link, now)).count() == 1);
     }
 
     /// The note is drawn on the header's second line with no pointer over the plot, and the pointer's

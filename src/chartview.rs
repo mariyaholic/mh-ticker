@@ -1829,4 +1829,39 @@ mod tests {
             }
         }
     }
+    /// A spot-metal 5D file that crosses a weekend: the Saturday and Sunday repeats of Friday's close
+    /// are gone, the break is marked once where the market reopens, and every candle still reads back
+    /// from its own pixel.
+    #[test]
+    fn a_weekend_of_repeats_leaves_one_marked_break_and_exact_pixels() {
+        let fri = 1_793_998_200_i64; // Fri 21:48 UTC
+        let mut priced: Vec<(i64, [f64; 4])> =
+            (0..8).map(|i| (fri - 300 * (7 - i), [4065.0, 4066.0 + i as f64, 4064.0, 4065.5 + i as f64])).collect();
+        let close = priced[7].1[3];
+        priced.push((fri + 8_100, [close; 4]));
+        priced.push((fri + 108_000, [close; 4]));
+        for i in 0..8 {
+            priced.push((fri + 180_600 + 300 * i, [4066.0, 4067.0 + i as f64, 4065.0, 4066.5 + i as f64]));
+        }
+        let rows: Vec<_> = priced
+            .iter()
+            .map(|(t, p)| serde_json::json!({"open": p[0].to_string(), "high": p[1].to_string(), "low": p[2].to_string(), "close": p[3].to_string(), "volume": 0, "tradeTimeinMills": t * 1000}))
+            .collect();
+        let series = crate::source::parse_series(&serde_json::json!({"barData": {"priceBars": rows}}), 1_794_606_600.0);
+        assert_eq!(series.bars.len(), 16, "the two repeats are gone");
+        assert_eq!(series.bar_s, 300.0);
+        let (bars, bucket) = fitted_to(&series.bars, 650, series.t0, 0, series.bar_s, MONTH_S);
+        assert_eq!((bars.len(), bucket), (16, 300.0));
+        assert_eq!(gaps(&bars, bucket), [8], "one break, at the reopening");
+        assert!(bars.iter().all(|b| b.h > b.l), "no candle without a range");
+        let l = layout_for(650, bars.len(), 96);
+        for i in 0..bars.len() {
+            assert_eq!(l.index_at(l.x_of(i)), Some(i));
+        }
+        // The last price and a level line sit where the price says, whatever the candle count is.
+        let last = bars[bars.len() - 1].c as f64;
+        let level = Layout { lo: 4_060.0, hi: 4_080.0, ..l };
+        assert!(level.y_of(last) > level.plot.top && level.y_of(last) < level.plot.bottom);
+        assert_eq!(level.price_at(level.y_of(last)).map(|p| (p - last).abs() < 0.5), Some(true));
+    }
 }

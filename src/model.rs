@@ -207,6 +207,23 @@ pub fn is_stale(q: &Quote, now: f64, stale_after: f64, delayed_grace: f64) -> bo
     q.ts.map(|t| now - t > limit).unwrap_or(true)
 }
 
+/// How old a CNBC quote must be, with the feed answering, before the card calls its market closed.
+/// CNBC's own `curmktstatus` field reads `REG_MKT` on a Saturday for gold, silver, FX, futures and
+/// bitcoin alike, so the state comes from the age of the quote. 15 minutes is past the 10-minute
+/// delay of the index futures and past any governed poll interval.
+pub const CLOSED_AFTER_S: f64 = 900.0;
+
+/// Is this card's market closed, as opposed to its feed dead? True for a stale CNBC quote that is at
+/// least [`CLOSED_AFTER_S`] old while the last request was answered (`link` is not `Down`): the
+/// service is up and this instrument has stopped printing. False with the link down (the age says
+/// nothing then), with no quote, with a fallback-provider quote (its age is unknown), and while the
+/// quote is fresh.
+pub fn market_closed(cell: &Cell, link: Link, now: f64) -> bool {
+    link != Link::Down
+        && cell.stale
+        && cell.quote.as_ref().is_some_and(|q| q.source.is_empty() && q.ts.is_some_and(|t| now - t >= CLOSED_AFTER_S))
+}
+
 /// One cell per configured row, from the latest quotes keyed by symbol.
 pub fn resolve(rows: &[Row], quotes: &HashMap<String, Quote>, now: f64, stale_after: f64, delayed_grace: f64) -> Vec<Cell> {
     rows.iter()
@@ -356,6 +373,29 @@ mod tests {
             b.set_fallback(false);
             assert!(b.cells[0].quote.is_none());
         }
+    }
+
+    #[test]
+    fn an_old_quote_on_a_live_link_is_a_closed_market() {
+        let cell = |ts: Option<f64>, source: &'static str, stale: bool| Cell {
+            label: "XAG".into(),
+            digits: 3,
+            quote: Some(Quote { symbol: "XAG=".into(), source, price: 48.72, ts, realtime: true, ..Quote::default() }),
+            stale,
+        };
+        let now = 100_000.0;
+        let old = cell(Some(now - 2.0 * 86_400.0), "", true);
+        assert!(market_closed(&old, Link::Partial, now), "two days old, the service answering");
+        assert!(market_closed(&old, Link::Live, now));
+        assert!(!market_closed(&old, Link::Down, now), "a dead feed is not a closed market");
+        assert!(!market_closed(&cell(Some(now - CLOSED_AFTER_S + 1.0), "", true), Link::Live, now), "stale, but only just");
+        assert!(market_closed(&cell(Some(now - CLOSED_AFTER_S), "", true), Link::Live, now), "the limit itself counts");
+        assert!(!market_closed(&cell(Some(now - 5.0), "", false), Link::Live, now), "fresh");
+        assert!(!market_closed(&cell(Some(now - 86_400.0), "", false), Link::Live, now), "not stale by the board's rule");
+        assert!(!market_closed(&cell(None, "", true), Link::Live, now), "no time, no age");
+        assert!(!market_closed(&cell(Some(now - 86_400.0), "Metals.dev", true), Link::Live, now), "a fallback quote has no age");
+        let none = Cell { quote: None, ..old };
+        assert!(!market_closed(&none, Link::Live, now), "no quote");
     }
 
     #[test]
