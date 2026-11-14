@@ -470,7 +470,7 @@ pub fn pick(ultra: bool, name: &str) -> &'static Theme {
     }
 }
 
-/// One selectable face. `group` is the font choice it lands in, so the Font page reads as a catalogue
+/// One selectable face. `group` is the font choice it lands in, so the font groups under Theme and font on the Display page read as a catalogue
 /// rather than one long list of names.
 pub struct Face {
     pub name: &'static str,

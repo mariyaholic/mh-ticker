@@ -768,7 +768,7 @@ pub fn palette(t: &Theme) -> Palette {
         on_text: ink_on(on),
         ring: readable(t.price, page, 3.0),
         line: readable(t.guide, page, 1.0),
-        thumb: if t.contrast { text } else { soft(t.dim, page, 3.0) },
+        thumb: if t.contrast { soft(mix(page, text, 3, 4), page, 3.0) } else { soft(t.dim, page, 3.0) },
         thumb_hot: text,
     }
 }
@@ -1445,6 +1445,14 @@ mod tests {
                 let r = contrast_ratio(c, p.page);
                 assert!(r >= 3.0, "{}: {name} is {r:.2} to 1 against the page", t.name);
             }
+        }
+    }
+
+    #[test]
+    fn the_contrast_palettes_show_the_hot_thumb_apart_from_the_resting_one() {
+        for t in every_palette().iter().filter(|t| t.contrast) {
+            let p = palette(t);
+            assert_ne!(p.thumb, p.thumb_hot, "{}: the thumb shows no hover or drag", t.name);
         }
     }
 

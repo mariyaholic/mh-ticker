@@ -20,7 +20,8 @@
 //! - **Floating**: one row anywhere on screen, dragged by hand, position saved.
 //!
 //! On the taskbar the strip re-raises itself when the taskbar comes on top. Every placement hides
-//! while a fullscreen app (a game) is in front. With several displays, the Display page of the settings window also picks one.
+//! while a fullscreen app (a game) is in front. With several displays, the Display page of the
+//! settings window also picks one.
 //!
 //! The right-click menu is short: *Settings...*, expand or collapse, refresh, copy all prices, undo, show
 //! strip and quit, and on a card the entries for that card (copy, open, pin, rename, decimals, and in
@@ -5145,7 +5146,7 @@ mod tests {
         assert!(!log.set_outcome(seq, alerts::Outcome::Sent), "the line is gone");
     }
 
-    /// Audit 1.8, finding 4: the Alerts submenu's count is of the symbols it lists. An alert on a hidden
+    /// Audit 1.8, finding 4: the Alerts page's count is of the symbols it lists. An alert on a hidden
     /// symbol is kept in the settings but not counted.
     #[test]
     fn the_alerts_count_is_of_listed_symbols_only() {
