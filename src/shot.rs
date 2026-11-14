@@ -1251,7 +1251,7 @@ mod tests {
     #[test]
     fn the_quiet_board_is_calm_and_says_no_closed() {
         let b = board_quiet(WEEKEND_NOW);
-        assert_eq!(b.calm(WEEKEND_NOW), crate::model::Calm::QuietSome(2));
+        assert_eq!(b.calm(WEEKEND_NOW), crate::model::Calm::QuietSome { closed: 0, quiet: 2 });
         assert!(b.cells.iter().all(|c| !crate::model::market_closed(c, b.link, WEEKEND_NOW)));
         assert!(b.cells[..2].iter().all(|c| crate::model::calm_stale(c, b.link, WEEKEND_NOW)));
         assert!(b.cells[..2].iter().all(|c| crate::model::closed_card_words(c, b.link, WEEKEND_NOW, None, &tz_offset).is_none()));

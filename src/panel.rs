@@ -1131,7 +1131,13 @@ pub fn draw(dc: HDC, w: i32, h: i32, sc: &Scene) {
     let calm = sc.board.calm(sc.now);
     fill_ellipse(dc, dx, ty + (lh - d) / 2, d, crate::theme::calm_color(t, sc.board.link, calm));
     let sh = line_height(dc, sc.fonts.small);
-    text(dc, sc.fonts.small, dx + d + s(7), ty + (lh - sh) / 2, &crate::theme::calm_name(sc.board.link, calm), t.label);
+    let nx = dx + d + s(7);
+    let room = (if sc.picker_btn { g.pick_btn.left } else { w - g.pad }) - s(6) - nx;
+    let mut name = crate::theme::calm_name(sc.board.link, calm);
+    if text_width(dc, sc.fonts.small, &name) > room {
+        name = crate::theme::calm_name_short(sc.board.link, calm);
+    }
+    text(dc, sc.fonts.small, nx, ty + (lh - sh) / 2, &name, t.label);
 
     if sc.picker_btn {
         if sc.pick_hover {

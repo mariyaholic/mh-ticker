@@ -1029,8 +1029,9 @@ pub fn collect_bodies(rows: &[Row], day_rows: usize, current: &str) -> crate::pr
 
 /// The word the probe prints after a quote: ` CLOSED` for a market that has stopped, ` QUIET` for a
 /// calm quote that is not yet closed, ` STALE` for a price that is old for any other reason, nothing
-/// for a fresh one. The probe only reaches here
-/// when the service answered, so the link counts as live.
+/// for a fresh one. The probe only reaches here when the service answered, so the link counts as live.
+/// The caller applies [`crate::model::Board::apply_bar_restamps`] first, so a quote the 1D bars show
+/// to be a re-stamp is stale here, as it is in the app.
 pub(crate) fn probe_state(c: &crate::model::Cell, now: f64) -> &'static str {
     if crate::model::reads_closed(c, Link::Live, now) {
         " CLOSED"
@@ -1053,7 +1054,23 @@ pub fn probe(cfg: &Config, dump: Option<&std::path::Path>) -> bool {
         Some(Ok(body)) => match serde_json::from_str::<Value>(body) {
             Ok(v) => {
                 let map: HashMap<_, _> = parse_quotes_at(&v, now).into_iter().map(|q| (q.symbol.clone(), q)).collect();
-                for c in resolve(&cfg.rows, &map, now, cfg.stale_after_s, cfg.delayed_grace_s) {
+                // The cells go through the board's re-stamp rule with the 1D bars this pass fetched, so
+                // the label matches what the app shows.
+                let mut board = crate::model::Board::new(&cfg.rows);
+                board.link = Link::Live;
+                board.cells = resolve(&cfg.rows, &map, now, cfg.stale_after_s, cfg.delayed_grace_s);
+                board.bars = vec![Vec::new().into(); cfg.rows.len()];
+                board.bars_t0 = vec![0.0; cfg.rows.len()];
+                for (i, r) in cfg.rows.iter().enumerate() {
+                    let chart = b.day.iter().find(|(s, _)| s == &r.symbol).and_then(|(_, a)| a.as_ref().ok()).and_then(|t| serde_json::from_str::<Value>(t).ok());
+                    if let (Some(v), Some(slot)) = (chart, board.bars.get_mut(i)) {
+                        let (t0, bars) = parse_chart(&v, now);
+                        *slot = bars.into();
+                        board.bars_t0[i] = t0;
+                    }
+                }
+                board.apply_bar_restamps(now);
+                for c in board.cells.iter().cloned() {
                     match &c.quote {
                         Some(q) => println!(
                             "{:<5} {:>12} {:>8}  {}{}{} age={}",

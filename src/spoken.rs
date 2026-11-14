@@ -3,8 +3,8 @@
 //!
 //! With a card locked the name is that card as a sentence, `Gold 4,012.30, up 0.4 percent`, with
 //! `, closed` added when its market is closed, `, quiet` while it is calm but not yet closed
-//! (`model::calm_stale`), and `, stale` when its price is old for another reason. With none locked it is one line about the board. The name ends with the app's own, so
-//! the window is still recognisable. Classic never gets a price in its window name, so `window_name`
+//! (`model::calm_stale`), and `, stale` when its price is old for another reason. With none locked it
+//! is one line about the board. The name ends with the app's own, so the window is still recognisable. Classic never gets a price in its window name, so `window_name`
 //! answers `None` for it and the title stays as it always was.
 
 use crate::model::{calm_stale, fmt_price, reads_closed, Cell, Link};
