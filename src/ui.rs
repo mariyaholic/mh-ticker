@@ -815,7 +815,7 @@ fn make_icon(color: COLORREF, pending: bool) -> HICON {
 }
 
 /// (label, price, price colour, change + colour) for one row of the board. A stale cell that is calm
-/// (`model::calm_stale`: a closed market) dims to the grey of the theme's secondary text. A stale
+/// (`model::calm_stale`: a quiet or closed market) dims to the grey of the theme's secondary text. A stale
 /// cell that is a fault (no known age, a fallback quote, a dead link) takes the amber of the theme
 /// and loses its change colours, so the two read differently on the strip.
 fn cell_texts(c: &Cell, t: &Theme, link: Link, now: f64) -> (String, String, COLORREF, Option<(String, COLORREF)>) {
@@ -1367,8 +1367,18 @@ fn tooltip_with(view: &Board, pending: Option<&str>, blind: Option<&str>) -> Str
     tooltip_at(view, pending, blind, crate::source::now_s())
 }
 
+/// The tray tooltip holds this many UTF-16 units; the shell cuts the rest.
+const TIP_UNITS: usize = 127;
+
 /// [`tooltip_with`] at a given clock (UTC seconds), so a test can say what time it is.
 fn tooltip_at(view: &Board, pending: Option<&str>, blind: Option<&str>, now: f64) -> String {
+    tooltip_in(view, pending, blind, now, &local_offset_at)
+}
+
+/// [`tooltip_at`] with the zone given (`offset_at(t)` is seconds east of UTC at `t`). A row of a closed
+/// market says `closed since Fri 17:00` when the whole tooltip still fits the tray's limit with it,
+/// else `closed`; a calm row that is not yet closed shows its source and age (`CNBC 3m`).
+fn tooltip_in(view: &Board, pending: Option<&str>, blind: Option<&str>, now: f64, offset_at: &dyn Fn(f64) -> i32) -> String {
     let mut s = String::new();
     if let Some(title) = pending {
         s.push_str(&format!("Alert: {title}\n"));
@@ -1378,12 +1388,35 @@ fn tooltip_at(view: &Board, pending: Option<&str>, blind: Option<&str>, now: f64
         s.push('\n');
         s.push_str(line);
     }
-    for c in &view.cells {
+    // Each row is its short form and, for a closed market, a longer one with the since-time.
+    let mut rows: Vec<(String, Option<String>)> = Vec::new();
+    for (i, c) in view.cells.iter().enumerate() {
         if let Some(q) = &c.quote {
-            s.push_str(&format!("\n{} {}", c.label, fmt_price(q.price, c.digits)));
-            if !q.source.is_empty() { s.push_str(&format!(" ({}; age unknown)", q.source)); }
-            else if crate::model::reads_closed(c, view.link, now) { s.push_str(" (closed)"); }
-            else if c.stale { s.push_str(" (stale)"); }
+            let mut row = format!("\n{} {}", c.label, fmt_price(q.price, c.digits));
+            let mut long = None;
+            if !q.source.is_empty() { row.push_str(&format!(" ({}; age unknown)", q.source)); }
+            else if crate::model::reads_closed(c, view.link, now) {
+                row.push_str(" (closed)");
+                long = crate::model::closed_since_shown(q, now, view.last_bar_at(i))
+                    .map(|t| format!("\n{} {} (closed since {})", c.label, fmt_price(q.price, c.digits), crate::model::fmt_since(offset_at, now, t)));
+            }
+            else if crate::model::calm_stale(c, view.link, now) {
+                let src = if q.realtime { "CNBC" } else { "CNBC delayed" };
+                row.push_str(&format!(" ({src} {})", crate::panel::fmt_age(now - q.ts.unwrap_or(now))));
+            }
+            else if c.stale { row.push_str(" (stale)"); }
+            rows.push((row, long));
+        }
+    }
+    let units = |t: &str| t.encode_utf16().count();
+    let mut total = units(&s) + rows.iter().map(|(r, _)| units(r)).sum::<usize>();
+    for (row, long) in rows {
+        match long {
+            Some(l) if total - units(&row) + units(&l) <= TIP_UNITS => {
+                total = total - units(&row) + units(&l);
+                s.push_str(&l);
+            }
+            _ => s.push_str(&row),
         }
     }
     s
@@ -1417,7 +1450,9 @@ mod tooltip_tests {
         let rows = vec![Row { label: "XAU".into(), symbol: "XAU=".into(), digits: 2, name: String::new(), strip: true }];
         let alert = Alert { label: "XAU".into(), above: Some(4200.0), ..Alert::default() };
         let cfg = Config { alerts: vec![alert], rows, stale_after_s: 90.0, ..Config::default() };
-        for (age, closed) in [(91.0, true), (300.0, true), (899.0, true), (901.0, true), (30.0, false)] {
+        // The stale limit is 90 s: a fresh card at 30 s, a calm age with no `closed` from 91 s to 899 s,
+        // and `closed` on every surface from 901 s.
+        for (age, closed) in [(30.0, false), (91.0, false), (300.0, false), (899.0, false), (901.0, true)] {
             let c = cell("XAU", Some(now - age), age > 90.0);
             let mut b = Board::new(&[]);
             b.link = Link::Partial;
@@ -1439,10 +1474,38 @@ mod tooltip_tests {
             assert_eq!(said(&over), closed, "overview {over}, {ctx}");
             assert_eq!(probe == " CLOSED", closed, "probe {probe}, {ctx}");
             assert_eq!(tag.as_ref().is_some_and(|w| w.last().map(String::as_str) == Some("closed")), closed, "card tag {tag:?}, {ctx}");
-            if closed {
+            if age > 90.0 {
                 assert!(!tip.contains("stale") && !spoken.contains("stale") && !summary.contains("stale"), "{ctx}");
+                assert!(!probe.contains("STALE"), "{ctx}");
+                assert_ne!(header, theme::link_name(b.link), "the header stays calm, {ctx}");
+            }
+            if (91.0..=899.0).contains(&age) {
+                assert!(row.contains(&format!("CNBC {}", crate::panel::fmt_age(age))), "the calm age with its source: {row}, {ctx}");
+                assert!(header.contains("quiet"), "{header}, {ctx}");
+                assert_eq!(probe, " QUIET", "{ctx}");
             }
         }
+    }
+
+    #[test]
+    fn the_tooltip_adds_the_since_time_when_it_fits_the_tray() {
+        let now = crate::probe::parse_time("2026-11-14T17:18:36.000+0000").unwrap();
+        let fri = crate::probe::parse_time("2026-11-13T17:00:00.000-0500").unwrap();
+        let est = |_: f64| -5 * 3600;
+        let mut b = Board::new(&[]);
+        b.link = Link::Partial;
+        b.cells = vec![cell("S&P", Some(fri), true)];
+        let tip = tooltip_in(&b, None, None, now, &est);
+        assert!(tip.contains("S&P 10 (closed since Fri 17:00)"), "{tip}");
+        // Three long rows would pass the tray's limit, so the last one keeps the short word.
+        b.cells = (0..3).map(|i| cell(&format!("MARKET{i}"), Some(fri), true)).collect();
+        let tip = tooltip_in(&b, None, None, now, &est);
+        assert!(tip.encode_utf16().count() <= TIP_UNITS, "{tip}");
+        assert!(tip.contains("(closed)") && tip.contains("(closed since"), "the first rows that fit get the time: {tip}");
+        // A calm row that is not yet closed has its source and age and no since-time.
+        b.cells = vec![cell("XAU", Some(now - 300.0), true)];
+        let tip = tooltip_in(&b, None, None, now, &est);
+        assert!(tip.contains("XAU 10 (CNBC 5m)"), "{tip}");
     }
 
     #[test]

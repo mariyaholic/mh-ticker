@@ -670,6 +670,7 @@ impl Feed {
                 }
             }
             b.cells = cells;
+            b.apply_bar_restamps(now);
             b.link = link;
             b.note = note;
         }
@@ -685,6 +686,7 @@ impl Feed {
                 b.bars = self.chart.iter().map(|(_, bars)| bars.clone().into()).collect();
                 b.bars_t0 = self.chart.iter().map(|(t0, _)| *t0).collect();
                 b.bars_gen = self.backfill_gen;
+                b.apply_bar_restamps(now_s());
             }
         }
         (self.notify)();
@@ -1025,12 +1027,15 @@ pub fn collect_bodies(rows: &[Row], day_rows: usize, current: &str) -> crate::pr
     b
 }
 
-/// The word the probe prints after a quote: ` CLOSED` for a market that has stopped, ` STALE` for a
-/// price that is old for any other reason, nothing for a fresh one. The probe only reaches here
+/// The word the probe prints after a quote: ` CLOSED` for a market that has stopped, ` QUIET` for a
+/// calm quote that is not yet closed, ` STALE` for a price that is old for any other reason, nothing
+/// for a fresh one. The probe only reaches here
 /// when the service answered, so the link counts as live.
 pub(crate) fn probe_state(c: &crate::model::Cell, now: f64) -> &'static str {
     if crate::model::reads_closed(c, Link::Live, now) {
         " CLOSED"
+    } else if crate::model::calm_stale(c, Link::Live, now) {
+        " QUIET"
     } else if c.stale {
         " STALE"
     } else {
@@ -1413,6 +1418,10 @@ mod tests {
         let mut stuck = cells[0].clone();
         stuck.quote.as_mut().unwrap().ts = None;
         assert_eq!(probe_state(&stuck, now), " STALE");
+        let mut quiet = cells[0].clone();
+        quiet.quote.as_mut().unwrap().ts = Some(now - 300.0);
+        quiet.stale = true;
+        assert_eq!(probe_state(&quiet, now), " QUIET");
     }
 
     #[test]

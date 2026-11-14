@@ -57,18 +57,21 @@ pub fn link_name(link: Link) -> &'static str {
 pub fn calm_color(t: &Theme, link: Link, calm: Calm) -> COLORREF {
     match calm {
         Calm::No => link_color(t, link),
-        Calm::Some(_) => t.up,
-        Calm::All(_) => t.dim,
+        Calm::Some(_) | Calm::QuietSome(_) => t.up,
+        Calm::All(_) | Calm::QuietAll(_) => t.dim,
     }
 }
 
-/// [`link_name`], saying "closed" when that is the only reason a price is not fresh.
+/// [`link_name`], saying "closed" when that is the only reason a price is not fresh and every such
+/// row reads closed, and "quiet" while some of them are still inside the calm window before that.
 pub fn calm_name(link: Link, calm: Calm) -> String {
     match calm {
         Calm::No => link_name(link).to_string(),
         Calm::Some(n) => format!("CNBC live, {n} closed"),
         Calm::All(1) => "CNBC, market closed".to_string(),
         Calm::All(_) => "CNBC, markets closed".to_string(),
+        Calm::QuietSome(n) => format!("CNBC live, {n} quiet"),
+        Calm::QuietAll(_) => "CNBC, quiet".to_string(),
     }
 }
 
@@ -763,6 +766,10 @@ mod tests {
         assert_eq!(calm_name(Link::Partial, Calm::Some(2)), "CNBC live, 2 closed");
         assert_eq!(calm_name(Link::Partial, Calm::All(1)), "CNBC, market closed");
         assert_eq!(calm_name(Link::Partial, Calm::All(6)), "CNBC, markets closed");
+        assert_eq!(calm_name(Link::Partial, Calm::QuietSome(2)), "CNBC live, 2 quiet");
+        assert_eq!(calm_name(Link::Partial, Calm::QuietAll(2)), "CNBC, quiet");
+        assert_eq!(calm_color(t, Link::Partial, Calm::QuietAll(2)), t.dim);
+        assert_eq!(calm_color(t, Link::Partial, Calm::QuietSome(2)), t.up);
     }
 
     #[test]

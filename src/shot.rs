@@ -738,6 +738,21 @@ fn board_weekend(now: f64) -> Board {
     b
 }
 
+/// A weekday board in which gold and silver stopped printing 3 and 10 minutes ago: past the stale
+/// limit and short of the closed age, so their cards show `CNBC · 3m` and `CNBC · 10m` in the calm
+/// grey, the header says `CNBC live, 2 quiet`, and no card says `closed`.
+fn board_quiet(now: f64) -> Board {
+    let mut b = board(now);
+    for (i, age) in [(0usize, 180.0), (1, 600.0)] {
+        b.cells[i].stale = true;
+        if let Some(q) = b.cells[i].quote.as_mut() {
+            q.ts = Some(now - age);
+            q.realtime = true;
+        }
+    }
+    b
+}
+
 /// Every card closed, bitcoin included: the grey dot and the header "CNBC, markets closed".
 fn board_all_closed(now: f64) -> Board {
     let mut b = board_weekend(now);
@@ -807,6 +822,11 @@ pub fn write_wide(dir: &Path) -> Result<usize, String> {
     hista.record(&ba, WEEKEND_NOW);
     put(&mut n, "closed-all-cards.png", render(t, 0.0, WEEKEND_NOW, &ba, &hista, 96))?;
     put(&mut n, "closed-all-strip.png", crate::ui::strip_still(&ba.cells, ba.link, WEEKEND_NOW, t, 96, 1, 900))?;
+    let bq = board_quiet(WEEKEND_NOW);
+    let mut histq = History::new();
+    histq.record(&bq, WEEKEND_NOW);
+    put(&mut n, "closed-quiet-cards.png", render(t, 0.0, WEEKEND_NOW, &bq, &histq, 96))?;
+    put(&mut n, "closed-quiet-strip.png", crate::ui::strip_still(&bq.cells, bq.link, WEEKEND_NOW, t, 96, 1, 900))?;
     let bf = board_fault(WEEKEND_NOW);
     let mut histf = History::new();
     histf.record(&bf, WEEKEND_NOW);
@@ -1225,6 +1245,20 @@ mod tests {
         let q = b.cells[4].quote.as_ref().unwrap();
         let words = crate::model::closed_words("CNBC delayed", crate::model::closed_since(q, WEEKEND_NOW), &tz_offset, WEEKEND_NOW);
         assert_eq!(words, ["CNBC delayed \u{b7} closed since Fri 17:00", "closed since Fri 17:00", "closed"]);
+    }
+
+    /// Between the stale limit and the closed age the cards are calm and say no `closed`.
+    #[test]
+    fn the_quiet_board_is_calm_and_says_no_closed() {
+        let b = board_quiet(WEEKEND_NOW);
+        assert_eq!(b.calm(WEEKEND_NOW), crate::model::Calm::QuietSome(2));
+        assert!(b.cells.iter().all(|c| !crate::model::market_closed(c, b.link, WEEKEND_NOW)));
+        assert!(b.cells[..2].iter().all(|c| crate::model::calm_stale(c, b.link, WEEKEND_NOW)));
+        assert!(b.cells[..2].iter().all(|c| crate::model::closed_card_words(c, b.link, WEEKEND_NOW, None, &tz_offset).is_none()));
+        let t = &theme::ALL[0];
+        let quiet = crate::ui::strip_still(&b.cells, b.link, WEEKEND_NOW, t, 96, 1, 900);
+        let fresh = crate::ui::strip_still(&board(WEEKEND_NOW).cells, b.link, WEEKEND_NOW, t, 96, 1, 900);
+        assert_ne!(quiet.2, fresh.2, "the strip dims the quiet cards");
     }
 
     /// All six closed reads grey and "markets closed"; one fault among them keeps the link's own look.

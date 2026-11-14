@@ -2,12 +2,12 @@
 //! taskbar's thumbnail and in Alt+Tab.
 //!
 //! With a card locked the name is that card as a sentence, `Gold 4,012.30, up 0.4 percent`, with
-//! `, closed` added when its market is closed and `, stale` when its price is old for another
-//! reason. With none locked it is one line about the board. The name ends with the app's own, so
+//! `, closed` added when its market is closed, `, quiet` while it is calm but not yet closed
+//! (`model::calm_stale`), and `, stale` when its price is old for another reason. With none locked it is one line about the board. The name ends with the app's own, so
 //! the window is still recognisable. Classic never gets a price in its window name, so `window_name`
 //! answers `None` for it and the title stays as it always was.
 
-use crate::model::{fmt_price, reads_closed, Cell, Link};
+use crate::model::{calm_stale, fmt_price, reads_closed, Cell, Link};
 
 /// A change this small reads as no move: `0.00` is how the card shows it.
 const FLAT: f64 = 0.005;
@@ -20,7 +20,8 @@ fn percent(p: f64) -> String {
 
 /// One card as a sentence. No quote reads `Gold, no price`; a quote with no day change reads
 /// `Gold 4,012.30, no day change`; zero reads `unchanged`; a price of a closed market ends with
-/// `, closed` and any other stale price with `, stale`. `link` and `now` (UTC seconds) tell the two apart.
+/// `, closed`, a calm price that is not yet closed with `, quiet`, and any other stale price with
+/// `, stale`. `link` and `now` (UTC seconds) tell them apart.
 pub fn spoken_line(cell: &Cell, link: Link, now: f64) -> String {
     let Some(q) = cell.quote.as_ref().filter(|q| q.price.is_finite()) else {
         return format!("{}, no price", cell.label);
@@ -34,14 +35,16 @@ pub fn spoken_line(cell: &Cell, link: Link, now: f64) -> String {
     }
     if reads_closed(cell, link, now) {
         out.push_str(", closed");
+    } else if calm_stale(cell, link, now) {
+        out.push_str(", quiet");
     } else if cell.stale {
         out.push_str(", stale");
     }
     out
 }
 
-/// The board in one line: `6 symbols, 4 up, 2 down, 1 closed, 1 stale` (a count that is zero is left
-/// out; no cards is `no symbols`).
+/// The board in one line: `6 symbols, 4 up, 2 down, 1 closed, 1 quiet, 1 stale` (a count that is zero
+/// is left out; no cards is `no symbols`).
 pub fn summary_line(cells: &[Cell], link: Link, now: f64) -> String {
     if cells.is_empty() {
         return "no symbols".into();
@@ -50,9 +53,10 @@ pub fn summary_line(cells: &[Cell], link: Link, now: f64) -> String {
     let up = cells.iter().filter(|c| change(c).is_some_and(|p| p >= FLAT)).count();
     let down = cells.iter().filter(|c| change(c).is_some_and(|p| p <= -FLAT)).count();
     let closed = cells.iter().filter(|c| reads_closed(c, link, now)).count();
-    let stale = cells.iter().filter(|c| c.stale && c.quote.is_some() && !reads_closed(c, link, now)).count();
+    let quiet = cells.iter().filter(|c| calm_stale(c, link, now) && !reads_closed(c, link, now)).count();
+    let stale = cells.iter().filter(|c| c.stale && c.quote.is_some() && !calm_stale(c, link, now)).count();
     let mut out = format!("{} symbol{}", cells.len(), if cells.len() == 1 { "" } else { "s" });
-    for (n, word) in [(up, "up"), (down, "down"), (closed, "closed"), (stale, "stale")] {
+    for (n, word) in [(up, "up"), (down, "down"), (closed, "closed"), (quiet, "quiet"), (stale, "stale")] {
         if n > 0 {
             out.push_str(&format!(", {n} {word}"));
         }
