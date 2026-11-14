@@ -919,6 +919,9 @@ fn card(dc: HDC, sc: &Scene, r: RECT, i: usize, c: &Cell) {
             // on the card and "CNBC delayed" already uses the width.
             let src = if !q.source.is_empty() { q.source } else if q.realtime { "CNBC" } else { "CNBC delayed" };
             let closed = crate::model::market_closed(c, sc.board.link, sc.now);
+            // Stale and calm: closed, or quiet for less than the closed age. Only a stale price that
+            // is neither (feed down, fallback quote, unknown time) takes the amber of a fault.
+            let calm = crate::model::calm_stale(c, sc.board.link, sc.now);
             let room = rx - ix - text_width(dc, sc.fonts.mid, &c.label) - s(10);
             // A closed market is a calm state with its own words ("closed since Fri 17:40", then
             // "closed" when the card is narrow); a quote time ahead of the clock has no age to show.
@@ -943,7 +946,7 @@ fn card(dc: HDC, sc: &Scene, r: RECT, i: usize, c: &Cell) {
             // The Open button takes the tag's corner on a locked card; the tag is the first thing to
             // give way, as it already is for the volume.
             if !locked {
-                text_right(dc, sc.fonts.small, rx, r.top + s(10), &tag, if c.stale && !closed { t.amber } else { t.dim });
+                text_right(dc, sc.fonts.small, rx, r.top + s(10), &tag, if c.stale && !calm { t.amber } else { t.dim });
             }
             let pw = text(dc, sc.fonts.big, ix, r.top + s(26), &fmt_price(q.price, c.digits), if c.stale { t.dim } else { t.price });
             if !q.currency.is_empty() {
