@@ -66,6 +66,15 @@ pub fn reference_price(cell: &crate::model::Cell, cfg: &Config, now: f64) -> Opt
     Some(q.price)
 }
 
+/// Has the cooldown passed? `last` is the wall-clock second of the last fire. A clock set back (or a
+/// `last` written by a machine whose clock ran ahead) puts `last` after `now`: that reads as "cooled",
+/// not as a silence that lasts until the clock catches up, and the next fire writes a fresh `last`,
+/// so a jump costs at most one early fire and never a muted alert. A cooldown of 0 or NaN is 30 s.
+pub fn cooled(now: f64, last: f64, cooldown_s: f64) -> bool {
+    let cd = if cooldown_s.is_finite() { cooldown_s.max(30.0) } else { 30.0 };
+    now < last || now - last >= cd
+}
+
 /// Check every alert and mark the ones that fire. The caller saves the config.
 ///
 /// Contract: fresh quotes only; an alert fires when its price level or its day move is reached
@@ -83,7 +92,7 @@ pub fn check(cfg: &mut Config, board: &Board, now: f64) -> Vec<Fired> {
         }
         for (i, a) in cfg.alerts.iter_mut().enumerate().filter(|(_, a)| a.label == cell.label) {
             let Some((kind, level)) = tripped(a, q.price, q.change_pct) else { continue };
-            if now - a.last < a.cooldown_s.max(30.0) {
+            if !cooled(now, a.last, a.cooldown_s) {
                 continue;
             }
             a.last = now;
@@ -231,43 +240,86 @@ pub fn apply_level(a: &mut Alert, level: Level) {
 
 /// A price level typed by hand (*at a price...*). After trimming, accepts digits with an optional
 /// decimal point and fraction (`4200`, `4200.5`, `.5`), and commas as thousands separators only
-/// between digits of the whole part (`4,200.50`, `1,234,567`). Refuses everything else: empty, a sign
-/// (`-5`, `+5`), an exponent (`1e3`), `inf`, `NaN`, a second point, a comma after the point, a
-/// leading, trailing or doubled comma, spaces inside, and any result that is zero or not finite.
+/// when they group: the first group is one to three digits and every later group is exactly three
+/// (`4,200.50`, `1,234,567`). Refuses everything else: empty, a sign (`-5`, `+5`), an exponent
+/// (`1e3`), `inf`, `NaN`, a second point, a comma after the point, a leading, trailing or doubled
+/// comma, a comma that does not group (`4200,5` and `4,20` could be a decimal comma, so they are
+/// never read as 42,005 or 420), spaces inside, and any result that is zero or not finite.
+#[cfg(test)]
 pub fn parse_level(text: &str) -> Option<f64> {
+    parse_level_why(text).ok()
+}
+
+const NOT_A_PRICE: &str = "that is not a price";
+const COMMA_RULE: &str = "a comma must be followed by exactly three digits, so type a point for decimals";
+
+fn all_digits(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// [`parse_level`] with the reason for a refusal, as a phrase for the message box.
+pub fn parse_level_why(text: &str) -> Result<f64, &'static str> {
     let t = text.trim();
     let mut halves = t.split('.');
-    let whole = halves.next()?;
+    let whole = halves.next().unwrap_or("");
     let frac = halves.next().unwrap_or("");
-    if halves.next().is_some() || !frac.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
+    if halves.next().is_some() || !(frac.is_empty() || all_digits(frac)) {
+        return Err(if t.contains(',') && t.contains('.') { COMMA_RULE } else { NOT_A_PRICE });
     }
     let digits: String = if whole.contains(',') {
-        // Comma-separated groups: the first group and every later one must be non-empty digits.
         let mut groups = whole.split(',');
-        let first = groups.next()?;
-        if first.is_empty() || !first.bytes().all(|b| b.is_ascii_digit()) {
-            return None;
+        let first = groups.next().unwrap_or("");
+        if !all_digits(first) {
+            return Err(NOT_A_PRICE);
+        }
+        if first.len() > 3 {
+            return Err(COMMA_RULE);
         }
         let mut out = first.to_string();
         for g in groups {
-            if g.is_empty() || !g.bytes().all(|b| b.is_ascii_digit()) {
-                return None;
+            if !all_digits(g) {
+                return Err(NOT_A_PRICE);
+            }
+            if g.len() != 3 {
+                return Err(COMMA_RULE);
             }
             out.push_str(g);
         }
         out
-    } else if whole.bytes().all(|b| b.is_ascii_digit()) {
+    } else if whole.is_empty() || all_digits(whole) {
         whole.to_string()
     } else {
-        return None;
+        return Err(NOT_A_PRICE);
     };
     if digits.is_empty() && frac.is_empty() {
-        return None;
+        return Err(NOT_A_PRICE);
     }
     let number = format!("{}.{}", if digits.is_empty() { "0" } else { &digits }, frac);
-    let v: f64 = number.parse().ok()?;
-    (v.is_finite() && v > 0.0).then_some(v)
+    let v: f64 = number.parse().map_err(|_| NOT_A_PRICE)?;
+    if v.is_finite() && v > 0.0 { Ok(v) } else { Err(NOT_A_PRICE) }
+}
+
+/// How far from the reference price a typed level may be before the prompt asks first.
+pub const FAR_LEVEL: f64 = 0.20;
+
+/// The question to ask before setting a typed level that is more than 20 % from the fresh price
+/// (exactly 20 % is not asked), or `None`. It echoes the parsed level and the price in the symbol's
+/// own digits, so a misread shows before it is saved.
+pub fn far_level_question(label: &str, level: f64, reference: f64, digits: u32) -> Option<String> {
+    if !(level.is_finite() && reference.is_finite() && reference > 0.0) {
+        return None;
+    }
+    let away = (level - reference).abs() / reference;
+    (away > FAR_LEVEL).then(|| {
+        format!(
+            "You typed a level of {}, which is {:.0} % {} the price now ({}). Set the alert for {label} at {}?",
+            fmt_price(level, digits),
+            away * 100.0,
+            if level > reference { "above" } else { "below" },
+            fmt_price(reference, digits),
+            fmt_price(level, digits),
+        )
+    })
 }
 
 /// The side rule for a typed or pointed level: `Above(level)` when it is above the fresh `reference`
@@ -382,12 +434,14 @@ pub fn hhmm(minute: u16) -> String {
     format!("{:02}:{:02}", m / 60, m % 60)
 }
 
-/// The local clock time of the UTC instant `at`, given the local minute of the day at `now_utc`.
-/// Uses the offset implied by `local_minute_now`, so a DST change in between is off by an hour.
-pub fn local_hhmm(local_minute_now: u16, now_utc: f64, at: f64) -> String {
-    let delta = ((at - now_utc) / 60.0).floor();
-    let delta = if delta.is_finite() { delta.clamp(-1_000_000.0, 1_000_000.0) as i64 } else { 0 };
-    hhmm((local_minute_now as i64 + delta).rem_euclid(1440) as u16)
+/// The local clock time of the UTC instant `at`, read on the offset in force AT that instant
+/// (`offset_at(t)` is seconds east of UTC at `t`), so a time before or after a daylight-saving change
+/// is shown on its own clock instead of today's. A time that is not a number is read as `now_utc`.
+pub fn local_hhmm(offset_at: &dyn Fn(f64) -> i32, now_utc: f64, at: f64) -> String {
+    let t = if at.is_finite() { at } else { now_utc };
+    let t = if t.is_finite() { t.clamp(-1e12, 1e12) } else { 0.0 };
+    let local = ((t + offset_at(t) as f64) / 60.0).floor() as i64;
+    hhmm(local.rem_euclid(1440) as u16)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -466,7 +520,7 @@ impl Log {
 
 /// The menu text for one log entry: `14:30  XAU above 4,200.00 \u{b7} muted`. Time via
 /// [`local_hhmm`]; the outcome words are `shown`, `muted`, `quiet hours`, `sent`, `send failed`.
-pub fn entry_line(e: &Entry, local_minute_now: u16, now_utc: f64) -> String {
+pub fn entry_line(e: &Entry, offset_at: &dyn Fn(f64) -> i32, now_utc: f64) -> String {
     let word = match e.outcome {
         Outcome::Shown => "shown",
         Outcome::Muted => "muted",
@@ -474,7 +528,7 @@ pub fn entry_line(e: &Entry, local_minute_now: u16, now_utc: f64) -> String {
         Outcome::Sent => "sent",
         Outcome::SendFailed => "send failed",
     };
-    format!("{}  {} \u{b7} {word}", local_hhmm(local_minute_now, now_utc, e.at), e.title)
+    format!("{}  {} \u{b7} {word}", local_hhmm(offset_at, now_utc, e.at), e.title)
 }
 
 /// Validate a webhook URL taken from the clipboard. Trimmed; `http` or `https` only (via
@@ -773,13 +827,19 @@ mod tests {
         assert!(fresh > seqs[11], "sequence numbers survive a clear");
     }
 
+    /// A fixed clock: the offset that makes `now_utc` read `minute_now` of the local day.
+    fn clock_at(minute_now: u16, now_utc: f64) -> impl Fn(f64) -> i32 {
+        let offset = minute_now as i32 * 60 - now_utc.rem_euclid(86_400.0) as i32;
+        move |_| offset
+    }
+
     #[test]
     fn local_clock_labels() {
         assert_eq!(hhmm(0), "00:00");
         assert_eq!(hhmm(14 * 60 + 5), "14:05");
-        assert_eq!(local_hhmm(13 * 60 + 30, 1000.0, 1000.0 + 3600.0), "14:30");
-        assert_eq!(local_hhmm(23 * 60 + 30, 1000.0, 1000.0 + 3600.0), "00:30");
-        assert_eq!(local_hhmm(0, 1000.0, 1000.0 - 60.0), "23:59");
+        assert_eq!(local_hhmm(&clock_at(13 * 60 + 30, 1000.0), 1000.0, 1000.0 + 3600.0), "14:30");
+        assert_eq!(local_hhmm(&clock_at(23 * 60 + 30, 1000.0), 1000.0, 1000.0 + 3600.0), "00:30");
+        assert_eq!(local_hhmm(&clock_at(0, 1000.0), 1000.0, 1000.0 - 60.0), "23:59");
     }
 
     #[test]
@@ -804,14 +864,53 @@ mod tests {
             (" 4,200.50 ", 4200.5),
             ("4200.5", 4200.5),
             (".5", 0.5),
-            ("4,20,0", 4200.0),
             ("1,234,567", 1_234_567.0),
+            ("999", 999.0),
+            ("12,345.678", 12_345.678),
+            ("0.5", 0.5),
         ] {
             assert_eq!(parse_level(text), Some(want), "{text:?}");
         }
         for text in ["0", "0.00", "-5", "+5", "1e3", "inf", "NaN", ",4200", "4200,", "4,,200", "4.2.0", "4.200,5", "4 200", "", "."] {
             assert_eq!(parse_level(text), None, "{text:?} is refused");
         }
+    }
+
+    #[test]
+    fn a_comma_that_does_not_group_is_refused_with_a_reason() {
+        // seen failing first: `4200,5` was read as 42,005 and `4,20` as 420.
+        for text in ["4200,5", "4,20", "1,2345", ",500", "4,20,0", "4.200,5"] {
+            assert!(parse_level_why(text).is_err(), "{text:?}");
+            assert_eq!(parse_level(text), None, "{text:?}");
+        }
+        assert!(parse_level_why("4200,5").unwrap_err().contains("exactly three digits"));
+        assert_eq!(parse_level_why("4,200.50"), Ok(4200.5));
+        assert_eq!(parse_level_why("abc"), Err("that is not a price"));
+    }
+
+    #[test]
+    fn the_far_level_question_asks_above_twenty_percent_only() {
+        // exactly 20 % is not asked, a hair more is.
+        assert_eq!(far_level_question("XAU", 1200.0, 1000.0, 2), None);
+        assert_eq!(far_level_question("XAU", 800.0, 1000.0, 2), None);
+        let q = far_level_question("XAU", 1200.01, 1000.0, 2).expect("asks");
+        assert!(q.contains("1,200.01") && q.contains("1,000.00") && q.contains("above"), "{q}");
+        let q = far_level_question("XAU", 799.0, 1000.0, 0).expect("asks");
+        assert!(q.contains("below") && q.contains("799"), "{q}");
+        assert_eq!(far_level_question("XAU", f64::NAN, 1000.0, 2), None);
+        assert_eq!(far_level_question("XAU", 5.0, 0.0, 2), None);
+    }
+
+    #[test]
+    fn a_clock_set_back_does_not_silence_an_alert() {
+        // seen failing first: with `last` in the future the old test `now - last < cooldown` held
+        // for as long as the clock was behind, so the alert never fired.
+        let mut cfg = fresh_cfg(vec![Alert { last: 20_000.0, ..alert(Some(4100.0), None) }]);
+        assert_eq!(check(&mut cfg, &board(4200.0, false), 10_000.0).len(), 1);
+        assert_eq!(cfg.alerts[0].last, 10_000.0, "the fire writes a fresh stamp");
+        assert!(check(&mut cfg, &board(4200.0, false), 10_010.0).is_empty(), "and the cooldown runs again");
+        assert!(cooled(100.0, 0.0, 30.0) && !cooled(10.0, 0.0, 30.0) && cooled(30.0, 0.0, 0.0));
+        assert!(!cooled(29.0, 0.0, f64::NAN) && cooled(30.0, 0.0, f64::NAN));
     }
 
     #[test]
@@ -871,7 +970,7 @@ mod tests {
         assert_eq!(preset_level(Preset::DayMove(0.0), &c, 4000.0), None);
         assert_eq!(preset_level(Preset::DayMove(f64::NAN), &c, 4000.0), None);
         // clock: a NaN time is treated as "now"; minute 1440 wraps to midnight.
-        assert_eq!(local_hhmm(600, 1000.0, f64::NAN), "10:00");
+        assert_eq!(local_hhmm(&clock_at(600, 1000.0), 1000.0, f64::NAN), "10:00");
         assert_eq!(hhmm(1440), "00:00");
         assert_eq!(hhmm(1439), "23:59");
         // log: an empty log is empty; exactly 10 entries keep all of them; the 11th drops the oldest.
@@ -994,19 +1093,40 @@ mod tests {
         assert_eq!(describe(&alert(None, Some(-5.0)), 2), "below -5.00");
     }
 
+    /// A made-up rule: UTC+1 until `change`, UTC+2 from it on (a clock change in the middle).
+    fn spring_forward(change: f64) -> impl Fn(f64) -> i32 {
+        move |t| if t >= change { 7_200 } else { 3_600 }
+    }
+
+    #[test]
+    fn a_time_across_a_clock_change_shows_the_hour_it_had() {
+        // seen failing first: one offset (today's) was applied to a time on the other side of the change.
+        let change = 1_000_000.0;
+        let rule = spring_forward(change);
+        let (before, after) = (change - 1_800.0, change + 1_800.0);
+        // 1,000,000 s = day 11, 13:46:40 UTC, so 30 minutes before is 13:16 UTC = 14:16 at +1, and
+        // 30 minutes after is 14:16 UTC = 16:16 at +2.
+        assert_eq!(local_hhmm(&rule, after, before), "14:16");
+        assert_eq!(local_hhmm(&rule, after, after), "16:16");
+        // The mute label after a change: a mute set to end at `after`, read now (after) and earlier.
+        assert_eq!(local_hhmm(&rule, before, after), "16:16");
+        let e = Entry { seq: 1, at: before, title: "XAU".into(), outcome: Outcome::Shown };
+        assert!(entry_line(&e, &rule, after).starts_with("14:16  "));
+    }
+
     #[test]
     fn entry_line_names_time_title_and_outcome() {
         let e = |outcome| Entry { seq: 1, at: 1000.0 + 3600.0, title: "XAU above 4,200.00".into(), outcome };
-        assert_eq!(entry_line(&e(Outcome::Muted), 13 * 60 + 30, 1000.0), "14:30  XAU above 4,200.00 \u{b7} muted");
-        assert_eq!(entry_line(&e(Outcome::Shown), 13 * 60 + 30, 1000.0), "14:30  XAU above 4,200.00 \u{b7} shown");
-        assert_eq!(entry_line(&e(Outcome::Quiet), 13 * 60 + 30, 1000.0), "14:30  XAU above 4,200.00 \u{b7} quiet hours");
-        assert_eq!(entry_line(&e(Outcome::Sent), 13 * 60 + 30, 1000.0), "14:30  XAU above 4,200.00 \u{b7} sent");
-        assert_eq!(entry_line(&e(Outcome::SendFailed), 13 * 60 + 30, 1000.0), "14:30  XAU above 4,200.00 \u{b7} send failed");
+        assert_eq!(entry_line(&e(Outcome::Muted), &clock_at(13 * 60 + 30, 1000.0), 1000.0), "14:30  XAU above 4,200.00 \u{b7} muted");
+        assert_eq!(entry_line(&e(Outcome::Shown), &clock_at(13 * 60 + 30, 1000.0), 1000.0), "14:30  XAU above 4,200.00 \u{b7} shown");
+        assert_eq!(entry_line(&e(Outcome::Quiet), &clock_at(13 * 60 + 30, 1000.0), 1000.0), "14:30  XAU above 4,200.00 \u{b7} quiet hours");
+        assert_eq!(entry_line(&e(Outcome::Sent), &clock_at(13 * 60 + 30, 1000.0), 1000.0), "14:30  XAU above 4,200.00 \u{b7} sent");
+        assert_eq!(entry_line(&e(Outcome::SendFailed), &clock_at(13 * 60 + 30, 1000.0), 1000.0), "14:30  XAU above 4,200.00 \u{b7} send failed");
         // An entry from before now, and a NaN time, fall back to safe text.
         let old = Entry { at: 1000.0 - 60.0, ..e(Outcome::Sent) };
-        assert!(entry_line(&old, 0, 1000.0).starts_with("23:59  "));
+        assert!(entry_line(&old, &clock_at(0, 1000.0), 1000.0).starts_with("23:59  "));
         let nan = Entry { at: f64::NAN, ..e(Outcome::Sent) };
-        assert!(entry_line(&nan, 600, 1000.0).starts_with("10:00  "));
+        assert!(entry_line(&nan, &clock_at(600, 1000.0), 1000.0).starts_with("10:00  "));
     }
 
     #[test]

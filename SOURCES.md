@@ -174,6 +174,20 @@ Notes on the table:
 - The fallback hosts (`api.gold-api.com`, `api.kraken.com`) are unchanged from 1.3 and are used only when the
   user has turned fallback sources on.
 
+### Changes in 1.9
+
+The table above is the 1.8 record. These are the changes in 1.9:
+
+- *Copy diagnostics report* makes, once per click, the requests `--probe` makes, to the hosts already listed
+  (the CNBC quote and chart hosts, and `api.github.com`). That is one quote request for all shown symbols, one
+  quote request for a symbol that should not exist, the 1D file of the first rows (the report reads only the first
+  few, not every row as `--probe` does), the four range files (5D, 1M, 1Y, 5Y) of the first row, and the release
+  answer. No other request is made. Its size has not been measured.
+- The update check's `User-Agent` is now `MH-Ticker`: the app name, with no version and no browser string. Its
+  other headers are unchanged, and it still reads only `tag_name`.
+- CNBC requests are unchanged, including the browser-style `User-Agent`.
+- The data meter counts these bytes, after decompression. It makes no request of its own.
+
 ---
 
 ## What I could not verify

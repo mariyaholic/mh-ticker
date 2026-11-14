@@ -7,6 +7,20 @@
 pub const API_URL: &str = "https://api.github.com/repos/mariyaholic/mh-ticker/releases/latest";
 /// What *Open the download page* opens. Never replaced by anything from the response.
 pub const RELEASES_URL: &str = "https://github.com/mariyaholic/mh-ticker/releases/latest";
+/// The `User-Agent` of the update request: the app's name and nothing else. No version number (it
+/// would tell the server which build is asking) and no browser string (the request is not a
+/// browser's). GitHub's API only requires that one is sent.
+pub const USER_AGENT: &str = "MH-Ticker";
+
+/// Is `ua` an app name only: letters, spaces and hyphens, with no digit and no browser token?
+#[cfg(test)]
+pub fn is_plain_app_name(ua: &str) -> bool {
+    let lower = ua.to_ascii_lowercase();
+    !ua.is_empty()
+        && ua.chars().all(|c| c.is_ascii_alphabetic() || c == '-' || c == ' ')
+        && ["mozilla", "chrome", "safari", "webkit", "windows"].iter().all(|b| !lower.contains(b))
+}
+
 /// Bytes read from the response at most.
 pub const MAX_BODY: usize = 256 * 1024;
 
@@ -106,6 +120,17 @@ pub fn decide(current: &str, body: &str) -> Outcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_update_request_sends_an_app_name_only() {
+        assert!(is_plain_app_name(USER_AGENT), "{USER_AGENT}");
+        assert!(!USER_AGENT.chars().any(|c| c.is_ascii_digit()), "no version number");
+        // The browser string the other requests carry is exactly what this check refuses.
+        let browser = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+        assert!(!is_plain_app_name(browser));
+        assert!(!is_plain_app_name("MH-Ticker/1.9.0"));
+        assert!(!is_plain_app_name(""));
+    }
 
     #[test]
     fn update_latest_reads_the_tag_from_a_release() {

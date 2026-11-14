@@ -31,7 +31,9 @@ use crate::chartview;
 use crate::hotkey;
 use crate::keys;
 use crate::update;
+use crate::probe;
 use crate::prompt;
+use crate::report;
 use crate::config::{self, Config, Placement, Profile};
 use crate::dock;
 use crate::panel;
@@ -149,6 +151,15 @@ const CMD_AUTOSTART: usize = 5402;
 const CMD_VERSION: usize = 5403;
 const CMD_UPDATE: usize = 5404;
 const CMD_SAVE_STATUS: usize = 5405;
+/// The greyed line that says a settings file that would not parse was kept under another name.
+const CMD_KEPT_STATUS: usize = 5406;
+/// The greyed data meter line.
+const CMD_METER: usize = 5407;
+/// *Copy diagnostics report* (W1): the probe's checks on a click, as text on the clipboard.
+const CMD_REPORT: usize = 5408;
+/// The report's checks finished off-thread (the text is in `Ui::report_result`). `WM_APP + 16` is
+/// free: P7 uses 14 and 15, and nothing else is above 15.
+const WM_REPORT: u32 = WM_APP + 16;
 /// Hotkey submenu: Off, `hotkey::PRESETS` at `CMD_HOTKEY + 1 + i`, and `CMD_HOTKEY_CUSTOM` for a
 /// configured combo that is none of them.
 const CMD_HOTKEY: usize = 5410;
@@ -402,6 +413,11 @@ struct Ui {
     update_running: bool,
     /// Where the worker leaves its `update::Outcome` before posting `WM_UPDATE`; taken by the handler.
     update_result: Arc<Mutex<Option<update::Outcome>>>,
+    /// The diagnostics report's checks are in flight. Set by `start_report`, cleared by the
+    /// `WM_REPORT` handler in every outcome (answer, failed spawn); a second click is ignored while set.
+    report_running: bool,
+    /// Where the worker leaves the finished report and its warning count before posting `WM_REPORT`.
+    report_result: Arc<Mutex<Option<(String, usize)>>>,
     /// The symbol *Add symbol...* is looking up while its worker runs: the menu entry then reads
     /// "Adding <symbol>..." and is greyed, and a second add is refused. Set by `add_symbol` just before
     /// the worker starts, cleared by `on_lookup` (the `WM_LOOKUP` handler) in every outcome: found, not
@@ -846,6 +862,59 @@ fn draw_strip(u: &Ui, dc: HDC) {
     }
 }
 
+/// A picture of the docked strip for the stills: the board laid out as `layout` lays it out when the
+/// taskbar gap is `avail` px wide and the strip has `rows` lines (the full grid if it fits, else every
+/// symbol without the change column, else the leading symbols), painted as `draw_strip` paints it, in
+/// the theme's background and the default strip font. Off-screen; only the `shots` feature has it.
+#[cfg(feature = "shots")]
+pub(crate) fn strip_still(cells: &[Cell], t: &Theme, dpi: u32, rows: usize, avail: i32) -> (u32, u32, Vec<u8>) {
+    let cfg = Config::default();
+    let font = make_font(&Config { placement: Some(Placement::TaskbarRight), ..cfg }, dpi);
+    let frame = unsafe {
+        let screen = GetDC(null_mut());
+        let dc = CreateCompatibleDC(screen);
+        let old = SelectObject(dc, font);
+        let mut pick = None;
+        'fit: for k in (1..=cells.len()).rev() {
+            for show_change in [true, false] {
+                let f = layout_grid(dc, &cells[..k], dpi, rows, show_change, t);
+                if f.w <= avail {
+                    pick = Some(f);
+                    break 'fit;
+                }
+            }
+        }
+        let frame = pick.unwrap_or_else(|| layout_grid(dc, &cells[..cells.len().min(1)], dpi, rows, false, t));
+        SelectObject(dc, old);
+        DeleteDC(dc);
+        ReleaseDC(null_mut(), screen);
+        frame
+    };
+    let (w, h) = (frame.w.max(1), frame.h.max(1));
+    let out = crate::shot::capture_with(w, h, |dc| unsafe {
+        let bg = CreateSolidBrush(t.bg);
+        FillRect(dc, &RECT { left: 0, top: 0, right: w, bottom: h }, bg);
+        DeleteObject(bg);
+        let old_font = SelectObject(dc, font);
+        SetBkMode(dc, TRANSPARENT as _);
+        for r in &frame.runs {
+            SetTextColor(dc, r.color);
+            TextOutW(dc, r.x, r.y, r.text.as_ptr(), r.text.len() as i32);
+        }
+        let (dx, dy, d) = frame.dot;
+        let brush = CreateSolidBrush(theme::link_color(t, Link::Live));
+        let old_brush = SelectObject(dc, brush);
+        let old_pen = SelectObject(dc, GetStockObject(NULL_PEN));
+        Ellipse(dc, dx, dy, dx + d, dy + d);
+        SelectObject(dc, old_pen);
+        SelectObject(dc, old_brush);
+        SelectObject(dc, old_font);
+        DeleteObject(brush);
+    });
+    unsafe { DeleteObject(font) };
+    out
+}
+
 fn draw_panel(u: &mut Ui, dc: HDC, w: i32, h: i32) {
     let Some(f) = &u.fonts else { return };
     // The catalogue is only drawn while the picker is open; building it is a clone of every row, so
@@ -872,6 +941,17 @@ fn draw_panel(u: &mut Ui, dc: HDC, w: i32, h: i32) {
             .unwrap_or_default()
     } else {
         Vec::new()
+    };
+    // The note on a long range: past its time to live, or dates that are off (`Series::note`).
+    let note: String = if u.chart && u.range != Range::D1 {
+        selected_row(u)
+            .and_then(|row| u.view.cells.get(row))
+            .and_then(|c| u.cfg.rows.iter().find(|r| r.label == c.label))
+            .and_then(|r| u.range.key(&r.symbol))
+            .and_then(|k| u.book.get(&k).map(|sr| sr.note(now, ranges::ttl_of(k.file), if u.cfg.chart_utc { 0 } else { local_offset_s() })))
+            .unwrap_or_default()
+    } else {
+        String::new()
     };
     let scene = panel::Scene {
         title: u.profile.title(),
@@ -929,8 +1009,14 @@ fn draw_panel(u: &mut Ui, dc: HDC, w: i32, h: i32) {
                     _ => (u.view.bars.get(row).map(|b| &b[..]).unwrap_or(&[]), u.view.bars_t0.get(row).copied().unwrap_or(0.0), 60.0, ranges::Status::Ready),
                 };
                 panel::Chart {
-                    tz_offset_s: if u.cfg.chart_utc { 0 } else { local_offset_s() },
+                    zone: if u.cfg.chart_utc || bars.is_empty() {
+                        chartview::Zone::fixed(if u.cfg.chart_utc { 0 } else { local_offset_s() })
+                    } else {
+                        let end = |b: &crate::model::Bar| t0 + b.dt as f64;
+                        chartview::Zone::spanning(end(&bars[0]), end(&bars[bars.len() - 1]), &local_offset_at)
+                    },
                     tz_label: chartview::zone_label(u.cfg.chart_utc),
+                    note: &note,
                     // Today's references and today's change belong to 1D; a long range is coloured by
                     // its own first open and last close.
                     prev: chartview::positive(quote.and_then(|q| q.prev_close)).filter(|_| day),
@@ -961,8 +1047,9 @@ fn draw_panel(u: &mut Ui, dc: HDC, w: i32, h: i32) {
                 status: ranges::Status::Ready,
                 bar_s: 60.0,
                 tabs: false,
-                tz_offset_s: 0,
+                zone: chartview::Zone::fixed(0),
                 tz_label: "UTC",
+                note: "",
                 prev: None,
                 day_hi: None,
                 day_lo: None,
@@ -985,6 +1072,27 @@ fn local_offset_s() -> i32 {
     offset_from_bias(id, tz.Bias, tz.StandardBias, tz.DaylightBias)
 }
 
+/// Seconds east of UTC the machine's clock ran on at the UTC instant `t` (UTC seconds): the offset
+/// in force then, daylight time included, not today's. Windows converts the instant with the zone's
+/// own rules (`SystemTimeToTzSpecificLocalTime`); the difference of the two readings is the offset.
+/// Falls back to [`local_offset_s`] when Windows cannot convert it.
+fn local_offset_at(t: f64) -> i32 {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
+    if !t.is_finite() || !(0.0..=253_402_300_799.0).contains(&t) {
+        return local_offset_s();
+    }
+    let ticks = ((t + 11_644_473_600.0) * 10_000_000.0) as u64;
+    let ft = FILETIME { dwLowDateTime: ticks as u32, dwHighDateTime: (ticks >> 32) as u32 };
+    let (mut utc, mut local): (SYSTEMTIME, SYSTEMTIME) = unsafe { (std::mem::zeroed(), std::mem::zeroed()) };
+    let ok = unsafe { FileTimeToSystemTime(&ft, &mut utc) != 0 && SystemTimeToTzSpecificLocalTime(null(), &utc, &mut local) != 0 };
+    if !ok {
+        return local_offset_s();
+    }
+    let secs = |s: &SYSTEMTIME| chartview::civil_secs(s.wYear as i64, s.wMonth as u32, s.wDay as u32, s.wHour as u32, s.wMinute as u32, s.wSecond as u32);
+    (secs(&local) - secs(&utc)) as i32
+}
+
 /// The offset east of UTC from `GetTimeZoneInformation`'s answer. `id` 2 (`TIME_ZONE_ID_DAYLIGHT`)
 /// means daylight time is in force; 0 and 1 are standard time (unknown / standard); anything else
 /// (`TIME_ZONE_ID_INVALID`) is "cannot say" and gives 0. Biases are minutes WEST of UTC.
@@ -998,7 +1106,19 @@ fn offset_from_bias(id: u32, bias: i32, standard_bias: i32, daylight_bias: i32) 
 
 #[cfg(test)]
 mod offset_tests {
-    use super::offset_from_bias;
+    use super::{local_offset_at, local_offset_s, offset_from_bias};
+
+    #[test]
+    fn the_offset_at_an_instant_agrees_with_the_offset_now() {
+        // Not a daylight-saving test (the machine's zone is not under the test's control): the
+        // conversion call must give what `GetTimeZoneInformation` gives for the present instant,
+        // and must not panic for instants far out or not numbers.
+        let now = crate::source::now_s();
+        assert_eq!(local_offset_at(now), local_offset_s());
+        for t in [f64::NAN, f64::INFINITY, -1.0, 0.0, 1e12] {
+            let _ = local_offset_at(t);
+        }
+    }
 
     #[test]
     fn the_bias_becomes_seconds_east_with_daylight_time_applied() {
@@ -2107,7 +2227,7 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
             AppendMenuW(mute, MF_SEPARATOR, 0, null());
             let (mute_title, is_muted) = match av.silence {
                 Some(alerts::Silence::Muted) => ("Muted".to_string(), true),
-                Some(alerts::Silence::MutedUntil(t)) => (format!("Muted until {}", alerts::local_hhmm(av.minute, av.now, t)), true),
+                Some(alerts::Silence::MutedUntil(t)) => (format!("Muted until {}", alerts::local_hhmm(&local_offset_at, av.now, t)), true),
                 _ => ("Mute".to_string(), false),
             };
             add(mute, MF_STRING | if is_muted { 0 } else { MF_GRAYED }, CMD_UNMUTE, "Unmute");
@@ -2146,7 +2266,7 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
                 add(recent, MF_STRING | MF_GRAYED, 0, "(nothing yet)");
             }
             for e in &av.log {
-                add(recent, MF_STRING | MF_GRAYED, 0, &alerts::entry_line(e, av.minute, av.now));
+                add(recent, MF_STRING | MF_GRAYED, 0, &alerts::entry_line(e, &local_offset_at, av.now));
             }
             AppendMenuW(recent, MF_SEPARATOR, 0, null());
             add(recent, MF_STRING | if av.log.is_empty() { MF_GRAYED } else { 0 }, CMD_LOG_CLEAR, "Clear list");
@@ -2249,11 +2369,20 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
         if config::save_failed() {
             item(MF_STRING | MF_GRAYED, CMD_SAVE_STATUS, "Settings could not be saved (changes last until you quit)");
         }
+        if let Some(name) = config::kept_bad_config() {
+            item(MF_STRING | MF_GRAYED, CMD_KEPT_STATUS, &format!("Settings were unreadable; kept as {name}, defaults loaded"));
+        }
+        item(MF_STRING | MF_GRAYED, CMD_METER, &crate::source::meter_line());
         item(MF_STRING | MF_GRAYED, CMD_VERSION, &format!("{} {}", config::profile().title(), env!("CARGO_PKG_VERSION")));
         if with_ui(|u| u.update_running).unwrap_or(false) {
             item(MF_STRING | MF_GRAYED, CMD_UPDATE, "Checking...");
         } else {
             item(MF_STRING, CMD_UPDATE, "Check for updates");
+        }
+        if with_ui(|u| u.report_running).unwrap_or(false) {
+            item(MF_STRING | MF_GRAYED, CMD_REPORT, "Diagnostics report: checking...");
+        } else {
+            item(MF_STRING, CMD_REPORT, "Copy diagnostics report");
         }
         item(MF_STRING, CMD_FOLDER, "Open config folder");
         AppendMenuW(m, MF_SEPARATOR, 0, null());
@@ -2453,6 +2582,7 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
             }
         }
         CMD_UPDATE => start_update_check(hwnd),
+        CMD_REPORT => start_report(hwnd),
         CMD_HOTKEY => set_hotkey(hwnd, None),
         c if (CMD_HOTKEY + 1..CMD_HOTKEY + 1 + hotkey::PRESETS.len()).contains(&c) => {
             set_hotkey(hwnd, Some(hotkey::PRESETS[c - CMD_HOTKEY - 1].to_string()));
@@ -2561,9 +2691,8 @@ fn fallback_settings(current: &Config, enabling: bool) -> Config {
 /// What the Alerts submenu needs, read in one `with_ui` call so the menu build never nests.
 #[derive(Default)]
 struct AlertsView {
-    /// UTC seconds and the local minute of the day, taken together.
+    /// UTC seconds now.
     now: f64,
-    minute: u16,
     once: bool,
     quiet: Option<[u16; 2]>,
     /// Whether alerts are silenced right now, and why.
@@ -2589,7 +2718,6 @@ struct AlertsRow {
 fn alerts_view(list: &[config::Row], shown: &[bool]) -> Option<AlertsView> {
     with_ui(|u| {
         let now = crate::source::now_s();
-        let minute = local_minute();
         let rows = list
             .iter()
             .zip(shown)
@@ -2615,7 +2743,6 @@ fn alerts_view(list: &[config::Row], shown: &[bool]) -> Option<AlertsView> {
             .collect();
         AlertsView {
             now,
-            minute,
             once: u.cfg.alert_once,
             quiet: u.cfg.quiet_hours,
             silence: alerts::mute_state(&u.cfg, now),
@@ -2845,6 +2972,87 @@ fn on_update(hwnd: HWND) {
     with_ui(|u| u.update_running = false);
 }
 
+/// *Copy diagnostics report*: the probe's checks on a worker thread, then the report as text on the
+/// clipboard. One at a time (a second click while it runs does nothing). The facts are read here, in
+/// one borrow and with no I/O; the worker fetches (the quotes of every shown symbol, one unknown
+/// symbol, the first row's 1D and range files, the release answer: the same hosts and the same
+/// requests as `--probe`, about 50 to 250 KB), judges, builds the text and posts `WM_REPORT`. A failed
+/// spawn posts it too, so the flag always gets cleared.
+fn start_report(hwnd: HWND) {
+    // The registry read is I/O: done before the borrow.
+    let autostart_on = autostart::enabled(config::profile().id);
+    let Some((slot, rows, mut facts)) = with_ui(|u| {
+        if u.report_running {
+            return None;
+        }
+        u.report_running = true;
+        let facts = report::Facts {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            build: if u.profile.ultra { "Ultra" } else { "Classic" }.to_string(),
+            dpi: u.dpi,
+            placement: u.cfg.placement().label().to_string(),
+            mode: if u.mode == Mode::Panel { "panel" } else { "strip" }.to_string(),
+            symbols: u.cfg.rows.len(),
+            alerts: u.cfg.alerts.len(),
+            hotkey: u.cfg.hotkey.clone(),
+            hotkey_failed: u.hotkey_failed,
+            autostart: autostart_on,
+            settings_path: config::path().display().to_string(),
+            user: std::env::var("USERNAME").ok(),
+            save_failed: config::save_failed(),
+            kept_config: config::kept_bad_config(),
+            webhook: u.cfg.webhook.clone(),
+            fallback: u.cfg.fallback_enabled,
+            poll_s: u.cfg.poll_s,
+            stale_after_s: u.cfg.stale_after_s,
+            meter: String::new(),
+            findings: Vec::new(),
+        };
+        Some((u.report_result.clone(), u.cfg.rows.clone(), facts))
+    })
+    .flatten() else {
+        return;
+    };
+    let target = hwnd as isize;
+    let worker_slot = slot.clone();
+    let spawned = std::thread::Builder::new().name("report".into()).spawn(move || {
+        let bodies = crate::source::collect_bodies(&rows, 1, env!("CARGO_PKG_VERSION"));
+        facts.findings = probe::judge(&bodies);
+        // Read last, so the meter includes what these checks just fetched.
+        facts.meter = crate::source::meter_line();
+        let warns = facts.findings.iter().filter(|f| f.verdict == probe::Verdict::Warn).count();
+        if let Ok(mut g) = worker_slot.lock() {
+            *g = Some((report::text(&facts), warns));
+        }
+        unsafe { PostMessageW(target as HWND, WM_REPORT, 0, 0) };
+    });
+    if spawned.is_err() {
+        unsafe { PostMessageW(hwnd, WM_REPORT, 0, 0) };
+    }
+}
+
+/// `WM_REPORT`: put the report on the clipboard and say so. `report_running` is cleared last, after
+/// the box closes, so a second report cannot start underneath it.
+fn on_report(hwnd: HWND) {
+    let result = with_ui(|u| u.report_result.lock().ok().and_then(|mut g| g.take())).flatten();
+    match result {
+        Some((text, warns)) => {
+            copy_text(&text);
+            let msg = if warns == 0 {
+                "The diagnostics report is on the clipboard. Every check passed or was a note. Paste it into a message."
+                    .to_string()
+            } else {
+                format!("The diagnostics report is on the clipboard. {warns} check{} warned. Paste it into a message.", if warns == 1 { "" } else { "s" })
+            };
+            alert_box(hwnd, "Diagnostics report", &msg, MB_OK | MB_ICONINFORMATION);
+        }
+        None => {
+            alert_box(hwnd, "Diagnostics report", "The report could not be made. Try again later.", MB_OK | MB_ICONWARNING);
+        }
+    }
+    with_ui(|u| u.report_running = false);
+}
+
 /// What *Add symbol...* does with a cleaned symbol, decided in one `with_ui` call.
 enum AddStep {
     /// On the strip already.
@@ -3014,10 +3222,18 @@ fn alert_at_price(hwnd: HWND, label: &str) {
     let title = format!("Alert for {label}");
     let text = format!("Alert when {label} reaches this price (now {now}):");
     let Some(typed) = prompt::ask(hwnd, &title, &text, &now, LEVEL_PROMPT_LEN) else { return };
-    match alerts::parse_level(&typed) {
-        Some(level) => set_price_level(hwnd, label, level),
-        None => {
-            let msg = format!("\"{}\" is not a price. Type a number such as 4200 or 4,200.50.", shown_text(typed.trim(), 32));
+    match alerts::parse_level_why(&typed) {
+        Ok(level) => {
+            // A level far from the price is read back in the symbol's digits and asked about first.
+            if let Some(q) = alerts::far_level_question(label, level, reference, digits) {
+                if alert_box(hwnd, &title, &q, MB_YESNO | MB_ICONQUESTION) != IDYES {
+                    return;
+                }
+            }
+            set_price_level(hwnd, label, level)
+        }
+        Err(why) => {
+            let msg = format!("\"{}\": {why}. Type a number such as 4200 or 4,200.50.", shown_text(typed.trim(), 32));
             alert_box(hwnd, &title, &msg, MB_OK | MB_ICONWARNING);
         }
     }
@@ -3535,6 +3751,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_UPDATE => {
             on_update(hwnd);
+            0
+        }
+        WM_REPORT => {
+            on_report(hwnd);
             0
         }
         // The client area is the whole window: no caption, no border, no offset for the hit tests.
@@ -4108,6 +4328,8 @@ pub fn run(cfg: Config, board: Arc<Mutex<Board>>) {
             hotkey_failed: false,
             update_running: false,
             update_result: Arc::new(Mutex::new(None)),
+            report_running: false,
+            report_result: Arc::new(Mutex::new(None)),
             adding: None,
             lookup_result: Arc::new(Mutex::new(None)),
             back: None,

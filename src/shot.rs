@@ -157,13 +157,18 @@ fn render(t: &Theme, phase: f64, now: f64, b: &Board, h: &History, dpi: u32) -> 
 
 /// Paint a scene into a top-down RGBA buffer.
 fn capture(w: i32, hh: i32, sc: &Scene) -> (u32, u32, Vec<u8>) {
+    capture_with(w, hh, |dc| panel::draw(dc, w, hh, sc))
+}
+
+/// Paint whatever `draw` paints on a `w` x `hh` bitmap into a top-down RGBA buffer.
+pub(crate) fn capture_with(w: i32, hh: i32, draw: impl FnOnce(HDC)) -> (u32, u32, Vec<u8>) {
     let mut px = vec![0u8; (w * hh * 4) as usize];
     unsafe {
         let screen = GetDC(std::ptr::null_mut());
         let dc = CreateCompatibleDC(screen);
         let bmp = CreateCompatibleBitmap(screen, w, hh);
         let old = SelectObject(dc, bmp);
-        panel::draw(dc, w, hh, sc);
+        draw(dc);
         // `GetDIBits` refuses a bitmap that is still selected into a DC.
         SelectObject(dc, old);
         let mut bi: BITMAPINFO = std::mem::zeroed();
@@ -406,8 +411,9 @@ fn write_chart_fixture(
             status: Status::Ready,
             bar_s,
             tabs: range.is_some(),
-            tz_offset_s: TZ_S,
+            zone: crate::chartview::Zone::fixed(TZ_S),
             tz_label: "local",
+            note: "",
             prev,
             day_hi,
             day_lo,
@@ -426,6 +432,7 @@ fn write_chart_fixture(
         if let Some(lay) = layout.get() {
             let i = bar.min(lay.bars.saturating_sub(1));
             let (drawn, _) = crate::chartview::fitted_to(&charted, lay.plot.right - lay.plot.left, chart_t0, TZ_S, bar_s, coarsest);
+            let drawn = crate::chartview::newest_that_fit(drawn, lay.plot.right - lay.plot.left, sc.dpi);
             let close = drawn.get(i).map_or(last.unwrap_or(0.0), |b| b.c as f64);
             let close = lay.y_of(close).clamp(lay.plot.top, lay.plot.bottom - 1);
             sc.chart_at = lay.pointer_at(lay.x_of(i), close, 2);
@@ -567,6 +574,99 @@ pub fn write_all(dir: &Path) -> Result<usize, String> {
     Ok(n)
 }
 
+/// The labels of the 24-symbol board, in the order a user might add them.
+const LABELS_24: [&str; 24] = [
+    "XAU", "XAG", "BTC", "ETH", "DOW", "S&P", "NAS", "RUT", "VIX", "OIL", "GAS", "EUR", "GBP", "JPY", "TNX", "AAPL", "MSFT", "NVDA",
+    "TSLA", "AMZN", "META", "GOOG", "AMD", "INTC",
+];
+
+/// `n` (at most 24) symbols: the fixture's six cycled, each round a little dearer, with one stale
+/// cell and one with no quote among them, so the wide pictures show the awkward cards as well.
+fn board_n(now: f64, n: usize) -> Board {
+    let base = board(now);
+    let n = n.clamp(1, LABELS_24.len());
+    let rows: Vec<Row> = (0..n).map(|i| row(LABELS_24[i], &format!("SYM{i}="), base.cells[i % 6].digits)).collect();
+    let mut b = Board::new(&rows);
+    b.link = crate::model::Link::Partial;
+    b.note.clear();
+    b.cells = rows
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let (k, scale) = (i % 6, 1.0 + (i / 6) as f64 * 0.07 - (i % 5) as f64 * 0.011);
+            let mut cell = base.cells[k].clone();
+            cell.label = r.label.clone();
+            if let Some(q) = cell.quote.as_mut() {
+                q.symbol = r.symbol.clone();
+                q.price *= scale;
+                q.prev_close = q.prev_close.map(|v| v * scale);
+                q.open = q.open.map(|v| v * scale);
+                q.high = q.high.map(|v| v * scale);
+                q.low = q.low.map(|v| v * scale);
+                q.yr_hi = q.yr_hi.map(|v| v * scale);
+                q.yr_lo = q.yr_lo.map(|v| v * scale);
+                q.change_pct = q.change_pct.map(|p| p * (1.0 + (i % 4) as f64 * 0.8) * if i % 3 == 1 { -1.0 } else { 1.0 });
+            }
+            cell.stale = i == 7;
+            if i == 13 {
+                cell.quote = None;
+            }
+            cell
+        })
+        .collect();
+    b.backfill = (0..n).map(|i| base.backfill[i % 6].iter().map(|&(t, v)| (t, v * (1.0 + (i / 6) as f64 * 0.07 - (i % 5) as f64 * 0.011))).collect()).collect();
+    b.backfill_gen = 1;
+    b
+}
+
+/// A chart still written under `file` in `dir`: the chart fixture renders to `chart-<theme>.png` in a
+/// scratch folder, which is then moved to its own name.
+#[allow(clippy::too_many_arguments)]
+fn chart_still(dir: &Path, file: &str, dpi: u32, w: i32, bar: Option<usize>, range: &str) -> Result<(), String> {
+    let scratch = dir.join(".scratch");
+    let made = write_chart_named_levels(&scratch, "midnight", dpi, w, None, bar, false, Some(range), true, false)?;
+    std::fs::rename(&made, dir.join(file)).map_err(|e| format!("{file}: {e}"))?;
+    let _ = std::fs::remove_dir(&scratch);
+    Ok(())
+}
+
+/// The wider set of pictures (W1, H14), written into `dir` beside the theme catalogue and never over
+/// it: 24 cards; 24 symbols on 1, 2 and 3 strip rows in a 1,800 px taskbar gap; the narrowest panel
+/// with the pane open; 192 DPI cards and pane; and the pane on each of the six ranges. All in the
+/// first palette, at the catalogue's fixture time. Returns how many files were written.
+pub fn write_wide(dir: &Path) -> Result<usize, String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let now = 1_792_052_981.0;
+    let t = theme::ALL.iter().find(|t| t.name == "midnight").unwrap_or(&theme::ALL[0]);
+    let mut n = 0;
+    let put = |n: &mut usize, file: &str, (w, h, px): (u32, u32, Vec<u8>)| -> Result<(), String> {
+        write_png(&dir.join(file), w, h, &px)?;
+        println!("{w:>4}x{h:<4} {file}");
+        *n += 1;
+        Ok(())
+    };
+    let b24 = board_n(now, 24);
+    let mut hist = History::new();
+    hist.record(&b24, now);
+    put(&mut n, "wide-cards-24.png", render(t, 0.0, now, &b24, &hist, 96))?;
+    for rows in 1..=3usize {
+        put(&mut n, &format!("wide-strip-24-rows{rows}.png"), crate::ui::strip_still(&b24.cells, t, 96, rows, 1_800))?;
+    }
+    let b6 = board(now);
+    let mut hist6 = History::new();
+    hist6.record(&b6, now);
+    put(&mut n, "wide-192dpi-cards.png", render(t, 0.0, now, &b6, &hist6, 192))?;
+    put(&mut n, "wide-192dpi-strip-24-rows2.png", crate::ui::strip_still(&b24.cells, t, 192, 2, 3_600))?;
+    chart_still(dir, "wide-pane-narrow.png", 96, panel::minimum(6, 0, 96, false, true).0, Some(40), "5D")?;
+    chart_still(dir, "wide-192dpi-pane.png", 192, 1488 * 2, Some(40), "1D")?;
+    n += 2;
+    for range in ["1D", "5D", "1M", "6M", "1Y", "5Y"] {
+        chart_still(dir, &format!("wide-range-{}.png", range.to_lowercase()), 96, 1488, None, range)?;
+        n += 1;
+    }
+    Ok(n)
+}
+
 /// The chart fixture as an owned value, so a test or a timing loop can build a scene, change one hover
 /// part, and draw again. Same data as `write_chart_fixture` with a locked card: the S&P row, 1488 px
 /// wide at 96 dpi, the first theme, the pane open on `range` (`None` is the closed panel).
@@ -584,18 +684,27 @@ pub struct Fixture {
     range: Option<Range>,
     row: usize,
     now: f64,
+    /// The pane's note line (`Chart::note`); empty for every existing picture.
+    pub note: String,
+    pub dpi: u32,
     pub w: i32,
     pub h: i32,
 }
 
 impl Fixture {
     pub fn new(range: Option<&str>) -> Result<Fixture, String> {
+        Fixture::with(range, 96, 1488, None)
+    }
+
+    /// The fixture at `dpi`, `w` px wide, with the panel face `face` (any installed family name)
+    /// instead of the theme's own. `w` below the content's minimum is raised to it: the narrowest
+    /// panel with the pane open is `panel::minimum(..).0`.
+    pub fn with(range: Option<&str>, dpi: u32, w: i32, face: Option<&str>) -> Result<Fixture, String> {
         let t = &theme::ALL[0];
         let rg = match range {
             Some(r) => Some(Range::parse(r).ok_or_else(|| format!("no range named {r}"))?),
             None => None,
         };
-        let (dpi, w) = (96, 1488);
         let now = 1_792_052_981.0;
         let mut b = board(now);
         let (n, t0) = (390, now - 390.0 * 60.0);
@@ -614,7 +723,7 @@ impl Fixture {
         let g = panel::geometry_in(w, b.cells.len(), 0, dpi, false, rg.is_some());
         Ok(Fixture {
             hist,
-            fonts: Fonts::new(theme::font_of(t, None), dpi, t.is_pixel()),
+            fonts: Fonts::new(face.unwrap_or_else(|| theme::font_of(t, None)), dpi, t.is_pixel()),
             grad: Gradient::new(t),
             layout: std::cell::Cell::new(None),
             board: b,
@@ -626,6 +735,8 @@ impl Fixture {
             range: rg,
             row,
             now,
+            note: String::new(),
+            dpi,
             w: g.w,
             h: g.h,
         })
@@ -633,7 +744,7 @@ impl Fixture {
 
     /// The panel's geometry as the app computes it for this fixture.
     pub fn geo(&self) -> panel::Geo {
-        panel::geometry_in(self.w, self.board.cells.len(), 0, 96, false, self.range.is_some())
+        panel::geometry_in(self.w, self.board.cells.len(), 0, self.dpi, false, self.range.is_some())
     }
 
     /// The scene with the hover state `hot` applied.
@@ -646,7 +757,7 @@ impl Fixture {
             fonts: &self.fonts,
             theme: &theme::ALL[0],
             grad: &self.grad,
-            dpi: 96,
+            dpi: self.dpi,
             now: self.now,
             btn_hover: hot.btn,
             pick_hover: hot.pick,
@@ -673,8 +784,9 @@ impl Fixture {
                 status: Status::Ready,
                 bar_s: self.bar_s,
                 tabs: true,
-                tz_offset_s: TZ_S,
+                zone: crate::chartview::Zone::fixed(TZ_S),
                 tz_label: "local",
+                note: &self.note,
                 prev: None,
                 day_hi: None,
                 day_lo: None,
@@ -817,8 +929,11 @@ mod tests {
     /// painter, one hover part at a time and in pairs, with the pane open and closed.
     #[test]
     fn a_hover_change_repaints_inside_the_rectangle_it_names() {
-        for range in [None, Some("5D")] {
-            let fx = Fixture::new(range).unwrap();
+        // The pane's note line is drawn only while no candle is hovered, so it is part of what a hover
+        // change repaints: run every case with and without one.
+        for (range, note) in [(None, ""), (Some("5D"), ""), (Some("5D"), "as of 14:05 \u{b7} check dates")] {
+            let mut fx = Fixture::new(range).unwrap();
+            fx.note = note.into();
             let g = fx.geo();
             let none = Hot::default();
             let base = fx.frame(&none);
@@ -858,6 +973,116 @@ mod tests {
                 assert!(name.contains(" and ") || area * 2 < (fx.w as i64) * (fx.h as i64), "{name}: the rectangle should be under half the window");
             }
         }
+    }
+
+    /// The note is drawn on the header's second line with no pointer over the plot, and the pointer's
+    /// legend takes its place (so the note never sits under the legend).
+    #[test]
+    fn the_chart_note_shows_until_a_candle_is_hovered() {
+        let none = Hot::default();
+        let mut fx = Fixture::new(Some("5D")).unwrap();
+        let plain = fx.frame(&none);
+        fx.note = "check dates".into();
+        let noted = fx.frame(&none);
+        let moved = diff(&plain, &noted, fx.w);
+        assert!(!moved.is_empty(), "the note must be visible");
+        let pane = fx.pane().unwrap();
+        // Everything it changed is on the header's second line, inside the pane.
+        for (x, y) in &moved {
+            assert!(panel::in_rect(&pane, *x, *y) && *y < pane.top + 56, "({x},{y}) outside the header line");
+        }
+        // Hovering a candle replaces it with the legend: the frame equals the one drawn with no note.
+        let aim = fx.aim_middle().unwrap();
+        let hot = Hot { aim: Some(aim), ..none };
+        let with = fx.frame(&hot);
+        fx.note = String::new();
+        let without = fx.frame(&hot);
+        assert!(diff(&with, &without, fx.w).is_empty(), "a hovered pane shows the legend, not the note");
+    }
+
+    /// The width of `s` in `font` on a scratch DC, and the height of a line of it.
+    fn measure(font: HFONT, s: &str) -> (i32, i32) {
+        unsafe {
+            let screen = GetDC(std::ptr::null_mut());
+            let dc = CreateCompatibleDC(screen);
+            let old = SelectObject(dc, font);
+            let t: Vec<u16> = s.encode_utf16().collect();
+            let mut sz = windows_sys::Win32::Foundation::SIZE { cx: 0, cy: 0 };
+            GetTextExtentPoint32W(dc, t.as_ptr(), t.len() as i32, &mut sz);
+            SelectObject(dc, old);
+            DeleteDC(dc);
+            ReleaseDC(std::ptr::null_mut(), screen);
+            (sz.cx, sz.cy)
+        }
+    }
+
+    /// The faces of the catalogue's Mono and Bitmap groups that this machine draws at a fixed pitch
+    /// (an absent face is substituted by a proportional one, which fails the test of `iiii` against
+    /// `WWWW` and is left out: nothing here can be said about it by counting characters).
+    fn fixed_pitch_faces() -> Vec<&'static str> {
+        // Windows has the catalogue's own; Wine substitutes all of those with one proportional face,
+        // so a family Wine does ship (DejaVu Sans Mono) stands in for them there.
+        let own = theme::FACES.iter().filter(|f| f.group == "Mono" || f.group == "Bitmap").map(|f| f.name);
+        own.chain(["DejaVu Sans Mono", "Liberation Mono"])
+            .filter(|name| {
+                let fonts = Fonts::new(name, 96, false);
+                measure(fonts.small, "iiii").0 == measure(fonts.small, "WWWW").0
+            })
+            .collect()
+    }
+
+    /// Every string the pane and the panel draw, in the narrowest panel with the pane open, for each
+    /// fixed-pitch face at 96, 120, 144 and 192 DPI, on every range, with and without a candle
+    /// hovered and with the longest note: each fits by character count (a run's width is its length
+    /// times the face's advance), lies inside the window, and a run that starts in the pane ends in
+    /// it; and no two strings of the pane's header collide.
+    #[test]
+    fn every_line_fits_for_each_fixed_pitch_face_at_each_dpi() {
+        let faces = fixed_pitch_faces();
+        assert!(!faces.is_empty(), "this machine draws no fixed-pitch face to count characters in");
+        let mut checked = 0;
+        for face in &faces {
+            for dpi in [96u32, 120, 144, 192] {
+                let w = panel::minimum(6, 0, dpi, false, true).0;
+                for range in ["1D", "5D", "1M", "6M", "1Y", "5Y"] {
+                    for hovered in [false, true] {
+                        let mut fx = Fixture::with(Some(range), dpi, w, Some(face)).unwrap();
+                        fx.note = "as of Nov 12 14:05 \u{b7} check dates".into();
+                        let none = Hot::default();
+                        fx.frame(&none);
+                        let hot = Hot { aim: if hovered { fx.aim_middle() } else { None }, ..none };
+                        panel::trace::start();
+                        fx.frame(&hot);
+                        let runs = panel::trace::take();
+                        let pane = fx.pane().expect("the pane is open");
+                        let ctx = format!("{face} {dpi} dpi {range} hovered {hovered}");
+                        assert!(runs.len() > 20, "{ctx}: the frame drew {} strings", runs.len());
+                        let (_, line_h) = measure(fx.fonts.small, "Xg");
+                        let header = pane.top + 56 * dpi as i32 / 96;
+                        for r in &runs {
+                            let n = r.text.chars().count() as i32;
+                            let (adv, _) = measure(r.font as HFONT, "0");
+                            assert_eq!(r.w, n * adv, "{ctx}: {:?} is not {n} characters of {adv} px", r.text);
+                            assert!(r.x >= 0 && r.x + r.w <= fx.w, "{ctx}: {:?} leaves the window ({}..{} of {})", r.text, r.x, r.x + r.w, fx.w);
+                            if r.x >= pane.left && r.x < pane.right && r.y >= pane.top && r.y < pane.bottom {
+                                assert!(r.x + r.w <= pane.right, "{ctx}: {:?} runs past the pane's right edge ({} > {})", r.text, r.x + r.w, pane.right);
+                            }
+                            checked += 1;
+                        }
+                        let band: Vec<_> = runs.iter().filter(|r| r.y >= pane.top && r.y < header && r.x >= pane.left && r.x < pane.right).collect();
+                        assert!(band.iter().any(|r| r.text == "5Y") && band.iter().any(|r| r.text.contains('\u{b7}')), "{ctx}: the header band was not read: {:?}", band.iter().map(|r| &r.text).collect::<Vec<_>>());
+                        for (i, a) in band.iter().enumerate() {
+                            for b in &band[i + 1..] {
+                                let same_line = (a.y - b.y).abs() < line_h;
+                                let overlap = a.x < b.x + b.w && b.x < a.x + a.w;
+                                assert!(!(same_line && overlap), "{ctx}: {:?} and {:?} collide in the header", a.text, b.text);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked > 1000, "{checked} strings checked");
     }
 
     /// No change, no area; an aimed pointer with no pane to name has no rectangle at all.

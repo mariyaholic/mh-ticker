@@ -1,4 +1,4 @@
-# Runtime state machines, 1.8
+# Runtime state machines, 1.8 (W1 rows are at the end of the inventory)
 
 Scope: Classic and Ultra at the 1.8 integration head. Source inventory plus targeted tests; not a proof
 of every native interleaving. Findings and fixes of this pass: `docs/STATE-AUDIT-1.8.md`. The 1.7.1
@@ -30,7 +30,7 @@ and the earlier version of this file; what it says still holds unless a row belo
 | Range book (per key) | absent, in flight, cached, failed | `want` (pane needs it, every feed tick), `arrived`, `cancel`, `forget`, lost after 120 s, retry after 30 s, `retry_now` (Refresh now) | `book` | every state leaves by time, by answer or by `forget` | 10+ `ranges` tests incl. `refresh_now_asks_again_for_a_failed_key_and_keeps_the_rest` |
 | Range slots | empty, request waiting; done queue | `submit` replaces (caller cancels), worker `take_request`, `deliver`, UI `take_done`, `clear_request` on rows change | `range_slots` (Arc, shared with the worker) | lock never held across I/O | `Slots` tests |
 | Feed and chart workers | polling, backoff, waiting; rows_gen, kick | rows change, `Board.kick` (Refresh now), timers | `Board` (`rows_gen`, `kick`, `poll_s`, fallback) | generation checks drop stale publications | source tests incl. kick tests |
-| Alerts (per alert) | armed, cooling down, spent (once) | `check` on fresh CNBC quotes; preset, *at a price*, pane *Alert at* (`apply_level` re-arms); Clear; Forget symbol | `Config::alerts` (`above`, `below`, `day_move`, `last`, `once`) | cooldown by clock; once alert removed when empty | alerts tests |
+| Alerts (per alert) | armed, cooling down, spent (once) | `check` on fresh CNBC quotes; preset, *at a price*, pane *Alert at* (`apply_level` re-arms); Clear; Forget symbol | `Config::alerts` (`above`, `below`, `day_move`, `last`, `once`) | cooldown by clock (a clock set back reads as cooled, `alerts::cooled`); once alert removed when empty; a typed level that is far from the price asks first (a box, nothing stored) | alerts tests |
 | Silence | none, Muted, MutedUntil(t), Quiet | Mute menu, Unmute, clock, quiet window | `alerts_muted`, `alerts_mute_until`, `quiet_hours` | timed mute ends by the clock; Unmute | `silence_order...`, `quiet_window...` |
 | Alert marker | none, pending(title) | any fired alert (silenced too), unless the panel is open and in front (`marks_tray`) | `alert_pending`, `icon_link` | `clear_pending` on expand and any menu | `a_pending_alert_leads_the_tooltip...`, `an_alert_does_not_light_the_marker_while_the_panel_is_in_front` |
 | Alert log and webhook | entry Shown/Muted/Quiet -> Sent/SendFailed | fire, POST result `WM_ALERT` (bit 0 failed, bit 1 test), Clear list | `alert_log` (seq never reused), `alert_note` | late result for a gone line changes nothing; the note still names a test | log tests, `a_webhook_result_knows_a_test_without_its_log_line` |
@@ -52,12 +52,18 @@ and the earlier version of this file; what it says still holds unless a row belo
 | Back buffer | none, valid for (w, h) | `paint` allocates on the first paint and on any size change; every paint draws into it clipped to `rcPaint` and copies that rectangle | `Ui::back` | a new buffer is drawn whole; every state change other than a hover invalidates the whole window, so outside `rcPaint` the buffer is still current | `shot` pixel test below |
 | Hover rectangle | none, rect | `WM_MOUSEMOVE`/`WM_MOUSELEAVE` compare `panel::Hot` before and after (`hot_dirty`) and invalidate the union of what differs; moving backgrounds and unnameable changes invalidate everything | `Ui::hover`, `pick_hover`, `chart_hover`, `gear_hover`, `open_hover`, `chart_at`, `hover_at` (read as one `Hot`) | the next full invalidate repaints everything | `a_hover_change_repaints_inside_the_rectangle_it_names` (pixel diff against the real painter) |
 | Folded candles | none (not cached) | `fitted_to` runs on every pane repaint: 72 us for 1,950 bars, 165 us for 4,000 (`docs/1.8/notes/responsive.md`) | none | nothing to reset; a cache was measured and rejected | none |
+| Diagnostics report (W1) | idle, running | menu *Copy diagnostics report*; worker posts `WM_REPORT` (a failed spawn posts too) | `report_running`, `report_result` | cleared after the box in every outcome; a second click while set does nothing | `report` tests (text); the flag follows the update check's pattern, no ui test |
+| Data meter (W1) | counting | every response body read is counted when its reader drops; read when the menu is built | `source::METER` (`meter::Meter`, 60 minute slots and a total) | in memory only, gone at quit; an hour-old slot is ignored by `last_hour` and overwritten, no timer | `meter` tests (roll-over, idle hour, clock set back) |
+| Kept settings (W1) | none, kept(name) | start-up finds a settings file that will not parse: it is renamed to `settings.bad.json` (or `.bad-2`...) and the defaults are written | `config::KEPT_AS` (file name only) | for the run; fix or delete the kept file, nothing in the app clears it before quit | `a_config_that_will_not_parse_is_kept_and_defaults_load` |
+| Chart note (W1) | none, as of, check dates | computed at every paint from the cached series (`Series::note`) | none stored | disappears when the series is fresh or the pointer is over the plot (the legend takes the line) | `ranges` tests, `the_chart_note_shows_until_a_candle_is_hovered` |
+| Probe and dump (W1) | command line only | `--probe`, `--probe --dump <folder>` | none (a process that exits) | exit 0, 1 on any WARN, 2 on a bad `--dump`; writes only into the named folder | `probe` tests |
+| Clock zone (W1) | fixed, one change | built per paint from the bars' first and last instant (`chartview::Zone::spanning`) | none stored | rebuilt every paint | `a_fold_across_a_clock_change...`, `zone_spanning...` |
 
 ## Ownership
 
 `ui.rs` owns every transition and every window call. `ranges`, `alerts`, `keys`, `chartview`,
 `menu_commands`, `config` row functions and `update`/`hotkey` parsing are pure and are what the tests pin;
-the Linux harness runs the pure modules (107 tests).
+the Linux harness runs the pure modules (see `scripts/check-state-linux.sh`).
 
 ## Open findings
 

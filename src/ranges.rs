@@ -117,6 +117,56 @@ pub struct Key {
     pub file: &'static str,
 }
 
+/// Do the stamps of a daily file sit on a day boundary? A daily bar is stamped at midnight on its
+/// exchange's clock, so each stamp's time of day (UTC) is a whole quarter hour (every zone offset
+/// is), and all of them agree to within the hour a daylight-saving change moves it. `stamps` are UTC
+/// seconds. `true` for an empty list. Tolerance 30 s each way: a stamp five years out has passed
+/// through an `f32` offset, which is 16 s coarse. This is the assumption `--probe` and the pane's
+/// *check dates* note judge; nothing live has verified it.
+pub fn stamps_on_day_boundary(stamps: &[f64]) -> bool {
+    const TOL: f64 = 30.0;
+    let Some(first) = stamps.iter().copied().find(|t| t.is_finite()) else {
+        return stamps.iter().all(|t| t.is_finite());
+    };
+    let tod = |t: f64| t.rem_euclid(DAY_S);
+    stamps.iter().all(|&t| {
+        if !t.is_finite() {
+            return false;
+        }
+        let r = tod(t) % 900.0;
+        let off_grid = r.min(900.0 - r) > TOL;
+        let apart = (tod(t) - tod(first)).abs();
+        let apart = apart.min(DAY_S - apart);
+        !off_grid && apart <= 3_600.0 + TOL
+    })
+}
+
+/// How long past its time to live a series may be before the pane says so: a refresh that is on its
+/// way (a request in flight) is not worth a note, one that has failed is.
+pub const STALE_GRACE_S: f64 = RETRY_AFTER_S;
+
+/// `as of 14:05` when the series on screen was fetched more than its time to live (plus
+/// [`STALE_GRACE_S`]) ago, on the clock `tz_offset_s` east of UTC; `as of Nov 12 14:05` when that is a
+/// day or more back; `None` while it is fresh or when a time is not a number.
+pub fn age_label(now: f64, fetched: f64, ttl_s: f64, tz_offset_s: i32) -> Option<String> {
+    if !(now.is_finite() && fetched.is_finite() && ttl_s.is_finite()) || now - fetched <= ttl_s + STALE_GRACE_S {
+        return None;
+    }
+    let clock = crate::chartview::clock(fetched, tz_offset_s);
+    Some(if now - fetched >= DAY_S * 0.9 {
+        format!("as of {} {clock}", crate::chartview::date_label(fetched, tz_offset_s, crate::chartview::DateStyle::DayMonth))
+    } else {
+        format!("as of {clock}")
+    })
+}
+
+/// What a series says about itself that the reader should know.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Check {
+    /// A daily file whose stamps are not on a day boundary: its candles may be dated a day off.
+    pub dates_off: bool,
+}
+
 /// One fetched file, parsed. Bar times are offsets (`Bar::dt`) from `t0`, and each is the START of
 /// its bar (unlike the 1D path, which stamps bars at their end).
 #[derive(Clone, Debug)]
@@ -136,6 +186,26 @@ impl Series {
     pub fn new(t0: f64, bars: Vec<Bar>, fetched: f64) -> Series {
         let bar_s = median_spacing(&bars);
         Series { t0, bars: bars.into(), bar_s, fetched }
+    }
+
+    /// Flags computed from the bars: nothing is stored. Only a daily or longer series (`bar_s` of 0.95
+    /// day or more) can have its dates off; an intraday one never does.
+    pub fn check(&self) -> Check {
+        if self.bar_s < DAY_S * 0.95 || self.bars.is_empty() {
+            return Check::default();
+        }
+        let stamps: Vec<f64> = self.bars.iter().map(|b| b.t(self.t0)).collect();
+        Check { dates_off: !stamps_on_day_boundary(&stamps) }
+    }
+
+    /// The note for the pane's header, or `""`: `as of 14:05`, `check dates`, both joined by `" \u{b7} "`.
+    pub fn note(&self, now: f64, ttl_s: f64, tz_offset_s: i32) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        parts.extend(age_label(now, self.fetched, ttl_s, tz_offset_s));
+        if self.check().dates_off {
+            parts.push("check dates".to_string());
+        }
+        parts.join(" \u{b7} ")
     }
 
     /// The bars whose start is at or after `now - span_s`, as a slice of `bars` (the tail).
@@ -664,5 +734,54 @@ mod tests {
         // The only bar is exactly 10 s old: inside for a 10 s span, outside for 9 s.
         assert_eq!(s.window(60.0, 10.0).len(), 1);
         assert!(s.window(60.0, 9.0).is_empty());
+    }
+
+    /// A daily file of `n` bars stamped at `tod` seconds after UTC midnight, from 2026-01-05.
+    fn daily_at(tod: f64, n: usize) -> Series {
+        let t0 = crate::chartview::days_from_civil(2026, 1, 5) as f64 * DAY_S + tod;
+        let bars = (0..n).map(|i| Bar { dt: (i as f64 * DAY_S) as f32, o: 1.0, h: 1.0, l: 1.0, c: 1.0, v: 0.0 }).collect();
+        Series::new(t0, bars, 1_000_000.0)
+    }
+
+    #[test]
+    fn daily_stamps_on_a_boundary_pass_and_off_it_are_flagged() {
+        // New York midnight in winter is 05:00 UTC; Tokyo midnight is 15:00 UTC the day before.
+        for tod in [0.0, 5.0 * 3_600.0, 15.0 * 3_600.0, 19_800.0] {
+            assert!(!daily_at(tod, 30).check().dates_off, "tod {tod}");
+        }
+        // 13:07 is no zone's midnight.
+        assert!(daily_at(13.0 * 3_600.0 + 7.0 * 60.0, 30).check().dates_off);
+        // Stamps that agree with each other only within an hour of a clock change pass; a two-hour
+        // spread does not.
+        assert!(stamps_on_day_boundary(&[5.0 * 3_600.0, 4.0 * 3_600.0 + DAY_S]));
+        assert!(!stamps_on_day_boundary(&[5.0 * 3_600.0, 7.0 * 3_600.0 + DAY_S]));
+        assert!(!stamps_on_day_boundary(&[f64::NAN]));
+        // An intraday series is never flagged, however its stamps fall.
+        let intraday = Series::new(1_000.0, (0..10).map(|i| Bar { dt: i as f32 * 300.0, o: 1.0, h: 1.0, l: 1.0, c: 1.0, v: 0.0 }).collect(), 0.0);
+        assert_eq!(intraday.check(), Check::default());
+        assert_eq!(Series::new(0.0, vec![], 0.0).check(), Check::default());
+    }
+
+    #[test]
+    fn the_age_label_appears_only_past_the_time_to_live() {
+        let fetched = 14.0 * 3_600.0 + 5.0 * 60.0;
+        let ttl = 600.0;
+        assert_eq!(age_label(fetched + 100.0, fetched, ttl, 0), None, "fresh");
+        assert_eq!(age_label(fetched + ttl + STALE_GRACE_S, fetched, ttl, 0), None, "a refresh on its way");
+        assert_eq!(age_label(fetched + ttl + STALE_GRACE_S + 1.0, fetched, ttl, 0).as_deref(), Some("as of 14:05"));
+        assert_eq!(age_label(fetched + 3_600.0, fetched, ttl, 3_600).as_deref(), Some("as of 15:05"), "on the viewer's clock");
+        // A day or more back it carries the date.
+        let old = age_label(fetched + 2.0 * DAY_S, fetched, ttl, 0).unwrap();
+        assert!(old.starts_with("as of Jan ") && old.ends_with(" 14:05"), "{old}");
+        assert_eq!(age_label(f64::NAN, fetched, ttl, 0), None);
+    }
+
+    #[test]
+    fn the_note_joins_what_is_suspect() {
+        let s = daily_at(13.0 * 3_600.0 + 420.0, 30);
+        assert_eq!(s.note(s.fetched + 10.0, 3_600.0, 0), "check dates");
+        let both = s.note(s.fetched + 9_000.0, 3_600.0, 0);
+        assert!(both.starts_with("as of ") && both.ends_with(" \u{b7} check dates"), "{both}");
+        assert_eq!(daily_at(0.0, 30).note(1_000_001.0, 3_600.0, 0), "");
     }
 }
