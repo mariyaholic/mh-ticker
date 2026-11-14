@@ -2,10 +2,10 @@
 
 ## unreleased - 1.9: know it is true   [claude.impl]
 
-**Files:** mostly `src/`: new `probe.rs`, `report.rs`, `meter.rs`, `governor.rs`, `watch.rs`, `retry.rs`, `pins.rs`, `undo.rs` and `find.rs`; changed
+**Files:** mostly `src/`: new `probe.rs`, `report.rs`, `meter.rs`, `governor.rs`, `watch.rs`, `retry.rs`, `pins.rs`, `undo.rs`, `find.rs`, `contrast.rs`, `updown.rs`, `motion.rs`, `typed.rs`, `zoom.rs` and `spoken.rs`; changed
 `alerts.rs`, `chartview.rs`, `config.rs`, `ranges.rs`, `source.rs`, `update.rs`, `panel.rs`, `ui.rs`, `shot.rs`
 and `Cargo.toml` (the `Win32_System_RemoteDesktop` feature). Also `examples/wide.rs`
-(new), `examples/w3.rs` (new), `shots/wide-*.png` (new), `shots/w3-strip-24-pinned-6.png` (new), `scripts/check-state-linux.sh`, `README.md`, `SOURCES.md`, `CHANGELOG.md`
+(new), `examples/w3.rs` (new), `shots/wide-*.png` (new), `shots/w3-strip-24-pinned-6.png` (new), `examples/w4.rs` (new), `shots/w4-*.png` (new), `scripts/check-state-linux.sh`, `README.md`, `SOURCES.md`, `CHANGELOG.md`
 and `docs/1.9/`.
 
 **What.** The 1.9 packages, grouped by what you see. The first group adds no new feature; it makes the features
@@ -105,12 +105,42 @@ already here easier to check. The alerts group adds behaviour. Each group says w
     2 MB ceiling on the bars. The chart reopens on the range you used last.
   - **Fix.** A renamed card used to lose its quote, bars and sparkline until the next fetch, because rows were
     matched by label. They are now matched by symbol.
+- **Reach (Ultra, and Classic where marked).**
+  - **The chart by keyboard (Ultra).** Shift+Left and Shift+Right move the crosshair from candle to candle, and it
+    snaps to the candle's close. R changes the range, Z flips the zone, and A sets an alert at the crosshair price
+    through the prompt. The menu key opens the card menu, F10 opens the main menu, and F1 lists the keys. Plain arrows
+    keep their 1.8 meaning. A pointer move takes the crosshair back.
+  - **Typed settings (both builds; quiet hours, mute and cooldown on Ultra).** Any hotkey can be typed, on both
+    builds. Quiet hours take a span such as `22:30-06:45`, which can wrap past midnight; equal ends mean off. *Mute
+    until* takes a time. A cooldown per symbol, such as `90s`, `15m` or `2h`, is set in that symbol's alert submenu.
+    A bad entry is refused with a fixed sentence and changes nothing.
+  - **High contrast (Ultra follows Windows; Classic has a tick, off by default).** In a Windows contrast theme, Ultra
+    draws in the system's colours. Direction is carried by sign and shape as well as colour: fills become outlines,
+    up candles are hollow, and the sign says which way the price moved. Classic has *Follow the Windows contrast
+    theme* in its Accessibility menu. It is off, so Classic's pixels do not change until it is ticked.
+  - **Up and down colours (Ultra).** Accessibility has green and red (the default, as before), red and green, and blue
+    and orange, and *Hollow up candles*. The palette swap changes only the two direction colours.
+  - **A contrast test over every theme.** Price and label text are tested at 4.5 to 1 or better against the card and
+    every colour a theme's cycle passes through; up and down at 3 to 1 or better. The dim colour is measured, not
+    gated. Glass, ega, gameboy and c64 were tuned to pass. Label ratios went from 3.97 to 4.60 (glass), 3.66 to 4.59
+    (ega), 2.71 to 4.64 (gameboy, whose down went from 2.30 to 3.05) and 4.00 to 4.56 (c64). Classic was measured
+    and not changed.
+  - **Reduced motion (Ultra follows Windows; Classic has a tick).** With Windows animations off, the panel opens and
+    closes in one step. Classic has *Follow the Windows animation setting* in its Accessibility menu, off by default,
+    so Classic keeps its glide.
+  - **Panel size (Ultra).** Accessibility has *Panel size* at 75, 90, 100, 125 and 150 %. It scales the panel and its
+    chart. The strip keeps its size.
+  - **Window title (Ultra).** The window's name carries the locked card as a sentence, such as
+    `Gold 4,012.30, up 0.4 percent - MH Ticker Ultra`, with `stale` added when the price is stale. With no lock it
+    reads `MH Ticker Ultra, 6 symbols, 4 up, 2 down`. Classic's title is never changed.
 
-**Checked.** Under Wine: 387 tests pass, plus the one known Wine-only failure
+**Checked.** Under Wine: 430 tests pass, plus the one known Wine-only failure
 (`ui::tests::a_theme_switch_takes_the_new_themes_face`, because Wine has no Consolas). The Linux harness
-(`scripts/check-state-linux.sh`) passes 191. The 36 old stills are identical to the baseline (36 of 36). The 14 wide
-stills were drawn, six of them again because the chart header changed, and the new still
-`shots/w3-strip-24-pinned-6.png` was drawn. Both release exes are about 1.49 MB.
+(`scripts/check-state-linux.sh`) passes 224. Classic's stills are identical to the baseline. Four Ultra theme stills
+changed on purpose, after the contrast tuning: glass, ega, gameboy and c64. The checker looked at each before and
+after and took them into the baseline. Seven new stills (`shots/w4-*.png`) were drawn. Earlier in 1.9, the 36 old
+stills were identical and the 14 wide stills were drawn, six of them again because the chart header changed. Both
+release exes are about 1.52 MB.
 
 **Not verified.** The live CNBC and GitHub answers: `--probe`, the report and the release tag have not run
 against the services. On a real Windows desktop: the clipboard, the menu lines, a real clock change, the real
@@ -119,6 +149,10 @@ fonts, and gzip byte counts against a capture. Also not verified: the real lock 
 a POST in flight; and the poll governor's saving and bytes against the live feed.
 Also not verified: key presses (`/`, Ctrl+Z, Home and End), focus after the find prompt closes, and the strip
 with pins at each placement on a real taskbar. Menu entries were not clicked.
+For Reach: key focus and the keys themselves (Shift+arrows, R, Z, A, F10, F1 and the menu key), and focus after the
+prompts close; the real system colours and their change message; the Windows animation setting and the one-step
+morph on a real display; screen readers and Alt+Tab reading the window name. The window-name call was reviewed by
+code only.
 
 ## 2026-11-14 — 1.8.0: alerts you can set and silence, a chart that reads, typed symbols   [claude.impl]
 

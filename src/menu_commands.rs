@@ -24,6 +24,8 @@ pub(crate) enum Action {
     /// Alerts submenu, per symbol (Ultra): the fast-move choice `alerts::FAST_MOVES[k]`; the current one again turns it off.
     Fast(String, usize),
     ClearAlert(String),
+    /// Alerts submenu, per symbol (Ultra): ask for how long this symbol's alert waits before it can fire again.
+    Cooldown(String),
     /// Alerts submenu, per symbol (Ultra): ask for a price level for this label.
     AlertAt(String),
     /// Symbols > Remove a symbol I added (both builds): drop this catalogue entry, by symbol.
