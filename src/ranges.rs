@@ -262,6 +262,10 @@ fn flat(b: &Bar) -> bool {
 /// The fewest bars `drop_idle` will judge.
 const MIN_FOR_SPACING: usize = 5;
 
+/// A break is a time gap of more than this many bars. A hole of a minute or two in sampled 1D ticks
+/// stays below it, so repeats after such a hole remain real quotes.
+const BREAK_BARS: f64 = 10.0;
+
 /// Drops the bars of a closed market from `(start time, bar)` pairs in time order.
 ///
 /// Spot metals keep a feed running through weekends and holidays, and CNBC fills those hours with
@@ -274,8 +278,8 @@ const MIN_FOR_SPACING: usize = 5;
 ///   `o == h == l == c` and repeat the last close to within a few basis points. They are dropped
 ///   while fewer than half of the bars are flat, so a series that carries closes alone (every bar
 ///   flat by construction) is kept whole.
-/// * Shorter bars: a run of flat bars that all repeat the close before the run, when the run starts
-///   after a break longer than 1.5 bars. Repeated closes inside a session, however many in a row,
+/// * Shorter bars: the flat bars that repeat the close before them from the first break onward,
+///   where a break is a gap of more than ten bars. The in-session part of such a run stays. Repeated closes inside a session, however many in a row,
 ///   are real quotes that did not move (CNBC's 1D files are sampled ticks, so a slow quote repeats
 ///   for minutes) and stay.
 ///
@@ -309,8 +313,9 @@ pub(crate) fn drop_idle(pts: Vec<(f64, Bar)>) -> Vec<(f64, Bar)> {
         while j < pts.len() && flat(&pts[j].1) && pts[j].1.c == before {
             j += 1;
         }
-        if j > i && pts[i].0 - pts[i - 1].0 > 1.5 * spacing {
-            keep[i..j].iter_mut().for_each(|k| *k = false);
+        // The first break inside the run ends the session part; the repeats from there on are idle.
+        if let Some(k) = (i..j).find(|&k| pts[k].0 - pts[k - 1].0 > BREAK_BARS * spacing) {
+            keep[k..j].iter_mut().for_each(|x| *x = false);
         }
         i = j.max(i + 1);
     }
@@ -1044,6 +1049,38 @@ mod tests {
         // A flat bar at a different price than the close before it is a quote, even after a break.
         let moved = [(0.0, 1.0, 2.0, 0.5, 1.5), (60.0, 1.5, 2.5, 1.0, 2.0), (120.0, 1.0, 2.0, 0.5, 1.5), (3_000.0, 3.0, 3.0, 3.0, 3.0)];
         assert_eq!(drop_idle(pairs(&moved)).len(), 4);
+    }
+
+    #[test]
+    fn a_friday_close_that_repeats_keeps_its_session_part_and_drops_the_weekend() {
+        // US10Y 1D ends with flat repeats of the last close; the weekend repeats follow the same run.
+        let fri = 1_793_998_200.0;
+        let mut rows: Vec<(f64, f32, f32, f32, f32)> =
+            (0..6).map(|i| (fri - 300.0 * (6 - i) as f64, 4065.0, 4066.0 + i as f32, 4064.0, 4065.5 + i as f32)).collect();
+        let last = rows[5].4;
+        rows.push((fri, last, last, last, last));
+        rows.push((fri + 8_100.0, last, last, last, last));
+        rows.push((fri + 108_000.0, last, last, last, last));
+        rows.push((fri + 180_600.0, 4066.09, 4066.09, 4060.09, 4062.78));
+        let kept = drop_idle(pairs(&rows));
+        assert_eq!(kept.len(), 8);
+        assert_eq!(kept[6].0, fri, "the in-session repeat stays");
+        assert_eq!(kept[7].0, fri + 180_600.0, "the reopening follows the last session bar");
+    }
+
+    #[test]
+    fn repeats_after_a_short_hole_in_sampled_ticks_stay() {
+        // A two-minute hole at one-minute spacing is a missing sample, not a closure.
+        let rows = [
+            (0.0, 1.0, 2.0, 0.5, 1.5),
+            (60.0, 1.5, 2.5, 1.0, 2.0),
+            (120.0, 2.0, 2.0, 2.0, 2.0),
+            (180.0, 2.0, 3.0, 1.5, 2.5),
+            (300.0, 2.5, 2.5, 2.5, 2.5),
+            (360.0, 2.5, 2.5, 2.5, 2.5),
+            (420.0, 2.5, 3.0, 2.0, 2.6),
+        ];
+        assert_eq!(drop_idle(pairs(&rows)).len(), rows.len());
     }
 
     #[test]
