@@ -275,11 +275,14 @@ const MIN_FOR_SPACING: usize = 5;
 ///   while fewer than half of the bars are flat, so a series that carries closes alone (every bar
 ///   flat by construction) is kept whole.
 /// * Shorter bars: a run of flat bars that all repeat the close before the run, when the run starts
-///   after a break longer than 1.5 bars or holds three bars or more. One repeated minute inside a
-///   busy session is a real quote that did not move and stays.
+///   after a break longer than 1.5 bars. Repeated closes inside a session, however many in a row,
+///   are real quotes that did not move (CNBC's 1D files are sampled ticks, so a slow quote repeats
+///   for minutes) and stay.
 ///
-/// Fewer than five bars come back as they are. A symbol that trades around the
-/// clock (BTC) has no such runs and comes back unchanged.
+/// Fewer than five bars come back as they are. A series without a break that precedes a repeat, such
+/// as BTC around the clock or a session with no closed hours, comes back unchanged. A series of
+/// closes alone is kept whole at daily spacing only; at intraday spacing the bars after a break that
+/// repeat the close before it are dropped.
 pub(crate) fn drop_idle(pts: Vec<(f64, Bar)>) -> Vec<(f64, Bar)> {
     // A handful of bars has no spacing worth the name: one overnight gap would be its median.
     if pts.len() < MIN_FOR_SPACING {
@@ -306,7 +309,7 @@ pub(crate) fn drop_idle(pts: Vec<(f64, Bar)>) -> Vec<(f64, Bar)> {
         while j < pts.len() && flat(&pts[j].1) && pts[j].1.c == before {
             j += 1;
         }
-        if j > i && (j - i >= 3 || pts[i].0 - pts[i - 1].0 > 1.5 * spacing) {
+        if j > i && pts[i].0 - pts[i - 1].0 > 1.5 * spacing {
             keep[i..j].iter_mut().for_each(|k| *k = false);
         }
         i = j.max(i + 1);
@@ -979,7 +982,7 @@ mod tests {
             (fri + d, 4066.28, 4066.28, 4066.28, 4066.28),
             (fri + 2.0 * d, 4066.28, 4066.28, 4066.28, 4066.28),
             (fri + 3.0 * d, 4066.09, 4147.29, 4054.4886, 4140.91),
-            (fri + 4.0 * d, 4140.5075, 4145.45, 4013.89, 4032.2749),
+            (fri + 4.0 * d, 4140.5075, 4145.45, 4013.89, 4032.275),
         ];
         let kept = drop_idle(pairs(&rows));
         assert_eq!(times(&kept), [fri - d, fri, fri + 3.0 * d, fri + 4.0 * d]);
@@ -1028,7 +1031,7 @@ mod tests {
             (240.0, 2.5, 3.0, 2.0, 2.2),
         ];
         assert_eq!(drop_idle(pairs(&busy)).len(), 5);
-        // Three of them in a row with no break is a feed repeating itself.
+        // Several of them in a row with no break are still quotes: slow quotes repeat for minutes.
         let stuck = [
             (0.0, 1.0, 2.0, 0.5, 1.5),
             (60.0, 1.5, 2.5, 1.0, 2.0),
@@ -1037,10 +1040,32 @@ mod tests {
             (240.0, 2.0, 2.0, 2.0, 2.0),
             (300.0, 2.0, 3.0, 1.5, 2.5),
         ];
-        assert_eq!(times(&drop_idle(pairs(&stuck))), [0.0, 60.0, 300.0]);
+        assert_eq!(drop_idle(pairs(&stuck)).len(), 6);
         // A flat bar at a different price than the close before it is a quote, even after a break.
         let moved = [(0.0, 1.0, 2.0, 0.5, 1.5), (60.0, 1.5, 2.5, 1.0, 2.0), (120.0, 1.0, 2.0, 0.5, 1.5), (3_000.0, 3.0, 3.0, 3.0, 3.0)];
         assert_eq!(drop_idle(pairs(&moved)).len(), 4);
+    }
+
+    #[test]
+    fn a_slow_quote_repeating_through_a_session_keeps_every_bar() {
+        // US10Y 1D, Thu 2026-11-12 17:01 to 17:07: one-minute sampled ticks where the close stays at
+        // 5.109 for five minutes with no time gap. Every one of them is a trading minute.
+        let t0 = 1_794_070_860.0;
+        let mut rows = vec![(t0 - 120.0, 5.101, 5.101, 5.101, 5.101), (t0 - 60.0, 5.105, 5.105, 5.105, 5.105)];
+        rows.extend((0..5).map(|i| (t0 + 60.0 * i as f64, 5.109, 5.109, 5.109, 5.109)));
+        rows.push((t0 + 300.0, 5.11, 5.11, 5.11, 5.11));
+        assert_eq!(drop_idle(pairs(&rows)).len(), rows.len());
+    }
+
+    #[test]
+    fn a_flat_newest_daily_bar_is_dropped() {
+        // A Monday bar with a single print has no range yet and is removed until it grows one.
+        let d = 86_400.0;
+        let mut rows: Vec<_> = (0..5).map(|i| (i as f64 * d, 10.0, 11.0, 9.0, 10.5)).collect();
+        rows.push((5.0 * d, 10.5, 10.5, 10.5, 10.5));
+        let kept = drop_idle(pairs(&rows));
+        assert_eq!(kept.len(), 5);
+        assert_eq!(kept[4].0, 4.0 * d);
     }
 
     #[test]

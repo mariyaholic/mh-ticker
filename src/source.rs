@@ -1760,7 +1760,7 @@ mod tests {
 
         // 4,001 minute bars keep the newest 4,000; t0 is the second bar's time.
         let many: Vec<Value> = (0..4_001)
-            .map(|i| serde_json::json!({"close": (1 + i % 2).to_string(), "tradeTimeinMills": ms(60 * i)}))
+            .map(|i| serde_json::json!({"close": "1", "tradeTimeinMills": ms(60 * i)}))
             .collect();
         let v = serde_json::json!({"barData": {"priceBars": many}});
         let s = parse_series(&v, 1e9);
