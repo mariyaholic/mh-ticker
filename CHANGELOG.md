@@ -1,10 +1,10 @@
 # Changelog — MH Ticker
 
-## unreleased - 1.9: know it is true   [claude.impl]
+## 2026-11-14 — 1.9.0: know it is true, alerts that say when they cannot see, twenty-four symbols, reach   [claude.impl]
 
 **Files:** mostly `src/`: new `probe.rs`, `report.rs`, `meter.rs`, `governor.rs`, `watch.rs`, `retry.rs`, `pins.rs`, `undo.rs`, `find.rs`, `contrast.rs`, `updown.rs`, `motion.rs`, `typed.rs`, `zoom.rs` and `spoken.rs`; changed
 `alerts.rs`, `chartview.rs`, `config.rs`, `ranges.rs`, `source.rs`, `update.rs`, `panel.rs`, `ui.rs`, `shot.rs`
-and `Cargo.toml` (the `Win32_System_RemoteDesktop` feature). Also `examples/wide.rs`
+and `Cargo.toml` (the `Win32_System_RemoteDesktop` feature, the `[[example]]` entries and the version, 1.9.0). Also `examples/wide.rs`
 (new), `examples/w3.rs` (new), `shots/wide-*.png` (new), `shots/w3-strip-24-pinned-6.png` (new), `examples/w4.rs` (new), `shots/w4-*.png` (new), `scripts/check-state-linux.sh`, `README.md`, `SOURCES.md`, `CHANGELOG.md`
 and `docs/1.9/`.
 
