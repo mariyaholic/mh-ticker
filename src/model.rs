@@ -225,6 +225,10 @@ pub const CLOSED_AFTER_S: f64 = 900.0;
 /// same for [`CLOSED_AFTER_S`] on the feed's own observations (`Quote::moved_at`), whatever time the
 /// quote carries. Futures print thin re-stamps after the session ends; a fresh-looking time on a
 /// frozen price must not count as a fresh price.
+///
+/// The rule also holds for a symbol whose market is open: a thinly traded stock or future that
+/// keeps one price for 15 minutes reads as stale and as closed, and the alert gap tracker counts it
+/// as checked. The quote carries nothing that tells a quiet market from a closed one.
 pub fn restamped(q: &Quote, now: f64) -> bool {
     q.source.is_empty() && q.moved_at.is_some_and(|m| now - m >= CLOSED_AFTER_S)
 }
@@ -239,6 +243,25 @@ pub fn closed_since(q: &Quote, now: f64) -> Option<f64> {
     q.ts.filter(|t| now - t >= CLOSED_AFTER_S).or_else(|| q.moved_at.filter(|_| restamped(q, now)))
 }
 
+/// Does the UTC instant `t` fall on a Saturday or a Sunday (UTC)? A quote time there is a weekend
+/// stamp: spot metals and the futures print it with no trade behind it.
+fn on_weekend(t: f64) -> bool {
+    matches!(((t / 86_400.0).floor() as i64 + 4).rem_euclid(7), 6 | 0)
+}
+
+/// The moment a closed card says its market stopped. It is [`closed_since`], except that a quote
+/// time on a weekend is a stamp and not a trade: spot gold carried `Sat 09:19` while its last 1D
+/// bar was Friday 16:50. For such a time the answer is the earlier of the stamp and `last_bar` (the
+/// time of the last bar the 1D chart kept, see [`Board::last_bar_at`]), and `None` when there is no
+/// bar, which leaves the card with plain `closed`. A time on a weekday is shown as it is.
+pub fn closed_since_shown(q: &Quote, now: f64, last_bar: Option<f64>) -> Option<f64> {
+    let since = closed_since(q, now)?;
+    if !on_weekend(since) {
+        return Some(since);
+    }
+    last_bar.filter(|b| b.is_finite()).map(|b| b.min(since))
+}
+
 /// Is this card's market closed, as opposed to its feed dead? True for a stale CNBC quote whose
 /// market has stopped ([`closed_since`]) while the last request was answered (`link` is not `Down`):
 /// the service is up and this instrument has stopped printing. False with the link down (the age
@@ -251,6 +274,7 @@ pub fn closed_since(q: &Quote, now: f64) -> Option<f64> {
 pub fn market_closed(cell: &Cell, link: Link, now: f64) -> bool {
     link != Link::Down && cell.stale && cell.quote.as_ref().is_some_and(|q| closed_since(q, now).is_some())
 }
+
 /// How much of the board is closed, when closed is the only reason a price is not fresh. Every
 /// surface that names the link (the panel header, the strip's dot, the tray icon and tooltip) asks
 /// [`Board::calm`], so a closed market looks the same everywhere and a fault never does.
@@ -266,12 +290,21 @@ pub enum Calm {
 }
 
 impl Board {
+    /// The time of the last bar the 1D chart kept for row `i`, as UTC seconds: the last trade the
+    /// chart knows of, with the idle bars of a closed market already dropped. `None` before the
+    /// first chart answer.
+    pub fn last_bar_at(&self, i: usize) -> Option<f64> {
+        let last = self.bars.get(i)?.last()?;
+        Some(self.bars_t0.get(i).copied()? + last.dt as f64)
+    }
+
     /// See [`Calm`]. `now` is UTC seconds.
     pub fn calm(&self, now: f64) -> Calm {
         if self.link == Link::Down {
             return Calm::No;
         }
-        let stale = self.cells.iter().filter(|c| c.stale).count();
+        // A cell with no quote is a fault whatever its `stale` flag says.
+        let stale = self.cells.iter().filter(|c| c.stale || c.quote.is_none()).count();
         let closed = self.cells.iter().filter(|c| market_closed(c, self.link, now)).count();
         match (stale, closed) {
             (0, _) | (_, 0) => Calm::No,
@@ -550,6 +583,47 @@ mod tests {
         assert_eq!(b.calm(now), Calm::No, "a dead feed is a fault");
         b.link = Link::Live;
         b.cells = vec![];
+        assert_eq!(b.calm(now), Calm::No);
+    }
+
+    #[test]
+    fn a_weekend_stamp_shows_the_last_bar_and_never_the_stamp() {
+        // Live CNBC on Saturday 2026-11-14 gave XAU a stamp of 09:19 ET; the last 1D bar was Friday 16:50 ET.
+        let stamp = crate::probe::parse_time("2026-11-14T09:19:58.806-0500").unwrap();
+        let bar = crate::probe::parse_time("2026-11-13T16:50:00.000-0500").unwrap();
+        let now = crate::probe::parse_time("2026-11-14T17:18:36.000+0000").unwrap();
+        let xau = q("XAU=", Some(stamp), true);
+        assert_eq!(closed_since(&xau, now), Some(stamp), "the card is closed either way");
+        assert_eq!(closed_since_shown(&xau, now, Some(bar)), Some(bar));
+        assert_eq!(closed_since_shown(&xau, now, None), None, "no bar backs a Saturday stamp");
+        // A later bar does not push the time forward.
+        assert_eq!(closed_since_shown(&xau, now, Some(stamp + 60.0)), Some(stamp));
+        // A weekday stamp stands as it is.
+        let thu = q("XAU=", Some(bar - 86_400.0), true);
+        assert_eq!(closed_since_shown(&thu, now, None), Some(bar - 86_400.0));
+        assert_eq!(closed_since_shown(&thu, now, Some(bar)), Some(bar - 86_400.0));
+        let est = |_: f64| -5 * 3600;
+        let words = |s| closed_words("CNBC", s, &est, now);
+        assert_eq!(words(closed_since_shown(&xau, now, Some(bar))), ["CNBC \u{b7} closed since Fri 16:50", "closed since Fri 16:50", "closed"]);
+        assert_eq!(words(closed_since_shown(&xau, now, None)), ["closed"]);
+        // The bar time comes from the 1D bars of the row.
+        let mut b = Board::new(&[]);
+        assert_eq!(b.last_bar_at(0), None);
+        let bar_at = |dt: f32| Bar { dt, o: 1.0, h: 1.0, l: 1.0, c: 1.0, v: 0.0 };
+        b.bars = vec![vec![bar_at(0.0), bar_at(120.0)].into()];
+        b.bars_t0 = vec![bar - 120.0];
+        assert_eq!(b.last_bar_at(0), Some(bar));
+    }
+
+    #[test]
+    fn a_cell_with_no_quote_is_a_fault_even_when_not_marked_stale() {
+        let now = 1_000_000.0;
+        let mut b = Board::new(&[]);
+        b.link = Link::Partial;
+        let mut none = closed_cell("JPY", 0.0, now);
+        none.quote = None;
+        none.stale = false;
+        b.cells = vec![closed_cell("S&P", 20.0 * 3600.0, now), none];
         assert_eq!(b.calm(now), Calm::No);
     }
 

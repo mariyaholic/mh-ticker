@@ -9,7 +9,10 @@
 //! - Closed: every shown market is closed (`model::market_closed`). It counts as a quiet spell of
 //!   30 minutes at once ([`with_closed`]), so a weekend is polled every 60 s from its first poll on
 //!   instead of after half an hour. The first trade after the reopening is seen within 60 s, and it
-//!   restarts the quiet clock, so the poll after that is back at the base.
+//!   restarts the quiet clock, so the poll after that is back at the base. The rule needs every shown
+//!   row closed, because the feed makes one batched request for all rows. The default board has
+//!   bitcoin, which trades on weekends, so the default board is not closed on a weekend and keeps the
+//!   base interval until the quiet rule applies; a board without a 24-hour symbol polls slowly.
 //! - Locked session: one poll per 5 minutes.
 //! - Armed: while any alert is armed the answer is never slower than 15 s (or the user's own base,
 //!   when that is already slower). This rule wins over the two above.

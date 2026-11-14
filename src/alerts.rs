@@ -1971,6 +1971,30 @@ mod tests {
     }
 
     #[test]
+    fn no_alert_fires_at_startup_on_a_saturday_futures_stamp() {
+        // CNBC writes Saturday's date in front of Friday's clock on S&P. A freshly started feed has
+        // seen the price for 0 s, so only the quote time can say that it is Friday's.
+        let saturday = r#"{"FormattedQuoteResult":{"FormattedQuote":[
+          {"symbol":"@SP.1","last":"7,561.00","last_time":"2026-11-14T17:40:14.000-0500","realTime":"false","settleDate":"2026-11-13"}]}}"#;
+        let v: serde_json::Value = serde_json::from_str(saturday).unwrap();
+        let rows = vec![crate::config::Row { label: "S&P".into(), symbol: "@SP.1".into(), digits: 2, name: String::new(), strip: true }];
+        for at in ["2026-11-14T23:00:00.000+0000", "2026-11-15T03:00:00.000+0000"] {
+            let now = crate::probe::parse_time(at).unwrap();
+            let mut quotes = crate::source::parse_quotes_at(&v, now);
+            quotes[0].moved_at = Some(now);
+            let map = quotes.into_iter().map(|q| (q.symbol.clone(), q)).collect();
+            let a = Alert { label: "S&P".into(), above: Some(7000.0), ..Alert::default() };
+            let mut cfg = Config { alerts: vec![a], stale_after_s: 90.0, ..Config::default() };
+            let mut b = Board::new(&rows);
+            b.link = Link::Live;
+            b.cells = crate::model::resolve(&rows, &map, now, 90.0, cfg.delayed_grace_s);
+            assert!(b.cells[0].stale, "{at}: Friday's price is stale");
+            assert!(check(&mut cfg, &b, now).is_empty(), "{at}: nothing fires on Friday's unchanged price");
+            assert_eq!(cfg.alerts[0].last, 0.0, "{at}: and no cooldown is burned");
+        }
+    }
+
+    #[test]
     fn a_preset_and_the_fire_path_agree_on_what_is_fresh() {
         let now = 10_000.0;
         let cfg = Config { alerts: vec![alert(Some(4100.0), None)], stale_after_s: 90.0, ..Config::default() };

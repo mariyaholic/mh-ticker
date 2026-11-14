@@ -112,17 +112,34 @@ pub use crate::probe::parse_time;
 /// keeps printing thin re-stamps and writes today's date in front of the clock of the last one:
 /// on Saturday 14 Nov 2026 `@SP.1` read `2026-11-14T17:40:14.000-0500` while its last print was
 /// Friday 17:40 (the 1D chart has a bar at `20261113174000`, and `settleDate` is `2026-11-13`).
-/// A stamp more than [`crate::model::FUTURE_SKEW_S`] ahead of `now` is therefore read again with
-/// the `settleDate` as its date; when that is not in the past either, the time is unknown.
+/// The wrong date lies ahead of the clock in the early hours and behind it later in the day, so a
+/// futures stamp (one with a `settleDate`) is read on its `settleDate` whenever the date written in
+/// it is a Saturday, or a Sunday before 18:00 (the clock of the stamp, which is Eastern time), when
+/// no session runs. Any other stamp is read as sent unless it is more than
+/// [`crate::model::FUTURE_SKEW_S`] ahead of `now`, and then it is read with the `settleDate` as
+/// well. When the `settleDate` reading is not in the past, the time is unknown.
 pub fn quote_time(last_time: &str, settle_date: Option<&str>, now: f64) -> Option<f64> {
     let ts = parse_time(last_time)?;
-    if ts <= now + crate::model::FUTURE_SKEW_S {
+    let settle = settle_date.map(str::trim).filter(|s| !s.is_empty());
+    if !(settle.is_some() && written_in_weekend_break(last_time)) && ts <= now + crate::model::FUTURE_SKEW_S {
         return Some(ts);
     }
-    let settle = settle_date?.trim();
     let clock = last_time.get(10..).filter(|c| c.starts_with('T'))?;
-    let fixed = parse_time(&format!("{settle}{clock}"))?;
-    (fixed <= now + crate::model::FUTURE_SKEW_S && ts - fixed < 7.0 * 86_400.0).then_some(fixed)
+    let fixed = parse_time(&format!("{}{clock}", settle?))?;
+    (fixed <= ts && fixed <= now + crate::model::FUTURE_SKEW_S && ts - fixed < 7.0 * 86_400.0).then_some(fixed)
+}
+
+/// Does the date and clock written in a `last_time` string fall in the weekend break of the US
+/// futures: all of Saturday, and Sunday before 18:00? The written clock is the exchange's, so no
+/// offset is applied.
+fn written_in_weekend_break(last_time: &str) -> bool {
+    let num = |r: std::ops::Range<usize>| last_time.get(r).and_then(|s| s.parse::<u32>().ok());
+    let (Some(y), Some(m), Some(d), Some(h)) = (num(0..4), num(5..7), num(8..10), num(11..13)) else { return false };
+    match (crate::chartview::days_from_civil(y as i64, m, d) + 4).rem_euclid(7) {
+        6 => true,
+        0 => h < 18,
+        _ => false,
+    }
 }
 
 /// `restQuote` body -> quotes.
@@ -1342,11 +1359,35 @@ mod tests {
         assert_eq!(age("@DJ.1"), 18.0 * 3600.0 + 38.0 * 60.0 + 4.0);
         assert_eq!(age("@ND.1"), 18.0 * 3600.0 + 39.0 * 60.0 + 29.0);
         assert_eq!(age("@CL.1"), 18.0 * 3600.0 + 4.0 * 60.0 + 52.0);
-        // Stamps that were already in the past are read as sent.
+        // Stamps with no `settleDate` are read as sent. The Saturday XAU stamp is not a trade time:
+        // gold stopped on Friday, and `model::closed_since_shown` takes the day from the 1D bars.
         assert!((age("XAU=") - (2.0 * 3600.0 + 58.0 * 60.0 + 37.194)).abs() < 1e-3);
         assert_eq!(age("BTC.CB="), 8.0);
         assert_eq!(age("EUR="), 19.0 * 3600.0 + 19.0 * 60.0 + 36.0);
         assert!(qs.iter().all(|q| q.ts.is_some_and(|t| t <= now + crate::model::FUTURE_SKEW_S)));
+    }
+
+    #[test]
+    fn a_saturday_futures_stamp_is_a_friday_stamp_whether_it_lies_ahead_or_behind_the_clock() {
+        let fri = parse_time("2026-11-13T17:40:14.000-0500").unwrap();
+        // 23:00 UTC is 18:00 ET Saturday: the written time is already in the past.
+        for at in ["2026-11-14T23:00:00.000+0000", "2026-11-15T03:00:00.000+0000", "2026-11-14T17:18:36.000+0000"] {
+            let now = parse_time(at).unwrap();
+            let qs = parse_quotes_at(&serde_json::from_str(SATURDAY).unwrap(), now);
+            let sp = qs.iter().find(|q| q.symbol == "@SP.1").unwrap();
+            assert_eq!(sp.ts, Some(fri), "now {at}");
+            assert_eq!(parse_time("2026-11-13T22:40:14.000+0000"), sp.ts);
+        }
+        // Sunday before 18:00 is still the break; from 18:00 the stamp is a real print.
+        let now = parse_time("2026-11-15T22:30:00.000+0000").unwrap();
+        let sun_early = "2026-11-15T17:40:14.000-0500";
+        assert_eq!(quote_time(sun_early, Some("2026-11-13"), now), parse_time("2026-11-13T17:40:14.000-0500"));
+        let sun_open = "2026-11-15T18:00:30.000-0500";
+        let now = parse_time("2026-11-15T23:01:00.000+0000").unwrap();
+        assert_eq!(quote_time(sun_open, Some("2026-11-13"), now), parse_time(sun_open));
+        // A stamp with no settleDate is read as sent, on any day.
+        let now = parse_time("2026-11-14T23:00:00.000+0000").unwrap();
+        assert_eq!(quote_time("2026-11-14T09:19:58.806-0500", None, now), parse_time("2026-11-14T09:19:58.806-0500"));
     }
 
     #[test]

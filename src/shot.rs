@@ -701,7 +701,7 @@ fn board_n(now: f64, n: usize) -> Board {
                 q.yr_lo = q.yr_lo.map(|v| v * scale);
                 q.change_pct = q.change_pct.map(|p| p * (1.0 + (i % 4) as f64 * 0.8) * if i % 3 == 1 { -1.0 } else { 1.0 });
             }
-            cell.stale = i == 7;
+            cell.stale = i == 7 || i == 13;
             if i == 7 {
                 // A weekend: the quote is 52 hours old, so the card reads "closed since" and a day beside a long label.
                 if let Some(q) = cell.quote.as_mut() {
