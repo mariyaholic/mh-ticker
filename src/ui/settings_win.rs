@@ -25,7 +25,6 @@ const TIMER_REFRESH: usize = 77;
 const REFRESH_MS: u32 = 1000;
 
 struct Sw {
-    hwnd: HWND,
     ultra: bool,
     sections: Vec<Section>,
     cur: usize,
@@ -236,6 +235,8 @@ fn sync_owner(hwnd: HWND, open: bool) {
         match plan.restack {
             Restack::Keep => {}
             Restack::Raise => {
+                // An owned window always stays above its owner, whatever band the owner is in, so
+                // HWND_TOP is enough to put it above the panel even while the panel is topmost.
                 place(HWND_TOP);
             }
             Restack::NotTopmost => {
@@ -301,17 +302,19 @@ pub(super) fn open_settings(main: HWND) {
     match reopen(alive, minimized) {
         Reopen::Create => {}
         plan => unsafe {
-            if plan == Reopen::RestoreAndFront {
-                ShowWindow(open, SW_RESTORE);
-            }
             // The panel may have opened or closed since the window last refreshed: settle its owner
-            // from the cached facts before raising it, so it lands above the panel. Raising it
-            // activates it, and `WM_ACTIVATE` does the one fresh read.
+            // from the cached facts before raising it, so it lands above the panel. Restoring and
+            // raising activate the window, and `WM_ACTIVATE` does the one fresh read, so the restore
+            // runs inside the raise.
             refresh(open);
-            read_fresh_after(|| {
-                BringWindowToTop(open);
-                SetForegroundWindow(open);
-            }, || refresh_fresh(open));
+            run_open(
+                plan,
+                || FRESH_READS.with(|c| c.get()),
+                || {},
+                || { ShowWindow(open, SW_RESTORE); },
+                || { BringWindowToTop(open); SetForegroundWindow(open); },
+                || refresh_fresh(open),
+            );
             return;
         },
     }
@@ -364,7 +367,6 @@ pub(super) fn open_settings(main: HWND) {
         }
         let sections = Section::for_build(snap.env.ultra);
         let mut sw = Sw {
-            hwnd,
             ultra: snap.env.ultra,
             sections,
             cur: 0,
@@ -387,15 +389,49 @@ pub(super) fn open_settings(main: HWND) {
         SW.with(|c| *c.borrow_mut() = Some(sw));
         OPEN.with(|c| c.set(hwnd as isize));
         SetTimer(hwnd, TIMER_REFRESH, REFRESH_MS, None);
-        ShowWindow(hwnd, SW_SHOWNORMAL);
-        // The snapshot above was fresh; activation reads again only when nothing else did.
-        read_fresh_after(|| { SetForegroundWindow(hwnd); }, || refresh_fresh(hwnd));
+        // The snapshot above was the first fresh read. Showing the window activates it and
+        // `WM_ACTIVATE` reads once more, so the show and the foreground call run inside the raise and
+        // the explicit read happens only when activation did not read.
+        run_open(
+            Reopen::Create,
+            || FRESH_READS.with(|c| c.get()),
+            || { ShowWindow(hwnd, SW_SHOWNORMAL); },
+            || {},
+            || { SetForegroundWindow(hwnd); },
+            || refresh_fresh(hwnd),
+        );
     }
+}
+
+/// The calls that bring the window up for `plan`, in order, inside one `read_fresh_after`. Each of
+/// `show`, `restore` and `foreground` may activate the window and so bump the fresh-read count; `read`
+/// runs only when none of them did. `show` belongs to a new window, `restore` to a minimised one.
+fn run_open(
+    plan: Reopen,
+    count: impl Fn() -> u32,
+    show: impl FnOnce(),
+    restore: impl FnOnce(),
+    foreground: impl FnOnce(),
+    read: impl FnOnce(),
+) {
+    read_fresh_after_counted(
+        count,
+        || {
+            match plan {
+                Reopen::Create => show(),
+                Reopen::RestoreAndFront => restore(),
+                Reopen::Front => {}
+            }
+            foreground();
+        },
+        read,
+    );
 }
 
 /// Close the window when the app quits.
 pub(super) fn close() {
-    if let Some(h) = with_sw(|s| s.hwnd) {
+    let h = OPEN.with(|c| c.get()) as HWND;
+    if !h.is_null() {
         unsafe {
             if IsWindow(h) != 0 {
                 DestroyWindow(h);
@@ -601,8 +637,9 @@ fn key_of(vk: u32, shift: bool) -> Option<Key> {
     })
 }
 
-/// The scroll offset a key sets, when it scrolls the page: Page Up, Page Down, Home and End. The caller
-/// only asks for a focus on a control; Home and End in the sidebar pick the first or last section first.
+/// The scroll offset a key sets, when it scrolls the page: Page Up, Page Down, Home and End. A focus on
+/// a control passes Home and End here; in the sidebar they pick the first or last section instead
+/// (`key_of`), and `key_scroll` is not asked.
 fn key_scroll(vk: u32, l: &settings::Layout) -> Option<i32> {
     let key = match vk {
         0x21 => PageKey::PageUp,
@@ -629,6 +666,11 @@ fn on_key(hwnd: HWND, vk: u32) -> Option<Do> {
         if vk == 0x21 || vk == 0x22 {
             let l = current_layout(s, hwnd);
             s.scroll = key_scroll(vk, &l).unwrap_or(l.scroll);
+            // The focus follows the page, so the next arrow key steps from what is on screen.
+            let paged = current_layout(s, hwnd);
+            if let Some(at) = settings::focus_in_view(&paged, &s.controls) {
+                s.focus = at;
+            }
             invalidate(hwnd);
             return None;
         }
@@ -829,7 +871,6 @@ mod tests {
 
     fn state(controls: Vec<Control>) -> Sw {
         Sw {
-            hwnd: null_mut(),
             ultra: true,
             sections: Section::for_build(true),
             cur: 1,
@@ -889,7 +930,8 @@ mod tests {
 
     #[test]
     fn a_docked_strip_with_the_panel_closed_owns_nothing_and_leaves_the_topmost_band() {
-        // A docked strip is topmost, and an owned window follows its owner there.
+        // A docked strip is topmost, and an owned window follows its owner there. The plan does not
+        // depend on placement, so the floating case below uses the same inputs.
         let plan = owner_plan(false, true);
         assert_eq!(plan.owner, Owner::Nobody);
         assert_eq!(plan.restack, Restack::NotTopmost, "it must not stay above other apps");
@@ -897,6 +939,8 @@ mod tests {
 
     #[test]
     fn a_floating_strip_with_the_panel_closed_owns_nothing_either() {
+        // The plan takes no placement: a docked and a floating strip get the same answer, and the
+        // restack to not-topmost does nothing to a window that was never topmost.
         assert_eq!(owner_plan(false, true), OwnerPlan { owner: Owner::Nobody, restack: Restack::NotTopmost });
         // Already unowned: nothing to undo, and no restack on every refresh.
         assert_eq!(owner_plan(false, false), OwnerPlan { owner: Owner::Nobody, restack: Restack::Keep });
@@ -919,17 +963,53 @@ mod tests {
         assert!(!needs_fresh_read(u32::MAX, 0), "the count wraps");
     }
 
-    #[test]
-    fn opening_reopening_and_commands_read_once_around_the_raise() {
+    /// Runs `run_open` the way the window does: the snapshot is the first read, and each call that
+    /// activates the window bumps the count as `WM_ACTIVATE` would. Returns the reads after the snapshot.
+    fn reads_after_snapshot(plan: Reopen, show_activates: bool, restore_activates: bool, foreground_activates: bool) -> u32 {
         use std::cell::Cell;
         let count = Cell::new(10u32);
-        let reads = Cell::new(0);
-        // The raise activates the window and the activation reads: no second read.
-        read_fresh_after_counted(|| count.get(), || count.set(count.get() + 1), || reads.set(reads.get() + 1));
-        assert_eq!(reads.get(), 0);
-        // The window was already active, nothing read: one read.
-        read_fresh_after_counted(|| count.get(), || {}, || reads.set(reads.get() + 1));
-        assert_eq!(reads.get(), 1);
+        let reads = Cell::new(0u32);
+        let bump = |on: bool| if on { count.set(count.get() + 1); reads.set(reads.get() + 1) };
+        run_open(
+            plan,
+            || count.get(),
+            || bump(show_activates),
+            || bump(restore_activates),
+            || bump(foreground_activates),
+            || { count.set(count.get() + 1); reads.set(reads.get() + 1) },
+        );
+        reads.get()
+    }
+
+    #[test]
+    fn opening_reads_at_most_once_after_the_snapshot() {
+        // A window is activated once, by whichever call gets there first; the other calls find it active.
+        for (show, foreground) in [(true, false), (false, true), (false, false)] {
+            assert_eq!(reads_after_snapshot(Reopen::Create, show, false, foreground), 1, "create {show} {foreground}");
+        }
+    }
+
+    #[test]
+    fn bringing_the_open_window_forward_reads_once() {
+        // Inactive window: the foreground call activates it and `WM_ACTIVATE` reads.
+        assert_eq!(reads_after_snapshot(Reopen::Front, false, false, true), 1);
+        // Already active: no activation, so the helper reads once itself.
+        assert_eq!(reads_after_snapshot(Reopen::Front, false, false, false), 1);
+    }
+
+    #[test]
+    fn restoring_a_minimised_window_reads_once() {
+        // The restore activates the window; nothing before it reads.
+        assert_eq!(reads_after_snapshot(Reopen::RestoreAndFront, false, true, false), 1);
+        assert_eq!(reads_after_snapshot(Reopen::RestoreAndFront, false, false, true), 1);
+        assert_eq!(reads_after_snapshot(Reopen::RestoreAndFront, false, false, false), 1);
+    }
+
+    #[test]
+    fn a_plan_runs_only_its_own_steps() {
+        // A reopened window is not shown as new, and a new window is not restored.
+        assert_eq!(reads_after_snapshot(Reopen::Front, true, true, false), 1, "front ignores show and restore");
+        assert_eq!(reads_after_snapshot(Reopen::Create, false, true, false), 1, "create ignores restore");
     }
 
     #[test]
@@ -986,7 +1066,7 @@ mod tests {
     }
 
     #[test]
-    fn page_and_end_keys_scroll_and_home_and_end_in_the_sidebar_do_not() {
+    fn page_keys_home_and_end_set_the_scroll_and_other_keys_do_not() {
         let l = tall_layout(100);
         assert_eq!(key_scroll(0x22, &l), Some(settings::scroll_for(&l, PageKey::PageDown)));
         assert_eq!(key_scroll(0x21, &l), Some(settings::scroll_for(&l, PageKey::PageUp)));

@@ -406,6 +406,16 @@ pub fn reveal(l: &Layout, ci: usize) -> i32 {
     scroll.clamp(0, l.max_scroll())
 }
 
+/// The option the focus moves to after the page scrolled to `l`: the first focusable control that lies
+/// wholly inside the viewport, else the first one that shows at all, else `None` (the focus stays).
+pub fn focus_in_view(l: &Layout, controls: &[Control]) -> Option<Hit> {
+    let at = |ci: usize| entry_opt(&controls[ci]).map(|oi| Hit::Opt(ci, oi));
+    let rows = || controls.iter().enumerate().filter(|(_, c)| c.focusable()).filter_map(|(ci, _)| l.rows.get(ci).map(|r| (ci, r.bounds)));
+    let whole = rows().find(|(_, b)| b.top >= l.viewport.top && b.bottom <= l.viewport.bottom);
+    let any = || rows().find(|(_, b)| b.bottom > l.viewport.top && b.top < l.viewport.bottom);
+    whole.or_else(any).and_then(|(ci, _)| at(ci))
+}
+
 // ---------------------------------------------------------------------------------------------
 // Scrollbar
 
@@ -1083,6 +1093,19 @@ mod tests {
         assert_eq!(layout(96, w, h, 6, &controls, -40).scroll, 0);
         // The last row is reachable: its bottom is inside the viewport at the end.
         assert!(far.rows.last().unwrap().bounds.bottom <= far.viewport.bottom);
+    }
+
+    #[test]
+    fn focus_after_paging_lands_on_the_first_control_in_view() {
+        let page: Vec<Control> = (0..40).map(|i| Control::button(&format!("Row {i}"), "", "Go", Act::Cmd(i), true)).collect();
+        let top = layout(96, 780, 400, 6, &page, 0);
+        assert_eq!(focus_in_view(&top, &page), Some(Hit::Opt(0, 0)));
+        let down = layout(96, 780, 400, 6, &page, scroll_for(&top, PageKey::PageDown));
+        let Some(Hit::Opt(ci, _)) = focus_in_view(&down, &page) else { panic!("a control is in view") };
+        let r = down.rows[ci].bounds;
+        assert!(r.top >= down.viewport.top && r.bottom <= down.viewport.bottom, "the row is wholly in view");
+        assert!(ci > 0, "the focus moved off the first row");
+        assert_eq!(focus_in_view(&top, &[]), None);
     }
 
     #[test]
