@@ -365,7 +365,11 @@ const WHEEL_DEN: i64 = 96 * 120;
 /// The pixels a wheel `delta` scrolls at `dpi`, scaled continuously so the small deltas of a precision
 /// touchpad or a smooth-scroll mouse count. `rem` carries what a step could not show as whole pixels
 /// into the next one, so a run of very fine deltas adds up to the same distance as one large delta.
+/// A remainder left by the other direction is dropped first, so a reversal starts from zero.
 pub fn wheel_step(delta: i32, dpi: u32, rem: &mut i64) -> i32 {
+    if (*rem > 0 && delta < 0) || (*rem < 0 && delta > 0) {
+        *rem = 0;
+    }
     let total = delta as i64 * 48 * dpi as i64 + *rem;
     *rem = total % WHEEL_DEN;
     (total / WHEEL_DEN) as i32
@@ -400,6 +404,137 @@ pub fn reveal(l: &Layout, ci: usize) -> i32 {
         scroll += r.bounds.bottom - l.viewport.bottom;
     }
     scroll.clamp(0, l.max_scroll())
+}
+
+/// The option the focus moves to after the page scrolled to `l`: the first focusable control that lies
+/// wholly inside the viewport, else the first one that shows at all, else `None` (the focus stays).
+pub fn focus_in_view(l: &Layout, controls: &[Control]) -> Option<Hit> {
+    let at = |ci: usize| entry_opt(&controls[ci]).map(|oi| Hit::Opt(ci, oi));
+    let rows = || controls.iter().enumerate().filter(|(_, c)| c.focusable()).filter_map(|(ci, _)| l.rows.get(ci).map(|r| (ci, r.bounds)));
+    let whole = rows().find(|(_, b)| b.top >= l.viewport.top && b.bottom <= l.viewport.bottom);
+    let any = || rows().find(|(_, b)| b.bottom > l.viewport.top && b.top < l.viewport.bottom);
+    whole.or_else(any).and_then(|(ci, _)| at(ci))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Scrollbar
+
+/// Width of the scrollbar's hit area at 96 DPI. The thumb is drawn narrower, inside it.
+const BAR_HIT_W: i32 = 16;
+const BAR_THUMB_W: i32 = 8;
+const BAR_MIN_THUMB: i32 = 32;
+
+/// The scrollbar at the right edge of the viewport. `track` is the hit area (full height, `BAR_HIT_W`
+/// wide) and `thumb` the part of it that stands for the visible page. Both are hit areas; the painter
+/// draws a narrower thumb inside `thumb`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Scrollbar {
+    pub track: Rc,
+    pub thumb: Rc,
+    /// The largest scroll offset, and how far the thumb can travel (track height minus thumb height).
+    max: i32,
+    room: i32,
+}
+
+/// What a point on the scrollbar stands for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BarHit {
+    Thumb,
+    /// The track above the thumb.
+    PageUp,
+    /// The track below the thumb.
+    PageDown,
+}
+
+/// How the scrollbar is drawn.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BarState {
+    #[default]
+    Idle,
+    Hot,
+    Dragging,
+}
+
+/// The scrollbar of a layout, or `None` when the content fits the viewport.
+pub fn scrollbar(l: &Layout) -> Option<Scrollbar> {
+    let max = l.max_scroll();
+    if max <= 0 {
+        return None;
+    }
+    let s = |v: i32| px(v, l.dpi);
+    let vp = l.viewport;
+    let track = Rc::new((vp.right - s(BAR_HIT_W)).max(vp.left), vp.top, vp.right, vp.bottom);
+    let th = ((track.height() as i64 * track.height() as i64 / l.content_h.max(1) as i64) as i32).max(s(BAR_MIN_THUMB)).min(track.height());
+    let room = track.height() - th;
+    let top = track.top + (room as i64 * l.scroll as i64 / max as i64) as i32;
+    Some(Scrollbar { track, thumb: Rc::new(track.left, top, track.right, top + th), max, room })
+}
+
+impl Scrollbar {
+    /// The thumb as drawn: narrower than its hit area and inset from its ends.
+    pub fn thumb_drawn(&self, dpi: u32) -> Rc {
+        let s = |v: i32| px(v, dpi);
+        let t = self.thumb;
+        let right = t.right - s(4);
+        Rc::new((right - s(BAR_THUMB_W)).max(t.left), t.top + s(2), right, (t.bottom - s(2)).max(t.top + s(2) + 1))
+    }
+}
+
+/// What is under the point: the thumb, or the track above or below it.
+pub fn bar_hit(b: &Scrollbar, x: i32, y: i32) -> Option<BarHit> {
+    if !b.track.contains(x, y) {
+        return None;
+    }
+    Some(if y < b.thumb.top {
+        BarHit::PageUp
+    } else if y >= b.thumb.bottom {
+        BarHit::PageDown
+    } else {
+        BarHit::Thumb
+    })
+}
+
+/// One page: nine tenths of the viewport, so a line of context stays in view.
+pub fn page_px(l: &Layout) -> i32 {
+    (l.viewport.height() * 9 / 10).max(1)
+}
+
+/// The scroll offset after a click in the track above or below the thumb: one page that way.
+pub fn page_click(l: &Layout, hit: BarHit) -> i32 {
+    match hit {
+        BarHit::PageUp => (l.scroll - page_px(l)).clamp(0, l.max_scroll()),
+        BarHit::PageDown => (l.scroll + page_px(l)).clamp(0, l.max_scroll()),
+        BarHit::Thumb => l.scroll,
+    }
+}
+
+/// The scroll offset while the thumb is dragged: `grab` is how far below the thumb's top the pointer was
+/// when the drag began, `y` the pointer now. The thumb stays inside the track.
+pub fn drag_scroll(b: &Scrollbar, grab: i32, y: i32) -> i32 {
+    if b.room <= 0 {
+        return 0;
+    }
+    let top = (y - grab - b.track.top).clamp(0, b.room);
+    (top as i64 * b.max as i64 / b.room as i64) as i32
+}
+
+/// The keys that scroll the page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PageKey {
+    PageUp,
+    PageDown,
+    Home,
+    End,
+}
+
+/// The scroll offset after a page key.
+pub fn scroll_for(l: &Layout, k: PageKey) -> i32 {
+    match k {
+        PageKey::PageUp => (l.scroll - page_px(l)).clamp(0, l.max_scroll()),
+        PageKey::PageDown => (l.scroll + page_px(l)).clamp(0, l.max_scroll()),
+        PageKey::Home => 0,
+        PageKey::End => l.max_scroll(),
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -573,6 +708,10 @@ pub struct Palette {
     pub on_text: COLORREF,
     pub ring: COLORREF,
     pub line: COLORREF,
+    /// The scrollbar thumb: at least 3 to 1 against the page. `thumb_hot` is used while the pointer is
+    /// over the bar or the thumb is dragged.
+    pub thumb: COLORREF,
+    pub thumb_hot: COLORREF,
 }
 
 pub fn contrast_ratio(a: COLORREF, b: COLORREF) -> f64 {
@@ -639,6 +778,8 @@ pub fn palette(t: &Theme) -> Palette {
         on_text: ink_on(on),
         ring: readable(t.price, page, 3.0),
         line: readable(t.guide, page, 1.0),
+        thumb: if t.contrast { soft(mix(page, text, 3, 4), page, 3.0) } else { soft(t.dim, page, 3.0) },
+        thumb_hot: text,
     }
 }
 
@@ -655,6 +796,7 @@ pub struct Paint<'a> {
     pub layout: &'a Layout,
     pub focus: Option<Focus>,
     pub hover: Option<Hit>,
+    pub bar: BarState,
 }
 
 fn utf16(s: &str) -> Vec<u16> {
@@ -798,13 +940,10 @@ pub fn draw(dc: HDC, w: i32, h: i32, p: &Paint) {
         }
     }
     unsafe { RestoreDC(dc, -1) };
-    // A thin thumb when the content is taller than the window.
-    let max = p.layout.max_scroll();
-    if max > 0 {
-        let track = vp.height();
-        let thumb = (track * track / p.layout.content_h).max(s(24));
-        let top = (track - thumb) * p.layout.scroll / max;
-        plate(dc, Rc::new(vp.right - s(8), top + s(2), vp.right - s(3), top + thumb - s(2)), s(4), pal.dim);
+    // The scrollbar thumb, when the content is taller than the window.
+    if let Some(bar) = scrollbar(p.layout) {
+        let color = if p.bar == BarState::Idle { pal.thumb } else { pal.thumb_hot };
+        plate(dc, bar.thumb_drawn(p.layout.dpi), s(4), color);
     }
 }
 
@@ -954,6 +1093,19 @@ mod tests {
         assert_eq!(layout(96, w, h, 6, &controls, -40).scroll, 0);
         // The last row is reachable: its bottom is inside the viewport at the end.
         assert!(far.rows.last().unwrap().bounds.bottom <= far.viewport.bottom);
+    }
+
+    #[test]
+    fn focus_after_paging_lands_on_the_first_control_in_view() {
+        let page: Vec<Control> = (0..40).map(|i| Control::button(&format!("Row {i}"), "", "Go", Act::Cmd(i), true)).collect();
+        let top = layout(96, 780, 400, 6, &page, 0);
+        assert_eq!(focus_in_view(&top, &page), Some(Hit::Opt(0, 0)));
+        let down = layout(96, 780, 400, 6, &page, scroll_for(&top, PageKey::PageDown));
+        let Some(Hit::Opt(ci, _)) = focus_in_view(&down, &page) else { panic!("a control is in view") };
+        let r = down.rows[ci].bounds;
+        assert!(r.top >= down.viewport.top && r.bottom <= down.viewport.bottom, "the row is wholly in view");
+        assert!(ci > 0, "the focus moved off the first row");
+        assert_eq!(focus_in_view(&top, &[]), None);
     }
 
     #[test]
@@ -1204,6 +1356,146 @@ mod tests {
                 assert!(r >= min, "{}: {name} is {r:.2} to 1", t.name);
             }
         }
+    }
+
+    fn tall(eff: u32, scroll: i32) -> Layout {
+        let (w, _) = window_size(eff);
+        layout(eff, w, 300, 6, &sample(), scroll)
+    }
+
+    #[test]
+    fn there_is_no_scrollbar_when_the_content_fits() {
+        let one = vec![Control::header("Only")];
+        let l = layout(96, 780, 560, 6, &one, 0);
+        assert_eq!(scrollbar(&l), None);
+        assert!(scrollbar(&tall(96, 0)).is_some());
+    }
+
+    #[test]
+    fn the_thumb_stays_inside_the_track_and_reaches_both_ends() {
+        for eff in scales() {
+            let top = tall(eff, 0);
+            let b = scrollbar(&top).unwrap();
+            assert_eq!(b.thumb.top, b.track.top, "at the top at {eff}");
+            assert!(b.thumb.height() >= px(BAR_MIN_THUMB, eff).min(b.track.height()), "thumb is at least the minimum at {eff}");
+            let end = tall(eff, 100_000);
+            let b = scrollbar(&end).unwrap();
+            assert_eq!(b.thumb.bottom, b.track.bottom, "at the bottom at {eff}");
+            let mid = tall(eff, end.max_scroll() / 2);
+            let b = scrollbar(&mid).unwrap();
+            assert!(b.thumb.top >= b.track.top && b.thumb.bottom <= b.track.bottom);
+        }
+    }
+
+    #[test]
+    fn the_hit_area_is_wider_than_the_drawn_thumb_and_clear_of_the_options() {
+        for eff in scales() {
+            let l = tall(eff, 0);
+            let b = scrollbar(&l).unwrap();
+            assert!(b.track.width() >= px(BAR_HIT_W, eff) - 1, "hit area is {} px at {eff}", b.track.width());
+            let drawn = b.thumb_drawn(eff);
+            assert!(drawn.width() < b.thumb.width() && drawn.left >= b.thumb.left && drawn.right <= b.thumb.right && drawn.top >= b.thumb.top && drawn.bottom <= b.thumb.bottom);
+            assert_eq!(b.track.right, l.viewport.right);
+            for row in &l.rows {
+                for o in &row.opts {
+                    assert!(o.right <= b.track.left, "{o:?} runs under the scrollbar at {eff}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_point_on_the_track_is_the_thumb_or_a_page_either_side_of_it() {
+        let l = tall(96, 100);
+        let b = scrollbar(&l).unwrap();
+        let x = b.track.left + 2;
+        assert_eq!(bar_hit(&b, x, (b.thumb.top + b.thumb.bottom) / 2), Some(BarHit::Thumb));
+        assert_eq!(bar_hit(&b, x, b.thumb.top - 1), Some(BarHit::PageUp));
+        assert_eq!(bar_hit(&b, x, b.thumb.bottom), Some(BarHit::PageDown));
+        assert_eq!(bar_hit(&b, b.track.left - 1, b.thumb.top + 2), None, "left of the track");
+        assert_eq!(bar_hit(&b, x, b.track.bottom), None, "below the track");
+    }
+
+    #[test]
+    fn a_click_in_the_track_scrolls_one_page_and_stops_at_the_ends() {
+        let l = tall(96, 100);
+        assert_eq!(page_px(&l), 300 * 9 / 10);
+        assert_eq!(page_click(&l, BarHit::PageDown), (100 + page_px(&l)).min(l.max_scroll()));
+        assert_eq!(page_click(&l, BarHit::PageUp), 0);
+        assert_eq!(page_click(&l, BarHit::Thumb), 100);
+        let end = tall(96, 100_000);
+        assert_eq!(page_click(&end, BarHit::PageDown), end.max_scroll());
+    }
+
+    #[test]
+    fn dragging_the_thumb_follows_the_pointer_and_clamps_at_the_ends() {
+        for eff in scales() {
+            let l = tall(eff, 0);
+            let b = scrollbar(&l).unwrap();
+            let grab = b.thumb.height() / 2;
+            assert_eq!(drag_scroll(&b, grab, b.thumb.top + grab), 0, "no move, no scroll at {eff}");
+            assert_eq!(drag_scroll(&b, grab, -500), 0, "above the track");
+            assert_eq!(drag_scroll(&b, grab, 100_000), l.max_scroll(), "below the track");
+            // Dragging to where the thumb of a given scroll sits gives back that scroll, within the
+            // rounding of one thumb pixel.
+            for want in [0, l.max_scroll() / 3, l.max_scroll() / 2, l.max_scroll()] {
+                let at = scrollbar(&tall(eff, want)).unwrap();
+                let got = drag_scroll(&b, grab, at.thumb.top + grab);
+                let one_px = l.max_scroll() / (b.track.height() - b.thumb.height()).max(1) + 1;
+                assert!((got - want).abs() <= one_px, "wanted {want}, got {got} at {eff}");
+            }
+        }
+    }
+
+    #[test]
+    fn page_keys_scroll_a_page_or_jump_to_an_end() {
+        let l = tall(96, 150);
+        assert_eq!(scroll_for(&l, PageKey::PageDown), (150 + page_px(&l)).min(l.max_scroll()));
+        assert_eq!(scroll_for(&l, PageKey::PageUp), 0);
+        assert_eq!(scroll_for(&l, PageKey::Home), 0);
+        assert_eq!(scroll_for(&l, PageKey::End), l.max_scroll());
+        let end = tall(96, 100_000);
+        assert_eq!(scroll_for(&end, PageKey::PageDown), end.max_scroll());
+        let one = layout(96, 780, 560, 6, &[Control::header("Only")], 0);
+        assert_eq!(scroll_for(&one, PageKey::End), 0, "nothing to scroll");
+    }
+
+    #[test]
+    fn the_thumb_reads_against_the_page_in_every_theme_and_both_contrast_palettes() {
+        for t in &every_palette() {
+            let p = palette(t);
+            for (name, c) in [("thumb", p.thumb), ("hot thumb", p.thumb_hot)] {
+                let r = contrast_ratio(c, p.page);
+                assert!(r >= 3.0, "{}: {name} is {r:.2} to 1 against the page", t.name);
+            }
+        }
+    }
+
+    #[test]
+    fn the_contrast_palettes_show_the_hot_thumb_apart_from_the_resting_one() {
+        for t in every_palette().iter().filter(|t| t.contrast) {
+            let p = palette(t);
+            assert_ne!(p.thumb, p.thumb_hot, "{}: the thumb shows no hover or drag", t.name);
+        }
+    }
+
+    #[test]
+    fn a_reversed_wheel_starts_from_zero() {
+        let mut rem = 0;
+        // 4 deltas of 1 at 96 DPI are 1.6 px: one pixel shown, 0.6 px carried.
+        let down: i32 = (0..4).map(|_| wheel_step(1, 96, &mut rem)).sum();
+        assert_eq!(down, 1);
+        assert!(rem > 0);
+        // One delta the other way is -0.4 px by itself: nothing of the old remainder is added to it.
+        assert_eq!(wheel_step(-1, 96, &mut rem), 0);
+        assert!(rem < 0, "the remainder is the new direction's own");
+        let mut fresh = 0;
+        assert_eq!(wheel_step(-1, 96, &mut fresh), 0);
+        assert_eq!(rem, fresh);
+        // The same direction keeps adding up.
+        let mut rem = 0;
+        let up: i32 = (0..5).map(|_| wheel_step(-1, 96, &mut rem)).sum();
+        assert_eq!(up, -2);
     }
 
     #[test]

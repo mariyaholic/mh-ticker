@@ -69,7 +69,7 @@ pub enum Kind {
 impl Kind {
     pub const ALL: [Kind; 4] = [Kind::Flat, Kind::Gradient, Kind::Animated, Kind::Pixel];
 
-    /// The submenu title.
+    /// The title of the theme group.
     pub fn label(self) -> &'static str {
         match self {
             Kind::Flat => "Basic",
@@ -371,8 +371,8 @@ pub fn index_of(name: &str) -> usize {
     ALL.iter().position(|t| t.name == name).unwrap_or(0)
 }
 
-/// The catalogue indices of one tier, in `ALL` order. The Theme menu is built from this, so adding
-/// a palette to `ALL` is all it takes for it to appear in the right submenu.
+/// The catalogue indices of one tier, in `ALL` order. The Display page's theme choices are built from this, so adding
+/// a palette to `ALL` is all it takes for it to appear in the right group.
 pub fn tier(kind: Kind) -> impl Iterator<Item = usize> {
     ALL.iter().enumerate().filter(move |(_, t)| t.kind == kind).map(|(i, _)| i)
 }
@@ -470,8 +470,7 @@ pub fn pick(ultra: bool, name: &str) -> &'static Theme {
     }
 }
 
-/// One selectable face. `group` is the submenu it lands in, so the Font menu reads as a catalogue
-/// rather than one long list of names.
+/// One selectable face. `group` names the font group the face is listed under on the Display page.
 pub struct Face {
     pub name: &'static str,
     pub group: &'static str,
