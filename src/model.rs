@@ -226,6 +226,12 @@ pub const CLOSED_AFTER_S: f64 = 900.0;
 /// quote carries. Futures print thin re-stamps after the session ends; a fresh-looking time on a
 /// frozen price must not count as a fresh price.
 ///
+/// Limit at startup: `moved_at` starts when the app first sees a price, so for the first
+/// [`CLOSED_AFTER_S`] after a start a re-stamped price has no history yet. In that window an alert
+/// can fire on an unchanged price: the Friday 17:40 to 17:56 futures re-stamps, and a Saturday gold
+/// stamp that lies within `stale_after` of the start, can trigger an above-level alert on Friday's
+/// price.
+///
 /// The rule also holds for a symbol whose market is open: a thinly traded stock or future that
 /// keeps one price for 15 minutes reads as stale and as closed, and the alert gap tracker counts it
 /// as checked. The quote carries nothing that tells a quiet market from a closed one.
@@ -249,18 +255,26 @@ fn on_weekend(t: f64) -> bool {
     matches!(((t / 86_400.0).floor() as i64 + 4).rem_euclid(7), 6 | 0)
 }
 
-/// The moment a closed card says its market stopped. It is [`closed_since`], except that a quote
-/// time on a weekend is a stamp and not a trade: spot gold carried `Sat 09:19` while its last 1D
-/// bar was Friday 16:50. For such a time the answer is the earlier of the stamp and `last_bar` (the
-/// time of the last bar the 1D chart kept, see [`Board::last_bar_at`]), and `None` when there is no
-/// bar, which leaves the card with plain `closed`. A time on a weekday is shown as it is.
+/// The moment a closed card says its market stopped. It is [`closed_since`], capped at the end of
+/// the last bar the 1D chart kept (`last_bar` is that bar's start, see [`Board::last_bar_at`], and
+/// a 1D bar lasts [`BAR_END_S`]). A quote time after that end is a stamp and not a trade: spot gold
+/// carried `Sat 09:19` while its last bar was Friday 16:50, and the index futures carry the
+/// re-stamp `Fri 17:40` while their last kept bar is Friday 16:59 and the 17:00 halt follows. With
+/// no bar the answer is the quote time on a weekday and `None` on a weekend, which leaves the card
+/// with plain `closed`. A weekday holiday has no weekend stamp to tell it apart, so with no bar it
+/// shows the stamp as it is.
 pub fn closed_since_shown(q: &Quote, now: f64, last_bar: Option<f64>) -> Option<f64> {
     let since = closed_since(q, now)?;
-    if !on_weekend(since) {
-        return Some(since);
+    match last_bar.filter(|b| b.is_finite()) {
+        Some(b) => Some(since.min(b + BAR_END_S)),
+        None if on_weekend(since) => None,
+        None => Some(since),
     }
-    last_bar.filter(|b| b.is_finite()).map(|b| b.min(since))
 }
+
+/// How long a 1D bar lasts, in seconds: the 1D chart is one-minute bars, and a bar ends this long
+/// after its start.
+const BAR_END_S: f64 = 60.0;
 
 /// Is this card's market closed, as opposed to its feed dead? True for a stale CNBC quote whose
 /// market has stopped ([`closed_since`]) while the last request was answered (`link` is not `Down`):
@@ -287,6 +301,18 @@ pub enum Calm {
     Some(usize),
     /// Every row is a closed market (`n` of them).
     All(usize),
+}
+
+impl Calm {
+    /// This state without its count, for a cache key of something drawn from the colour alone (the
+    /// tray icon): a change from one closed row to two does not redraw it.
+    pub fn look(self) -> Calm {
+        match self {
+            Calm::No => Calm::No,
+            Calm::Some(_) => Calm::Some(0),
+            Calm::All(_) => Calm::All(0),
+        }
+    }
 }
 
 impl Board {
@@ -594,7 +620,7 @@ mod tests {
         let now = crate::probe::parse_time("2026-11-14T17:18:36.000+0000").unwrap();
         let xau = q("XAU=", Some(stamp), true);
         assert_eq!(closed_since(&xau, now), Some(stamp), "the card is closed either way");
-        assert_eq!(closed_since_shown(&xau, now, Some(bar)), Some(bar));
+        assert_eq!(closed_since_shown(&xau, now, Some(bar)), Some(bar + 60.0), "the end of the last bar");
         assert_eq!(closed_since_shown(&xau, now, None), None, "no bar backs a Saturday stamp");
         // A later bar does not push the time forward.
         assert_eq!(closed_since_shown(&xau, now, Some(stamp + 60.0)), Some(stamp));
@@ -604,7 +630,7 @@ mod tests {
         assert_eq!(closed_since_shown(&thu, now, Some(bar)), Some(bar - 86_400.0));
         let est = |_: f64| -5 * 3600;
         let words = |s| closed_words("CNBC", s, &est, now);
-        assert_eq!(words(closed_since_shown(&xau, now, Some(bar))), ["CNBC \u{b7} closed since Fri 16:50", "closed since Fri 16:50", "closed"]);
+        assert_eq!(words(closed_since_shown(&xau, now, Some(bar))), ["CNBC \u{b7} closed since Fri 16:51", "closed since Fri 16:51", "closed"]);
         assert_eq!(words(closed_since_shown(&xau, now, None)), ["closed"]);
         // The bar time comes from the 1D bars of the row.
         let mut b = Board::new(&[]);
@@ -613,6 +639,38 @@ mod tests {
         b.bars = vec![vec![bar_at(0.0), bar_at(120.0)].into()];
         b.bars_t0 = vec![bar - 120.0];
         assert_eq!(b.last_bar_at(0), Some(bar));
+    }
+
+    #[test]
+    fn calm_look_drops_the_count() {
+        assert_eq!(Calm::Some(3).look(), Calm::Some(0).look());
+        assert_eq!(Calm::All(2).look(), Calm::All(6).look());
+        assert_ne!(Calm::Some(1).look(), Calm::All(1).look());
+        assert_eq!(Calm::No.look(), Calm::No);
+    }
+
+    #[test]
+    fn a_futures_restamp_on_a_weekday_is_capped_at_the_end_of_the_last_bar() {
+        // Live @SP.1 on Saturday 2026-11-14: the stamp is the CME halt re-stamp Fri 17:40:14 ET (a
+        // weekday in UTC), and the last bar the 1D chart keeps is Fri 16:59 ET.
+        let stamp = crate::probe::parse_time("2026-11-13T17:40:14.000-0500").unwrap();
+        let bar = crate::probe::parse_time("2026-11-13T16:59:00.000-0500").unwrap();
+        let now = crate::probe::parse_time("2026-11-14T17:18:36.000+0000").unwrap();
+        let sp = q("@SP.1", Some(stamp), false);
+        assert_eq!(closed_since(&sp, now), Some(stamp));
+        assert_eq!(closed_since_shown(&sp, now, Some(bar)), Some(bar + 60.0));
+        let est = |_: f64| -5 * 3600;
+        assert_eq!(closed_words("CNBC delayed", closed_since_shown(&sp, now, Some(bar)), &est, now)[0], "CNBC delayed \u{b7} closed since Fri 17:00");
+        // With no bar yet, a weekday stamp is shown as it is.
+        assert_eq!(closed_since_shown(&sp, now, None), Some(stamp));
+        // Christmas Day 2026 is a Friday: a futures stamp written after the holiday close is read as
+        // sent, and the last bar caps it the same way.
+        let stamp = crate::probe::parse_time("2026-12-25T13:00:05.000-0500").unwrap();
+        let bar = crate::probe::parse_time("2026-12-25T09:14:00.000-0500").unwrap();
+        let now = crate::probe::parse_time("2026-12-25T23:30:00.000+0000").unwrap();
+        let sp = q("@SP.1", Some(stamp), false);
+        assert_eq!(closed_since_shown(&sp, now, Some(bar)), Some(bar + 60.0));
+        assert_eq!(closed_words("", closed_since_shown(&sp, now, Some(bar)), &est, now), ["closed since Fri 09:15", "closed"]);
     }
 
     #[test]

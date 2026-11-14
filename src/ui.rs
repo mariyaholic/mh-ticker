@@ -815,6 +815,11 @@ fn make_icon(color: COLORREF, pending: bool) -> HICON {
 }
 
 /// (label, price, price colour, change + colour) for one row of the board.
+///
+/// Open question for the owner: a closed cell and a stale fault cell dim to the same grey here. The
+/// strip's dot separates the cases (`theme::calm_color` stays amber while any cell is a fault), but
+/// it does not say which cell is at fault. The Ultra card shows closed with a tag and keeps the
+/// day-change colours.
 fn cell_texts(c: &Cell, t: &Theme) -> (String, String, COLORREF, Option<(String, COLORREF)>) {
     let label = match &c.quote {
         Some(q) if !q.source.is_empty() => format!("{} ({} ?)", c.label, q.source),
@@ -1432,7 +1437,8 @@ fn tooltip_for(u: &Ui) -> String {
 /// Rebuild the tray icon when the link colour or the alert marker differs from what it was drawn
 /// for. True when it was rebuilt (the caller then pushes it to the tray).
 fn sync_icon(u: &mut Ui) -> bool {
-    let key = (u.view.link, u.view.calm(crate::source::now_s()), u.alert_pending.is_some());
+    // The key drops the closed count: the icon colour is the same for any count.
+    let key = (u.view.link, u.view.calm(crate::source::now_s()).look(), u.alert_pending.is_some());
     if u.icon_link == Some(key) {
         return false;
     }
@@ -4073,7 +4079,7 @@ fn apply_theme(hwnd: HWND) {
             unsafe { DestroyIcon(u.icon) };
         }
         u.icon = fresh;
-        u.icon_link = Some((u.view.link, calm, u.alert_pending.is_some()));
+        u.icon_link = Some((u.view.link, calm.look(), u.alert_pending.is_some()));
         Some((u.icon, tooltip_for(u)))
     })
     .flatten()
