@@ -1,6 +1,6 @@
 [package]
 name = "mh_ticker"
-version = "1.8.0"
+version = "1.9.0"
 edition = "2021"
 description = "MH Ticker: a price strip docked in the Windows taskbar that opens into a centred panel. Public CNBC quotes, no login, no server. Two builds from one source: MH_Ticker (one theme, lean) and MH_Ticker_Ultra (themes, alerts, symbol picker)."
 license = "MIT"
@@ -36,6 +36,21 @@ name = "chart"
 path = "examples/chart.rs"
 required-features = ["shots"]
 
+[[example]]
+name = "wide"
+path = "examples/wide.rs"
+required-features = ["shots"]
+
+[[example]]
+name = "w3"
+path = "examples/w3.rs"
+required-features = ["shots"]
+
+[[example]]
+name = "w4"
+path = "examples/w4.rs"
+required-features = ["shots"]
+
 [features]
 shots = ["dep:png"]
 
@@ -59,7 +74,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_DataExchange",
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
-    "Win32_System_Registry",
+    "Win32_System_Registry", "Win32_System_RemoteDesktop",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
     "Win32_System_Time",

@@ -52,13 +52,13 @@ Word for word from 05, W1:
 
 Plus the standing checks in [01-workflow.md](01-workflow.md), and both exes still under 2 MB.
 
-## Decisions for the owner before the writer starts
+## Decisions taken (the owner gave the orchestrator autonomy for 1.9 on 2026-11-14)
 
-1. **H3 and "no history files on disk".** `--dump` writes files, but only from the command line,
-   only into a folder the user names, and never from the running app. 05 reads the rule as being
-   about the running app. If the rule is stricter, H3 is struck and the rest of W1 is unchanged.
-2. **H14 adds stills to `shots/`.** The 36 existing stills stay byte-identical; the new ones are added
-   beside them. This is the one package allowed to add to `shots/`.
+1. **H3 stays.** "No history files on disk" is about the running app. `--dump` runs only from the
+   command line, only into a folder the user names, and writes neither the config nor the webhook.
+   The README must say exactly that.
+2. **H14 may add stills to `shots/`.** The 36 existing stills stay byte-identical; new ones are added
+   beside them and `stills-check` keeps comparing only the 36.
 
 ## Lessons carried from 1.8 and the responsiveness pass
 

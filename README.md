@@ -62,13 +62,35 @@ Double click it. If prompted, simply select Run anyway.
 - **Pick ur symbols:** right click → *Symbols* and tick whatever u want from 23 of them (metals, crypto, us
   futures, oil, gas, copper, fx, the dollar index, us yields, vix, nikkei, dax, ftse, hang seng). the strip and
   the panel change right away, no restart. up to 24 at once, and *Reset to default* gets u back the original six
+- **Pin to strip:** the taskbar strip can show only the symbols you pick, while the panel still shows all of them.
+  Right click a card and choose *Pin to strip* or *Unpin from strip*. *Show all on strip* in the Symbols menu pins
+  every card again. The last pinned card cannot be unpinned, and a settings file from before this version shows every card.
+- **Rename a card:** right click a card and choose *Rename...*. Its alerts and its lock follow the new label. *Reset name*
+  goes back to the symbol's own name. *Decimals* sets how many digits the price shows (0 to 6), or *Auto*, which uses the
+  symbol's own count or one worked out from its price.
+- **Order the cards once:** Symbols → *Order the cards (once)* sorts them by day move (biggest first), by name, or back to
+  the default order. It changes the saved order one time and does not keep sorting.
+- **Undo:** the main menu has an *Undo the last ...* line that says what it would undo: a removal, move, sort, pin change or
+  alert clear. Ctrl+Z does the same on Ultra. It steps back one change, does not bring back a removed webhook, and is gone
+  when you quit.
 - **Add any symbol:** *Symbols* → *Add symbol...* and type a CNBC symbol like `AAPL`, `EUR=` or `@GC.1`. the app
   checks it with one request to CNBC before it adds it, and the name and first price come from CNBC. if the symbol
   isn't one CNBC knows, nothing is added. u can take it back off with *Symbols* → *Remove a symbol I added*, which
   also removes its alerts
 - **Traffic:** every symbol on the strip is one more quote in each refresh, so the data grows with the number u
   show. the cost at 24 hasn't been measured yet. all of it goes to CNBC, except the optional fallback providers
-  and one request to `api.github.com` for the update check below, which only happens when u click it
+  and one request to `api.github.com` for the update check below, which only happens when u click it. the
+  diagnostics report (below) makes the same requests as `--probe` once, to the same hosts, only when u click it.
+  the poll governor (below) can make fewer quote requests when nothing moves, never more than the *Poll every* setting
+  asks for. a webhook POST that fails with a network error or a 5xx is tried once more, and never after a 4xx
+- **Quiet markets and locks (both builds, on for Ultra):** right click → *Poll every* has two ticks, *Slow down when
+  nothing moves* and *Rest while the PC is locked*. with them on, a quote is polled every 15 s once no shown price has
+  changed for 10 minutes, every 60 s after 30 minutes, and once every 5 minutes while the PC is locked with no alert
+  armed. while an alert is armed it's never slower than 15 s. any change, expanding the panel, the hotkey, an unlock or
+  *Refresh now* goes back to the normal poll at once. Classic has both ticks off, so it polls as it did before unless u
+  tick them. in a scripted two-hour run, a market that moved for 5 minutes and then sat still made 2,400 polls at a 3 s
+  setting, and 465 with the governor (720 with an alert armed). the bytes weren't measured on the live feed. a source
+  that keeps failing still backs off as before, so it can wait longer than 15 s while an alert is armed
 - **Move it:** right click → *Position*, since not everyone has free space on the left of their taskbar:
   - **Auto** (default) - Stays in the taskbar and finds the space itself. it uses the left of start while theres
     room there, otherwise next to the tray, and if ur taskbar has no room at all (auto-hide or a vertical one) it
@@ -121,10 +143,15 @@ Double click it. If prompted, simply select Run anyway.
   low, close and change, with a crosshair and the price on the axis. the previous close is a dashed line marked
   `prev`, the day's high and low are small ticks on the right edge, and a faint dotted line marks where the
   market was shut. the day's change sits beside the last price
+- **Suspect data (Ultra):** the chart's second header line can say `as of 14:05`. that means the data is past its
+  refresh time and the refresh hasn't come back, so it's older than the chart looks (once it's nearly a day old it
+  shows the date too). daily and longer ranges say `check dates` when their dates don't fall on the day boundary,
+  which can mean the feed's dates are off. neither note shows while a candle is under the pointer, and 1D has none
 - **Ranges (Ultra):** the tabs on the chart's second header line are `1D 5D 1M 6M 1Y 5Y`. `1D` is today. the others
-  load the first time u click them, for the locked card, and refresh themselves when they get old. a range that
+  load the first time u click them (or press `R` on the chart), for the locked card, and refresh themselves when they get old. a range that
   fails says so and tries again after 30 seconds. `1M` and `6M` are daily bars trimmed to a month or half a year.
-  daily and longer bars keep the exchange's own dates for everyone, so they have no local/UTC switch
+  daily and longer bars keep the exchange's own dates for everyone, so they have no local/UTC switch. The chart opens on the range you used last. The header shows the change over the range
+  on screen (such as `5Y +182 %`) in place of the day's change, except on 1D, and the range's high and low are marked
 - **Volume (Ultra):** where CNBC sends volume, a strip of volume bars sits under the candles. FX, yields and spot
   metals don't have it, so there's no strip for them
 - **Alert levels on the chart (Ultra):** an alert level inside the chart's price range is a dashed line with its
@@ -137,17 +164,61 @@ Double click it. If prompted, simply select Run anyway.
   *at a price...* takes an exact level, like `4,200.50`. u get a tray balloon and, if u set a webhook, a message in
   Discord/Slack/ntfy. it fires once per cooldown and **never on a stale price** (a market closed at a level would
   otherwise ping u forever). *Fire once* clears a level after it fires. Focus Assist eats balloons, so the tray icon
-  gets a marker and its tooltip names the alert, and the *Recent* list keeps the last 10 with what happened to each
+  gets a marker and its tooltip names the alert, and the *Recent* list keeps the last 50 with what happened to each,
+  and *Copy list* copies them
+- **Repeat (Ultra):** *Alerts* → *Repeat* is one choice: *Every cooldown* (the default, as before), *Fire once, then
+  clear*, or *Each crossing*. a crossing alert fires when the price crosses its level, and only fires again after the
+  price has gone back past the level by 0.1 %. if the first fresh price is already past the level, it fires once.
+  a stale or fallback price fires nothing in any of them
+- **Fast move (Ultra):** an alert can watch for a move of 1 % in 5 minutes, 2 % in 15 minutes or 3 % in 60 minutes. it's
+  worked out from the prices the app already holds, and needs fresh prices covering the whole window with no gap longer
+  than three polls. a window it can't cover fires nothing
+- **Alerts at a glance (Ultra):** *Alerts* → *At a glance* lists everything set, with its distance, like
+  `XAU above 4,200.00, 1.2 % away`, or `reached, 2.3 % past`. a level whose symbol isn't on the strip says it cannot
+  fire. *Clear all alerts...* asks first. a card with a level has a small amber dot
+- **Not checked (Ultra):** when no alert on a shown symbol has a fresh price for longer than 5 minutes (or ten polls,
+  if that's longer), the tray tooltip says so, and *Recent* gets a line like `02:10 to 02:31 not checked (no fresh price)`.
+  after a sleep it says `no checks ran, the PC slept`. *Alerts* → *Say when alerts could not be checked* sends one
+  message to the webhook when checking is back, off by default. that message never has a price in it, and it isn't sent
+  while alerts are muted or in quiet hours
+- **Typed levels (Ultra):** in *at a price...* a comma only groups thousands, so `4,200.50` works. `4200,5`, `4,20`
+  and `,500` are refused and the menu says why. a level more than 20 % away from the price asks first, and the question
+  repeats the level and the price, so a slip like `42,005` for 4200.5 gets caught. a level within 20 % is set at once
 - **Mute and quiet hours (Ultra):** *Alerts* → *Mute* for 1 hour, 8 hours or until u turn it back on. *Quiet hours*
   is off or a window of 22:00 to 07:00, 23:00 to 08:00 or 00:00 to 09:00, by ur PC's clock. a muted or quiet alert is still
-  checked and shows up in *Recent*, but it makes no balloon and sends nothing to the webhook
+  checked and shows up in *Recent*, but it makes no balloon and sends nothing to the webhook. when the mute or the quiet
+  hours end, one balloon says how many alerts came in meanwhile, like `3 alerts while muted. See Alerts > Recent.`
+  (nothing if there were none)
+- **Typed settings:** a few settings take text you type, not only the presets.
+  - *Hotkey* → *Type a hotkey...* (both builds): letters, digits, `F1` to `F24`, Space, Home, End, Insert, Delete, PageUp
+    and PageDown, with at least one of Ctrl, Alt or Win.
+  - *Alerts* → *Quiet hours* → *Type hours...* (Ultra): a span such as `22:30-06:45`. it can run past midnight, and equal
+    ends mean off.
+  - *Alerts* → *Mute* → *Until a time...* (Ultra): a 24-hour time, which ends the mute the next time the clock reads it.
+  - an alert's own submenu has *cooldown...* (Ultra): `90s`, `15m` or `2h`, from 30 seconds to 24 hours. a bare number is minutes.
+  - a bad entry is refused with a sentence that says what to type, and nothing is changed
 - **Webhook (Ultra):** *Alerts* → *Paste URL from clipboard* reads the URL u copied, checks it and asks before saving.
   the menu shows only its host. *Send a test alert* checks it works, and *Remove* deletes it. the URL is the password
-  for that channel, so the app never shows or logs all of it
+  for that channel, so the app never shows or logs all of it. a POST that fails with a network error or a 5xx is tried
+  once more after 3 seconds, and the log says `sent on retry` if that works. a 4xx is never retried. quitting waits up
+  to 2 seconds for a POST still on its way
+- **Accessibility:** right click → *Accessibility*. the first two ticks are on both builds, and both start off on Classic.
+  - *Follow the Windows contrast theme*: with a Windows contrast theme on, Ultra draws in the system's colours, and shows
+    direction by shape and sign as well as colour (up candles are hollow, and the sign says which way the price moved).
+    Ultra follows it by default. **Classic has this tick and it starts off**, so Classic looks as it always did until u tick it.
+  - *Follow the Windows animation setting*: with Windows animations off, the panel opens and closes in one step. Ultra
+    follows it by default. **Classic has this tick and it starts off**, so Classic keeps its glide until u tick it.
+  - *Hollow up candles* (Ultra): up candles are outlines.
+  - the up and down colours (Ultra): *Green up, red down* (as before), *Red up, green down*, or *Blue up, orange down*.
+    only the two direction colours change. if the secondary text is too faint for u, the Windows contrast theme is the answer.
+  - *Panel size* (Ultra): 75, 90, 100, 125 or 150 %. it scales the panel's text, cards and chart. the strip keeps its size.
+- **Window name (Ultra):** the name Windows shows in Alt+Tab and on the taskbar thumbnail carries the locked card as a
+  sentence, such as `Gold 4,012.30, up 0.4 percent - MH Ticker Ultra`, with `stale` added when the price is stale. with
+  nothing locked it reads the count of symbols up and down. Classic's name never changes.
 - **Start with Windows:** right click → tick *Start with Windows* and it starts when u sign in. untick it to stop.
   it's a `Run` entry for ur own account (no admin needed), and the menu reads the tick each time it opens
 - **Hotkey:** right click → *Hotkey* → *Off*, one of four presets (`Ctrl+Alt+M`, `Ctrl+Alt+T`, `Ctrl+Shift+F12`,
-  `Ctrl+Alt+Space`), or a custom one from the config. the key opens and closes the panel from anywhere. if another
+  `Ctrl+Alt+Space`), or a custom one from the config. *Type a hotkey...* takes any combination in the config's form, such as `Ctrl+Shift+M`, on both builds. the key opens and closes the panel from anywhere. if another
   app already has the combination, the entry says so
 - **Refresh now:** right click → *Refresh now* fetches every price and chart range at once, instead of waiting for
   the next poll. the backoff after a source that keeps failing still applies
@@ -155,13 +226,25 @@ Double click it. If prompted, simply select Run anyway.
   the text size (small, default, large, larger) and the opacity (100 down to 60 %). changes apply at once
 - **Check for updates:** right click → *Check for updates*. the app asks GitHub once for the latest release and
   tells u whether it's newer. if it is, it offers to open the download page. nothing else from GitHub's answer is
-  used. it never checks by itself, only when u click
+  used. it never checks by itself, only when u click. the request names the app `MH-Ticker` and nothing else about u
 - **Copy all prices:** right click → *Copy all prices* puts the whole board on the clipboard, one symbol per line,
   tab-separated. in the open Ultra panel, Ctrl+C copies the locked card's line, or every price if nothing is locked
+- **Copy diagnostics report:** right click → *Copy diagnostics report* runs the same checks as `--probe` and puts the
+  result on the clipboard as text: the app version, window and display details, the settings path (with ur user name
+  taken out), the webhook as its host only, and the data meter. it's for pasting into a message when something looks
+  wrong. the menu says `checking...` while it runs, and a second click waits for the first one to finish
+- **Data meter:** a greyed line above the version line in the menu shows how much the app has downloaded, like
+  `Data: 3.1 MB this hour, 41 MB since start`. it counts what the app reads after compression is undone, so it's a
+  little more than the network carried. request headers aren't counted
 - **Keys in the open Ultra panel:** arrows move the lock between cards, Enter opens the locked card on CNBC, `C`
   opens the chart, `S` opens the symbol picker, Delete takes the locked card off the strip, and Ctrl+Left and
-  Ctrl+Right move it one place. the card menu has *Move left*, *Move right*, *Move first* and *Remove from strip*
-  too, and a click on a symbol on a docked Ultra strip locks that card and opens the panel on it
+  Ctrl+Right move it one place. `/` opens a prompt that finds a card by its label or name, Home and End lock the first and
+  last card, and Ctrl+Z undoes the last removal, move, sort, pin change or alert clear. the card menu has *Move left*, *Move right*, *Move first* and *Remove from strip*
+  too, and a click on a symbol on a docked Ultra strip locks that card and opens the panel on it.
+  **Chart keys (Ultra, chart open):** Shift+Left and Shift+Right move the crosshair from candle to candle, and it snaps to
+  the candle's close. plain arrows still move the lock. `R` changes the range, `Z` flips the zone, and `A` sets an alert at
+  the crosshair price through the prompt. the menu key opens the card menu, `F10` opens the main menu, and `F1` lists every
+  key. a pointer move takes the crosshair back
 - **Save failures:** if the settings can't be written (a read-only folder, say), the menu shows a greyed line saying
   so. it clears when a later save works
 - **Quit or whatever else:** Right click the strip or the tray icon (or use the cog in the Ultra panel). u get *Expand view*, *Symbols*,
@@ -179,13 +262,21 @@ Double click it. If prompted, simply select Run anyway.
 in the menu takes u there). **Ultra keeps its own `config_ultra.json`** in the same folder, so the two builds
 never overwrite each other. if u edit it by hand, restart the app after. anything the menus change (symbols, poll, theme, font, alerts, strip,
 hotkey, position, chart time zone) takes effect at once, with no restart.
+
+If the settings file is there but won't load (it isn't UTF-8 text, or it isn't valid JSON), the app doesn't overwrite
+it. it renames it beside the new one as `config.bad.json` (`config_ultra.bad.json` for Ultra), or `config.bad-2.json`
+and so on after that, with the bytes unchanged, and loads the defaults. the menu has a greyed line naming the kept file.
+the kept file may still hold ur webhook URL, so check it before u share it.
+
 whats in there:
 - `rows`: the symbols that show, each with a `label`, the cnbc `symbol`, `digits` and an optional `name`
 - `catalog`: the list the Symbols menu shows, same fields. any symbol cnbc's quote pages have works, like
   `AUD=` for aud/usd or `@SI.1` for silver futures. *Symbols* → *Add symbol...* adds one from the menu, after a
   check against CNBC, and an entry can be taken out again with *Remove a symbol I added*
 - `fallback_enabled`: optional fallback consent, `false` by default; use the menu to change it
-- `poll_s`: seconds between price requests
+- `poll_s`: seconds between price requests. the poll governor only ever waits longer than this, never shorter
+- `slow_when_quiet` and `rest_when_locked` (Ultra): the two *Poll every* ticks for the poll governor. leave both out
+  and Ultra has them on and Classic has them off, so Classic polls as before. a `true` or `false` written here wins
 - `stale_after_s` and `delayed_grace_s`: when a price gets dimmed
 - `placement` (`auto`, `taskbar_left`, `taskbar_right`, `floating`, `top_right`, `bottom_right`, `top_left`,
   `bottom_left`) and `monitor` (like `\\.\DISPLAY2`, empty = main screen)
@@ -196,12 +287,19 @@ whats in there:
   and centres - which is what every config written before the panel could be resized does
 - `theme` (Ultra): any name from [THEMES.md](THEMES.md) - `midnight`, `aurora`, `vaporwave`, `pc98`, …
 - `theme_font` (Ultra): a panel face from `theme::FACES`, e.g. `Georgia` or `Terminal`. empty = the theme's own
-- `alerts` (Ultra): `{ label, above, below, day_move, once, cooldown_s, last }` each. `label` is the row label,
+- `alerts` (Ultra): `{ label, above, below, day_move, once, cooldown_s, last, crossing, fast }` each. `label` is the row label,
   `above`/`below` are absolute prices (not %), `day_move` is a percent day change that fires it (or missing),
   `once` clears a level after it fires, `cooldown_s` is floored at 30 s and `last` is the last fire time so a
-  restart doesn't re-ping u
+  restart doesn't re-ping u. `crossing` (missing means off) is the *Each crossing* repeat, and `fast` (missing means 0) is 1, 2 or 3 for
+  the 1 % in 5 min, 2 % in 15 min and 3 % in 60 min fast moves
+- `alert_crossing` and `gap_notice` (Ultra): `alert_crossing` true sets *Each crossing* for every alert (*Fire once*
+  wins if both are set). `gap_notice` true sends the "could not be checked" webhook notice. both are off when missing, which is the default
 - `alert_once`, `alerts_muted`, `alerts_mute_until` (seconds since 1970, UTC) and `quiet_hours` (`[from, to]` in
   minutes of the local day, or missing) (Ultra): what the *Alerts* menu sets for *Fire once*, *Mute* and *Quiet hours*
+- `updown` (Ultra): `red_green` or `blue_orange`. left out means green up and red down, as before.
+- `hollow_up` (Ultra): `true` draws up candles as outlines.
+- `contrast` and `animate`: `true` or `false`. left out means Ultra follows Windows, and Classic has both ticks off.
+- `panel_zoom` (Ultra): 75, 90, 100, 125 or 150. any other value is 100.
 - `webhook` (Ultra): a URL to also POST alerts to. **this is a secret** - the URL is the password for that
   channel, so dont paste it anywhere public. set it from *Alerts* → *Paste URL from clipboard* or here. the app
   never prints it (menus and `--probe` show the host at most)
@@ -211,8 +309,15 @@ whats in there:
   least one of `Ctrl`, `Alt` or `Win`. the menu's presets are the usual choice
 
 `MH_Ticker --probe` does one pass over the prices, the day's bars and (for the first row) each chart range file,
-prints it and exits - handy for checking a new symbol actually works before u add it, and for checking the ranges
-on a machine with a connection
+judges each assumption as PASS, WARN or NOTE, prints it and exits - handy for checking a new symbol actually works
+before u add it, and for checking the ranges on a machine with a connection. a WARN exits with 1, so a script can
+use it. a NOTE never fails the run; it marks a check the answers can't show, like bar times while the market is shut.
+`--probe` reads the settings but never writes them.
+
+`MH_Ticker --probe --dump <folder>` does the same and also saves the raw answers into that folder as files (the
+quotes, the unknown-symbol answer, the day files, the range files and the release answer), for making test fixtures.
+the folder is created if it's missing. it never writes the settings or the webhook. it only works from the command
+line, and it needs both the folder and `--probe`; without them it exits with 2 and says why
 
 ## Building it Yourself
 

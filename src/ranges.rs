@@ -62,6 +62,16 @@ impl Range {
         Range::ALL.into_iter().find(|r| r.label().eq_ignore_ascii_case(s.trim()))
     }
 
+    /// The range a saved `chart_range` names: `1D` when there is none or it names no range.
+    pub fn from_saved(saved: Option<&str>) -> Range {
+        saved.and_then(Range::parse).unwrap_or_default()
+    }
+
+    /// What `chart_range` holds for this range: `None` for `1D` (the default is never written).
+    pub fn to_saved(self) -> Option<String> {
+        (self != Range::D1).then(|| self.label().to_string())
+    }
+
     /// The file under `.../charts/` that serves this range. `M1` and `M6` share `1M.json`, which
     /// carries about a year of daily bars: the range only trims it. `D1` has no file.
     pub fn file(self) -> Option<&'static str> {
@@ -117,6 +127,56 @@ pub struct Key {
     pub file: &'static str,
 }
 
+/// Do the stamps of a daily file sit on a day boundary? A daily bar is stamped at midnight on its
+/// exchange's clock, so each stamp's time of day (UTC) is a whole quarter hour (every zone offset
+/// is), and all of them agree to within the hour a daylight-saving change moves it. `stamps` are UTC
+/// seconds. `true` for an empty list. Tolerance 30 s each way: a stamp five years out has passed
+/// through an `f32` offset, which is 16 s coarse. This is the assumption `--probe` and the pane's
+/// *check dates* note judge; nothing live has verified it.
+pub fn stamps_on_day_boundary(stamps: &[f64]) -> bool {
+    const TOL: f64 = 30.0;
+    let Some(first) = stamps.iter().copied().find(|t| t.is_finite()) else {
+        return stamps.iter().all(|t| t.is_finite());
+    };
+    let tod = |t: f64| t.rem_euclid(DAY_S);
+    stamps.iter().all(|&t| {
+        if !t.is_finite() {
+            return false;
+        }
+        let r = tod(t) % 900.0;
+        let off_grid = r.min(900.0 - r) > TOL;
+        let apart = (tod(t) - tod(first)).abs();
+        let apart = apart.min(DAY_S - apart);
+        !off_grid && apart <= 3_600.0 + TOL
+    })
+}
+
+/// How long past its time to live a series may be before the pane says so: a refresh that is on its
+/// way (a request in flight) is not worth a note, one that has failed is.
+pub const STALE_GRACE_S: f64 = RETRY_AFTER_S;
+
+/// `as of 14:05` when the series on screen was fetched more than its time to live (plus
+/// [`STALE_GRACE_S`]) ago, on the clock `tz_offset_s` east of UTC; `as of Nov 12 14:05` when that is a
+/// day or more back; `None` while it is fresh or when a time is not a number.
+pub fn age_label(now: f64, fetched: f64, ttl_s: f64, tz_offset_s: i32) -> Option<String> {
+    if !(now.is_finite() && fetched.is_finite() && ttl_s.is_finite()) || now - fetched <= ttl_s + STALE_GRACE_S {
+        return None;
+    }
+    let clock = crate::chartview::clock(fetched, tz_offset_s);
+    Some(if now - fetched >= DAY_S * 0.9 {
+        format!("as of {} {clock}", crate::chartview::date_label(fetched, tz_offset_s, crate::chartview::DateStyle::DayMonth))
+    } else {
+        format!("as of {clock}")
+    })
+}
+
+/// What a series says about itself that the reader should know.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Check {
+    /// A daily file whose stamps are not on a day boundary: its candles may be dated a day off.
+    pub dates_off: bool,
+}
+
 /// One fetched file, parsed. Bar times are offsets (`Bar::dt`) from `t0`, and each is the START of
 /// its bar (unlike the 1D path, which stamps bars at their end).
 #[derive(Clone, Debug)]
@@ -136,6 +196,26 @@ impl Series {
     pub fn new(t0: f64, bars: Vec<Bar>, fetched: f64) -> Series {
         let bar_s = median_spacing(&bars);
         Series { t0, bars: bars.into(), bar_s, fetched }
+    }
+
+    /// Flags computed from the bars: nothing is stored. Only a daily or longer series (`bar_s` of 0.95
+    /// day or more) can have its dates off; an intraday one never does.
+    pub fn check(&self) -> Check {
+        if self.bar_s < DAY_S * 0.95 || self.bars.is_empty() {
+            return Check::default();
+        }
+        let stamps: Vec<f64> = self.bars.iter().map(|b| b.t(self.t0)).collect();
+        Check { dates_off: !stamps_on_day_boundary(&stamps) }
+    }
+
+    /// The note for the pane's header, or `""`: `as of 14:05`, `check dates`, both joined by `" \u{b7} "`.
+    pub fn note(&self, now: f64, ttl_s: f64, tz_offset_s: i32) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        parts.extend(age_label(now, self.fetched, ttl_s, tz_offset_s));
+        if self.check().dates_off {
+            parts.push("check dates".to_string());
+        }
+        parts.join(" \u{b7} ")
     }
 
     /// The bars whose start is at or after `now - span_s`, as a slice of `bars` (the tail).
@@ -202,8 +282,22 @@ pub struct Done {
     pub result: Result<Series, String>,
 }
 
-/// At most this many series are kept; the least recently used goes first.
-pub const MAX_SERIES: usize = 12;
+/// At most this many series are kept; the least recently used goes first. 48 is two ranges for each of
+/// the 24 symbols the strip can hold, so coming back to a symbol and a range already seen is instant.
+/// Only the series on screen is ever asked for (`Book::want` is called for that key alone), so more
+/// room buys no traffic.
+pub const MAX_SERIES: usize = 48;
+/// What a "full" series is sized at, in bars: about 1,100. A daily file is 260 bars to the year and an
+/// intraday one a few hundred; the parser's own ceiling (`SERIES_BARS`) is a guard against a payload
+/// that is not a chart, not a size to plan for.
+#[cfg_attr(not(test), allow(dead_code))] // the size arithmetic's input; only tests read it
+pub const FULL_SERIES_BARS: usize = 1_100;
+/// A bar in memory: six `f32`.
+pub const BAR_BYTES: usize = std::mem::size_of::<Bar>();
+/// The cache's other ceiling, in bar bytes: 2 MB. [`MAX_SERIES`] full series come to 1.27 MB, so this
+/// only bites when files are far bigger than planned for (a 4,000-bar series is 96 KB); then the least
+/// recently used series go until the rest fit, and the newest always stays.
+pub const MAX_CACHE_BYTES: usize = 2_000_000;
 /// After a failure, the same key is not asked for again for this long.
 pub const RETRY_AFTER_S: f64 = 30.0;
 /// A request that has been in flight this long is presumed lost (the worker's own timeout is 45 s),
@@ -283,7 +377,7 @@ impl Book {
     /// The worker's answer. Accepted (and `true`) only when `generation` is the one in flight for
     /// `key`. Then: `Ok` is cached (an empty series too, so the pane can say "no data" and the time
     /// to live stops the file being asked for in a loop) and clears the key's failure; `Err` records
-    /// the failure at `now`. The 13th cached series evicts the least recently used one. Anything else
+    /// the failure at `now`. The 49th cached series evicts the least recently used one. Anything else
     /// is dropped and `false`: a stale generation, a forgotten key, a repeat delivery.
     pub fn arrived(&mut self, generation: u64, key: &Key, result: Result<Series, String>, now: f64) -> bool {
         let Some(i) = self.flying.iter().position(|f| f.generation == generation && &f.key == key) else {
@@ -301,6 +395,17 @@ impl Book {
                 }
                 self.tick.set(self.tick.get() + 1);
                 self.cache.push(Cached { key: key.clone(), series, used: Cell::new(self.tick.get()) });
+                // Over the byte ceiling: drop the least recently used, never the series just stored.
+                while self.cache.len() > 1 && self.bytes() > MAX_CACHE_BYTES {
+                    let newest = self.cache.len() - 1;
+                    let lru = self.cache[..newest].iter().enumerate().min_by_key(|(_, c)| c.used.get()).map(|(i, _)| i);
+                    match lru {
+                        Some(i) => {
+                            self.cache.remove(i);
+                        }
+                        None => break,
+                    }
+                }
             }
             Err(_) => {
                 self.failed.retain(|(k, _)| k != key);
@@ -346,6 +451,11 @@ impl Book {
     /// day-chart loops but left a long range saying "failed" for up to 30 s.
     pub fn retry_now(&mut self) {
         self.failed.clear();
+    }
+
+    /// The bars held, in bytes.
+    fn bytes(&self) -> usize {
+        self.cache.iter().map(|c| c.series.bars.len() * BAR_BYTES).sum()
     }
 
     /// How many series are cached.
@@ -496,20 +606,95 @@ mod tests {
     }
 
     #[test]
-    fn the_thirteenth_series_evicts_the_least_recently_used() {
+    fn the_saved_range_round_trips_and_an_unknown_one_reads_as_one_day() {
+        for r in Range::ALL {
+            assert_eq!(Range::from_saved(r.to_saved().as_deref()), r, "{}", r.label());
+        }
+        assert_eq!(Range::D1.to_saved(), None, "the default is never written");
+        assert_eq!(Range::from_saved(None), Range::D1);
+        for bad in ["", "2Y", "5y!", "week", "1D1", "\u{0}"] {
+            assert_eq!(Range::from_saved(Some(bad)), Range::D1, "{bad:?}");
+        }
+        assert_eq!(Range::from_saved(Some(" 5y ")), Range::Y5, "case and spaces are forgiven, as parse does");
+    }
+
+    #[test]
+    fn the_series_past_the_cap_evicts_the_least_recently_used() {
         let mut b = Book::new();
-        let keys: Vec<Key> = (0..13).map(|i| key(&format!("S{i}"), "1Y.json")).collect();
-        for (i, k) in keys.iter().take(12).enumerate() {
+        let keys: Vec<Key> = (0..=MAX_SERIES).map(|i| key(&format!("S{i}"), "1Y.json")).collect();
+        for (i, k) in keys.iter().take(MAX_SERIES).enumerate() {
             let r = b.want(k, i as f64).unwrap();
             assert!(b.arrived(r.generation, k, Ok(series(i as f64, 2)), i as f64));
         }
-        assert_eq!(b.len(), 12);
+        assert_eq!(b.len(), MAX_SERIES);
         b.get(&keys[0]); // S0 is now the most recently used; S1 the least
-        let r = b.want(&keys[12], 20.0).unwrap();
-        assert!(b.arrived(r.generation, &keys[12], Ok(series(20.0, 2)), 20.0));
-        assert_eq!(b.len(), 12);
+        let r = b.want(&keys[MAX_SERIES], 100.0).unwrap();
+        assert!(b.arrived(r.generation, &keys[MAX_SERIES], Ok(series(100.0, 2)), 100.0));
+        assert_eq!(b.len(), MAX_SERIES);
         assert!(b.get(&keys[1]).is_none(), "S1 went");
-        assert!(b.get(&keys[0]).is_some() && b.get(&keys[12]).is_some());
+        assert!(b.get(&keys[0]).is_some() && b.get(&keys[MAX_SERIES]).is_some());
+    }
+
+    #[test]
+    fn the_cache_holds_forty_eight_series_and_a_fresh_book_still_asks_once_per_key() {
+        assert_eq!(MAX_SERIES, 48, "L3: two ranges for each of 24 symbols");
+        let mut b = Book::new();
+        for i in 0..MAX_SERIES {
+            let k = key(&format!("S{i}"), "5Y.json");
+            let r = b.want(&k, i as f64).unwrap();
+            assert!(b.arrived(r.generation, &k, Ok(series(i as f64, 3)), i as f64));
+        }
+        assert_eq!(b.len(), 48, "none evicted before the 49th");
+    }
+
+    #[test]
+    fn a_series_off_screen_is_never_due() {
+        // 48 series, all long past their time to live. Nothing the book does on its own asks for one:
+        // reading, status checks and `forget` leave nothing in flight, and only `want(key)` (called for
+        // the series on screen) puts that one key in flight.
+        let mut b = Book::new();
+        let keys: Vec<Key> = (0..MAX_SERIES).map(|i| key(&format!("S{i}"), "5D.json")).collect();
+        for k in &keys {
+            let r = b.want(k, 0.0).unwrap();
+            assert!(b.arrived(r.generation, k, Ok(series(1.0, 2)), 1.0));
+        }
+        let shown: Vec<&str> = keys.iter().map(|k| k.symbol.as_str()).collect();
+        for k in &keys {
+            assert_eq!(b.status(k), Status::Ready);
+            assert!(b.get(k).is_some());
+        }
+        b.forget(&shown);
+        b.retry_now();
+        assert!(b.flying.is_empty(), "no refresh is started by looking");
+        let on_screen = &keys[7];
+        assert!(b.want(on_screen, 1_000_000.0).is_some(), "the one on screen refreshes");
+        assert_eq!(b.flying.len(), 1, "and no other");
+    }
+
+    #[test]
+    fn forty_eight_full_series_are_under_one_point_three_megabytes() {
+        assert_eq!(BAR_BYTES, 24, "six f32");
+        let bytes = MAX_SERIES * FULL_SERIES_BARS * BAR_BYTES;
+        assert_eq!(bytes, 1_267_200);
+        assert!(bytes < 1_300_000);
+        assert!(bytes < MAX_CACHE_BYTES, "the byte ceiling is above the planned load");
+    }
+
+    #[test]
+    fn bigger_files_than_planned_for_cost_series_not_memory() {
+        // 4,000-bar series (the parser's ceiling) are 96 KB each: the byte ceiling keeps about 20.
+        let mut b = Book::new();
+        let mut last = None;
+        for i in 0..MAX_SERIES {
+            let k = key(&format!("S{i}"), "5Y.json");
+            let r = b.want(&k, i as f64).unwrap();
+            assert!(b.arrived(r.generation, &k, Ok(series(i as f64, 4_000)), i as f64));
+            assert!(b.bytes() <= MAX_CACHE_BYTES);
+            last = Some(k);
+        }
+        assert!(b.len() < MAX_SERIES && b.len() >= 20, "{}", b.len());
+        assert!(b.get(&last.unwrap()).is_some(), "the newest always stays");
+        assert!(b.get(&key("S0", "5Y.json")).is_none(), "the oldest went first");
     }
 
     #[test]
@@ -664,5 +849,54 @@ mod tests {
         // The only bar is exactly 10 s old: inside for a 10 s span, outside for 9 s.
         assert_eq!(s.window(60.0, 10.0).len(), 1);
         assert!(s.window(60.0, 9.0).is_empty());
+    }
+
+    /// A daily file of `n` bars stamped at `tod` seconds after UTC midnight, from 2026-01-05.
+    fn daily_at(tod: f64, n: usize) -> Series {
+        let t0 = crate::chartview::days_from_civil(2026, 1, 5) as f64 * DAY_S + tod;
+        let bars = (0..n).map(|i| Bar { dt: (i as f64 * DAY_S) as f32, o: 1.0, h: 1.0, l: 1.0, c: 1.0, v: 0.0 }).collect();
+        Series::new(t0, bars, 1_000_000.0)
+    }
+
+    #[test]
+    fn daily_stamps_on_a_boundary_pass_and_off_it_are_flagged() {
+        // New York midnight in winter is 05:00 UTC; Tokyo midnight is 15:00 UTC the day before.
+        for tod in [0.0, 5.0 * 3_600.0, 15.0 * 3_600.0, 19_800.0] {
+            assert!(!daily_at(tod, 30).check().dates_off, "tod {tod}");
+        }
+        // 13:07 is no zone's midnight.
+        assert!(daily_at(13.0 * 3_600.0 + 7.0 * 60.0, 30).check().dates_off);
+        // Stamps that agree with each other only within an hour of a clock change pass; a two-hour
+        // spread does not.
+        assert!(stamps_on_day_boundary(&[5.0 * 3_600.0, 4.0 * 3_600.0 + DAY_S]));
+        assert!(!stamps_on_day_boundary(&[5.0 * 3_600.0, 7.0 * 3_600.0 + DAY_S]));
+        assert!(!stamps_on_day_boundary(&[f64::NAN]));
+        // An intraday series is never flagged, however its stamps fall.
+        let intraday = Series::new(1_000.0, (0..10).map(|i| Bar { dt: i as f32 * 300.0, o: 1.0, h: 1.0, l: 1.0, c: 1.0, v: 0.0 }).collect(), 0.0);
+        assert_eq!(intraday.check(), Check::default());
+        assert_eq!(Series::new(0.0, vec![], 0.0).check(), Check::default());
+    }
+
+    #[test]
+    fn the_age_label_appears_only_past_the_time_to_live() {
+        let fetched = 14.0 * 3_600.0 + 5.0 * 60.0;
+        let ttl = 600.0;
+        assert_eq!(age_label(fetched + 100.0, fetched, ttl, 0), None, "fresh");
+        assert_eq!(age_label(fetched + ttl + STALE_GRACE_S, fetched, ttl, 0), None, "a refresh on its way");
+        assert_eq!(age_label(fetched + ttl + STALE_GRACE_S + 1.0, fetched, ttl, 0).as_deref(), Some("as of 14:05"));
+        assert_eq!(age_label(fetched + 3_600.0, fetched, ttl, 3_600).as_deref(), Some("as of 15:05"), "on the viewer's clock");
+        // A day or more back it carries the date.
+        let old = age_label(fetched + 2.0 * DAY_S, fetched, ttl, 0).unwrap();
+        assert!(old.starts_with("as of Jan ") && old.ends_with(" 14:05"), "{old}");
+        assert_eq!(age_label(f64::NAN, fetched, ttl, 0), None);
+    }
+
+    #[test]
+    fn the_note_joins_what_is_suspect() {
+        let s = daily_at(13.0 * 3_600.0 + 420.0, 30);
+        assert_eq!(s.note(s.fetched + 10.0, 3_600.0, 0), "check dates");
+        let both = s.note(s.fetched + 9_000.0, 3_600.0, 0);
+        assert!(both.starts_with("as of ") && both.ends_with(" \u{b7} check dates"), "{both}");
+        assert_eq!(daily_at(0.0, 30).note(1_000_001.0, 3_600.0, 0), "");
     }
 }

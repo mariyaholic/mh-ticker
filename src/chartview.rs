@@ -31,6 +31,63 @@ impl Rect {
     }
 }
 
+/// The clock a series is read on: seconds east of UTC, which can change once inside the series (a
+/// daylight-saving change in the middle of a 5D window). `before` holds up to the instant
+/// `change_at` (UTC seconds), `after` from it on. [`Zone::fixed`] never changes. Every fold, tick
+/// and legend asks `at(t)` for the instant it is about, so bars on both sides of a change are each
+/// read on their own local clock instead of one offset applied to all.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Zone {
+    pub before: i32,
+    pub change_at: f64,
+    pub after: i32,
+}
+
+impl Zone {
+    pub const fn fixed(offset_s: i32) -> Zone {
+        Zone { before: offset_s, change_at: f64::INFINITY, after: offset_s }
+    }
+
+    /// Seconds east of UTC at the UTC instant `t`.
+    pub fn at(&self, t: f64) -> i32 {
+        if t >= self.change_at { self.after } else { self.before }
+    }
+
+    /// The offset the series started on (the one a daily series and the header use).
+    pub fn first(&self) -> i32 {
+        self.before
+    }
+
+    /// The zone over `[first, last]` (UTC seconds) given a function that says the local offset at any
+    /// instant: fixed when the two ends agree, otherwise the instant of the change found to the
+    /// minute by bisection (at most 20 calls, and only when the ends differ). A zone that changes
+    /// more than once inside the window is read as one change.
+    pub fn spanning(first: f64, last: f64, offset_at: &dyn Fn(f64) -> i32) -> Zone {
+        let (a, b) = (offset_at(first), offset_at(last));
+        if a == b || !(first.is_finite() && last.is_finite() && last > first) {
+            return Zone::fixed(a);
+        }
+        let (mut lo, mut hi) = (first, last);
+        for _ in 0..24 {
+            if hi - lo <= 60.0 {
+                break;
+            }
+            let mid = ((lo + hi) / 2.0 / 60.0).floor() * 60.0;
+            if mid <= lo || mid >= hi {
+                break;
+            }
+            if offset_at(mid) == a { lo = mid } else { hi = mid }
+        }
+        Zone { before: a, change_at: hi, after: b }
+    }
+}
+
+impl From<i32> for Zone {
+    fn from(offset_s: i32) -> Zone {
+        Zone::fixed(offset_s)
+    }
+}
+
 /// Where the pointer is on the pane: the candle (index into the bars as drawn, after folding) and a
 /// y in pane pixels already quantised by [`Layout::pointer_at`], so equality means "nothing to repaint".
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -69,6 +126,10 @@ pub struct Layout {
     /// `right` are the plot's; time ticks hang under its `bottom`, not under `plot.bottom`.
     /// `plot` is then the PRICE plot (shortened), so `y_of` and `price_at` mean what they always did.
     pub vol: Option<Rect>,
+    /// The candle and price the painter drew the crosshair at this frame (`None` with no crosshair).
+    /// Written by the painter after it has resolved a keyed crosshair onto its candle's close, so
+    /// *Alert at the crosshair* asks for the price on screen, not for one the key handler guessed.
+    pub cross: Option<(usize, f64)>,
 }
 
 impl Layout {
@@ -88,11 +149,18 @@ impl Layout {
     }
 
     /// The pixel row of `price`: `plot.bottom` at `lo`, `plot.top` at `hi`, rounded to a whole pixel.
-    /// Not clamped: a price outside the window lands outside the plot, and the painter decides.
+    /// Not clamped: a finite price outside the window lands outside the plot, and the painter
+    /// decides. A price that is not a number sits mid-plot (it has no place, and the bottom edge is
+    /// outside the plot), and an infinite one is held a bounded distance away so the sum cannot
+    /// overflow.
     pub fn y_of(&self, price: f64) -> i32 {
         let span_px = (self.plot.bottom - self.plot.top) as f64;
+        if price.is_nan() {
+            return self.plot.top + (self.plot.bottom - self.plot.top) / 2;
+        }
         let span = (self.hi - self.lo).max(f64::EPSILON);
-        self.plot.bottom - (((price - self.lo) / span) * span_px).round() as i32
+        let up = (((price - self.lo) / span) * span_px).round().clamp(-16_777_216.0, 16_777_216.0);
+        self.plot.bottom - up as i32
     }
 
     /// The price at pixel row `y`. `None` unless `plot.top <= y <= plot.bottom`.
@@ -119,6 +187,17 @@ impl Layout {
     /// The pointer for client position `(x, y)`, or `None` when it is not over a candle's slot inside
     /// the plot. `y` is snapped down to a multiple of `quant` pixels counted from `plot.top`
     /// (`quant < 1` is treated as 1), so a mouse move inside one band does not change the `Pointer`.
+    /// The crosshair for candle `bar` set by a key: the pointer a mouse over that candle's slot, at the
+    /// height of `price` (clamped into the plot), would give, so a keyed crosshair and a pointer one name
+    /// the same layout index. `None` for a candle that is not drawn.
+    pub fn pointer_for_bar(&self, bar: usize, price: f64, quant: i32) -> Option<Pointer> {
+        if bar >= self.bars {
+            return None;
+        }
+        let y = self.y_of(price).clamp(self.plot.top, (self.plot.bottom - 1).max(self.plot.top));
+        self.pointer_at(self.x_of(bar), y, quant)
+    }
+
     pub fn pointer_at(&self, x: i32, y: i32, quant: i32) -> Option<Pointer> {
         let bar = self.index_at(x)?;
         if !self.plot.contains(x, y) {
@@ -181,6 +260,76 @@ pub fn level_marks(lay: &Layout, levels: &[f64]) -> LevelMarks {
     out
 }
 
+/// The change over the bars on screen, in percent: the last close against the first open,
+/// `(c_last - o_first) / o_first * 100`. `None` for no bars, and, by P2's rule (`bar_change_pct`), for a
+/// first open that is zero or not finite, or a last close that is not finite: a number built on those
+/// would be nonsense, so the header shows none rather than one.
+pub fn range_change(bars: &[Bar]) -> Option<f64> {
+    let (first, last) = (bars.first()?, bars.last()?);
+    bar_change_pct(&Bar { c: last.c, ..*first })
+}
+
+/// The header's range change: `5Y +182 %`, `1M -3.4 %`, `6M +0.52 %`. The label, a space, the signed
+/// percent with a space before the sign of the percent (two decimals under 10 %, one under 100 %, none
+/// from 100 %), so a huge move stays short. A zero change is `+0.00 %`.
+pub fn range_change_text(label: &str, pct: f64) -> String {
+    // The thresholds sit where the rounded text changes length (9.995 prints as 10.00).
+    let decimals = if pct.abs() < 9.995 { 2 } else if pct.abs() < 99.95 { 1 } else { 0 };
+    format!("{label} {pct:+.decimals$} %")
+}
+
+/// The highest high and the lowest low among the bars on screen, as `((index, price), (index, price))`
+/// (the first bar that holds each). Bars with a non-finite high or low are skipped. `None` for no usable
+/// bar, and when the high does not exceed the low (one flat bar, or all flat): there is nothing to mark.
+pub fn extremes(bars: &[Bar]) -> Option<((usize, f64), (usize, f64))> {
+    let mut hi: Option<(usize, f64)> = None;
+    let mut lo: Option<(usize, f64)> = None;
+    for (i, b) in bars.iter().enumerate() {
+        let (h, l) = (b.h as f64, b.l as f64);
+        if h.is_finite() && hi.is_none_or(|(_, v)| h > v) {
+            hi = Some((i, h));
+        }
+        if l.is_finite() && lo.is_none_or(|(_, v)| l < v) {
+            lo = Some((i, l));
+        }
+    }
+    let (hi, lo) = (hi?, lo?);
+    (hi.1 > lo.1).then_some((hi, lo))
+}
+
+/// Do two rectangles share any pixel?
+pub fn overlaps(a: Rect, b: Rect) -> bool {
+    a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom
+}
+
+/// Where a `size` label for the mark at `anchor` goes: inside `bounds`, clear of every rectangle in
+/// `avoid` (alert level lines and their prices, the last-price line), `gap` pixels from the anchor.
+/// Tried in order: above (for a high) or below (for a low) the anchor, centred, then pushed left and
+/// right; then beside it, left and right; then on the other side. `None` when nowhere fits, and then
+/// the painter draws the marker without its text. Never returns a rectangle that leaves `bounds` or
+/// touches `avoid`.
+pub fn place_label(anchor: (i32, i32), size: (i32, i32), above: bool, bounds: Rect, avoid: &[Rect], gap: i32) -> Option<Rect> {
+    let (x, y) = anchor;
+    let (w, h) = size;
+    let up = y - gap - h;
+    let down = y + gap;
+    let (near, far) = if above { (up, down) } else { (down, up) };
+    let centred = x - w / 2;
+    let spots = [
+        (centred, near),
+        (x - w, near),
+        (x, near),
+        (x - w - gap, y - h / 2),
+        (x + gap, y - h / 2),
+        (centred, far),
+        (x - w, far),
+        (x, far),
+    ];
+    spots.iter().map(|&(l, t)| Rect::new(l, t, l + w, t + h)).find(|r| {
+        r.left >= bounds.left && r.right <= bounds.right && r.top >= bounds.top && r.bottom <= bounds.bottom && !avoid.iter().any(|a| overlaps(*r, *a))
+    })
+}
+
 /// Indices of the drawn candles that start a new session: `i >= 1` where
 /// `bars[i].dt - bars[i - 1].dt > 1.5 * bucket_s`. Bars are in time order; `bars` are the folded
 /// candles, so a candle's `dt` is already on a bucket boundary. Empty for fewer than two bars or a
@@ -234,9 +383,10 @@ pub enum Stamp {
 }
 
 /// [`readout`] with the moment named by `stamp` instead of always the clock.
-pub fn readout_with(b: &Bar, t0: f64, tz_offset_s: i32, fmt: &dyn Fn(f64) -> String, compact: bool, stamp: Stamp) -> String {
+pub fn readout_with(b: &Bar, t0: f64, tz: impl Into<Zone>, fmt: &dyn Fn(f64) -> String, compact: bool, stamp: Stamp) -> String {
     let change = bar_change_pct(b).map(|p| format!("  {p:+.2}%")).unwrap_or_default();
     let t = b.t(t0);
+    let tz_offset_s = tz.into().at(t);
     let time = match stamp {
         Stamp::Clock => clock(t, tz_offset_s),
         Stamp::DayClock => format!("{} {}", date_label(t, tz_offset_s, DateStyle::DayMonth), clock(t, tz_offset_s)),
@@ -275,6 +425,19 @@ pub(crate) fn candle_metrics(plot_w: i32, n: i32, dpi: u32) -> (i32, i32, i32) {
 }
 
 /// Round gridline values inside `[lo, hi]`, about `want` of them, and how many decimals they need.
+/// The newest of `bars` that fit the plot, one slot each at the metrics `candle_metrics` gives for
+/// that many: when even one-pixel slots are fewer than the candles (a narrow pane over a long
+/// series), the oldest are left off, so no candle is drawn past the plot's right edge.
+pub(crate) fn newest_that_fit(bars: Vec<Bar>, plot_w: i32, dpi: u32) -> Vec<Bar> {
+    let (step, _, _) = candle_metrics(plot_w, bars.len() as i32, dpi);
+    let room = (plot_w / step.max(1)).max(1) as usize;
+    if bars.len() <= room {
+        return bars;
+    }
+    let skip = bars.len() - room;
+    bars.into_iter().skip(skip).collect()
+}
+
 /// The step is 1, 2, 2.5 or 5 times a power of ten — the spacings a reader can subtract in their
 /// head — so a day that runs 6,655 to 6,733 is gridded at 6,680 / 6,700 / 6,720, not at the
 /// arbitrary quarters of its own range.
@@ -328,8 +491,8 @@ const BIAS_S: f64 = 30.0;
 /// bars and no coarser than an hour: the 1D pane. Buckets are cut on the clock `tz_offset_s` seconds
 /// east of UTC.
 #[cfg(test)]
-pub(crate) fn fitted(bars: &[Bar], plot_w: i32, t0: f64, tz_offset_s: i32) -> (Vec<Bar>, f64) {
-    fitted_to(bars, plot_w, t0, tz_offset_s, 60.0, 3_600.0)
+pub(crate) fn fitted(bars: &[Bar], plot_w: i32, t0: f64, tz: impl Into<Zone>) -> (Vec<Bar>, f64) {
+    fitted_to(bars, plot_w, t0, tz, 60.0, 3_600.0)
 }
 
 /// The bucket ladder: 1, 5, 15, 30, 60 minutes, 4 hours, a day, a week, a calendar month.
@@ -340,13 +503,14 @@ pub(crate) const LADDER: [f64; 9] = [60.0, 300.0, 900.0, 1_800.0, 3_600.0, 14_40
 /// data (a rung within 5 % under `bar_s` counts as equal), so a daily series starts at a day. The
 /// finest rung that fits wins; if none does, `coarsest` is used rather than a comb. If `coarsest` is
 /// finer than the starting rung the starting rung is used.
-pub(crate) fn fitted_to(bars: &[Bar], plot_w: i32, t0: f64, tz_offset_s: i32, bar_s: f64, coarsest: f64) -> (Vec<Bar>, f64) {
+pub(crate) fn fitted_to(bars: &[Bar], plot_w: i32, t0: f64, tz: impl Into<Zone>, bar_s: f64, coarsest: f64) -> (Vec<Bar>, f64) {
+    let zone = tz.into();
     let from = LADDER.iter().position(|r| *r >= bar_s * 0.95).unwrap_or(LADDER.len() - 1);
-    let (mut best, mut bucket) = (fold(bars, LADDER[from], t0, tz_offset_s), LADDER[from]);
+    let (mut best, mut bucket) = (fold(bars, LADDER[from], t0, zone), LADDER[from]);
     // The finest bucket that fits wins; if none does, the coarsest is still better than a comb.
     if best.len() as i32 * MIN_BAR > plot_w {
         for b in LADDER[from + 1..].iter().take_while(|b| **b <= coarsest) {
-            best = fold(bars, *b, t0, tz_offset_s);
+            best = fold(bars, *b, t0, zone);
             bucket = *b;
             if best.len() as i32 * MIN_BAR <= plot_w {
                 break;
@@ -392,11 +556,14 @@ fn bucket_start(key: i64, bucket_s: f64) -> f64 {
 /// five-minute candles start at 13:30, which is what the time axis labels say, and a break in the
 /// session stays a gap instead of being papered over. A day is cut on local midnight, a week
 /// ([`WEEK_S`]) on local Monday 00:00, a month ([`MONTH_S`]) on the 1st.
-pub(crate) fn fold(bars: &[Bar], bucket_s: f64, t0: f64, tz_offset_s: i32) -> Vec<Bar> {
+pub(crate) fn fold(bars: &[Bar], bucket_s: f64, t0: f64, tz: impl Into<Zone>) -> Vec<Bar> {
+    let zone = tz.into();
     let mut out: Vec<Bar> = Vec::new();
     let mut key: Option<i64> = None;
-    let tz = tz_offset_s as f64;
     for b in bars {
+        // Each bar is read on the clock in force at its own instant; a bucket starts on the clock of
+        // the bar that opened it.
+        let tz = zone.at(t0 + b.dt as f64) as f64;
         let k = bucket_key(t0 + b.dt as f64 + tz, bucket_s);
         if key == Some(k) {
             if let Some(last) = out.last_mut() {
@@ -422,6 +589,12 @@ pub(crate) fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     let doy = (153 * mp + 2) / 5 + d as i64 - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     era * 146_097 + doe - 719_468
+}
+
+/// Seconds since 1970-01-01 00:00 of the civil time `y-m-d h:mi:s`, read as if it were UTC: the
+/// difference of a local and a UTC reading of one instant is that instant's offset.
+pub(crate) fn civil_secs(y: i64, m: u32, d: u32, h: u32, mi: u32, s: u32) -> i64 {
+    days_from_civil(y, m, d) * 86_400 + h as i64 * 3_600 + mi as i64 * 60 + s as i64
 }
 
 /// The civil date `(year, month 1..=12, day 1..=31)` of `days` since 1970-01-01.
@@ -485,12 +658,18 @@ pub fn daily(bar_s: f64) -> bool {
 /// viewer's clock instead, every candle would be dated a day early for anyone west of the exchange
 /// (a Tokyo session seen from Manila, a New York one from Los Angeles) and weeks would be cut on the
 /// wrong day. The midnight stamp is an assumption, unverified live: `--probe` prints the stamps.
+#[cfg(test)]
 pub fn date_zone(bar_s: f64, tz_offset_s: i32) -> i32 {
     if daily(bar_s) {
         43_200
     } else {
         tz_offset_s
     }
+}
+
+/// [`date_zone`] for a viewer clock that may change inside the series.
+pub fn date_zone_of(bar_s: f64, viewer: Zone) -> Zone {
+    if daily(bar_s) { Zone::fixed(43_200) } else { viewer }
 }
 
 /// Axis ticks for candles of a day or more: `(candle index, label)` at each candle that starts a new
@@ -736,7 +915,92 @@ mod tests {
             zone_btn: Rect::new(60, 12, 100, 28),
             tabs: [Rect::default(); 6],
             vol: None,
+            cross: None,
         }
+    }
+
+    /// Three days of half-hour bars from 2026-03-28 00:00 UTC (a Saturday), on a made-up zone that is
+    /// UTC+1 until 2026-03-29 02:00 UTC and UTC+2 after (a spring-forward in the middle of the series).
+    fn across_a_change() -> (Vec<Bar>, f64, Zone) {
+        let t0 = days_from_civil(2026, 3, 28) as f64 * DAY_S;
+        let change = t0 + DAY_S + 2.0 * 3_600.0;
+        let bars = (0..144).map(|i| bar(i as f32 * 1_800.0, 1.0, 1.0, 1.0, 1.0)).collect();
+        (bars, t0, Zone { before: 3_600, change_at: change, after: 7_200 })
+    }
+
+    #[test]
+    fn a_fold_across_a_clock_change_cuts_each_day_on_its_own_local_midnight() {
+        let (bars, t0, zone) = across_a_change();
+        let days = fold(&bars, DAY_S, t0, zone);
+        // The window holds the local 28th, 29th, 30th and the first hour of the 31st; the 30th
+        // starts at 22:00 UTC on the 29th (at +2), an hour earlier than a +1 midnight would.
+        let starts: Vec<f64> = days.iter().map(|d| d.t(t0)).collect();
+        assert_eq!(days.len(), 4, "{starts:?}");
+        for d in &days {
+            let t = d.t(t0);
+            let local = t + zone.at(t) as f64;
+            assert_eq!(local.rem_euclid(DAY_S), 0.0, "a candle starts on its own local midnight, got {}", clock(t, zone.at(t)));
+        }
+        // The old way, one offset for the whole series, cuts the second midnight an hour late.
+        let one = fold(&bars, DAY_S, t0, zone.before);
+        let bad = one.iter().any(|d| {
+            let t = d.t(t0);
+            (t + zone.at(t) as f64).rem_euclid(DAY_S) != 0.0
+        });
+        assert!(bad, "one offset puts a post-change candle off its local midnight");
+        // The bars on each side keep their own local hour in the legend.
+        let hour = |i: usize| readout_with(&bars[i], t0, zone, &|v| format!("{v}"), true, Stamp::Clock);
+        let (i_before, i_after) = (2 * 24 - 4, 2 * 24 + 6); // 22:00 UTC on the 28th, 03:00 UTC on the 29th
+        assert!(hour(i_before).starts_with("23:00"), "{}", hour(i_before));
+        assert!(hour(i_after).starts_with("05:00"), "{}", hour(i_after));
+    }
+
+    #[test]
+    fn zone_spanning_finds_the_change_to_the_minute() {
+        let (_, _, zone) = across_a_change();
+        let rule = |t: f64| zone.at(t);
+        let found = Zone::spanning(zone.change_at - 3.0 * DAY_S, zone.change_at + 3.0 * DAY_S, &rule);
+        assert_eq!((found.before, found.after), (3_600, 7_200));
+        assert!((found.change_at - zone.change_at).abs() <= 60.0, "{} vs {}", found.change_at, zone.change_at);
+        // No change inside the window: fixed, and the offset is asked for twice only.
+        let calls = std::cell::Cell::new(0);
+        let flat = Zone::spanning(0.0, DAY_S, &|_| { calls.set(calls.get() + 1); 3_600 });
+        assert_eq!((flat, calls.get()), (Zone::fixed(3_600), 2));
+        assert_eq!(Zone::spanning(5.0, 5.0, &|_| 0), Zone::fixed(0));
+        assert_eq!(civil_secs(1970, 1, 2, 1, 1, 1), 86_400 + 3_661);
+    }
+
+    #[test]
+    fn y_of_a_non_finite_price_stays_inside_the_plot() {
+        let l = lay();
+        for p in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let y = l.y_of(p);
+            assert!(y >= l.plot.top - (1 << 24) && y <= l.plot.bottom + (1 << 24), "{p}: {y}");
+        }
+        let y = l.y_of(f64::NAN);
+        assert!(l.plot.contains(l.plot.left, y), "NaN lands at {y}, plot {:?}", l.plot);
+        // Finite prices keep their old, unclamped meaning.
+        assert_eq!(l.y_of(100.0), l.plot.bottom);
+        assert_eq!(l.y_of(200.0), l.plot.top);
+        assert!(l.y_of(250.0) < l.plot.top);
+    }
+
+    #[test]
+    fn no_candle_lies_past_the_plots_right_edge() {
+        // 5D at one-hour candles (120 of them) in the narrowest pane the painter draws (a 40 px plot).
+        let hours: Vec<Bar> = (0..120).map(|i| bar((i * 3_600) as f32, 1.0, 2.0, 0.5, 1.5)).collect();
+        for dpi in [96, 120, 144, 192] {
+            for plot_w in [40, 61, 100, 250] {
+                let kept = newest_that_fit(hours.clone(), plot_w, dpi);
+                let l = layout_for(plot_w, kept.len(), dpi);
+                assert!(!kept.is_empty());
+                let last = l.x_of(kept.len() - 1);
+                assert!(last + l.step / 2 < l.plot.right + 1 && last < l.plot.right, "dpi {dpi} w {plot_w}: last wick {last}, right {}", l.plot.right);
+                assert_eq!(kept.last().map(|b| b.dt), hours.last().map(|b| b.dt), "the newest stays");
+            }
+        }
+        // Bars that already fit are left alone.
+        assert_eq!(newest_that_fit(hours[..5].to_vec(), 400, 96).len(), 5);
     }
 
     #[test]
@@ -1087,6 +1351,57 @@ mod tests {
             zone_btn: Rect::default(),
             tabs: [Rect::default(); 6],
             vol: None,
+            cross: None,
+        }
+    }
+
+    /// A crosshair set by key and one set by the pointer give the same layout index, at every width and
+    /// scale, and a keyed one is always inside the plot.
+    #[test]
+    fn a_keyed_crosshair_and_a_pointer_one_name_the_same_candle() {
+        for dpi in [96, 120, 144, 192] {
+            for plot_w in [296, 650, 1_200] {
+                for n in [1, 8, 78, 390] {
+                    let l = layout_for(plot_w, n, dpi);
+                    // The painter draws only the candles that fit (`newest_that_fit`).
+                    if n as i32 * l.step > plot_w {
+                        continue;
+                    }
+                    let mut at = None;
+                    for _ in 0..n + 2 {
+                        at = crate::keys::step_candle(at, n, -1);
+                        let i = at.unwrap();
+                        let keyed = l.pointer_for_bar(i, 6_700.0, 2).unwrap();
+                        let by_pointer = l.pointer_at(l.x_of(i), keyed.y, 2).unwrap();
+                        assert_eq!(keyed, by_pointer, "dpi {dpi} w {plot_w} n {n} candle {i}");
+                        assert_eq!(keyed.bar, i);
+                        assert!(l.plot.contains(l.x_of(i), keyed.y));
+                    }
+                    assert_eq!(at, Some(0), "walking left ends on the oldest candle");
+                    assert_eq!(l.pointer_for_bar(n, 6_700.0, 2), None, "past the last candle");
+                    // A price off the top or bottom of the window is held inside the plot.
+                    assert!(l.pointer_for_bar(0, 1e9, 2).is_some() && l.pointer_for_bar(0, -1e9, 2).is_some());
+                }
+            }
+        }
+    }
+
+    /// Zoom is a DPI multiplier (`zoom::effective_dpi`), so P2's `index_at(x_of(i)) == i` must hold at the
+    /// effective DPI of every zoom step, on every real DPI.
+    #[test]
+    fn every_candle_round_trips_at_every_zoom_step() {
+        for dpi in [96, 120, 144, 192] {
+            for z in crate::zoom::STEPS {
+                let eff = crate::zoom::effective_dpi(dpi, z);
+                for plot_w in [296, 650, 1_200, 2_000] {
+                    for n in [1, 4, 8, 24, 78, 96, 390] {
+                        let l = layout_for(plot_w, n, eff);
+                        for i in 0..n {
+                            assert_eq!(l.index_at(l.x_of(i)), Some(i), "dpi {dpi} zoom {z} ({eff}) w {plot_w} n {n} candle {i}");
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1426,5 +1741,92 @@ mod tests {
         assert_eq!(days.len(), 10);
         assert_eq!(date_label(days[0].t(t0) + BIAS_S, date_zone(DAY_S, viewer), DateStyle::Full), "Nov 2 2026");
         assert_eq!(date_label(days[9].t(t0) + BIAS_S, date_zone(DAY_S, viewer), DateStyle::Full), "Nov 13 2026");
+    }
+
+    #[test]
+    fn range_change_is_the_last_close_against_the_first_open() {
+        let bars = [bar(0.0, 100.0, 120.0, 90.0, 110.0), bar(0.0, 110.0, 300.0, 100.0, 282.0)];
+        assert!((range_change(&bars).unwrap() - 182.0).abs() < 1e-9);
+        assert!((range_change(&[bar(0.0, 200.0, 200.0, 100.0, 100.0)]).unwrap() + 50.0).abs() < 1e-9, "one bar: its own change");
+        assert_eq!(range_change(&[bar(0.0, 100.0, 100.0, 100.0, 100.0)]), Some(0.0));
+    }
+
+    #[test]
+    fn range_change_returns_nothing_for_a_zero_or_non_finite_first_open_and_a_bad_close() {
+        assert_eq!(range_change(&[]), None);
+        assert_eq!(range_change(&[bar(0.0, 0.0, 5.0, 0.0, 5.0), bar(0.0, 5.0, 6.0, 5.0, 6.0)]), None, "zero open");
+        assert_eq!(range_change(&[bar(0.0, f32::NAN, 5.0, 1.0, 5.0)]), None);
+        assert_eq!(range_change(&[bar(0.0, f32::INFINITY, 5.0, 1.0, 5.0)]), None);
+        assert_eq!(range_change(&[bar(0.0, 5.0, 5.0, 1.0, 5.0), bar(0.0, 5.0, 5.0, 1.0, f32::NAN)]), None, "a NaN close");
+        // A later zero open is nobody's business: only the first bar's open counts.
+        assert!(range_change(&[bar(0.0, 10.0, 12.0, 9.0, 11.0), bar(0.0, 0.0, 1.0, 0.0, 12.0)]).is_some());
+    }
+
+    #[test]
+    fn the_header_text_names_the_range_and_keeps_big_moves_short() {
+        assert_eq!(range_change_text("5Y", 182.4), "5Y +182 %");
+        assert_eq!(range_change_text("1M", -13.449), "1M -13.4 %");
+        assert_eq!(range_change_text("6M", 0.517), "6M +0.52 %");
+        assert_eq!(range_change_text("1Y", 0.0), "1Y +0.00 %");
+        assert_eq!(range_change_text("5Y", -99.96), "5Y -100 %");
+        assert_eq!(range_change_text("5Y", 9.999), "5Y +10.0 %");
+    }
+
+    #[test]
+    fn extremes_find_the_first_highest_high_and_lowest_low_and_skip_what_is_not_a_number() {
+        let bars = [bar(0.0, 10.0, 12.0, 9.0, 11.0), bar(0.0, 11.0, 15.0, 10.0, 14.0), bar(0.0, 14.0, 15.0, 8.0, 9.0), bar(0.0, 9.0, f32::NAN, f32::NAN, 9.0)];
+        assert_eq!(extremes(&bars), Some(((1, 15.0), (2, 8.0))), "the first of equal highs");
+        assert_eq!(extremes(&[]), None);
+        assert_eq!(extremes(&[bar(0.0, 5.0, 5.0, 5.0, 5.0)]), None, "all flat: nothing to mark");
+        assert_eq!(extremes(&[bar(0.0, 1.0, f32::NAN, f32::NAN, 1.0)]), None);
+    }
+
+    #[test]
+    fn a_label_goes_above_a_high_and_below_a_low_inside_the_plot() {
+        let plot = Rect::new(0, 0, 400, 200);
+        let r = place_label((200, 100), (60, 12), true, plot, &[], 4).unwrap();
+        assert_eq!((r.left, r.top, r.right, r.bottom), (170, 84, 230, 96), "centred, above");
+        let r = place_label((200, 100), (60, 12), false, plot, &[], 4).unwrap();
+        assert_eq!((r.top, r.bottom), (104, 116), "centred, below");
+    }
+
+    #[test]
+    fn a_label_at_an_edge_is_moved_inside_and_never_leaves_the_plot() {
+        let plot = Rect::new(0, 0, 400, 200);
+        // At the top the label cannot go above: it goes below the anchor.
+        let top = place_label((200, 5), (60, 12), true, plot, &[], 4).unwrap();
+        assert!(top.top >= 5, "{top:?}");
+        // At the right edge it is pushed left, so it ends at or before the plot's edge.
+        let right = place_label((399, 100), (60, 12), true, plot, &[], 4).unwrap();
+        assert!(right.right <= 400 && right.left >= 0, "{right:?}");
+        for x in [0, 1, 30, 200, 399] {
+            for y in [0, 6, 100, 194, 199] {
+                for above in [true, false] {
+                    if let Some(r) = place_label((x, y), (60, 12), above, plot, &[], 4) {
+                        assert!(r.left >= 0 && r.top >= 0 && r.right <= 400 && r.bottom <= 200, "({x},{y}) {r:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_label_never_lands_on_an_alert_level_or_its_price() {
+        let plot = Rect::new(0, 0, 400, 200);
+        // A level line across the plot just above the anchor, and its price label at the right end.
+        let line = Rect::new(0, 82, 400, 86);
+        let price = Rect::new(340, 70, 396, 82);
+        let r = place_label((200, 100), (60, 12), true, plot, &[line, price], 4).unwrap();
+        assert!(!overlaps(r, line) && !overlaps(r, price), "{r:?}");
+        // Boxed in on every side: nothing fits, so there is no label (the marker still is).
+        let wall = [Rect::new(0, 0, 400, 200)];
+        assert_eq!(place_label((200, 100), (60, 12), true, plot, &wall, 4), None);
+        // Whatever the obstacles, the answer clears them.
+        for y in (10..190).step_by(7) {
+            let avoid = [Rect::new(0, y, 400, y + 3), Rect::new(330, y - 14, 396, y)];
+            if let Some(r) = place_label((350, 100), (60, 12), true, plot, &avoid, 4) {
+                assert!(avoid.iter().all(|a| !overlaps(r, *a)), "y {y}: {r:?}");
+            }
+        }
     }
 }

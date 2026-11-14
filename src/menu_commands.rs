@@ -12,8 +12,20 @@ pub(crate) enum Action {
     Move(String, i32),
     /// Card menu: move this symbol to the front.
     MoveFirst(String),
+    /// Card menu: pin the symbol to the taskbar strip (`true`) or take it off (`false`).
+    Pin(String, bool),
+    /// Card menu: ask for a new label for this symbol.
+    Rename(String),
+    /// Card menu: the derived label back on this symbol.
+    ResetName(String),
+    /// Card menu, Decimals: this many places, or `None` for auto.
+    Digits(String, Option<u32>),
     Alert(String, usize),
+    /// Alerts submenu, per symbol (Ultra): the fast-move choice `alerts::FAST_MOVES[k]`; the current one again turns it off.
+    Fast(String, usize),
     ClearAlert(String),
+    /// Alerts submenu, per symbol (Ultra): ask for how long this symbol's alert waits before it can fire again.
+    Cooldown(String),
     /// Alerts submenu, per symbol (Ultra): ask for a price level for this label.
     AlertAt(String),
     /// Symbols > Remove a symbol I added (both builds): drop this catalogue entry, by symbol.

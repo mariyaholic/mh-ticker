@@ -1,5 +1,159 @@
 # Changelog — MH Ticker
 
+## 2026-11-14 — 1.9.0: know it is true, alerts that say when they cannot see, twenty-four symbols, reach   [claude.impl]
+
+**Files:** mostly `src/`: new `probe.rs`, `report.rs`, `meter.rs`, `governor.rs`, `watch.rs`, `retry.rs`, `pins.rs`, `undo.rs`, `find.rs`, `contrast.rs`, `updown.rs`, `motion.rs`, `typed.rs`, `zoom.rs` and `spoken.rs`; changed
+`alerts.rs`, `chartview.rs`, `config.rs`, `ranges.rs`, `source.rs`, `update.rs`, `panel.rs`, `ui.rs`, `shot.rs`
+and `Cargo.toml` (the `Win32_System_RemoteDesktop` feature, the `[[example]]` entries and the version, 1.9.0). Also `examples/wide.rs`
+(new), `examples/w3.rs` (new), `shots/wide-*.png` (new), `shots/w3-strip-24-pinned-6.png` (new), `examples/w4.rs` (new), `shots/w4-*.png` (new), `scripts/check-state-linux.sh`, `README.md`, `SOURCES.md`, `CHANGELOG.md`
+and `docs/1.9/`.
+
+**What.** The 1.9 packages, grouped by what you see. The first group adds no new feature; it makes the features
+already here easier to check. The alerts group adds behaviour. Each group says which build gets it: Classic is `MH_Ticker.exe`, Ultra is `MH_Ticker_Ultra.exe`.
+
+- **Checking the feed (both builds).**
+  - `--probe` judges each assumption and prints PASS, WARN or NOTE. It checks the quote fields, an unknown
+    symbol, the time spelling, whether a bar's time is its start or its end, the stamps of daily bars, volume,
+    and the release tag. It also lists response field names the parser ignores. A WARN makes the run exit with 1.
+    A NOTE never fails a run. It marks a check the answers cannot show, such as bar start while the market is shut.
+  - `--probe` reads the settings and never writes them.
+  - `--probe --dump <folder>` (command line only) saves the raw answers into the folder for test fixtures. It
+    creates the folder if it is missing. It never writes the settings or the webhook. Without a folder, or without
+    `--probe`, it exits with 2 and says why.
+  - *Copy diagnostics report* (in the right-click menu): runs the same checks and puts the text on the clipboard.
+    It gives the version, window mode, DPI, placement, counts, the settings path with the user name removed, the
+    kept settings file if there is one, the hotkey, autostart, the webhook as its host only, and the data meter.
+    While it runs the menu shows a greyed "checking" line. A second click is ignored until it finishes.
+- **The data meter (both builds).** A greyed menu line above the version line, for example
+  `Data: 3.1 MB this hour, 41 MB since start`. It counts response bytes as they are read, after gzip is undone, so
+  it is higher than the compressed bytes on the wire. Request headers are not counted. It makes no request of its own.
+- **The chart says when it is suspect (Ultra).** The chart's second header line can show `as of 14:05`, when the
+  series is past its refresh time and the refresh has not come back. Older data also shows its date. Daily and
+  longer ranges show `check dates` when their stamps do not fall on a day boundary. Neither note shows while a
+  candle is under the pointer, and 1D has no note.
+- **Local time per instant (Ultra).** Each candle and each alert time is read on the clock in force at its own
+  instant. Candles on either side of a clock change each sit on their own local midnight. The mute label shows the
+  right hour after a change. Daily ranges keep the exchange's dates.
+- **Typed levels (Ultra).** Commas in a level must group thousands. `4,200.50` is read as 4200.50. `4200,5`,
+  `4,20`, `1,2345` and `,500` are refused, and the menu gives the reason. A level more than 20 % from the price
+  asks before it is set, and the question echoes the level and the price in the symbol's digits. A level within
+  20 % is set at once, as before.
+- **A settings file that will not load is kept (both builds).** A file that is not UTF-8 or does not parse is
+  renamed beside the new one, to `config.bad.json` (or `config_ultra.bad.json`), then `.bad-2.json` and so on.
+  Its bytes are moved, not rewritten. The defaults load and a greyed menu line names the kept file. If the rename
+  fails, the file stays and the error is reported as before.
+- **Hardening (both builds, the chart items Ultra only).**
+  - A price that is NaN or infinite prints as `--`, in the card text and in *Copy all prices*.
+  - A NaN price is drawn in the middle of the chart's plot, and an infinite one is held inside it.
+  - At one-hour candles in the narrowest pane, the oldest candles that cannot fit are dropped, so no candle is
+    drawn past the right edge.
+  - The update check identifies itself as `MH-Ticker`: no version number and no browser string. CNBC requests
+    keep their browser string.
+  - A wall clock set back no longer silences an alert until the clock catches up. The alert counts as cooled and
+    fires once more, with a fresh stamp.
+- **Pictures (in the repository, not in the exes).** Fourteen new pictures, `shots/wide-*`: 24 cards, 24 symbols
+  on one, two and three strip rows, the narrow pane, 192 DPI, and each range. The 36 existing pictures are unchanged.
+- **Alerts that say when they cannot see (the governor: both builds; the alert parts: Ultra).**
+  - **Poll governor.** When nothing moves, quotes are polled less often: every 15 s once no shown quote has changed
+    for 10 minutes, and every 60 s after 30 minutes. With the PC locked and no alert armed, one poll every 5 minutes.
+    While an alert is armed, the wait is never longer than 15 s. Any change, expanding a card, the hotkey, an unlock
+    or *Refresh now* goes back to the normal poll at once. Two ticks under *Poll every* turn it on or off: *Slow down
+    when nothing moves* and *Rest while the PC is locked*. Ultra has both on unless a choice is saved. Classic has both
+    off, so it polls as it did in 1.8 unless the user ticks them. The governor never polls more often than *Poll every*.
+    A source that keeps failing still backs off as before, so it can wait longer than 15 s while an alert is armed.
+  - **Scripted saving.** In a scripted two-hour run, a market that moved for five minutes and was then quiet made
+    2,400 polls at a 3 s base. The governor made 465, or 720 with an alert armed. Bytes were not measured.
+  - **Not checked.** When no alert on a shown symbol has a fresh price for longer than the larger of 5 minutes and
+    ten polls, the tooltip gets a line, and Recent gets one line when checking is back, for example
+    `02:10 to 02:31 not checked (no fresh price)`. After a sleep the line says `no checks ran, the PC slept`. A gap
+    needs every armed alert on a shown symbol to be blind. An optional webhook notice (*Say when alerts could not be
+    checked*, off by default) sends one message when checking is back, `Alerts could not be checked from 02:10 to 02:31.`
+    It never carries a price, and it is not sent while alerts are muted or in quiet hours.
+  - **Mute digest.** When a mute or quiet hours end, one balloon says how many alerts came in meanwhile, for example
+    `3 alerts while muted. See Alerts > Recent.` Nothing is shown when there were none. No timer was added.
+  - **Webhook retry.** A POST that fails with a network error or a 5xx is tried once more after 3 s. A 4xx is never
+    retried, and a second failure is final. A retry that gets through is logged as `sent on retry`. Quitting waits up
+    to 2 s for a POST still in flight, and a waiting retry is sent at once.
+  - **Each crossing.** The *Repeat* submenu has *Every cooldown* (still the default), *Fire once, then clear* and
+    *Each crossing*. A crossing alert fires when the price crosses its level, and fires again only after the price
+    has gone back past the level by 0.1 %. If the first fresh quote is already beyond the level, it fires once.
+  - **Fast move.** An alert can watch for a move of 1 % in 5 minutes, 2 % in 15 minutes or 3 % in 60 minutes. It is
+    judged from the price history already held, and needs the whole window covered by fresh samples with no gap
+    longer than three polls. In every repeat mode, a stale or fallback quote fires nothing.
+  - **Alerts at a glance.** *Alerts* → *At a glance* lists every level and move set, with its distance
+    (`XAU above 4,200.00, 1.2 % away`) or `reached, 2.3 % past`. A level whose symbol is not on the strip is marked
+    as unable to fire. *Clear all alerts...* asks first. A card with a level has a small amber dot. *Recent* keeps the
+    last 50 entries, and *Copy list* copies them.
+- **Twenty-four symbols (both builds; the find keys and the chart on Ultra).**
+  - **Pin to strip.** The taskbar strip shows only the symbols you pin, and the panel still shows all of them.
+    Settings from before this version show every card. Use *Pin to strip* or *Unpin from strip* in a card's menu,
+    or *Show all on strip* in the Symbols menu. The last pinned card cannot be unpinned.
+  - **Undo.** The main menu has an *Undo the last ...* line, which names what it would undo: a removal, move, sort,
+    pin change or alert clear. Ctrl+Z does the same on Ultra. It steps back one change, is held in memory until you
+    quit, and never restores a webhook. It does not roll back other settings changed since, and it is dropped when
+    the cards change another way, such as an add or a rename.
+  - **Rename and decimals.** *Rename...* in a card's menu changes its label. Its alerts and its lock follow the new
+    label. *Reset name* goes back to the symbol's own name. *Decimals* sets 0 to 6 digits, or *Auto*, which uses the
+    symbol's own count or one worked out from its price.
+  - **Order the cards once.** Symbols > *Order the cards (once)* sorts by day move (biggest first), by name, or back
+    to the default order. It changes the saved order one time. It is not a live sort.
+  - **Find a card (Ultra).** `/` opens a prompt that matches a card's label or name. The first match is locked and
+    scrolled into view. Esc, empty text or no match changes nothing. Home and End lock the first and last card; on
+    Classic they keep paging the body, as in 1.8.
+  - **Chart (Ultra).** The header shows the change over the range on screen, such as `5Y +182 %`, in place of the
+    day's change (1D is unchanged). The range's high and low are marked. The chart cache holds 48 series, with a
+    2 MB ceiling on the bars. The chart reopens on the range you used last.
+  - **Fix.** A renamed card used to lose its quote, bars and sparkline until the next fetch, because rows were
+    matched by label. They are now matched by symbol.
+- **Reach (Ultra, and Classic where marked).**
+  - **The chart by keyboard (Ultra).** Shift+Left and Shift+Right move the crosshair from candle to candle, and it
+    snaps to the candle's close. R changes the range, Z flips the zone, and A sets an alert at the crosshair price
+    through the prompt. The menu key opens the card menu, F10 opens the main menu, and F1 lists the keys. Plain arrows
+    keep their 1.8 meaning. A pointer move takes the crosshair back.
+  - **Typed settings (both builds; quiet hours, mute and cooldown on Ultra).** Any hotkey can be typed, on both
+    builds. Quiet hours take a span such as `22:30-06:45`, which can wrap past midnight; equal ends mean off. *Mute
+    until* takes a time. A cooldown per symbol, such as `90s`, `15m` or `2h`, is set in that symbol's alert submenu.
+    A bad entry is refused with a fixed sentence and changes nothing.
+  - **High contrast (Ultra follows Windows; Classic has a tick, off by default).** In a Windows contrast theme, Ultra
+    draws in the system's colours. Direction is carried by sign and shape as well as colour: fills become outlines,
+    up candles are hollow, and the sign says which way the price moved. Classic has *Follow the Windows contrast
+    theme* in its Accessibility menu. It is off, so Classic's pixels do not change until it is ticked.
+  - **Up and down colours (Ultra).** Accessibility has green and red (the default, as before), red and green, and blue
+    and orange, and *Hollow up candles*. The palette swap changes only the two direction colours.
+  - **A contrast test over every theme.** Price and label text are tested at 4.5 to 1 or better against the card and
+    every colour a theme's cycle passes through; up and down at 3 to 1 or better. The dim colour is measured, not
+    gated. Glass, ega, gameboy and c64 were tuned to pass. Label ratios went from 3.97 to 4.60 (glass), 3.66 to 4.59
+    (ega), 2.71 to 4.64 (gameboy, whose down went from 2.30 to 3.05) and 4.00 to 4.56 (c64). Classic was measured
+    and not changed.
+  - **Reduced motion (Ultra follows Windows; Classic has a tick).** With Windows animations off, the panel opens and
+    closes in one step. Classic has *Follow the Windows animation setting* in its Accessibility menu, off by default,
+    so Classic keeps its glide.
+  - **Panel size (Ultra).** Accessibility has *Panel size* at 75, 90, 100, 125 and 150 %. It scales the panel and its
+    chart. The strip keeps its size.
+  - **Window title (Ultra).** The window's name carries the locked card as a sentence, such as
+    `Gold 4,012.30, up 0.4 percent - MH Ticker Ultra`, with `stale` added when the price is stale. With no lock it
+    reads `MH Ticker Ultra, 6 symbols, 4 up, 2 down`. Classic's title is never changed.
+
+**Checked.** Under Wine: 430 tests pass, plus the one known Wine-only failure
+(`ui::tests::a_theme_switch_takes_the_new_themes_face`, because Wine has no Consolas). The Linux harness
+(`scripts/check-state-linux.sh`) passes 224. Classic's stills are identical to the baseline. Four Ultra theme stills
+changed on purpose, after the contrast tuning: glass, ega, gameboy and c64. The checker looked at each before and
+after and took them into the baseline. Seven new stills (`shots/w4-*.png`) were drawn. Earlier in 1.9, the 36 old
+stills were identical and the 14 wide stills were drawn, six of them again because the chart header changed. Both
+release exes are about 1.52 MB.
+
+**Not verified.** The live CNBC and GitHub answers: `--probe`, the report and the release tag have not run
+against the services. On a real Windows desktop: the clipboard, the menu lines, a real clock change, the real
+fonts, and gzip byte counts against a capture. Also not verified: the real lock and unlock, and
+`WTSRegisterSessionNotification` on a real desktop; sleep and resume; a real 5xx from a webhook host; quitting with
+a POST in flight; and the poll governor's saving and bytes against the live feed.
+Also not verified: key presses (`/`, Ctrl+Z, Home and End), focus after the find prompt closes, and the strip
+with pins at each placement on a real taskbar. Menu entries were not clicked.
+For Reach: key focus and the keys themselves (Shift+arrows, R, Z, A, F10, F1 and the menu key), and focus after the
+prompts close; the real system colours and their change message; the Windows animation setting and the one-step
+morph on a real display; screen readers and Alt+Tab reading the window name. The window-name call was reviewed by
+code only.
+
 ## 2026-11-14 — 1.8.0: alerts you can set and silence, a chart that reads, typed symbols   [claude.impl]
 
 **Files:** most of `src/` (`alerts.rs`, `chartview.rs`, `ranges.rs`, `keys.rs`, `hotkey.rs`, `update.rs`,

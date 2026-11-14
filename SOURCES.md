@@ -159,7 +159,7 @@ and are not repeated here. The table lists everything else 1.8 sends, so the tra
 
 | Host | Request | When | What is sent | What is read back |
 |---|---|---|---|---|
-| `ts-api.cnbc.com` | `GET /harmony/app/charts/{5D,1M,1Y,5Y}.json?symbol=…` (`1M.json` also serves 6M) | Ultra only: when a chart range tab is first clicked for the locked symbol, then again when the file is older than its time to live (10 minutes for 5D, an hour for 1M and 1Y, six hours for 5Y). A failed request is retried after 30 seconds | the symbol and the request line | a range file, parsed for bars and volume; `--probe` reads the same files |
+| `ts-api.cnbc.com` | `GET /harmony/app/charts/{5D,1M,1Y,5Y}.json?symbol=…` (`1M.json` also serves 6M) | Ultra only: when a chart range tab is first clicked (or `R` moves to that range) for the locked symbol, then again when the file is older than its time to live (10 minutes for 5D, an hour for 1M and 1Y, six hours for 5Y). A failed request is retried after 30 seconds | the symbol and the request line | a range file, parsed for bars and volume; `--probe` reads the same files |
 | `quote.cnbc.com` | `GET /quote-html-webservice/restQuote/…?symbols={typed symbol}&…&output=json` | once per *Symbols > Add symbol...* click, for the typed symbol only | the typed symbol (cleaned to `A-Z 0-9 . @ = - ^ / : _`, at most 20 characters) | one quote. The symbol is found only when it matches the typed one and its price is positive |
 | `api.github.com` | `GET /repos/mariyaholic/mh-ticker/releases/latest` | both builds, only when *Check for updates* is clicked. Never at startup or in the background | the request line and headers only: `Accept: application/vnd.github+json` and the same browser-style `User-Agent` as the price requests. No body, no cookies, no config, no symbols | at most 256 KiB, 10 second timeout, no redirects. Only `tag_name` is read, and only its digits and dots are shown. Nothing else from the answer is opened or followed; the download page is a fixed address (`github.com/mariyaholic/mh-ticker/releases/latest`) |
 
@@ -173,6 +173,31 @@ Notes on the table:
   The cache keeps at most 12 series.
 - The fallback hosts (`api.gold-api.com`, `api.kraken.com`) are unchanged from 1.3 and are used only when the
   user has turned fallback sources on.
+
+### Changes in 1.9
+
+The table above is the 1.8 record. These are the changes in 1.9:
+
+- *Copy diagnostics report* makes, once per click, the requests `--probe` makes, to the hosts already listed
+  (the CNBC quote and chart hosts, and `api.github.com`). That is one quote request for all shown symbols, one
+  quote request for a symbol that should not exist, the 1D file of the first rows (the report reads only the first
+  few, not every row as `--probe` does), the four range files (5D, 1M, 1Y, 5Y) of the first row, and the release
+  answer. No other request is made. Its size has not been measured.
+- The update check's `User-Agent` is now `MH-Ticker`: the app name, with no version and no browser string. Its
+  other headers are unchanged, and it still reads only `tag_name`.
+- CNBC requests are unchanged, including the browser-style `User-Agent`.
+- The data meter counts these bytes, after decompression. It makes no request of its own.
+- The poll governor changes how often the quotes are polled: less often when no shown quote has moved, and less
+  often while the PC is locked with no alert armed. It is never more often than the *Poll every* setting. The
+  requests and hosts are the same. It is on for Ultra and off for Classic unless the user ticks it, so Classic polls
+  as before by default.
+- A webhook POST that fails with a network error or a 5xx is sent once more after 3 seconds, to the same URL with the
+  same body. A 4xx is never retried, and nothing is queued on disk.
+- The chart opens on the range used last (Ultra). If that range is not cached when the chart opens, its one range file
+  is requested then, with the same request and time to live as a tab click. Nothing is requested for it when it is
+  already cached and fresh.
+- The chart cache keeps 48 series (1.8 kept 12), with a 2 MB ceiling on the bars held. A range already fetched is less
+  often fetched again.
 
 ---
 

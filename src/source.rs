@@ -36,6 +36,48 @@ const HOUR_S: f64 = 3600.0;
 /// is not what this endpoint is documented to be.
 const MAX_BARS: usize = 1_600;
 
+/// The data meter (H5): every response body the app reads is counted here, as it is read, by
+/// [`Counted`]. No request is made for the meter's sake. The menu reads it with [`meter_line`].
+static METER: Mutex<crate::meter::Meter> = Mutex::new(crate::meter::Meter::new());
+
+fn meter_add(n: u64) {
+    if let Ok(mut m) = METER.lock() {
+        m.add(now_s(), n);
+    }
+}
+
+/// The greyed menu line, `Data: 3.1 MB this hour, 41 MB since start`.
+pub fn meter_line() -> String {
+    METER.lock().map(|m| m.line(now_s())).unwrap_or_default()
+}
+
+/// A reader that counts the bytes read through it into the meter when it is dropped (one lock per
+/// response, not per chunk).
+struct Counted<R: std::io::Read> {
+    inner: R,
+    n: u64,
+}
+
+impl<R: std::io::Read> Counted<R> {
+    fn new(inner: R) -> Self {
+        Counted { inner, n: 0 }
+    }
+}
+
+impl<R: std::io::Read> std::io::Read for Counted<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let k = self.inner.read(buf)?;
+        self.n += k as u64;
+        Ok(k)
+    }
+}
+
+impl<R: std::io::Read> Drop for Counted<R> {
+    fn drop(&mut self) {
+        meter_add(self.n);
+    }
+}
+
 pub fn now_s() -> f64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
 }
@@ -64,35 +106,7 @@ fn flag(v: Option<&Value>) -> bool {
     }
 }
 
-/// Days from 1970-01-01 to a civil date (proleptic Gregorian).
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
-    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
-}
-
-/// "2026-10-15T04:29:41.313-0400" -> UTC epoch seconds. A bare date (a closed cash market's
-/// last close) has no time of day and returns None, so the row reads as stale.
-pub fn parse_time(s: &str) -> Option<f64> {
-    let (date, rest) = s.split_once('T')?;
-    let mut d = date.split('-').map(|p| p.parse::<i64>().ok());
-    let (y, mo, da) = (d.next()??, d.next()??, d.next()??);
-    let split = rest.rfind(['+', '-']).filter(|&i| i >= 8)?;
-    let (clock, zone) = rest.split_at(split);
-    let mut c = clock.split(':');
-    let h: f64 = c.next()?.parse().ok()?;
-    let mi: f64 = c.next()?.parse().ok()?;
-    let se: f64 = c.next().unwrap_or("0").parse().ok()?;
-    let sign = if zone.starts_with('-') { -1.0 } else { 1.0 };
-    let z = zone[1..].replace(':', "");
-    let zh: f64 = z.get(0..2)?.parse().ok()?;
-    let zm: f64 = z.get(2..4).unwrap_or("0").parse().ok()?;
-    let local = days_from_civil(y, mo, da) as f64 * 86_400.0 + h * 3600.0 + mi * 60.0 + se;
-    Some(local - sign * (zh * 3600.0 + zm * 60.0))
-}
+pub use crate::probe::parse_time;
 
 /// `restQuote` body -> quotes.
 pub fn parse_quotes(v: &Value) -> Vec<Quote> {
@@ -267,6 +281,7 @@ pub fn post(url: &str, body: &str, content_type: &str, timeout_s: u64) -> Result
         .user_agent(UA)
         .timeout(Duration::from_secs(timeout_s))
         .build();
+    meter_add(body.len() as u64);
     match agent.post(url).set("Content-Type", content_type).send_string(body) {
         Ok(_) => Ok(()),
         Err(ureq::Error::Status(code, _)) => Err(format!("HTTP {code}")),
@@ -275,7 +290,7 @@ pub fn post(url: &str, body: &str, content_type: &str, timeout_s: u64) -> Result
 }
 
 /// The update check's one request: GET `url` with a dedicated short-lived agent (native-tls, the
-/// same UA, 10 s timeout, no redirects) and `Accept: application/vnd.github+json`, reading at most
+/// app name as UA (`update::USER_AGENT`), 10 s timeout, no redirects) and `Accept: application/vnd.github+json`, reading at most
 /// `update::MAX_BODY` bytes. Returns the body text, or a fixed `update::Outcome::Failed` text
 /// (`"network"`, `"HTTP <code>"`, `"too large"`, `"unreadable answer"`): `ureq`'s own messages
 /// are not passed on. Blocking; call it from a worker thread only.
@@ -284,7 +299,7 @@ pub fn get_release(url: &str) -> Result<String, String> {
     let tls = native_tls::TlsConnector::new().map_err(|_| "network".to_string())?;
     let agent = ureq::AgentBuilder::new()
         .tls_connector(Arc::new(tls))
-        .user_agent(UA)
+        .user_agent(crate::update::USER_AGENT)
         .timeout(Duration::from_secs(10))
         .redirects(0)
         .build();
@@ -295,7 +310,7 @@ pub fn get_release(url: &str) -> Result<String, String> {
     };
     let limit = crate::update::MAX_BODY;
     let mut body = Vec::new();
-    resp.into_reader().take((limit + 1) as u64).read_to_end(&mut body).map_err(|_| "network".to_string())?;
+    Counted::new(resp.into_reader()).take((limit + 1) as u64).read_to_end(&mut body).map_err(|_| "network".to_string())?;
     if body.len() > limit {
         return Err("too large".into());
     }
@@ -338,7 +353,7 @@ pub fn lookup(symbol: &str) -> Lookup {
         Err(_) => return Lookup::Failed("network".into()),
     };
     let mut body = Vec::new();
-    if resp.into_reader().take((LOOKUP_MAX_BODY + 1) as u64).read_to_end(&mut body).is_err() {
+    if Counted::new(resp.into_reader()).take((LOOKUP_MAX_BODY + 1) as u64).read_to_end(&mut body).is_err() {
         return Lookup::Failed("network".into());
     }
     if body.len() > LOOKUP_MAX_BODY {
@@ -397,7 +412,7 @@ impl Client {
         let resp = self.agent.get(url).call().map_err(|_| "fallback request failed".to_string())?;
         if !(200..300).contains(&resp.status()) { return Err("fallback HTTP status".into()); }
         let mut body = Vec::new();
-        resp.into_reader().take((LIMIT + 1) as u64).read_to_end(&mut body).map_err(|_| "fallback read failed".to_string())?;
+        Counted::new(resp.into_reader()).take((LIMIT + 1) as u64).read_to_end(&mut body).map_err(|_| "fallback read failed".to_string())?;
         if body.len() > LIMIT { return Err("fallback response too large".into()); }
         serde_json::from_slice(&body).map_err(|_| "invalid fallback JSON".into())
     }
@@ -416,7 +431,7 @@ impl Client {
             None => req,
         };
         match req.call() {
-            Ok(resp) => resp.into_json::<Value>().map_err(|e| e.to_string()),
+            Ok(resp) => serde_json::from_reader(Counted::new(resp.into_reader())).map_err(|e| format!("Failed to read JSON: {e}")),
             Err(ureq::Error::Status(code, _)) => Err(format!("HTTP {code}")),
             Err(e) => Err(e.to_string()),
         }
@@ -591,7 +606,8 @@ impl Feed {
                 return;
             }
             let now = now_s();
-            let mut cells = resolve(&self.rows, &self.quotes, now, self.cfg.stale_after_s, self.cfg.delayed_grace_s);
+            let stale_after = crate::governor::stale_after(self.cfg.stale_after_s, b.governed_s);
+            let mut cells = resolve(&self.rows, &self.quotes, now, stale_after, self.cfg.delayed_grace_s);
             if link == Link::Down { for cell in &mut cells { cell.stale = true; } }
             // Keep a recent fallback until CNBC supplies a fresh response; never turn receipt
             // time into market freshness, and expire fallback if its refresh stops succeeding.
@@ -722,11 +738,41 @@ impl Feed {
         }
     }
 
+    /// What the governor says now: `(interval to wait, stale limit's interval)`. The second is 0 while
+    /// no governor tick is on, which keeps the configured stale limit and the plain cadence exactly
+    /// as 1.8 had them. Reads the board once; `quiet_for` comes from the caller's `Quiet`.
+    fn governed(&self, quiet_for: f64) -> (f64, f64) {
+        let cadence = self.cadence();
+        let Ok(b) = self.shared.lock() else { return (cadence, 0.0) };
+        if !b.gov.any() {
+            return (cadence, 0.0);
+        }
+        let iv = crate::governor::interval(cadence, quiet_for, b.locked, b.armed, b.gov);
+        (iv, iv)
+    }
+
+    /// Tell the board what the feed is waiting out, so the UI's stale rule and a wake can follow it.
+    fn note_governed(&self, governed_s: f64, base: f64) {
+        if let Ok(mut b) = self.shared.lock() {
+            b.governed_s = governed_s;
+            b.slowed = governed_s > base + 0.5;
+        }
+    }
+
     fn run(mut self) {
+        let started = Instant::now();
+        let mut quiet = crate::governor::Quiet::default();
+        let mut seen_kick = self.shared.lock().map(|b| b.kick).unwrap_or(0);
         loop {
             self.sync_rows();
             // Read before the request: a kick that lands while it is in flight ends the wait below.
             let acted = self.shared.lock().map(|b| b.kick).unwrap_or(0);
+            // A wake (expand, hotkey, unlock, Refresh now) puts the quiet clock back to base.
+            if acted != seen_kick {
+                seen_kick = acted;
+                quiet.reset(started.elapsed().as_secs_f64());
+            }
+            let mut governed_s = 0.0;
             let (link, note) = match self.client.quotes(&self.rows) {
                 Ok(qs) => {
                     self.fails = 0;
@@ -738,8 +784,13 @@ impl Feed {
                     for q in qs {
                         self.quotes.insert(q.symbol.clone(), q);
                     }
-                    let cells =
-                        resolve(&self.rows, &self.quotes, now_s(), self.cfg.stale_after_s, self.cfg.delayed_grace_s);
+                    let prices: Vec<f64> = self.rows.iter()
+                        .map(|r| self.quotes.get(&r.symbol).map_or(f64::NAN, |q| q.price))
+                        .collect();
+                    let quiet_for = quiet.observe(started.elapsed().as_secs_f64(), &prices);
+                    governed_s = self.governed(quiet_for).1;
+                    let stale_after = crate::governor::stale_after(self.cfg.stale_after_s, governed_s);
+                    let cells = resolve(&self.rows, &self.quotes, now_s(), stale_after, self.cfg.delayed_grace_s);
                     let lagging: Vec<&str> = cells.iter().filter(|c| c.stale).map(|c| c.label.as_str()).collect();
                     if lagging.is_empty() {
                         (Link::Live, String::new())
@@ -752,10 +803,12 @@ impl Feed {
                     (Link::Down, format!("CNBC: {e}"))
                 }
             };
+            let (iv, _) = self.governed(quiet.quiet_for(started.elapsed().as_secs_f64()));
+            self.note_governed(governed_s, self.cadence());
             self.publish(link, note.clone());
             let cadence = self.cadence();
             let wait = if self.fails == 0 {
-                cadence
+                iv
             } else {
                 (cadence * 2f64.powi(self.fails.min(6) as i32)).min(60.0)
             };
@@ -839,82 +892,173 @@ pub fn spawn(cfg: Config, shared: Arc<Mutex<Board>>, notify: Box<dyn Fn() + Send
     thread::Builder::new().name("feed".into()).spawn(move || feed.run()).expect("spawn feed thread");
 }
 
-/// `MH_Ticker --probe`: one pass over the quotes and the hour of bars, printed, then exit.
-pub fn probe(cfg: &Config) {
+/// The answer of one request as text, for the probe: the body as the network sent it (decoded from
+/// gzip by the HTTP library), at most [`RAW_MAX`] bytes. Errors are fixed words, never the library's
+/// own text.
+impl Client {
+    fn get_raw(&self, url: &str, timeout: Duration) -> Result<String, String> {
+        use std::io::Read;
+        match self.agent.get(url).timeout(timeout).call() {
+            Ok(resp) => {
+                let mut body = Vec::new();
+                Counted::new(resp.into_reader()).take((RAW_MAX + 1) as u64).read_to_end(&mut body).map_err(|_| "network".to_string())?;
+                if body.len() > RAW_MAX {
+                    return Err("too large".into());
+                }
+                String::from_utf8(body).map_err(|_| "unreadable answer".to_string())
+            }
+            Err(ureq::Error::Status(code, _)) => Err(format!("HTTP {code}")),
+            Err(_) => Err("network".into()),
+        }
+    }
+}
+
+/// The longest answer the probe keeps: a 5Y file of one symbol is well under a megabyte.
+const RAW_MAX: usize = 8 * 1024 * 1024;
+
+fn quote_url(symbols: &str) -> String {
+    format!("{QUOTE_URL}?symbols={}&requestMethod=itv&noform=1&partnerId=2&fund=1&exthrs=1&output=json", encode(symbols))
+}
+
+/// Fetch what [`crate::probe::judge`] needs, one request after another and only when called (the
+/// command line or the diagnostics menu entry): the quotes of every shown symbol, one unknown symbol,
+/// the 1D file of the first `day_rows` rows, the four range files of the first row, and the release
+/// answer. Blocking; call it from a worker thread or the command line only. No request here is made
+/// to a host the app does not already name.
+pub fn collect_bodies(rows: &[Row], day_rows: usize, current: &str) -> crate::probe::Bodies {
+    use crate::probe::Bodies;
+    let now = now_s();
+    let shown: Vec<String> = rows.iter().map(|r| r.symbol.clone()).collect();
+    let mut b = Bodies { now, current: current.to_string(), shown, ..Bodies::default() };
+    let release = get_release(crate::update::API_URL);
     let client = match Client::new() {
         Ok(c) => c,
-        Err(e) => return println!("TLS: {e}"),
+        Err(_) => {
+            let tls = || Some(Err::<String, String>("TLS".to_string()));
+            b.quotes = tls();
+            b.unknown = tls();
+            b.release = Some(release);
+            return b;
+        }
     };
-    let now = now_s();
-    match client.quotes(&cfg.rows) {
-        Ok(qs) => {
-            let map: HashMap<_, _> = qs.into_iter().map(|q| (q.symbol.clone(), q)).collect();
-            for c in resolve(&cfg.rows, &map, now, cfg.stale_after_s, cfg.delayed_grace_s) {
-                match &c.quote {
-                    Some(q) => println!(
-                        "{:<5} {:>12} {:>8}  {}{}{} age={}",
-                        c.label,
-                        crate::model::fmt_price(q.price, c.digits),
-                        q.change_pct.map(crate::model::fmt_change).unwrap_or_default(),
-                        q.name,
-                        if q.realtime { "" } else { " DELAYED" },
-                        if c.stale { " STALE" } else { "" },
-                        q.ts.map(|t| format!("{:.0}s", now - t)).unwrap_or_else(|| "?".into()),
-                    ),
-                    None => println!("{:<5} {:>12}  no quote", c.label, "-"),
+    let timeout = Duration::from_secs(20);
+    let joined = b.shown.join("|");
+    b.quotes = Some(client.get_raw(&quote_url(&joined), timeout));
+    b.unknown = Some(client.get_raw(&quote_url(crate::probe::UNKNOWN_SYMBOL), timeout));
+    for r in rows.iter().take(day_rows) {
+        let url = format!("{CHART_URL}?symbol={}", encode(&r.symbol));
+        b.day.push((r.symbol.clone(), client.get_raw(&url, BARS_TIMEOUT)));
+    }
+    if let Some(r) = rows.first() {
+        for file in ["5D.json", "1M.json", "1Y.json", "5Y.json"] {
+            let url = format!("{CHARTS_DIR}{file}?symbol={}", encode(&r.symbol));
+            b.ranges.push((file.to_string(), client.get_raw(&url, BARS_TIMEOUT)));
+        }
+    }
+    b.release = Some(release);
+    b
+}
+
+/// `--probe`: one pass over the quotes and the bars, then the findings; with `dump` the raw answers
+/// are also saved in that folder (and nothing else is written). Returns true when any finding is a
+/// `WARN`, for a non-zero exit. Command line only: `lib::launch` never calls it for the running app.
+pub fn probe(cfg: &Config, dump: Option<&std::path::Path>) -> bool {
+    let b = collect_bodies(&cfg.rows, cfg.rows.len(), env!("CARGO_PKG_VERSION"));
+    let now = b.now;
+    match &b.quotes {
+        Some(Ok(body)) => match serde_json::from_str::<Value>(body) {
+            Ok(v) => {
+                let map: HashMap<_, _> = parse_quotes(&v).into_iter().map(|q| (q.symbol.clone(), q)).collect();
+                for c in resolve(&cfg.rows, &map, now, cfg.stale_after_s, cfg.delayed_grace_s) {
+                    match &c.quote {
+                        Some(q) => println!(
+                            "{:<5} {:>12} {:>8}  {}{}{} age={}",
+                            c.label,
+                            crate::model::fmt_price(q.price, c.digits),
+                            q.change_pct.map(crate::model::fmt_change).unwrap_or_default(),
+                            q.name,
+                            if q.realtime { "" } else { " DELAYED" },
+                            if c.stale { " STALE" } else { "" },
+                            q.ts.map(|t| format!("{:.0}s", now - t)).unwrap_or_else(|| "?".into()),
+                        ),
+                        None => println!("{:<5} {:>12}  no quote", c.label, "-"),
+                    }
                 }
             }
-        }
-        Err(e) => println!("quotes: {e}"),
+            Err(_) => println!("quotes: unreadable answer"),
+        },
+        Some(Err(e)) => println!("quotes: {e}"),
+        None => {}
     }
-    for r in &cfg.rows {
-        match client.chart(&r.symbol) {
-            Ok((t0, bars)) if !bars.is_empty() => println!(
-                "bars {:<5} {} bars, {:.0} min long, last {:.0} s ago",
-                r.label,
-                bars.len(),
-                (bars[bars.len() - 1].t(t0) - t0) / 60.0,
-                (now - bars[bars.len() - 1].t(t0)).max(0.0)
-            ),
-            Ok(_) => println!("bars {:<5} none", r.label),
-            Err(e) => println!("bars {:<5} {e}", r.label),
-        }
-    }
-    // The live check for the range files, on the first row: what each file really carries.
-    if let Some(r) = cfg.rows.first() {
-        for file in ["5D.json", "1M.json", "1Y.json", "5Y.json"] {
-            match client.chart_file(&r.symbol, file) {
-                Ok(sr) => {
-                    let n = sr.bars.len();
-                    let span_d = sr.bars.last().map_or(0.0, |b| b.dt as f64) / 86_400.0;
-                    // The last bar's stamp, in UTC. Daily and weekly candles are dated on the
-                    // assumption that this is midnight on the exchange's clock (`chartview::date_zone`):
-                    // this line is where that can be seen to hold.
-                    let last = sr.bars.last().map_or_else(String::new, |b| {
-                        let t = b.t(sr.t0);
-                        format!(
-                            ", last bar {} {} UTC",
-                            crate::chartview::date_label(t, 0, crate::chartview::DateStyle::Full),
-                            crate::chartview::clock(t, 0)
-                        )
-                    });
+    for (symbol, answer) in &b.day {
+        let label = cfg.rows.iter().find(|r| &r.symbol == symbol).map_or(symbol.as_str(), |r| r.label.as_str());
+        match answer.as_ref().map_err(String::clone).and_then(|t| serde_json::from_str::<Value>(t).map_err(|_| "unreadable answer".to_string())) {
+            Ok(v) => {
+                let (t0, bars) = parse_chart(&v, now);
+                if bars.is_empty() {
+                    println!("bars {label:<5} none");
+                } else {
                     println!(
-                        "range {:<5} {file}: {n} bars, {:.0} s a bar, {:.1} days, volume {}{last}",
-                        r.label,
-                        sr.bar_s,
-                        span_d,
-                        if sr.bars.iter().any(|b| b.v > 0.0) { "yes" } else { "no" }
+                        "bars {:<5} {} bars, {:.0} min long, last {:.0} s ago",
+                        label,
+                        bars.len(),
+                        (bars[bars.len() - 1].t(t0) - t0) / 60.0,
+                        (now - bars[bars.len() - 1].t(t0)).max(0.0)
                     );
                 }
-                Err(e) => println!("range {:<5} {file}: {e}", r.label),
             }
+            Err(e) => println!("bars {label:<5} {e}"),
         }
     }
+    let label = cfg.rows.first().map_or("", |r| r.label.as_str());
+    for (file, answer) in &b.ranges {
+        match answer.as_ref().map_err(String::clone).and_then(|t| serde_json::from_str::<Value>(t).map_err(|_| "unreadable answer".to_string())) {
+            Ok(v) => {
+                let sr = parse_series(&v, now);
+                let span_d = sr.bars.last().map_or(0.0, |b| b.dt as f64) / 86_400.0;
+                // The last bar's stamp, in UTC: where the daily-stamp assumption can be seen to hold.
+                let last = sr.bars.last().map_or_else(String::new, |b| {
+                    let t = b.t(sr.t0);
+                    format!(", last bar {} {} UTC", crate::chartview::date_label(t, 0, crate::chartview::DateStyle::Full), crate::chartview::clock(t, 0))
+                });
+                println!(
+                    "range {:<5} {file}: {} bars, {:.0} s a bar, {:.1} days, volume {}{last}",
+                    label,
+                    sr.bars.len(),
+                    sr.bar_s,
+                    span_d,
+                    if sr.bars.iter().any(|b| b.v > 0.0) { "yes" } else { "no" }
+                );
+            }
+            Err(e) => println!("range {label:<5} {file}: {e}"),
+        }
+    }
+    let findings = crate::probe::judge(&b);
+    println!("\n{}", crate::probe::render(&findings));
+    if let Some(dir) = dump {
+        match crate::probe::write_dump(dir, &b) {
+            Ok(n) => println!("\n{n} raw answers saved in {}", dir.display()),
+            Err(e) => println!("\nthe answers could not be saved: {}", e.kind()),
+        }
+    }
+    crate::probe::exit_code(&findings) != 0
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_response_read_through_counted_reaches_the_meter() {
+        use std::io::Read;
+        let before = METER.lock().unwrap().since_start();
+        let mut body = Vec::new();
+        Counted::new(std::io::Cursor::new(vec![7u8; 4_321])).read_to_end(&mut body).unwrap();
+        let after = METER.lock().unwrap().since_start();
+        // Other tests may count too, never less than this one.
+        assert!(after - before >= 4_321, "{before} -> {after}");
+        assert!(meter_line().starts_with("Data: "));
+    }
 
     #[test]
     fn parses_cnbc_times_to_utc() {
@@ -1461,6 +1605,58 @@ mod tests {
         feed.wait(Duration::from_secs(30), 0);
         t.join().unwrap();
         assert!(started.elapsed() < Duration::from_secs(2), "wait ignored the kick: {:?}", started.elapsed());
+    }
+
+    fn test_feed(shared: &Arc<Mutex<Board>>, rows: Vec<Row>) -> Feed {
+        Feed { cfg: Config::default(), rows, rows_gen: 0, shared: shared.clone(), notify: Arc::new(|| {}),
+            client: Client::new().unwrap(), quotes: HashMap::new(), chart: Vec::new(),
+            backfill: Vec::new(), backfill_gen: 0, bars_next: Instant::now(), bars_due: Vec::new(), fails: 0 }
+    }
+
+    /// The governor as the feed reads it from the board: nothing changes with both ticks off (Classic),
+    /// a quiet market and a locked session slow the wait, and an armed alert holds it to 15 s.
+    #[test]
+    fn the_feed_waits_the_governed_interval_only_when_a_tick_is_on() {
+        let rows = Config::default().rows[..2].to_vec();
+        let shared = Arc::new(Mutex::new(Board::new(&rows)));
+        let feed = test_feed(&shared, rows);
+        for quiet in [0.0, 700.0, 4_000.0] {
+            assert_eq!(feed.governed(quiet), (3.0, 0.0), "off: the plain cadence, stale limit untouched");
+        }
+        {
+            let mut b = shared.lock().unwrap();
+            b.gov = crate::governor::Settings { slow_when_quiet: true, rest_when_locked: true };
+        }
+        assert_eq!(feed.governed(0.0), (3.0, 3.0));
+        assert_eq!(feed.governed(700.0), (15.0, 15.0));
+        assert_eq!(feed.governed(2_000.0), (60.0, 60.0));
+        shared.lock().unwrap().locked = true;
+        assert_eq!(feed.governed(0.0), (300.0, 300.0));
+        shared.lock().unwrap().armed = true;
+        assert_eq!(feed.governed(2_000.0), (15.0, 15.0), "armed: never slower than 15 s, locked or not");
+        // The feed tells the board what it waits, and the board says when a wake is worth a kick.
+        feed.note_governed(300.0, 3.0);
+        let b = shared.lock().unwrap();
+        assert_eq!((b.governed_s, b.slowed), (300.0, true));
+        drop(b);
+        feed.note_governed(0.0, 3.0);
+        let b = shared.lock().unwrap();
+        assert_eq!((b.governed_s, b.slowed), (0.0, false));
+    }
+
+    /// A quote one slow poll old is not stale in the cells the feed publishes; ungoverned it is.
+    #[test]
+    fn publish_uses_the_governed_stale_limit() {
+        let rows = Config::default().rows[..1].to_vec();
+        let shared = Arc::new(Mutex::new(Board::new(&rows)));
+        let mut feed = test_feed(&shared, rows.clone());
+        let q = Quote { symbol: rows[0].symbol.clone(), price: 1.0, ts: Some(now_s() - 250.0), realtime: true, ..Quote::default() };
+        feed.quotes.insert(q.symbol.clone(), q);
+        feed.publish(Link::Live, String::new());
+        assert!(shared.lock().unwrap().cells[0].stale, "250 s old against the configured 90 s");
+        shared.lock().unwrap().governed_s = 300.0;
+        feed.publish(Link::Live, String::new());
+        assert!(!shared.lock().unwrap().cells[0].stale, "one 300 s poll old is not stale");
     }
 
     #[test]
