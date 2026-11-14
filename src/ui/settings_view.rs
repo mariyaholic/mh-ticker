@@ -186,13 +186,14 @@ fn display(cfg: &Config, env: &Env) -> Vec<Control> {
                 .filter(|(_, f)| f.group == group)
                 .map(|(i, f)| opt(f.name, cmd(CMD_FONT + i)).checked(f.name == face).enabled(theme::face_available(f.name)))
                 .collect();
-            v.push(Control::choice(&format!("Font: {group}"), "", opts, None));
+            let note = theme::FACES.iter().find(|f| f.group == group && f.name == face).map_or("", |f| f.note);
+            v.push(Control::choice(&format!("Font: {group}"), note, opts, None));
         }
         v.push(Control::toggle("Symbol picker", "the chip list under the cards", env.picked, cmd(CMD_PICK), true));
     }
     v.push(Control::header("Accessibility"));
-    v.push(Control::toggle("Follow the Windows contrast theme", "", env.reach.contrast, cmd(CMD_CONTRAST), true));
-    v.push(Control::toggle("Follow the Windows animation setting", "", env.reach.animate, cmd(CMD_ANIMATE), true));
+    v.push(Control::toggle("Contrast theme", "follow the Windows contrast theme", env.reach.contrast, cmd(CMD_CONTRAST), true));
+    v.push(Control::toggle("Animation", "follow the Windows animation setting", env.reach.animate, cmd(CMD_ANIMATE), true));
     if env.ultra {
         let sizes = crate::zoom::STEPS.iter().map(|z| format!("{z} %")).collect();
         let cur = crate::zoom::STEPS.iter().position(|z| *z == env.reach.zoom).unwrap_or(2);
@@ -272,7 +273,7 @@ fn alerts_page(cfg: &Config, env: &Env) -> Vec<Control> {
         ],
         None,
     ));
-    v.push(Control::toggle("Say when alerts could not be checked", "", av.gap_notice, cmd(CMD_GAP_NOTICE), has_hook));
+    v.push(Control::toggle("Alert gaps", "say when alerts could not be checked", av.gap_notice, cmd(CMD_GAP_NOTICE), has_hook));
 
     v.push(Control::header("Alerts for each symbol"));
     if av.rows.is_empty() {
@@ -280,12 +281,23 @@ fn alerts_page(cfg: &Config, env: &Env) -> Vec<Control> {
     }
     for row in &av.rows {
         let line = row.alert.as_ref().map(|a| alerts::describe(a, row.digits)).filter(|d| !d.is_empty());
-        let presets = alerts::PRESETS
-            .iter()
-            .enumerate()
-            .map(|(k, p)| opt(p.label, Act::Do(Action::Alert(row.label.clone(), k))).enabled(row.enabled.get(k).copied().unwrap_or(false)))
-            .collect();
-        v.push(Control::choice(&row.label, &line.unwrap_or_else(|| "nothing set".into()), presets, None));
+        // The presets are split where the menu drew a separator: one control per group, the first one
+        // carrying the symbol's name and its current alert.
+        let mut first = true;
+        for group in 0..=alerts::PRESETS.iter().map(|p| p.group).max().unwrap_or(0) {
+            let presets: Vec<Opt> = alerts::PRESETS
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p.group == group)
+                .map(|(k, p)| opt(p.label, Act::Do(Action::Alert(row.label.clone(), k))).enabled(row.enabled.get(k).copied().unwrap_or(false)))
+                .collect();
+            if presets.is_empty() {
+                continue;
+            }
+            let (name, hint) = if first { (row.label.as_str(), line.clone().unwrap_or_else(|| "nothing set".into())) } else { ("", String::new()) };
+            v.push(Control::choice(name, &hint, presets, None));
+            first = false;
+        }
         let cur_fast = row.alert.as_ref().map_or(0, |a| a.fast as usize);
         let fast = (0..alerts::FAST_MOVES.len())
             .map(|k| opt(format!("fast move {}", alerts::fast_label(k)), Act::Do(Action::Fast(row.label.clone(), k))).checked(cur_fast == k + 1))
@@ -294,7 +306,7 @@ fn alerts_page(cfg: &Config, env: &Env) -> Vec<Control> {
         let cooldown = row.alert.as_ref().map(|a| a.cooldown_s);
         let cooldown_text = cooldown.map_or("cooldown...".to_string(), |c| format!("cooldown {}...", crate::typed::cooldown_text(c)));
         v.push(Control::choice(
-            &format!("{} more", row.label),
+            &format!("{} extras", row.label),
             "",
             vec![
                 opt("at a price...", Act::Do(Action::AlertAt(row.label.clone()))).enabled(row.fresh),
@@ -363,8 +375,8 @@ fn system(cfg: &Config, env: &Env) -> Vec<Control> {
     let cur_poll = POLL_CHOICES.iter().position(|secs| (secs - cfg.poll_s).abs() < 0.01).unwrap_or(2);
     v.push(radio("Poll every", "while prices move", POLL_CHOICES.iter().map(|s| format!("{s} s")).collect(), CMD_POLL, cur_poll, true));
     let gov = cfg.governor(env.ultra);
-    v.push(Control::toggle("Slow down when nothing moves", "never below one poll in 15 s with an alert armed", gov.slow_when_quiet, cmd(CMD_SLOW_QUIET), true));
-    v.push(Control::toggle("Rest while the PC is locked", "", gov.rest_when_locked, cmd(CMD_REST_LOCKED), true));
+    v.push(Control::toggle("Slow when quiet", "slow down when nothing moves; never below one poll in 15 s with an alert armed", gov.slow_when_quiet, cmd(CMD_SLOW_QUIET), true));
+    v.push(Control::toggle("Rest when locked", "rest while the PC is locked", gov.rest_when_locked, cmd(CMD_REST_LOCKED), true));
     v.push(Control::toggle("Allow fallback sources", "Gold API or Kraken when CNBC is unavailable", cfg.fallback_enabled, cmd(CMD_FALLBACK), true));
     v.push(Control::choice("Now", "", vec![opt("Refresh now", cmd(CMD_REFRESH)), opt("Copy all prices", cmd(CMD_COPY_ALL))], None));
     v
@@ -447,9 +459,8 @@ mod tests {
     }
 
     fn rich_env(ultra: bool) -> (Config, Env) {
-        let mut cfg = Config::default();
-        cfg.hotkey = Some("Ctrl+Alt+Q".into());
-        cfg.rows.push(config::Row { label: "ZZZ".into(), symbol: "ZZZ.TEST".into(), digits: 2, name: String::new(), strip: true, ..cfg.rows[0].clone() });
+        let mut cfg = Config { hotkey: Some("Ctrl+Alt+Q".into()), ..Config::default() };
+        cfg.rows.push(config::Row { label: "ZZZ".into(), symbol: "ZZZ.TEST".into(), digits: 2, name: String::new(), strip: true });
         let mut env = Env { ultra, ..Env::default() };
         env.monitors = vec![
             MonitorFact { device: "A".into(), primary: true, w: 1920, h: 1080 },
@@ -629,13 +640,53 @@ mod tests {
     }
 
     #[test]
+    fn no_control_label_needs_more_than_one_line_at_the_default_window_size() {
+        let (w, _) = settings::window_size(96);
+        let lw = settings::label_width(96, w);
+        for ultra in [false, true] {
+            let (cfg, env) = rich_env(ultra);
+            for s in Section::for_build(ultra) {
+                for c in build(&cfg, &env, s).iter().filter(|c| matches!(c.kind, Kind::Toggle | Kind::Choice | Kind::Button)) {
+                    let (names, hints) = settings::label_lines(c, lw, 96);
+                    assert!(names.len() <= 1, "label {:?} wraps in {s:?}", c.label);
+                    assert!(hints.len() <= 3, "hint {:?} needs {} lines in {s:?}", c.hint, hints.len());
+                    for l in names.iter() {
+                        assert!(l.chars().count() as i32 * 8 <= lw, "{l:?} is wider than the label column {lw}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn alert_presets_are_split_where_the_menu_had_separators() {
+        let (cfg, env) = rich_env(true);
+        let page = build(&cfg, &env, Section::Alerts);
+        let first = cfg.rows[0].label.as_str();
+        let at = page.iter().position(|c| c.label == first).expect("the first symbol has a preset row");
+        let groups = alerts::PRESETS.iter().map(|p| p.group).max().unwrap() as usize + 1;
+        let shown: usize = page[at..at + groups].iter().map(|c| c.opts.len()).sum();
+        assert_eq!(shown, alerts::PRESETS.len(), "every preset appears once across the group rows");
+        assert!(page[at + 1..at + groups].iter().all(|c| c.label.is_empty()), "only the first row carries the name");
+    }
+
+    #[test]
+    fn a_font_group_shows_the_note_of_the_face_in_use() {
+        let (mut cfg, env) = rich_env(true);
+        cfg.theme_font = Some("Georgia".into());
+        let page = build(&cfg, &env, Section::Display);
+        let serif = page.iter().find(|c| c.label == "Font: Serif").unwrap();
+        assert_eq!(serif.hint, "warm, screen-safe");
+    }
+
+    #[test]
     fn every_page_has_focusable_controls_and_every_option_has_text() {
         for ultra in [false, true] {
             let (cfg, env) = rich_env(ultra);
             for s in Section::for_build(ultra) {
                 let page = build(&cfg, &env, s);
                 assert!(!page.is_empty(), "{s:?}");
-                assert!(page.iter().any(|c| c.focusable()) || s == Section::About && false, "{s:?} has nothing to focus");
+                assert!(page.iter().any(|c| c.focusable()) , "{s:?} has nothing to focus");
                 for c in &page {
                     for o in &c.opts {
                         assert!(!o.label.trim().is_empty(), "{} has an option with no text", c.label);
