@@ -495,7 +495,7 @@ pub(crate) mod trace {
 }
 
 /// Draw `s` with its top-left at (x, y); returns its width.
-fn text(dc: HDC, font: HFONT, x: i32, y: i32, s: &str, color: COLORREF) -> i32 {
+pub(crate) fn text(dc: HDC, font: HFONT, x: i32, y: i32, s: &str, color: COLORREF) -> i32 {
     unsafe {
         let old = SelectObject(dc, font);
         SetTextColor(dc, color);
@@ -547,7 +547,7 @@ fn line_height(dc: HDC, font: HFONT) -> i32 {
     }
 }
 
-fn fill_round(dc: HDC, r: RECT, radius: i32, color: COLORREF) {
+pub(crate) fn fill_round(dc: HDC, r: RECT, radius: i32, color: COLORREF) {
     unsafe {
         let brush = CreateSolidBrush(color);
         let old_b = SelectObject(dc, brush);
@@ -560,7 +560,7 @@ fn fill_round(dc: HDC, r: RECT, radius: i32, color: COLORREF) {
     }
 }
 
-fn fill_ellipse(dc: HDC, x: i32, y: i32, d: i32, color: COLORREF) {
+pub(crate) fn fill_ellipse(dc: HDC, x: i32, y: i32, d: i32, color: COLORREF) {
     unsafe {
         let brush = CreateSolidBrush(color);
         let old_b = SelectObject(dc, brush);
@@ -572,7 +572,7 @@ fn fill_ellipse(dc: HDC, x: i32, y: i32, d: i32, color: COLORREF) {
     }
 }
 
-fn fill_rect(dc: HDC, r: RECT, color: COLORREF) {
+pub(crate) fn fill_rect(dc: HDC, r: RECT, color: COLORREF) {
     unsafe {
         let brush = CreateSolidBrush(color);
         FillRect(dc, &r, brush);

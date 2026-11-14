@@ -1005,6 +1005,61 @@ pub fn bench_fold(n: usize, plot_w: i32, iters: u32) -> f64 {
     start.elapsed().as_secs_f64() * 1e6 / iters.max(1) as f64
 }
 
+/// The settings window as stills, written into `dir`: Classic on its one theme, two Ultra themes (a
+/// dark flat one and the bitmap pc98), the two fixed Windows contrast palettes, and 150 percent zoom.
+/// A page is drawn at the window's opening size; the `-full` pictures are the whole scrolling page.
+/// Returns how many files were written.
+pub fn write_settings(dir: &Path) -> Result<usize, String> {
+    use crate::settings::{self, Hit, Paint, Section};
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    struct Case {
+        file: &'static str,
+        ultra: bool,
+        theme: &'static Theme,
+        name: &'static str,
+        section: Section,
+        dpi: u32,
+        zoom: u32,
+        full: bool,
+    }
+    let case = |file, ultra, theme: &'static Theme, name, section, dpi, zoom, full| Case { file, ultra, theme, name, section, dpi, zoom, full };
+    let mid = theme::resolve("midnight");
+    let pc = theme::resolve("pc98");
+    let cases = [
+        case("settings-classic-symbols.png", false, theme::classic(), "midnight", Section::Symbols, 96, 100, false),
+        case("settings-classic-display.png", false, theme::classic(), "midnight", Section::Display, 96, 100, false),
+        case("settings-classic-system.png", false, theme::classic(), "midnight", Section::System, 96, 100, false),
+        case("settings-ultra-display-midnight.png", true, mid, "midnight", Section::Display, 96, 100, false),
+        case("settings-ultra-display-midnight-full.png", true, mid, "midnight", Section::Display, 96, 100, true),
+        case("settings-ultra-alerts-midnight-full.png", true, mid, "midnight", Section::Alerts, 96, 100, true),
+        case("settings-ultra-display-pc98.png", true, pc, "pc98", Section::Display, 96, 100, false),
+        case("settings-ultra-chart-pc98.png", true, pc, "pc98", Section::Chart, 96, 100, false),
+        case("settings-ultra-system-144dpi.png", true, mid, "midnight", Section::System, 144, 100, false),
+        case("settings-ultra-symbols-zoom150.png", true, mid, "midnight", Section::Symbols, 96, 150, false),
+        case("settings-contrast-black.png", true, theme::system(&crate::contrast::HC_BLACK), "midnight", Section::Display, 96, 100, false),
+        case("settings-contrast-white.png", true, theme::system(&crate::contrast::HC_WHITE), "midnight", Section::System, 96, 100, false),
+    ];
+    let mut n = 0;
+    for c in &cases {
+        let eff = crate::zoom::effective_dpi(c.dpi, c.zoom);
+        let controls = crate::ui::settings_still(c.ultra, c.name, c.section);
+        let sections = Section::for_build(c.ultra);
+        let cur = sections.iter().position(|s| *s == c.section).unwrap_or(0);
+        let (w, mut h) = settings::window_size(eff);
+        if c.full {
+            h = settings::layout(eff, w, 100_000, sections.len(), &controls, 0).content_h;
+        }
+        let l = settings::layout(eff, w, h, sections.len(), &controls, 0);
+        let fonts = Fonts::new(theme::font_of(c.theme, None), eff, c.theme.is_pixel());
+        let focus = controls.iter().position(|k| k.focusable()).and_then(|ci| settings::entry_opt(&controls[ci]).map(|oi| Hit::Opt(ci, oi)));
+        let p = Paint { theme: c.theme, fonts: &fonts, title: "Settings", sections: &sections, cur, controls: &controls, layout: &l, focus, hover: None };
+        let (pw, ph, px) = capture_with(w, h, |dc| settings::draw(dc, w, h, &p));
+        write_png(&dir.join(c.file), pw, ph, &px)?;
+        n += 1;
+    }
+    Ok(n)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

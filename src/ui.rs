@@ -82,6 +82,16 @@ const TIMER_ANIM: usize = 2;
 /// One-shot re-check soon after a foreground change: a taskbar click raises the taskbar a moment
 /// after the foreground event, so the immediate check can miss it.
 const TIMER_RECHECK: usize = 3;
+mod settings_view;
+mod settings_win;
+
+/// A page of the settings window from a fixed fixture (no window, no registry, no network), for the
+/// still renderer. `theme` names the palette in force for an Ultra build.
+#[cfg(feature = "shots")]
+pub(crate) fn settings_still(ultra: bool, theme: &str, section: crate::settings::Section) -> Vec<crate::settings::Control> {
+    settings_view::fixture(ultra, theme, section)
+}
+
 const CMD_STRIP: usize = 1001;
 const CMD_TOP: usize = 1002;
 const CMD_STATUS: usize = 1003;
@@ -110,7 +120,6 @@ const CMD_UNMUTE: usize = 5204;
 const CMD_QUIET_OFF: usize = 5205;
 /// Quiet hours: CMD_QUIET + index into `alerts::QUIET_CHOICES`.
 const CMD_QUIET: usize = 5206;
-const CMD_HOOK_HOST: usize = 5210;
 const CMD_HOOK_PASTE: usize = 5211;
 const CMD_HOOK_TEST: usize = 5212;
 const CMD_HOOK_REMOVE: usize = 5213;
@@ -165,13 +174,10 @@ const HOTKEY_ID: i32 = 1;
 const CMD_REFRESH: usize = 5400;
 const CMD_COPY_ALL: usize = 5401;
 const CMD_AUTOSTART: usize = 5402;
-const CMD_VERSION: usize = 5403;
 const CMD_UPDATE: usize = 5404;
 const CMD_SAVE_STATUS: usize = 5405;
 /// The greyed line that says a settings file that would not parse was kept under another name.
 const CMD_KEPT_STATUS: usize = 5406;
-/// The greyed data meter line.
-const CMD_METER: usize = 5407;
 /// *Copy diagnostics report* (W1): the probe's checks on a click, as text on the clipboard.
 const CMD_REPORT: usize = 5408;
 /// The report's checks finished off-thread (the text is in `Ui::report_result`). `WM_APP + 16` is
@@ -228,6 +234,8 @@ const OPACITY_STEPS: [(u8, &str); 5] = [(255, "100 %"), (235, "92 %"), (205, "80
 const WM_LOOKUP: u32 = WM_APP + 14;
 /// Symbols > *Add symbol...* (both builds).
 const CMD_ADD_SYMBOL: usize = 6000;
+/// The short menu's first entry: opens the settings window. Not a setting itself.
+const CMD_SETTINGS: usize = 6020;
 /// The candle pane's own right-click menu (Ultra): alert at the price under the pointer, clear the
 /// symbol's alerts, and the main menu.
 const CMD_PANE_ALERT: usize = 6010;
@@ -2272,54 +2280,15 @@ fn menu(hwnd: HWND, at: Option<(i32, i32)>) {
     menu_at(hwnd, at, None)
 }
 
-/// The panel's settings button: the same menu the tray icon opens, dropped from under the button
-/// (left edges aligned; Windows slides it back on screen if it would not fit) instead of wherever
-/// the cursor happened to be.
-fn settings_menu(hwnd: HWND) {
-    let Some((x, y)) = with_ui(|u| {
-        let g = panel_geo(u);
-        (g.gear_btn.left, g.gear_btn.bottom + 4 * pdpi(u) as i32 / 96)
-    }) else {
-        return;
-    };
-    let mut pt = POINT { x, y };
-    unsafe { ClientToScreen(hwnd, &mut pt) };
-    menu_at(hwnd, None, Some((pt.x, pt.y)));
-    // The menu ran its own message loop, so the pointer's departure from the button was never seen.
-    with_ui(|u| u.gear_hover = false);
-    unsafe { InvalidateRect(hwnd, null(), 0) };
-}
-
 /// `anchor` is a screen point to drop the menu from; `None` drops it at the cursor.
 fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
     clear_pending(hwnd);
-    #[allow(clippy::type_complexity)]
-    let Some((visible, top, docked, status, open, list, shown, theme_name, theme_font, poll_s, ultra, picked, alerted)) = with_ui(|u| {
-        let list = config::menu_list(&u.cfg);
-        let shown: Vec<bool> = list.iter().map(|r| config::is_shown(&u.cfg, &r.symbol)).collect();
+    let Some((visible, top, status, open, ultra, picked)) = with_ui(|u| {
         let note = if u.view.note.is_empty() { theme::link_name(u.view.link).to_string() } else { u.view.note.clone() };
-        let shown_labels: Vec<&str> = list.iter().zip(&shown).filter(|(_, on)| **on).map(|(r, _)| r.label.as_str()).collect();
-        let alerted = armed_labels(&u.cfg.alerts, &shown_labels);
-        (
-            u.cfg.strip_visible,
-            u.cfg.topmost,
-            u.cfg.placement().on_taskbar(),
-            note,
-            u.mode != Mode::Strip,
-            list,
-            shown,
-            u.cfg.theme.clone(),
-            u.cfg.theme_font.clone(),
-            u.cfg.poll_s,
-            u.profile.ultra,
-            u.pick_open,
-            alerted,
-        )
+        (u.cfg.strip_visible, u.cfg.topmost, note, u.mode != Mode::Strip, u.profile.ultra, u.pick_open)
     }) else {
         return;
     };
-    let (placement, cur_mon) = with_ui(|u| (u.cfg.placement(), u.cfg.monitor.clone())).unwrap_or((Placement::Auto, None));
-    let mons = dock::monitors();
     let mut commands = crate::menu_commands::MenuCommands::default();
     let cmd = unsafe {
         let m = CreatePopupMenu();
@@ -2407,365 +2376,17 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
             }
             AppendMenuW(m, MF_SEPARATOR, 0, null());
         }
-        // Symbols: tick to show, untick to hide. The last one cannot go; at most MAX_ROWS show.
-        let n_shown = shown.iter().filter(|s| **s).count();
-        let full = n_shown >= config::MAX_ROWS;
-        let syms = CreatePopupMenu();
-        for (i, r) in list.iter().enumerate() {
-            let on = shown[i];
-            let locked = if on { n_shown <= 1 } else { full };
-            let flags = MF_STRING | if on { MF_CHECKED } else { 0 } | if locked { MF_GRAYED } else { 0 };
-            let text = if r.name.is_empty() { r.label.clone() } else { format!("{}\t{}", r.label, r.name) };
-            dynamic(syms, flags, &mut commands, crate::menu_commands::Action::Symbol(r.symbol.clone()), &text);
-        }
-        AppendMenuW(syms, MF_SEPARATOR, 0, null());
-        // Add and remove by hand (both builds). Read in a call of its own: the big tuple is not extended.
-        let (adding, custom) = with_ui(|u| (u.adding.clone(), config::custom_entries(&u.cfg))).unwrap_or((None, Vec::new()));
-        match &adding {
-            Some(symbol) => add(syms, MF_STRING | MF_GRAYED, CMD_ADD_SYMBOL, &format!("Adding {symbol}...")),
-            None => add(syms, MF_STRING, CMD_ADD_SYMBOL, "Add symbol..."),
-        }
-        let forget = CreatePopupMenu();
-        for r in &custom {
-            // The only symbol shown cannot go, here as everywhere.
-            let last = n_shown <= 1 && list.iter().zip(&shown).any(|(l, on)| *on && l.symbol == r.symbol);
-            let text = format!("{}\t{}", r.label, r.symbol);
-            dynamic(forget, MF_STRING | if last { MF_GRAYED } else { 0 }, &mut commands, crate::menu_commands::Action::Forget(r.symbol.clone()), &text);
-        }
-        add(syms, MF_POPUP | if custom.is_empty() { MF_GRAYED } else { 0 }, forget as usize, "Remove a symbol I added");
-        let order = CreatePopupMenu();
-        add(order, MF_STRING, CMD_ORDER_MOVE, "By day move, biggest first");
-        add(order, MF_STRING, CMD_ORDER_NAME, "By name, A to Z");
-        add(order, MF_STRING, CMD_ORDER_DEFAULT, "Default order");
-        add(syms, MF_POPUP | if n_shown <= 1 { MF_GRAYED } else { 0 }, order as usize, "Order the cards (once)");
-        let unpinned = with_ui(|u| u.cfg.rows.iter().any(|r| !r.strip)).unwrap_or(false);
-        add(syms, MF_STRING | if unpinned { 0 } else { MF_GRAYED }, CMD_PIN_ALL, "Show all on strip");
-        add(syms, MF_STRING, CMD_RESET, "Reset to default");
+        item(MF_STRING, CMD_SETTINGS, "Settings...");
         item(MF_STRING, CMD_PANEL, if open { "Back to taskbar" } else { "Expand view" });
         SetMenuDefaultItem(m, CMD_PANEL as u32, 0);
-        add(m, MF_POPUP, syms as usize, &format!("Symbols ({n_shown})"));
+        item(MF_STRING, CMD_REFRESH, "Refresh now");
+        item(MF_STRING, CMD_COPY_ALL, "Copy all prices");
         // Undo (W3 J2): one snapshot, so one line; it says what it would undo.
         match with_ui(|u| u.undo.kind()).flatten() {
             Some(kind) => item(MF_STRING, CMD_UNDO, &format!("Undo the last {}{}", kind.label(), if ultra { "\tCtrl+Z" } else { "" })),
             None => item(MF_STRING | MF_GRAYED, CMD_UNDO, "Undo"),
         }
-        // Poll interval: `poll_s` has always been in the config; nothing exposed it until now.
-        let poll = CreatePopupMenu();
-        for (i, secs) in POLL_CHOICES.iter().enumerate() {
-            add(poll, MF_STRING, CMD_POLL + i, &format!("{secs} s"));
-        }
-        let cur_poll = POLL_CHOICES.iter().position(|secs| (secs - poll_s).abs() < 0.01).unwrap_or(2);
-        CheckMenuRadioItem(
-            poll,
-            CMD_POLL as u32,
-            (CMD_POLL + POLL_CHOICES.len() - 1) as u32,
-            (CMD_POLL + cur_poll) as u32,
-            MF_BYCOMMAND,
-        );
-        // The governor (W2): the choice above is the pace while prices move; these two only ever slow it,
-        // and never below one poll in 15 s while an alert is armed.
-        let gov = with_ui(|u| u.cfg.governor(u.profile.ultra)).unwrap_or_default();
-        AppendMenuW(poll, MF_SEPARATOR, 0, null());
-        add(poll, MF_STRING | if gov.slow_when_quiet { MF_CHECKED } else { 0 }, CMD_SLOW_QUIET, "Slow down when nothing moves");
-        add(poll, MF_STRING | if gov.rest_when_locked { MF_CHECKED } else { 0 }, CMD_REST_LOCKED, "Rest while the PC is locked");
-        add(m, MF_POPUP, poll as usize, &format!("Poll every {poll_s} s"));
-        let sources = CreatePopupMenu();
-        let fallback = with_ui(|u| u.cfg.fallback_enabled).unwrap_or(false);
-        add(sources, MF_STRING | if fallback { MF_CHECKED } else { 0 }, CMD_FALLBACK, "Allow fallback sources");
-        add(m, MF_POPUP, sources as usize, "Data sources");
-        item(MF_STRING, CMD_REFRESH, "Refresh now");
-        item(MF_STRING, CMD_COPY_ALL, "Copy all prices");
-        let reach = reach_view();
-        {
-            let acc = CreatePopupMenu();
-            let on = |b: bool| MF_STRING | if b { MF_CHECKED } else { 0 };
-            if ultra {
-                for (i, mode) in crate::updown::UpDown::ALL.iter().enumerate() {
-                    add(acc, on(reach.updown == *mode), CMD_UPDOWN + i, mode.label());
-                }
-                add(acc, on(reach.hollow), CMD_HOLLOW, "Hollow up candles");
-                AppendMenuW(acc, MF_SEPARATOR, 0, null());
-            }
-            add(acc, on(reach.contrast), CMD_CONTRAST, "Follow the Windows contrast theme");
-            add(acc, on(reach.animate), CMD_ANIMATE, "Follow the Windows animation setting");
-            if ultra {
-                AppendMenuW(acc, MF_SEPARATOR, 0, null());
-                for (i, z) in crate::zoom::STEPS.iter().enumerate() {
-                    add(acc, on(reach.zoom == *z), CMD_ZOOM + i, &format!("Panel size {z} %"));
-                }
-            }
-            add(m, MF_POPUP, acc as usize, "Accessibility");
-        }
-        if ultra {
-            // Theme: four tier submenus, because 25 entries in one popup is a wall. The tier is a
-            // rendering rule (`theme::Kind`), so the menu cannot disagree with the painter.
-            let th = CreatePopupMenu();
-            let cur = theme::index_of(&theme_name);
-            for kind in theme::Kind::ALL {
-                let sub = CreatePopupMenu();
-                // The tier explains itself, so "Animated" and "Retro" do not need a README.
-                add(sub, MF_STRING | MF_GRAYED, 0, kind.note());
-                AppendMenuW(sub, MF_SEPARATOR, 0, null());
-                for i in theme::tier(kind) {
-                    let t = &theme::ALL[i];
-                    let flags = MF_STRING | if i == cur { MF_CHECKED } else { 0 };
-                    add(sub, flags, CMD_THEME + i, &format!("{}\t{}", t.name, t.note));
-                }
-                add(th, MF_POPUP, sub as usize, kind.label());
-            }
-            add(m, MF_POPUP, th as usize, &format!("Theme \u{b7} {}", theme::ALL[cur].name));
-            // Font: the same idea one axis over — grouped by family, not one list of 13 names.
-            let face = theme::font_of(&theme::ALL[cur], theme_font.as_deref());
-            let ft = CreatePopupMenu();
-            for group in theme::FACE_GROUPS {
-                let sub = CreatePopupMenu();
-                for (i, f) in theme::FACES.iter().enumerate().filter(|(_, f)| f.group == group) {
-                    // A face this machine cannot draw is greyed rather than hidden: the menu is a
-                    // catalogue of what the app can do, and "installed on other machines" is
-                    // information, not noise.
-                    let missing = !theme::face_available(f.name);
-                    let flags = MF_STRING
-                        | if f.name == face { MF_CHECKED } else { 0 }
-                        | if missing { MF_GRAYED } else { 0 };
-                    add(sub, flags, CMD_FONT + i, &format!("{}\t{}", f.name, f.note));
-                }
-                add(ft, MF_POPUP, sub as usize, group);
-            }
-            add(m, MF_POPUP, ft as usize, &format!("Font \u{b7} {face}"));
-            item(MF_STRING | if picked { MF_CHECKED } else { 0 }, CMD_PICK, "Symbol picker");
-            // Alerts: per symbol the presets, what is set and Clear; then the settings that apply
-            // to every alert. The state is read in one separate `with_ui` call (`alerts_view`).
-            let av = alerts_view(&list, &shown).unwrap_or_default();
-            let al = CreatePopupMenu();
-            for row in &av.rows {
-                let sub = CreatePopupMenu();
-                let mut group = None;
-                for (k, p) in alerts::PRESETS.iter().enumerate() {
-                    if group.is_some_and(|g| g != p.group) {
-                        AppendMenuW(sub, MF_SEPARATOR, 0, null());
-                    }
-                    group = Some(p.group);
-                    let on = row.enabled.get(k).copied().unwrap_or(false);
-                    dynamic(sub, MF_STRING | if on { 0 } else { MF_GRAYED }, &mut commands, crate::menu_commands::Action::Alert(row.label.clone(), k), p.label);
-                }
-                // The fast move: from the hour of samples held, so it needs no fresh price to be set.
-                AppendMenuW(sub, MF_SEPARATOR, 0, null());
-                let cur_fast = row.alert.as_ref().map_or(0, |a| a.fast as usize);
-                for k in 0..alerts::FAST_MOVES.len() {
-                    let text = format!("fast move {}", alerts::fast_label(k));
-                    dynamic(sub, MF_STRING | if cur_fast == k + 1 { MF_CHECKED } else { 0 }, &mut commands, crate::menu_commands::Action::Fast(row.label.clone(), k), &text);
-                }
-                // A level typed by hand: greyed without a fresh price, like the presets.
-                AppendMenuW(sub, MF_SEPARATOR, 0, null());
-                dynamic(sub, MF_STRING | if row.fresh { 0 } else { MF_GRAYED }, &mut commands, crate::menu_commands::Action::AlertAt(row.label.clone()), "at a price...");
-                // How long this symbol's alert waits before it can fire again, typed.
-                let cooldown = row.alert.as_ref().map(|a| a.cooldown_s);
-                let text = match cooldown {
-                    Some(c) => format!("cooldown {}...", crate::typed::cooldown_text(c)),
-                    None => "cooldown...".to_string(),
-                };
-                dynamic(sub, MF_STRING | if cooldown.is_some() { 0 } else { MF_GRAYED }, &mut commands, crate::menu_commands::Action::Cooldown(row.label.clone()), &text);
-                AppendMenuW(sub, MF_SEPARATOR, 0, null());
-                let line = row.alert.as_ref().map(|a| alerts::describe(a, row.digits)).filter(|d| !d.is_empty());
-                add(sub, MF_STRING | MF_GRAYED, 0, &line.unwrap_or_else(|| "nothing set".into()));
-                if alerted.contains(&row.label) {
-                    dynamic(sub, MF_STRING, &mut commands, crate::menu_commands::Action::ClearAlert(row.label.clone()), "Clear this symbol's alerts");
-                }
-                add(al, MF_POPUP, sub as usize, &row.label);
-            }
-            if av.rows.is_empty() {
-                add(al, MF_GRAYED, 0, "(no symbols shown)");
-            }
-            AppendMenuW(al, MF_SEPARATOR, 0, null());
-            // At a glance: everything that is set, how far each level is, and Clear all.
-            let glance = CreatePopupMenu();
-            if av.overview.is_empty() {
-                add(glance, MF_STRING | MF_GRAYED, 0, "(nothing set)");
-            }
-            for line in &av.overview {
-                add(glance, MF_STRING | MF_GRAYED, 0, &line.text.replace('&', "&&"));
-            }
-            AppendMenuW(glance, MF_SEPARATOR, 0, null());
-            add(glance, MF_STRING | if av.overview.is_empty() { MF_GRAYED } else { 0 }, CMD_ALERTS_CLEAR_ALL, "Clear all alerts...");
-            let cannot_fire = av.overview.iter().filter(|l| l.warn).count();
-            let glance_title = if cannot_fire > 0 {
-                format!("At a glance ({}, {cannot_fire} cannot fire)", av.overview.len())
-            } else {
-                format!("At a glance ({})", av.overview.len())
-            };
-            add(al, MF_POPUP, glance as usize, &glance_title);
-            // Repeat: how an alert comes back after it has fired. Every cooldown is 1.8's rule.
-            let repeat = CreatePopupMenu();
-            add(repeat, MF_STRING, CMD_REPEAT_COOLDOWN, "Every cooldown");
-            add(repeat, MF_STRING, CMD_ALERT_ONCE, "Fire once, then clear");
-            add(repeat, MF_STRING, CMD_REPEAT_CROSSING, "Each crossing");
-            let (cur_repeat, repeat_word) = if av.once {
-                (CMD_ALERT_ONCE, "once")
-            } else if av.crossing {
-                (CMD_REPEAT_CROSSING, "each crossing")
-            } else {
-                (CMD_REPEAT_COOLDOWN, "every cooldown")
-            };
-            CheckMenuRadioItem(repeat, CMD_REPEAT_COOLDOWN as u32, CMD_REPEAT_CROSSING as u32, cur_repeat as u32, MF_BYCOMMAND);
-            add(al, MF_POPUP, repeat as usize, &format!("Repeat \u{b7} {repeat_word}"));
-            // Mute. A timed mute ends by the clock; the label says when, in this PC's local time.
-            let mute = CreatePopupMenu();
-            add(mute, MF_STRING, CMD_MUTE_1H, "For 1 hour");
-            add(mute, MF_STRING, CMD_MUTE_8H, "For 8 hours");
-            add(mute, MF_STRING, CMD_MUTE_UNTIL, "Until a time...");
-            add(mute, MF_STRING, CMD_MUTE_INDEF, "Until I turn it back on");
-            AppendMenuW(mute, MF_SEPARATOR, 0, null());
-            let (mute_title, is_muted) = match av.silence {
-                Some(alerts::Silence::Muted) => ("Muted".to_string(), true),
-                Some(alerts::Silence::MutedUntil(t)) => (format!("Muted until {}", alerts::local_hhmm(&local_offset_at, av.now, t)), true),
-                _ => ("Mute".to_string(), false),
-            };
-            add(mute, MF_STRING | if is_muted { 0 } else { MF_GRAYED }, CMD_UNMUTE, "Unmute");
-            add(al, MF_POPUP, mute as usize, &mute_title);
-            // Quiet hours (local time).
-            let quiet = CreatePopupMenu();
-            add(quiet, MF_STRING, CMD_QUIET_OFF, "Off");
-            for (i, [from, to]) in alerts::QUIET_CHOICES.iter().enumerate() {
-                add(quiet, MF_STRING, CMD_QUIET + i, &format!("{} to {}", alerts::hhmm(*from), alerts::hhmm(*to)));
-            }
-            let custom_quiet = av.quiet.filter(|w| w[0] != w[1] && !alerts::QUIET_CHOICES.contains(w));
-            let typed_text = custom_quiet.map_or("Type hours...".to_string(), |w| format!("{}...", crate::typed::span_text(w)));
-            add(quiet, MF_STRING | if custom_quiet.is_some() { MF_CHECKED } else { 0 }, CMD_QUIET_TYPE, &typed_text);
-            let cur_quiet = match av.quiet {
-                None => Some(CMD_QUIET_OFF),
-                Some(w) => alerts::QUIET_CHOICES.iter().position(|c| *c == w).map(|i| CMD_QUIET + i),
-            };
-            if let Some(c) = cur_quiet {
-                CheckMenuRadioItem(quiet, CMD_QUIET_OFF as u32, (CMD_QUIET + alerts::QUIET_CHOICES.len() - 1) as u32, c as u32, MF_BYCOMMAND);
-            }
-            let quiet_title = match av.quiet {
-                Some([f, t]) if f != t => format!("Quiet hours \u{b7} {} to {}", alerts::hhmm(f), alerts::hhmm(t)),
-                _ => "Quiet hours".to_string(),
-            };
-            add(al, MF_POPUP, quiet as usize, &quiet_title);
-            // Webhook: only the host is ever shown.
-            let hook = CreatePopupMenu();
-            let hook_text = av.host.as_ref().map_or("(no webhook set)".to_string(), |h| format!("Sends to {h}"));
-            add(hook, MF_STRING | MF_GRAYED, CMD_HOOK_HOST, &hook_text);
-            AppendMenuW(hook, MF_SEPARATOR, 0, null());
-            add(hook, MF_STRING, CMD_HOOK_PASTE, "Paste URL from clipboard");
-            let has_hook = av.host.is_some();
-            add(hook, MF_STRING | if has_hook { 0 } else { MF_GRAYED }, CMD_HOOK_TEST, "Send a test alert");
-            add(hook, MF_STRING | if has_hook { 0 } else { MF_GRAYED }, CMD_HOOK_REMOVE, "Remove");
-            AppendMenuW(hook, MF_SEPARATOR, 0, null());
-            add(
-                hook,
-                MF_STRING | if has_hook { 0 } else { MF_GRAYED } | if av.gap_notice { MF_CHECKED } else { 0 },
-                CMD_GAP_NOTICE,
-                "Say when alerts could not be checked",
-            );
-            add(al, MF_POPUP, hook as usize, "Webhook");
-            // Recent alerts, newest first.
-            let recent = CreatePopupMenu();
-            if av.log.is_empty() {
-                add(recent, MF_STRING | MF_GRAYED, 0, "(nothing yet)");
-            }
-            for e in &av.log {
-                add(recent, MF_STRING | MF_GRAYED, 0, &alerts::entry_line(e, &local_offset_at, av.now).replace('&', "&&"));
-            }
-            AppendMenuW(recent, MF_SEPARATOR, 0, null());
-            add(recent, MF_STRING | if av.log.is_empty() { MF_GRAYED } else { 0 }, CMD_LOG_COPY, "Copy list");
-            add(recent, MF_STRING | if av.log.is_empty() { MF_GRAYED } else { 0 }, CMD_LOG_CLEAR, "Clear list");
-            add(al, MF_POPUP, recent as usize, &format!("Recent ({})", av.log.len()));
-            add(m, MF_POPUP, al as usize, &format!("Alerts ({})", alerted.len()));
-        }
-        AppendMenuW(m, MF_SEPARATOR, 0, null());
         item(MF_STRING | if visible { MF_CHECKED } else { 0 }, CMD_STRIP, "Show strip");
-        // Position: where the strip sits (and on which display, when there are several).
-        let pos = CreatePopupMenu();
-        for (i, p) in Placement::ALL.iter().enumerate() {
-            add(pos, MF_STRING, CMD_POS + i, p.label());
-        }
-        let cur = Placement::ALL.iter().position(|p| *p == placement).unwrap_or(0);
-        let last = CMD_POS + Placement::ALL.len() - 1;
-        CheckMenuRadioItem(pos, CMD_POS as u32, last as u32, (CMD_POS + cur) as u32, MF_BYCOMMAND);
-        if mons.len() > 1 {
-            AppendMenuW(pos, MF_SEPARATOR, 0, null());
-            let primary = mons.iter().position(|d| d.primary).unwrap_or(0);
-            let active = mons.iter().position(|d| Some(&d.device) == cur_mon.as_ref()).unwrap_or(primary);
-            let mut monitor_ids = Vec::with_capacity(mons.len());
-            for (i, d) in mons.iter().enumerate() {
-                let (w, h) = (d.bounds.right - d.bounds.left, d.bounds.bottom - d.bounds.top);
-                let main = if d.primary { ", main" } else { "" };
-                let id = dynamic(pos, MF_STRING, &mut commands,
-                    crate::menu_commands::Action::Monitor((!d.primary).then(|| d.device.clone())),
-                    &format!("Display {}{main}\t{w} x {h}", i + 1));
-                monitor_ids.push(id);
-            }
-            if let (Some(first), Some(last), Some(selected)) = (
-                monitor_ids.iter().flatten().next(), monitor_ids.iter().flatten().next_back(), monitor_ids[active]
-            ) {
-                CheckMenuRadioItem(pos, *first as u32, *last as u32, selected as u32, MF_BYCOMMAND);
-            }
-        }
-        add(m, MF_POPUP | if open { MF_GRAYED } else { 0 }, pos as usize, "Position");
-        item(MF_STRING | if top || docked { MF_CHECKED } else { 0 } | if docked { MF_GRAYED } else { 0 }, CMD_TOP, "Always on top");
-        // Strip: rows, text size and opacity, applied live. Radio marks show the nearest step.
-        {
-            let (rows, dock_pt, pt, opacity) =
-                with_ui(|u| (u.cfg.dock_rows, u.cfg.dock_font_pt, u.cfg.font_pt, u.cfg.opacity)).unwrap_or((2, 9, 10, 235));
-            let st = CreatePopupMenu();
-            let sub_rows = CreatePopupMenu();
-            for (i, n) in STRIP_ROWS.iter().enumerate() {
-                add(sub_rows, MF_STRING, CMD_STRIP_ROWS + i, &format!("{n} row{}", if *n == 1 { "" } else { "s" }));
-            }
-            CheckMenuRadioItem(sub_rows, CMD_STRIP_ROWS as u32, (CMD_STRIP_ROWS + STRIP_ROWS.len() - 1) as u32,
-                (CMD_STRIP_ROWS + nearest_rows(rows)) as u32, MF_BYCOMMAND);
-            add(st, MF_POPUP | if docked { 0 } else { MF_GRAYED }, sub_rows as usize, "Rows in the taskbar");
-            let sub_text = CreatePopupMenu();
-            for (i, (_, _, label)) in TEXT_STEPS.iter().enumerate() {
-                add(sub_text, MF_STRING, CMD_STRIP_TEXT + i, label);
-            }
-            CheckMenuRadioItem(sub_text, CMD_STRIP_TEXT as u32, (CMD_STRIP_TEXT + TEXT_STEPS.len() - 1) as u32,
-                (CMD_STRIP_TEXT + nearest_text(dock_pt, pt)) as u32, MF_BYCOMMAND);
-            add(st, MF_POPUP, sub_text as usize, "Text size");
-            let sub_op = CreatePopupMenu();
-            for (i, (_, label)) in OPACITY_STEPS.iter().enumerate() {
-                add(sub_op, MF_STRING, CMD_STRIP_OPACITY + i, label);
-            }
-            CheckMenuRadioItem(sub_op, CMD_STRIP_OPACITY as u32, (CMD_STRIP_OPACITY + OPACITY_STEPS.len() - 1) as u32,
-                (CMD_STRIP_OPACITY + nearest_opacity(opacity)) as u32, MF_BYCOMMAND);
-            add(st, MF_POPUP, sub_op as usize, "Opacity");
-            add(m, MF_POPUP, st as usize, "Strip");
-        }
-        // Start with Windows: the registry is the source of truth, read each time the menu opens.
-        item(MF_STRING | if autostart::enabled(config::profile().id) { MF_CHECKED } else { 0 }, CMD_AUTOSTART, "Start with Windows");
-        // Hotkey: Off, the presets, and the configured combo when it is none of them.
-        {
-            let (cfg_key, failed) = with_ui(|u| (u.cfg.hotkey.clone(), u.hotkey_failed)).unwrap_or((None, false));
-            let hk = CreatePopupMenu();
-            let parsed = cfg_key.as_deref().and_then(hotkey::parse);
-            let preset = cfg_key.as_deref().and_then(hotkey::preset_index);
-            let custom = cfg_key.as_ref().filter(|_| preset.is_none());
-            let note = if !failed { "" } else if parsed.is_some() { " (in use by another app)" } else { " (not a valid hotkey)" };
-            add(hk, MF_STRING, CMD_HOTKEY, "Off");
-            for (i, p) in hotkey::PRESETS.iter().enumerate() {
-                let tail = if preset == Some(i) { note } else { "" };
-                add(hk, MF_STRING, CMD_HOTKEY + 1 + i, &format!("{p}{tail}"));
-            }
-            if let Some(text) = custom {
-                let shown = parsed.map(|c| hotkey::label(&c)).unwrap_or_else(|| text.chars().take(24).collect());
-                add(hk, MF_STRING, CMD_HOTKEY_CUSTOM, &format!("{shown}{note}"));
-            }
-            AppendMenuW(hk, MF_SEPARATOR, 0, null());
-            add(hk, MF_STRING, CMD_HOTKEY_TYPE, "Type a hotkey...");
-            let selected = match (&cfg_key, preset) {
-                (None, _) => CMD_HOTKEY,
-                (Some(_), Some(i)) => CMD_HOTKEY + 1 + i,
-                (Some(_), None) => CMD_HOTKEY_CUSTOM,
-            };
-            CheckMenuRadioItem(hk, CMD_HOTKEY as u32, CMD_HOTKEY_CUSTOM as u32, selected as u32, MF_BYCOMMAND);
-            let head = match &cfg_key {
-                None => "Hotkey \u{b7} off".to_string(),
-                Some(text) => format!("Hotkey \u{b7} {}{note}", parsed.map(|c| hotkey::label(&c)).unwrap_or_else(|| text.chars().take(24).collect())),
-            };
-            add(m, MF_POPUP, hk as usize, &head);
-        }
         AppendMenuW(m, MF_SEPARATOR, 0, null());
         let status: String = status.chars().take(90).collect();
         item(MF_STRING | MF_GRAYED, CMD_STATUS, &status);
@@ -2775,19 +2396,6 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
         if let Some(name) = config::kept_bad_config() {
             item(MF_STRING | MF_GRAYED, CMD_KEPT_STATUS, &format!("Settings were unreadable; kept as {name}, defaults loaded"));
         }
-        item(MF_STRING | MF_GRAYED, CMD_METER, &crate::source::meter_line());
-        item(MF_STRING | MF_GRAYED, CMD_VERSION, &format!("{} {}", config::profile().title(), env!("CARGO_PKG_VERSION")));
-        if with_ui(|u| u.update_running).unwrap_or(false) {
-            item(MF_STRING | MF_GRAYED, CMD_UPDATE, "Checking...");
-        } else {
-            item(MF_STRING, CMD_UPDATE, "Check for updates");
-        }
-        if with_ui(|u| u.report_running).unwrap_or(false) {
-            item(MF_STRING | MF_GRAYED, CMD_REPORT, "Diagnostics report: checking...");
-        } else {
-            item(MF_STRING, CMD_REPORT, "Copy diagnostics report");
-        }
-        item(MF_STRING, CMD_FOLDER, "Open config folder");
         AppendMenuW(m, MF_SEPARATOR, 0, null());
         item(MF_STRING, CMD_EXIT, "Quit");
         let mut pt = POINT { x: 0, y: 0 };
@@ -2806,6 +2414,26 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
     // Dynamic actions are assigned unique IDs when this particular menu is built. They retain
     // their row identity even if an event changes the catalogue during the modal menu loop.
     if let Some(action) = commands.get(cmd) {
+        run_action(hwnd, action);
+        return;
+    }
+    run_command(hwnd, cmd, Listed { open, visible, top, picked, ultra });
+}
+
+/// What the menu (or the settings window) knew about the window when the command was listed: the mode,
+/// the strip flag, always-on-top and the picker. `run_command` reads the live mode itself.
+#[derive(Clone, Copy)]
+struct Listed {
+    open: bool,
+    visible: bool,
+    top: bool,
+    picked: bool,
+    ultra: bool,
+}
+
+/// A command that carries its own identity (a symbol, a label, a display). Shared by the menu and the
+/// settings window, so a control and its former menu entry run the same code.
+fn run_action(hwnd: HWND, action: &crate::menu_commands::Action) {
         use crate::menu_commands::Action;
         match action {
             Action::Symbol(symbol) => {
@@ -2897,8 +2525,11 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
                 }
             }
         }
-        return;
-    }
+}
+
+/// A fixed command id. Shared by the menu and the settings window.
+fn run_command(hwnd: HWND, cmd: usize, listed: Listed) {
+    let Listed { open, visible, top, picked, ultra } = listed;
     // The menu's own message loop ran the hotkey and the tray: what is chosen acts on the mode now,
     // not the one the menu was opened in (audit 1.8, finding 8).
     let now = with_ui(|u| u.mode).unwrap_or(if open { Mode::Panel } else { Mode::Strip });
@@ -3025,6 +2656,7 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
             with_ui(|u| u.cfg.theme_font = Some(theme::FACES[c - CMD_FONT].name.to_string()));
             apply_theme(hwnd);
         }
+        CMD_SETTINGS => settings_win::open_settings(hwnd),
         CMD_REFRESH => {
             // Wakes the quote loop and makes chart rows with no bars due now. The backoff counter
             // is untouched: a still-failing source backs off again after this one attempt.
@@ -4914,7 +4546,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     expand(hwnd);
                 }
                 Some(Act::Collapse) => collapse(hwnd),
-                Some(Act::Settings) => settings_menu(hwnd),
+                Some(Act::Settings) => settings_win::open_settings(hwnd),
                 // `apply_picker` closes the chart when the picker opens, and hands its width back.
                 Some(Act::TogglePicker) => {
                     let open = !with_ui(|u| u.pick_open).unwrap_or(false);
@@ -5168,6 +4800,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_DESTROY => {
+            settings_win::close();
             STRIP.store(0, Ordering::Relaxed);
             UnregisterHotKey(hwnd, HOTKEY_ID);
             WTSUnRegisterSessionNotification(hwnd);
