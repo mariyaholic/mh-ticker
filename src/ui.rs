@@ -1362,6 +1362,7 @@ fn tooltip_with(view: &Board, pending: Option<&str>, blind: Option<&str>) -> Str
         if let Some(q) = &c.quote {
             s.push_str(&format!("\n{} {}", c.label, fmt_price(q.price, c.digits)));
             if !q.source.is_empty() { s.push_str(&format!(" ({}; age unknown)", q.source)); }
+            else if crate::model::market_closed(c, view.link, crate::source::now_s()) { s.push_str(" (market closed)"); }
             else if c.stale { s.push_str(" (stale)"); }
         }
     }

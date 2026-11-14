@@ -916,7 +916,9 @@ fn card(dc: HDC, sc: &Scene, r: RECT, i: usize, c: &Cell) {
             // label. Volume is the first thing to go, because it is the least load-bearing number
             // on the card and "CNBC delayed" already uses the width.
             let src = if !q.source.is_empty() { q.source } else if q.realtime { "CNBC" } else { "CNBC delayed" };
+            let closed = crate::model::market_closed(c, sc.board.link, sc.now);
             let tag = if !q.source.is_empty() { format!("{src} \u{b7} age unknown") } else { match q.ts {
+                Some(ts) if closed => format!("{src} \u{b7} closed {}", fmt_age(sc.now - ts)),
                 Some(ts) => format!("{src} \u{b7} {}", fmt_age(sc.now - ts)),
                 None => src.to_string(),
             }};
