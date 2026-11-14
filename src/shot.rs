@@ -1031,6 +1031,7 @@ pub fn write_settings(dir: &Path) -> Result<usize, String> {
         case("settings-classic-system.png", false, theme::classic(), "midnight", Section::System, 96, 100, false),
         case("settings-ultra-display-midnight.png", true, mid, "midnight", Section::Display, 96, 100, false),
         case("settings-ultra-display-midnight-full.png", true, mid, "midnight", Section::Display, 96, 100, true),
+        case("settings-ultra-symbols-midnight-full.png", true, mid, "midnight", Section::Symbols, 96, 100, true),
         case("settings-ultra-alerts-midnight-full.png", true, mid, "midnight", Section::Alerts, 96, 100, true),
         case("settings-ultra-display-pc98.png", true, pc, "pc98", Section::Display, 96, 100, false),
         case("settings-ultra-chart-pc98.png", true, pc, "pc98", Section::Chart, 96, 100, false),
