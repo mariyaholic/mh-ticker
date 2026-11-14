@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# where [worktree-path ...]
+#
+# The orchestrator's recovery view. For every worktree of this repository (from
+# `git worktree list`, or only the paths given as arguments) it prints the branch, the commits
+# since the merge-base with the main integration branch, uncommitted files with a diffstat,
+# the TODO(finish) count and the last 4 lines of .progress.md.
+# Always exits 0, so a missing worktree or log never breaks a recovery script.
+#
+# Environment:
+#   WHERE_BASE      integration branch to measure from (default: origin's HEAD, else main/master)
+#   CHECKPOINT_SRC  space-separated paths searched for markers (default: whole worktree)
+
+set +e
+
+if ! git rev-parse --git-dir >/dev/null 2>&1; then
+  echo "where: not inside a git repository"
+  exit 0
+fi
+
+base=${WHERE_BASE:-}
+if [ -z "$base" ]; then
+  base=$(git symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null)
+fi
+if [ -z "$base" ]; then
+  for b in origin/main origin/master main master; do
+    if git rev-parse -q --verify "$b^{commit}" >/dev/null 2>&1; then base=$b; break; fi
+  done
+fi
+
+if [ $# -gt 0 ]; then
+  paths=("$@")
+else
+  paths=()
+  while IFS= read -r line; do
+    case $line in "worktree "*) paths+=("${line#worktree }") ;; esac
+  done < <(git worktree list --porcelain)
+fi
+
+marker="TODO(fin""ish)"
+echo "integration branch: ${base:-unknown}"
+
+for p in "${paths[@]}"; do
+  echo
+  echo "== $p"
+  if ! git -C "$p" rev-parse --git-dir >/dev/null 2>&1; then
+    echo "   (not a git worktree, or missing)"
+    continue
+  fi
+  branch=$(git -C "$p" branch --show-current)
+  [ -z "$branch" ] && branch="(detached at $(git -C "$p" rev-parse --short HEAD 2>/dev/null))"
+  echo "   branch:      $branch"
+
+  if [ -n "$base" ] && mb=$(git -C "$p" merge-base HEAD "$base" 2>/dev/null); then
+    n=$(git -C "$p" rev-list --count "$mb"..HEAD)
+    echo "   commits:     $n since merge-base with $base ($(git -C "$p" rev-parse --short "$mb"))"
+    git -C "$p" log --format='                %h %s' -n 5 "$mb"..HEAD
+  else
+    echo "   commits:     (no merge-base with ${base:-an integration branch})"
+  fi
+
+  dirty=$(git -C "$p" status --porcelain | wc -l | tr -d ' ')
+  stat=$(git -C "$p" diff HEAD --shortstat 2>/dev/null | sed 's/^ *//')
+  echo "   uncommitted: $dirty file(s)${stat:+; $stat}"
+
+  # shellcheck disable=SC2086
+  todo=$( (cd "$p" && git grep --untracked -I -n -F "$marker" -- ${CHECKPOINT_SRC:-.} \
+    ':(exclude)scripts/agent' ':(exclude)*.md' 2>/dev/null) | wc -l | tr -d ' ')
+  echo "   TODO(finish): $todo"
+
+  top=$(git -C "$p" rev-parse --show-toplevel 2>/dev/null)
+  if [ -f "$top/.progress.md" ]; then
+    echo "   .progress.md (last 4 lines):"
+    grep -v '^$' "$top/.progress.md" | tail -n 4 | sed 's/^/     /'
+  else
+    echo "   .progress.md: none yet"
+  fi
+done
+exit 0
