@@ -1,69 +1,67 @@
-# Runtime state-machine audit
+# Runtime state machines, 1.8
 
-Scope: both Classic and Ultra, at the `fix/state-transitions` branch based on main after PR #7. This is a source-level inventory and targeted regression audit, not a proof that every interleaving is safe. Win32 behavior still needs native Windows and multi-monitor testing.
+Scope: Classic and Ultra at the 1.8 integration head. Source inventory plus targeted tests; not a proof
+of every native interleaving. Findings and fixes of this pass: `docs/STATE-AUDIT-1.8.md`. The 1.7.1
+record (fallback policy, startup, placement, geometry, feed, backfill) is `docs/STATE-AUDIT-2026-11.md`
+and the earlier version of this file; what it says still holds unless a row below changes it.
 
-## Optional fallback policy
+## Rules every machine follows
 
-Fallback is off by default in both profiles. Each enable requires confirmation; successful persistence precedes enabling. Disabling clears fallback quotes immediately even if saving fails (the UI reports that restart may restore the saved policy). A policy generation and row generation are captured before I/O and checked under the board lock at publication. Already-authorized operations may connect or finish after disabling, but cannot publish; this is standard cancellation, not a network kill switch. This contract was explicitly selected for the PR instead of maintaining a custom TCP transport.
+- All `Ui` state lives in one thread-local `RefCell`; `with_ui` uses `try_borrow_mut` and silently does
+  nothing when nested. So: no modal loop, menu, box, dialog, morph, file write or message-sending window
+  call inside a `with_ui` closure, and no function taking `&mut Ui` calls `with_ui`. Settings are written
+  with `save_cfg()` (copy inside, write outside); the ten in-closure saves of 1.8.0 were moved out.
+- Modal loops (menus, boxes, the prompt) dispatch posted messages: feed, timers, hotkey, tray, lookup,
+  update, alert and range results. Code after a modal must re-read state, never act on a copy taken
+  before it (finding 2 fixed one that did not; finding 8 fixed the menu's mode snapshots).
+- The morph (`run_morph`) blocks the thread and pumps only sent messages; while it runs `mode == Morph`.
+- Workers never touch `Ui`: they fill an `Arc<Mutex<_>>` slot and post a message; the handler takes the
+  slot in one borrow.
 
-Three bounded, long-lived workers independently handle Gold API XAU/XAG and Kraken BTC. CNBC remains primary; unsupported instruments are never substituted. Rate-limit deadlines survive toggles. A separate expiry worker removes fallback values after 90 seconds from receipt even while HTTP workers block. Receipt time does not prove market freshness: fallback has unknown market age, no alert reference, and no CNBC chart/history overlay. Provider changes force tray refresh. Redirects are disabled and decoded alternate response bodies are capped at 32 KiB.
+## Inventory
 
-Regression coverage includes 10,000 toggle cycles, blocked response release after off/on, already-authorized completion after disable, independent provider progress and CNBC recovery, receipt expiry, source identity, alert-reference rejection, oversized responses, redirects and persistence failure. These component tests are not 10,000 native GUI clicks. Live Wine checks used an isolated one-second stale threshold to exercise real provider fallback; native Windows acceptance remains outstanding.
+| Machine | States | Transitions (trigger) | Encoded in | Way out / reset | Tested by |
+|---|---|---|---|---|---|
+| Window mode | Strip, Morph, Panel | expand (click, tray, hotkey, ExpandLock, Expand view); collapse (button, Esc, tray, hotkey, Back to taskbar); set_chart glide | `Ui::mode`, `morph`, `strip_rect`, `last_panel`, `prev_fg` | morph always ends in a mode; `TIMER_DOCK` repairs `Morph` with no picture; a scale change during the morph re-plans the end frame (`settled_frame`) | pure geometry tests; `a_morph_across_a_scale_change...`; no live morph test |
+| Chart pane | closed, open | button, key C, `apply_picker(true)` closes; open only from Panel | `chart`, `chart_grew`, `last_panel` | close gives the width back (`rect_after_chart`), resize or DPI drops the record, `compact_frame` for saved frames | `rect_after_chart`, `compact_frame`, `grown_rect` tests |
+| Lock | none, label | card click (toggle), arrows, Delete/Remove (to neighbour), strip slot click, chart open with none | `selected` (Ultra only) | `lock_card` is the one mover; `apply_rows` -> `settle_lock` | `toggle_lock`, `settle_lock`, `neighbour_of` tests |
+| Pointer and layout | none, bar+row | mouse move over plot; reset on leave, lock move, range tab, zone flip, rows change, chart toggle, expand, collapse | `chart_at`, `chart_layout` (Cell, painter-written) | painter clears the layout every frame without a card; painter clamps a stale bar | chartview layout and pointer tests |
+| Range choice | 1D, 5D, 1M, 6M, 1Y, 5Y | tab click | `range` | chart close -> 1D; kept across lock change and collapse | none in ui |
+| Range book (per key) | absent, in flight, cached, failed | `want` (pane needs it, every feed tick), `arrived`, `cancel`, `forget`, lost after 120 s, retry after 30 s, `retry_now` (Refresh now) | `book` | every state leaves by time, by answer or by `forget` | 10+ `ranges` tests incl. `refresh_now_asks_again_for_a_failed_key_and_keeps_the_rest` |
+| Range slots | empty, request waiting; done queue | `submit` replaces (caller cancels), worker `take_request`, `deliver`, UI `take_done`, `clear_request` on rows change | `range_slots` (Arc, shared with the worker) | lock never held across I/O | `Slots` tests |
+| Feed and chart workers | polling, backoff, waiting; rows_gen, kick | rows change, `Board.kick` (Refresh now), timers | `Board` (`rows_gen`, `kick`, `poll_s`, fallback) | generation checks drop stale publications | source tests incl. kick tests |
+| Alerts (per alert) | armed, cooling down, spent (once) | `check` on fresh CNBC quotes; preset, *at a price*, pane *Alert at* (`apply_level` re-arms); Clear; Forget symbol | `Config::alerts` (`above`, `below`, `day_move`, `last`, `once`) | cooldown by clock; once alert removed when empty | alerts tests |
+| Silence | none, Muted, MutedUntil(t), Quiet | Mute menu, Unmute, clock, quiet window | `alerts_muted`, `alerts_mute_until`, `quiet_hours` | timed mute ends by the clock; Unmute | `silence_order...`, `quiet_window...` |
+| Alert marker | none, pending(title) | any fired alert (silenced too), unless the panel is open and in front (`marks_tray`) | `alert_pending`, `icon_link` | `clear_pending` on expand and any menu | `a_pending_alert_leads_the_tooltip...`, `an_alert_does_not_light_the_marker_while_the_panel_is_in_front` |
+| Alert log and webhook | entry Shown/Muted/Quiet -> Sent/SendFailed | fire, POST result `WM_ALERT` (bit 0 failed, bit 1 test), Clear list | `alert_log` (seq never reused), `alert_note` | late result for a gone line changes nothing; the note still names a test | log tests, `a_webhook_result_knows_a_test_without_its_log_line` |
+| Test alert | idle, sent within 15 s | *Send a test alert* | `test_alert_at` | time-based, cannot stick | none |
+| Webhook URL | none, set | Paste (validated, host confirmed), Remove | `Config::webhook` | only the host is ever shown | `accept_webhook...`, redaction tests |
+| Update check | idle, running, box shown | menu; worker posts `WM_UPDATE` (failed spawn posts too) | `update_running`, `update_result` | cleared after the box in every outcome | update tests |
+| Hotkey | off, registered, failed | menu, start-up | `Config::hotkey`, `hotkey_failed` | re-registered on every change; Off | hotkey tests |
+| Autostart | off, on (this exe) | menu | registry only | read at every menu open | autostart tests |
+| Save failure | ok, failed | every `save`/`save_checked` | `config::SAVE_FAILED` | next good save clears | `save_failed_flag...` |
+| Symbol lookup | idle, adding(symbol) | *Add symbol* -> worker -> `WM_LOOKUP` | `adding`, `lookup_result` | `on_lookup` clears first, every outcome | config add tests, lookup parse tests |
+| Prompt dialog | closed, open (owner disabled) | add symbol, alert at a price | `prompt::ask` locals | OK / Cancel; caller re-reads state after | template and self-accepting tests |
+| Main menu | built, tracking, dispatched | right-click, tray, settings button, pane *More...* | `MenuCommands` registry (dynamic ids carry symbol/label, card Copy and Open included); fixed ids; the mode is re-read when an entry is chosen (`panel_step`, `position_applies`) | registry dropped with the menu | menu_commands tests; `the_card_menu_copy_and_open...`, `the_menu_acts_on_the_mode...` |
+| Pane menu | built, tracking | right-click inside the plot (Ultra, chart, bars drawn) | captured label, digits, level | acts by label, re-checks the side rule against the fresh price | `side_of`, `round_level` tests |
+| Keyboard | panel focused or not | `on_key` decides in one borrow, acts after | `keys::State` from `Ui` | Panel only; unmapped keys to the system | keys tests |
+| Picker and scroll | closed, open; scroll offset | button, key S, tray entry; wheel, paging | `pick_open`, `picker_scroll`, `wheel_remainder` | toggle resets both; viewport clamps | wheel, reveal tests |
+| Strip slots | per laid-out symbol | every strip layout | `frame.slots` | rebuilt by `strip_place` on each relayout and collapse | `slot_at` tests |
+| Strip settings | rows, text, opacity | Strip menu | `dock_rows`, `dock_font_pt`, `font_pt`, `opacity` | alpha set only in Strip; collapse picks up a change | `strip_step_tests` |
+| Zone | local, UTC | zone button | `Config::chart_utc` | toggles back | chartview clock tests |
+| Back buffer | none, valid for (w, h) | `paint` allocates on the first paint and on any size change; every paint draws into it clipped to `rcPaint` and copies that rectangle | `Ui::back` | a new buffer is drawn whole; every state change other than a hover invalidates the whole window, so outside `rcPaint` the buffer is still current | `shot` pixel test below |
+| Hover rectangle | none, rect | `WM_MOUSEMOVE`/`WM_MOUSELEAVE` compare `panel::Hot` before and after (`hot_dirty`) and invalidate the union of what differs; moving backgrounds and unnameable changes invalidate everything | `Ui::hover`, `pick_hover`, `chart_hover`, `gear_hover`, `open_hover`, `chart_at`, `hover_at` (read as one `Hot`) | the next full invalidate repaints everything | `a_hover_change_repaints_inside_the_rectangle_it_names` (pixel diff against the real painter) |
+| Folded candles | none (not cached) | `fitted_to` runs on every pane repaint: 72 us for 1,950 bars, 165 us for 4,000 (`docs/1.8/notes/responsive.md`) | none | nothing to reset; a cache was measured and rejected | none |
 
-## Machines and ownership
+## Ownership
 
-- **Startup and profile** (`lib.rs`, `config.rs`, `ui.rs`): profile selection → settings load/migration → single-instance check → window, tray and workers → shutdown. Each profile has its own settings and mutex. Settings load errors must not become successful defaults that are later saved over the original. Existing `config` tests cover deserialization defaults for old settings, not migration writes; this audit adds malformed/invalid settings tests.
-- **Window mode and morph** (`ui.rs`): Strip → Morph → Panel → Morph → Strip. Expansion/collapse own snapshot bitmaps, foreground restoration, opacity, z-order and animation timers. Invalid/reentrant transitions are ignored. No full native transition test exists.
-- **Placement, display and visibility** (`ui.rs`, `dock.rs`): floating/corner/taskbar placement, foreground/fullscreen suppression, display selection and taskbar fallback determine ownership, visibility and strip position. A dock probe periodically publishes changed geometry; the UI owns HWND operations. Pure dock/layout tests do not cover taskbar recreation or real monitor removal.
-- **Panel composition and interactions** (`ui.rs`, `panel.rs`, `workspace.rs`): picker and chart open/close; opening one should close the other. Window sizing, hit tests and painting must use the same client geometry; in Ultra a click locks a card and the chart follows the lock (hover no longer retargets it), pointer-over-sparkline selects a time; closing the chart glides back to the frame opening it grew from (opening centres the wider frame on the old one; a window the user has resized is left alone). Tests cover geometry and hit testing; this audit also exercised picker open/close under Wine.
-- **Chart lock and chart frame** (`ui.rs`, `panel.rs`; added 1.7.0/1.7.1, re-audited 1.7.1). Two small machines that must agree:
-  - *Lock* (`selected`, a label, Ultra only): none → locked on a card click; the same card again → none; another card → moves. The chart shows the lock and only the lock. Row changes go through `settle_lock` (a vanished label is dropped, never kept to re-light later; with the chart open the first card takes over). Opening the chart with no lock locks the first card.
-  - *Chart frame* (`chart`, `chart_grew: Option<(before, after)>`): closed → open widens the window only if it is narrower than two panes (`grow_target`, centred, clamped) and records the pair; open → closed returns to `before`, carried by any drag since (`rect_after_chart`). The record is dropped when the user resizes (`WM_EXITSIZEMOVE`) or the DPI changes (the pixels no longer match). Both directions run the strip<->panel morph, with the window still set to the target if a picture cannot be taken.
-  - *Frames that outlive the chart* go through `compact_frame`: the frame saved on a drag, and the frame a collapsed panel reopens at (`last_panel`). The chart flag is not persisted, so a wide frame saved or kept while the chart was open would reopen wide with nothing in it, and no control would shrink it. Closing the chart while the strip is showing (tray menu → Symbol picker) rewrites `last_panel` for the same reason.
-- **Geometry persistence and DPI** (`config.rs`, `ui.rs`): interactive move/resize → persisted panel rectangle → restore and fit to a monitor. DPI change updates fonts and geometry. Work-area fitting has pure tests; changing DPI or disconnecting a monitor while open has not been tested on Windows.
-- **Motion and resources** (`theme.rs`, `ui.rs`, `panel.rs`): Classic versus Ultra, active theme/optional face, motion enabled/disabled, panel open/closed → timer and phase; GDI brushes, bitmaps and fonts are replaced and released by their owners. Clock/theme tests do not exercise runtime system-setting changes.
-- **Row selection and identity** (`config.rs`, `model.rs`, `panel.rs`): add/remove/reorder rows → increment `rows_gen` → feed adopts the new set. Cells, chart bars, bar origins, backfill and live history must remain attached to the same label *and* symbol. Tests now exercise reorder and same-label symbol replacement, including line history.
-- **Quote feed and link health** (`source.rs`, `model.rs`): poll → live/partial on response or down with exponential backoff → retry; cached quotes are aged to stale and posted to the board. The UI copies snapshots on feed messages. A generation check rejects publication from obsolete row lists. Model tests cover timestamp staleness and quote resolution.
-- **Chart backfill and retry** (`source.rs`, `panel.rs`): refresh due → request rows → retain cached bars for failed rows → publish bars/backfill → schedule refresh or retry. `bars_gen`/`backfill_gen` gate publication and sparkline seeding. Tests cover parser, merges, and stale-generation rejection.
-- **Sparkline history** (`panel.rs`): align series to rows → seed historical closes on generation change → append fresh live observations → evict older points. Times and samples are ordered; the line must never cross symbol identities. Tests cover alignment, rolling window and seeding.
-- **Candles and bucket selection** (`source.rs`, `panel.rs`): parse OHLC → choose bucket from available width → fold → paint axes and candles; malformed/absent data becomes a waiting state. Tests cover parsing, flat bars and folding. See open chart timing issue below.
-- **Alerts and webhook delivery** (`alerts.rs`, `ui.rs`, `config.rs`): fresh quote on threshold side and cooldown elapsed → fire → store last-fired time → tray notification and optional detached webhook → completion/failure message. Tests cover thresholds, cooldown and stale quotes; they do not establish delivery durability on exit.
-- **Input menus and configuration** (`config.rs`, `ui.rs`): symbol/poll/theme/font/alert commands mutate settings, persist, and apply runtime effects. Menu IDs must remain disjoint and settings changes must reach both painters and workers. Existing tests cover row selection; most native menu dispatch paths are not tested.
-- **Worker and shutdown lifecycle** (`source.rs`, `dock.rs`, `alerts.rs`, `ui.rs`): feed, dock probe and webhook workers are detached and notify the HWND; window destruction removes tray and ends the message loop. Process termination ends remaining workers. There is no explicit worker cancellation/join or delivery-drain test.
+`ui.rs` owns every transition and every window call. `ranges`, `alerts`, `keys`, `chartview`,
+`menu_commands`, `config` row functions and `update`/`hotkey` parsing are pure and are what the tests pin;
+the Linux harness runs the pure modules (107 tests).
 
-## Fixed and checked in this branch
+## Open findings
 
-1. Row changes remap candles, origins and backfill with the corresponding label/symbol, and no longer retain a quote after changing a symbol under the same label. History also keys by label/symbol. Regression tests were run failing before the fixes and passing afterward.
-2. A rejected in-flight chart fetch no longer clears the remapped board on the subsequent row-generation sync. Regression tests cover stale fetch/publication ordering, partial failure after rows change, blocked chart I/O and independent per-row retry. A dedicated bounded chart worker keeps blocking chart requests off the quote thread; one blocked request can still delay other chart rows until its timeout.
-3. Invalid settings and non-NotFound read errors stop startup instead of silently creating/saving defaults. The GUI displays an error; `--probe` reports an error and exits nonzero. A synthetic invalid file in an isolated Wine prefix was preserved byte-for-byte by `--probe`.
-4. Opening the picker through either menu or header closes the chart and preserves the current frame. The panel body is clipped and scrollable by mouse wheel or Page Up/Down when its content exceeds the frame; hit testing follows the same geometry. Unsaved panel rectangles and track minima are bounded to the monitor work area. Native Windows, very small displays, and monitor changes still need testing.
-
-## Re-audit 1.7.1: transitions found wrong and fixed
-
-Source-traced, then fixed with pure-function tests (`compact_frame`, `settle_lock`, `rect_after_chart`); none was reproduced in a live window:
-
-1. Chart open → collapse → tray *Symbol picker* left the wide frame in `last_panel` and dropped the give-back record, so the next expand was wide with no chart and the chart toggle could not shrink it.
-2. Dragging the window while the chart was open saved the chart-wide frame as the panel rectangle; the next launch opened wide with no chart.
-3. A lock on a symbol removed from the strip stayed in `selected` and re-lit if the symbol came back.
-4. If the new-state picture failed in `set_chart`, the window was never moved to the state's frame and the old picture leaked.
-5. The give-back record survived a DPI change in the wrong pixels; the settings button stayed lit after its menu closed.
-
-Not changed and still open from this pass: the menu's captured `open` flag can be stale if the mode changes while its modal loop runs (a pre-existing pattern), and the animated resize is a stretched picture, so its mid-frames are approximate by design.
-
-## Open findings and verification gaps
-
-These are source-traced risks, not all reproduced in a running app. They are intentionally not presented as fixed:
-
-- **Chart latency and shutdown:** the single chart worker cannot process another chart request while one is blocked, and a generation change cannot interrupt an active request. Quote polling is independent. Workers remain detached; no notification-gate or cancellation/join test exists.
-- **Chart time axis (partly fixed in 1.7.0):** `fold` now cuts buckets on absolute UTC boundaries (`t0 + dt`), so the candle times and the axis labels agree; a test covers a day opening at 13:31. Still open: the painter spaces candles by index, so a market closure is not drawn as proportional empty time (labels after a break show the bar's real time, not a boundary it did not trade at).
-- **High — possible misdelivery on process exit:** webhook posts are detached and cooldown is persisted before delivery; quitting during a blocked POST can lose delivery while retaining cooldown. Decide and test an explicit retry/durability policy before changing it.
-- **Picker verification:** body scrolling and preserved frame size were implemented; test very small work areas, non-default DPI, large catalogues and native Windows. A frame narrower than a full card can still clip horizontally.
-- **Medium — panel reopening with retained panes (narrowed, still unverified live):** the chart flag survives collapse, and `expand` derives a natural size without it only when there is no `last_panel` and no saved frame. By source tracing that cannot coincide with an open chart (the chart can only be opened from an open panel, and collapsing always records `last_panel`), and the minimum track size is enforced once the panel is back. Re-check on Windows with a narrow saved frame.
-- **Medium — dynamic monitor/DPI changes:** an open panel is not refitted on display removal; DPI handling does not use Windows' suggested rectangle. Test monitor unplug, resolution changes and drag between scales on native Windows.
-- **Medium — motion transitions:** changing Windows' motion setting while running does not refresh `motion`/the timer (`motion` is read once at start-up; `WM_SETTINGCHANGE` only reposts the dock message). Test live on/off. (The theme/face half of this finding was fixed in 1.5.x/PR #10: `selected_look` resolves both together.)
-- **Medium — topmost/focus restoration:** expansion forces topmost, and the menu sets foreground before recording the previous foreground; collapse may not restore configured floating z-order or the prior app's focus. Reproduce on Windows with an independent foreground application.
-- **Medium — alert command-ID overlap:** `CMD_ALERT` consumes four IDs per catalog entry, crossing the `CMD_ALERT_CLEAR` range at catalog entry 51. Verify with a large hand-edited catalog and give command classes non-overlapping bounded ranges.
-- **Medium — corrected history and cached outage alerts:** historical seeding cannot distinguish previous bar points from live samples, so later bar corrections may be skipped. Alerts gate on quote age, not whether the latest request failed; decide whether an age-fresh cached price should repeat during an outage.
-- **Low — webhook redaction helper:** query-only URLs and userinfo are not stripped by `redact`. The current UI discards the callback error string, so this audit did not establish an actual UI leak; tighten redaction before exposing the error elsewhere.
-- **Suspected — floating drag during asynchronous updates:** a feed/dock relayout might reposition a strip from the old saved rect while native dragging is in progress. Verify with a live native drag and injected events.
-- **Settings I/O:** saves ignore write/rename errors, and config migration still precedes the single-instance check. Test full disk/locked file and duplicate launches. The invalid-config protection does not address these.
+See `docs/STATE-AUDIT-1.8.md`: findings 1 to 9 are all fixed (5, 6, 8, 9 in the responsiveness pass,
+`docs/1.8/notes/responsive.md`). Still open: the 1.7.1 list (webhook
+durability on exit, worker join, DPI and monitor changes, topmost and focus restoration, history
+corrections). Nothing here was exercised on native Windows.

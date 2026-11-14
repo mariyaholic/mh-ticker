@@ -2,8 +2,22 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Action {
     Symbol(String),
+    /// Card menu: copy this card's label and price (found by label when chosen).
+    Copy(String),
+    /// Card menu: open this symbol on CNBC.
+    Open(String),
+    /// Card menu: hide this symbol (the config refuses the last one).
+    Remove(String),
+    /// Card menu: move this symbol by this many places (-1 left, 1 right).
+    Move(String, i32),
+    /// Card menu: move this symbol to the front.
+    MoveFirst(String),
     Alert(String, usize),
     ClearAlert(String),
+    /// Alerts submenu, per symbol (Ultra): ask for a price level for this label.
+    AlertAt(String),
+    /// Symbols > Remove a symbol I added (both builds): drop this catalogue entry, by symbol.
+    Forget(String),
     Monitor(Option<String>),
 }
 
