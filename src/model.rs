@@ -214,17 +214,28 @@ pub fn is_stale(q: &Quote, now: f64, stale_after: f64, delayed_grace: f64) -> bo
     q.ts.map(|t| now - t > limit || now - t < -FUTURE_SKEW_S).unwrap_or(true) || restamped(q, now)
 }
 
-/// How old a CNBC quote must be, with the feed answering, before the card calls its market closed.
-/// CNBC's own `curmktstatus` field reads `REG_MKT` on a Saturday for gold, silver, FX, futures and
-/// bitcoin alike, so the state comes from the age of the quote. 15 minutes is past the 10-minute
-/// delay of the index futures. A delayed quote is stale only after the stale limit plus the delayed
-/// grace (990 s with the defaults), so it reads closed from that age on, not from 15 minutes. A
-/// realtime quote is stale after 90 s and reads closed 810 s later; the cell is a calm stale cell
-/// ([`calm_stale`]) in between, and every surface already says `closed` for it ([`reads_closed`]).
-/// The poll governor counts the board as closed when every row satisfies [`market_closed`], so it
-/// uses this age. A board with a 24-hour symbol such as BTC never counts as closed. A board that
-/// does count polls at the slowest step of its session (60 s, or 300 s when a session is locked),
-/// and that step is the longest wait before the first trade after a reopening shows.
+/// How old a CNBC quote must be, with the feed answering, before the surfaces write the word
+/// `closed` for it ([`market_closed`]). CNBC's own `curmktstatus` field reads `REG_MKT` on a Saturday
+/// for gold, silver, FX, futures and bitcoin alike, so the state comes from the age of the quote. 15
+/// minutes is past the 10-minute delay of the index futures.
+///
+/// The word and the calm look start at different ages. The calm look (no fault colour, alerts counted
+/// as checked, see [`calm_stale`]) starts when the quote goes stale: after the stale limit, which is
+/// `max(90 s, 2 x the governed interval)` for a realtime quote and that plus the delayed grace (900 s
+/// by default) for a delayed one. Between the stale limit and this age a surface shows the calm dimmed
+/// age with its source (`CNBC · 3m`) and does not say `closed`. A delayed quote is already stale at
+/// 990 s with the defaults, so it reads closed 90 s after it goes stale.
+///
+/// A quote also reads closed earlier when the price has not moved for this long under a fresh stamp
+/// ([`restamped`]) or when the 1D chart shows a re-stamp ([`Board::restamped_over_bars`]).
+///
+/// The age cannot tell a closed market from a quiet open one. A thinly traded open stock, and one
+/// symbol whose feed stopped while the others update, show the calm age after the stale limit and read
+/// `closed` after this age. The poll governor counts the board as closed when every row satisfies
+/// [`market_closed`], so it uses this age. A board with a 24-hour symbol such as BTC never counts as
+/// closed. A board that does count polls at the slowest step of its session (60 s, or 300 s when a
+/// session is locked), and that step is the longest wait before the first trade after a reopening
+/// shows.
 pub const CLOSED_AFTER_S: f64 = 900.0;
 
 /// Has CNBC re-stamped a price that did not move? True for a CNBC quote whose price has been the
@@ -238,7 +249,7 @@ pub const CLOSED_AFTER_S: f64 = 900.0;
 /// price equal to that bar's close, is a re-stamp.
 ///
 /// The rule also holds for a symbol whose market is open: a thinly traded stock or future that
-/// keeps one price for 15 minutes reads as stale and as closed, and the alert gap tracker counts it
+/// keeps one price for 15 minutes is stale and reads `closed`, and the alert gap tracker counts it
 /// as checked. The quote carries nothing that tells a quiet market from a closed one.
 pub fn restamped(q: &Quote, now: f64) -> bool {
     q.source.is_empty() && q.moved_at.is_some_and(|m| now - m >= CLOSED_AFTER_S)
@@ -263,7 +274,8 @@ pub fn closed_since(q: &Quote, now: f64) -> Option<f64> {
 /// CNBC's own, and its time is known and not ahead of the clock by more than [`FUTURE_SKEW_S`]. The
 /// service answered and this instrument has not printed lately, which is what every market does when
 /// it closes, so the card, the header and the alert gap tracker treat it as calm from the moment the
-/// quote goes stale. A down link, a missing quote, a fallback-provider quote and an unknown or
+/// quote goes stale. The word `closed` waits for [`market_closed`]; a quiet open market and a
+/// single-symbol stall are calm too, from the stale limit on. A down link, a missing quote, a fallback-provider quote and an unknown or
 /// future time are faults.
 pub fn calm_stale(cell: &Cell, link: Link, now: f64) -> bool {
     link != Link::Down && cell.stale && cell.quote.as_ref().is_some_and(|q| q.source.is_empty() && time_is_plausible(q, now))
@@ -271,10 +283,10 @@ pub fn calm_stale(cell: &Cell, link: Link, now: f64) -> bool {
 
 /// The one test every surface uses before it writes the word `closed`: the panel header, the tooltip
 /// title and rows, the spoken line and summary, the alert overview, the card tag and the probe. It is
-/// [`calm_stale`], so the word appears from the moment a CNBC quote goes stale. A surface that also
-/// has a since-time ([`closed_since_shown`]) adds it once the quote is [`CLOSED_AFTER_S`] old.
+/// [`market_closed`]. A stale CNBC quote that is calm but not yet closed ([`calm_stale`]) is shown
+/// with its source and age in the calm colour and without the word.
 pub fn reads_closed(cell: &Cell, link: Link, now: f64) -> bool {
-    calm_stale(cell, link, now)
+    market_closed(cell, link, now)
 }
 
 /// Seconds east of UTC on the US Eastern clock at the UTC instant `t`: -4 h from the second Sunday
@@ -333,15 +345,17 @@ const CAP_WITHIN_S: f64 = 4.0 * 3_600.0;
 /// after its start.
 const BAR_END_S: f64 = 60.0;
 
-/// Is this card's market closed, as opposed to its feed dead? True for a stale CNBC quote whose
-/// market has stopped ([`closed_since`]) while the last request was answered (`link` is not `Down`):
-/// the service is up and this instrument has stopped printing. False with the link down (the age
-/// says nothing then), with no quote, with a fallback-provider quote (its age is unknown), with a
-/// quote time ahead of the clock (unknown age, never age 0), and while the quote is fresh.
+/// Does this card say `closed`? True for a stale CNBC quote whose market has stopped
+/// ([`closed_since`]: a quote time [`CLOSED_AFTER_S`] old, or a price that did not move for that
+/// long) while the last request was answered (`link` is not `Down`). False with the link down (the
+/// age says nothing then), with no quote, with a fallback-provider quote (its age is unknown), with a
+/// quote time ahead of the clock (unknown age, never age 0), while the quote is fresh, and in the
+/// calm window between the stale limit and [`CLOSED_AFTER_S`] ([`calm_stale`]).
 ///
-/// A feed that stopped for one symbol while the others keep updating also reads closed after 15
-/// minutes, because the quote carries nothing that tells the two apart. A request that fails, or a
-/// service that stops answering, is the only fault this rule separates from a closed market.
+/// A feed that stopped for one symbol while the others keep updating reads `closed` after 15
+/// minutes, and so does a quiet open market, because the quote carries nothing that tells these
+/// apart from a close. A request that fails, or a service that stops answering, is the only fault
+/// this rule separates from a closed market.
 pub fn market_closed(cell: &Cell, link: Link, now: f64) -> bool {
     link != Link::Down && cell.stale && cell.quote.as_ref().is_some_and(|q| closed_since(q, now).is_some())
 }
@@ -358,6 +372,11 @@ pub enum Calm {
     Some(usize),
     /// Every row is a closed market (`n` of them).
     All(usize),
+    /// Like `Some`, but some stale cell is calm and not yet closed ([`market_closed`]): the header
+    /// says `quiet` and not `closed`.
+    QuietSome(usize),
+    /// Like `All`, but some cell is calm and not yet closed.
+    QuietAll(usize),
 }
 
 impl Calm {
@@ -366,8 +385,8 @@ impl Calm {
     pub fn look(self) -> Calm {
         match self {
             Calm::No => Calm::No,
-            Calm::Some(_) => Calm::Some(0),
-            Calm::All(_) => Calm::All(0),
+            Calm::Some(_) | Calm::QuietSome(_) => Calm::Some(0),
+            Calm::All(_) | Calm::QuietAll(_) => Calm::All(0),
         }
     }
 }
@@ -398,9 +417,27 @@ impl Board {
         same && time_is_plausible(q, now) && q.ts.is_some_and(|t| t - end > RESTAMP_AFTER_BAR_S)
     }
 
-    /// See [`Calm`]. `now` is UTC seconds. A stale cell counts as closed when it is [`calm_stale`],
-    /// from the moment its quote goes stale, so the header stays calm through the minutes before
-    /// [`market_closed`] holds.
+    /// Marks every card whose quote the 1D chart shows to be a re-stamp ([`Board::restamped_over_bars`])
+    /// as a stale card whose price last moved at the end of the last kept bar. The feed's own
+    /// `moved_at` has no history in the first [`CLOSED_AFTER_S`] after a start, so a weekend launch
+    /// would otherwise show a re-stamped price as a fresh one. Called whenever cells or bars are
+    /// published; the next quote publish builds its cells again from the feed's own history.
+    pub fn apply_bar_restamps(&mut self, now: f64) {
+        for i in 0..self.cells.len() {
+            let Some(end) = self.last_bar_at(i).map(|b| b + BAR_END_S).filter(|_| self.restamped_over_bars(i, now)) else {
+                continue;
+            };
+            let cell = &mut self.cells[i];
+            if let Some(q) = cell.quote.as_mut() {
+                q.moved_at = Some(q.moved_at.map_or(end, |m| m.min(end)));
+            }
+            cell.stale = true;
+        }
+    }
+
+    /// See [`Calm`]. `now` is UTC seconds. A stale cell is calm when it is [`calm_stale`], from the
+    /// moment its quote goes stale, so the header stays calm through the minutes before
+    /// [`market_closed`] holds. The header says `closed` only when every calm cell reads closed.
     pub fn calm(&self, now: f64) -> Calm {
         calm_of(&self.cells, self.link, now)
     }
@@ -414,11 +451,12 @@ pub fn calm_of(cells: &[Cell], link: Link, now: f64) -> Calm {
     // A cell with no quote is a fault whatever its `stale` flag says.
     let stale = cells.iter().filter(|c| c.stale || c.quote.is_none()).count();
     let closed = cells.iter().filter(|c| calm_stale(c, link, now)).count();
+    let said = cells.iter().filter(|c| reads_closed(c, link, now)).count();
     match (stale, closed) {
         (0, _) | (_, 0) => Calm::No,
         (s, c) if s != c => Calm::No,
-        (_, c) if c == cells.len() => Calm::All(c),
-        (_, c) => Calm::Some(c),
+        (_, c) if c == cells.len() => if said == c { Calm::All(c) } else { Calm::QuietAll(c) },
+        (_, c) => if said == c { Calm::Some(c) } else { Calm::QuietSome(c) },
     }
 }
 
@@ -447,8 +485,8 @@ pub fn first_fitting(options: &[String], fits: &dyn Fn(&str) -> bool) -> String 
 }
 
 /// The words a card's tag offers for a closed market, longest first, or `None` when the card does not
-/// read closed ([`reads_closed`]). The 90 to 900 s window after a realtime quote goes stale has no
-/// since-time yet, so it offers plain `closed`.
+/// read closed ([`reads_closed`]). A card in the calm window before that gets `None` and shows its
+/// source and age instead. A closed card with no since-time offers `CNBC · closed`, then `closed`.
 pub fn closed_card_words(cell: &Cell, link: Link, now: f64, last_bar: Option<f64>, offset_at: &dyn Fn(f64) -> i32) -> Option<Vec<String>> {
     if !reads_closed(cell, link, now) {
         return None;
@@ -460,7 +498,9 @@ pub fn closed_card_words(cell: &Cell, link: Link, now: f64, last_bar: Option<f64
 
 /// The words a closed card carries, longest first: `closed since Fri 17:40` with the source before
 /// it (`CNBC delayed · closed since Fri 17:40`) when `src` is given, then the words alone, then
-/// `closed` alone. `since` is [`closed_since`] and may be unknown, which leaves `closed`.
+/// `closed` alone. `since` is [`closed_since`] and may be unknown, which leaves the source with
+/// `closed` (`CNBC · closed`) when `src` is given, then `closed`. With a since-time the lists end in
+/// `closed` alone.
 pub fn closed_words(src: &str, since: Option<f64>, offset_at: &dyn Fn(f64) -> i32, now: f64) -> Vec<String> {
     let mut out = Vec::new();
     if let Some(t) = since {
@@ -469,6 +509,9 @@ pub fn closed_words(src: &str, since: Option<f64>, offset_at: &dyn Fn(f64) -> i3
             out.push(format!("{src} \u{b7} {words}"));
         }
         out.push(words);
+    }
+    if since.is_none() && !src.is_empty() {
+        out.push(format!("{src} \u{b7} closed"));
     }
     out.push("closed".into());
     out
@@ -723,7 +766,7 @@ mod tests {
         let est = |_: f64| -5 * 3600;
         let words = |s| closed_words("CNBC", s, &est, now);
         assert_eq!(words(closed_since_shown(&xau, now, Some(bar))), ["CNBC \u{b7} closed since Fri 16:51", "closed since Fri 16:51", "closed"]);
-        assert_eq!(words(closed_since_shown(&xau, now, None)), ["closed"]);
+        assert_eq!(words(closed_since_shown(&xau, now, None)), ["CNBC \u{b7} closed", "closed"]);
         // The bar time comes from the 1D bars of the row.
         let mut b = Board::new(&[]);
         assert_eq!(b.last_bar_at(0), None);
@@ -745,7 +788,7 @@ mod tests {
             let mut b = Board::new(&[]);
             b.link = Link::Partial;
             b.cells = vec![cell(age)];
-            assert_eq!(b.calm(now), Calm::All(1), "the header is calm at age {age}");
+            assert_eq!(b.calm(now), Calm::QuietAll(1), "the header is calm at age {age}, without the word closed");
         }
         assert!(market_closed(&cell(901.0), Link::Partial, now));
         // Faults keep the fault look.
@@ -767,6 +810,64 @@ mod tests {
         let mut skew = cell(300.0);
         skew.quote.as_mut().unwrap().ts = Some(now + FUTURE_SKEW_S);
         assert!(calm_stale(&skew, Link::Live, now), "a few minutes of skew is a known time");
+    }
+
+    #[test]
+    fn the_word_closed_starts_at_the_closed_age_and_the_calm_look_at_the_stale_limit() {
+        let now = 1_000_000.0;
+        let est = |_: f64| -5 * 3600;
+        let cell = |age: f64| Cell { label: "XAU".into(), digits: 2, quote: Some(q("XAU=", Some(now - age), true)), stale: age > 90.0 };
+        for (age, calm, closed) in [(30.0, false, false), (91.0, true, false), (300.0, true, false), (899.0, true, false), (901.0, true, true)] {
+            let c = cell(age);
+            assert_eq!(calm_stale(&c, Link::Partial, now), calm, "calm at {age}");
+            assert_eq!(reads_closed(&c, Link::Partial, now), closed, "closed at {age}");
+            assert_eq!(closed_card_words(&c, Link::Partial, now, None, &est).is_some(), closed, "tag words at {age}");
+            let mut b = Board::new(&[]);
+            b.link = Link::Partial;
+            b.cells = vec![c];
+            let want = match (calm, closed) {
+                (false, _) => Calm::No,
+                (true, false) => Calm::QuietAll(1),
+                (true, true) => Calm::All(1),
+            };
+            assert_eq!(b.calm(now), want, "header at {age}");
+        }
+        // One closed cell and one quiet cell: the header does not say closed for both.
+        let mut b = Board::new(&[]);
+        b.link = Link::Partial;
+        b.cells = vec![cell(300.0), cell(5.0 * 3600.0), Cell { stale: false, ..cell(2.0) }];
+        assert_eq!(b.calm(now), Calm::QuietSome(2));
+        b.cells = vec![cell(3600.0), cell(5.0 * 3600.0), Cell { stale: false, ..cell(2.0) }];
+        assert_eq!(b.calm(now), Calm::Some(2));
+        assert_eq!(Calm::QuietSome(2).look(), Calm::Some(7).look());
+        assert_eq!(Calm::QuietAll(2).look(), Calm::All(7).look());
+    }
+
+    #[test]
+    fn a_weekend_launch_marks_a_restamp_the_chart_exposes_as_stale_and_closed() {
+        let now = 1_000_000.0;
+        let bar_end = now - 3_000.0;
+        let mut b = Board::new(&[]);
+        b.link = Link::Live;
+        let mut quote = q("XAU=", Some(now - 20.0), true);
+        quote.price = 4_000.0;
+        quote.moved_at = Some(now - 5.0);
+        b.cells = vec![Cell { label: "XAU".into(), digits: 2, quote: Some(quote), stale: false }];
+        b.apply_bar_restamps(now);
+        assert!(!b.cells[0].stale, "no chart answer yet");
+        let bar = Bar { dt: 0.0, o: 4_000.0, h: 4_000.0, l: 4_000.0, c: 4_000.0, v: 0.0 };
+        b.bars = vec![vec![bar].into()];
+        b.bars_t0 = vec![bar_end - BAR_END_S];
+        b.apply_bar_restamps(now);
+        assert!(b.cells[0].stale, "a stamp 50 minutes after the last bar, on its close");
+        assert!(reads_closed(&b.cells[0], b.link, now));
+        assert_eq!(closed_since(b.cells[0].quote.as_ref().unwrap(), now), Some(bar_end));
+        assert_eq!(b.calm(now), Calm::All(1));
+        // A trade at another price is not a re-stamp.
+        let mut live = b.clone();
+        live.cells[0] = Cell { stale: false, quote: Some(Quote { price: 4_001.0, ..q("XAU=", Some(now - 20.0), true) }), ..live.cells[0].clone() };
+        live.apply_bar_restamps(now);
+        assert!(!live.cells[0].stale);
     }
 
     #[test]
@@ -878,7 +979,8 @@ mod tests {
         let words = closed_words("CNBC delayed", closed_since(&q, sat), &est, sat);
         assert_eq!(words, ["CNBC delayed \u{b7} closed since Fri 17:00", "closed since Fri 17:00", "closed"]);
         assert_eq!(closed_words("", closed_since(&q, sat), &est, sat), ["closed since Fri 17:00", "closed"]);
-        assert_eq!(closed_words("CNBC", None, &est, sat), ["closed"]);
+        assert_eq!(closed_words("CNBC", None, &est, sat), ["CNBC \u{b7} closed", "closed"]);
+        assert_eq!(closed_words("", None, &est, sat), ["closed"]);
     }
 
     #[test]

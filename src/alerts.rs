@@ -1868,7 +1868,11 @@ mod tests {
         let mut unknown = board(4150.0, true);
         unknown.cells[0].quote.as_mut().unwrap().ts = None;
         assert_eq!(overview(&cfg, &unknown, 100.0)[0].text, "XAU above 4,200.00, no fresh price", "a stale price of unknown age is a fault");
-        assert_eq!(overview(&cfg, &board(4150.0, true), 100.0)[0].text, "XAU above 4,200.00, closed", "a stale CNBC price of known age reads closed");
+        let mut old = board(4150.0, true);
+        old.cells[0].quote.as_mut().unwrap().ts = Some(100.0 - crate::model::CLOSED_AFTER_S);
+        assert_eq!(overview(&cfg, &old, 100.0)[0].text, "XAU above 4,200.00, closed", "a CNBC price 15 minutes old reads closed");
+        old.cells[0].quote.as_mut().unwrap().ts = Some(100.0 - crate::model::CLOSED_AFTER_S + 1.0);
+        assert_eq!(overview(&cfg, &old, 100.0)[0].text, "XAU above 4,200.00, no fresh price", "a calm price younger than that does not say closed");
         let mut fb = board(4150.0, false);
         fb.cells[0].quote.as_mut().unwrap().source = "Gold API";
         assert_eq!(overview(&cfg, &fb, 100.0)[0].text, "XAU above 4,200.00, no fresh price");
