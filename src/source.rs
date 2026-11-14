@@ -181,6 +181,8 @@ pub fn parse_chart(v: &Value, now: f64) -> (f64, Vec<Bar>) {
         }
     }
     pts.sort_by(|a, b| a.0.total_cmp(&b.0));
+    // Bars of a closed market (a feed repeating its last close) are not candles.
+    let mut pts = crate::ranges::drop_idle(pts);
     // A day of 1-minute bars is ~1,400; anything longer is a different endpoint, not a chart.
     let keep = pts.len().saturating_sub(MAX_BARS);
     pts.drain(..keep);
@@ -226,6 +228,8 @@ pub fn parse_series(v: &Value, now: f64) -> Series {
             _ => kept.push(p),
         }
     }
+    // Bars of a closed market (weekend and holiday days, a feed repeating its last close).
+    let mut kept = crate::ranges::drop_idle(kept);
     let drop = kept.len().saturating_sub(SERIES_BARS);
     kept.drain(..drop);
     let Some(t0) = kept.first().map(|p| p.0) else { return Series::new(now, Vec::new(), now) };
@@ -1756,7 +1760,7 @@ mod tests {
 
         // 4,001 minute bars keep the newest 4,000; t0 is the second bar's time.
         let many: Vec<Value> = (0..4_001)
-            .map(|i| serde_json::json!({"close": "1", "tradeTimeinMills": ms(60 * i)}))
+            .map(|i| serde_json::json!({"close": (1 + i % 2).to_string(), "tradeTimeinMills": ms(60 * i)}))
             .collect();
         let v = serde_json::json!({"barData": {"priceBars": many}});
         let s = parse_series(&v, 1e9);
