@@ -305,10 +305,13 @@ pub(super) fn open_settings(main: HWND) {
                 ShowWindow(open, SW_RESTORE);
             }
             // The panel may have opened or closed since the window last refreshed: settle its owner
-            // before raising it, so it lands above the panel.
-            refresh_fresh(open);
-            BringWindowToTop(open);
-            SetForegroundWindow(open);
+            // from the cached facts before raising it, so it lands above the panel. Raising it
+            // activates it, and `WM_ACTIVATE` does the one fresh read.
+            refresh(open);
+            read_fresh_after(|| {
+                BringWindowToTop(open);
+                SetForegroundWindow(open);
+            }, || refresh_fresh(open));
             return;
         },
     }
@@ -385,7 +388,8 @@ pub(super) fn open_settings(main: HWND) {
         OPEN.with(|c| c.set(hwnd as isize));
         SetTimer(hwnd, TIMER_REFRESH, REFRESH_MS, None);
         ShowWindow(hwnd, SW_SHOWNORMAL);
-        SetForegroundWindow(hwnd);
+        // The snapshot above was fresh; activation reads again only when nothing else did.
+        read_fresh_after(|| { SetForegroundWindow(hwnd); }, || refresh_fresh(hwnd));
     }
 }
 
@@ -421,10 +425,21 @@ fn activate(hwnd: HWND, act: Act) {
     }
     // SetFocus activates the window when it was not active, and `WM_ACTIVATE` then reads the registry
     // and the display list. Reading them again here would be a second read for the same command.
-    let before = FRESH_READS.with(|c| c.get());
-    unsafe { SetFocus(hwnd) };
-    if needs_fresh_read(before, FRESH_READS.with(|c| c.get())) {
-        refresh_fresh(hwnd);
+    read_fresh_after(|| unsafe { SetFocus(hwnd); }, || refresh_fresh(hwnd));
+}
+
+/// Run `raise` (a call that may activate the window), then `read` only when nothing read the registry
+/// and the display list during `raise`. Opening, reopening and finishing a command all use this, so each
+/// does one fresh read.
+fn read_fresh_after(raise: impl FnOnce(), read: impl FnOnce()) {
+    read_fresh_after_counted(|| FRESH_READS.with(|c| c.get()), raise, read);
+}
+
+fn read_fresh_after_counted(count: impl Fn() -> u32, raise: impl FnOnce(), read: impl FnOnce()) {
+    let before = count();
+    raise();
+    if needs_fresh_read(before, count()) {
+        read();
     }
 }
 
@@ -586,15 +601,14 @@ fn key_of(vk: u32, shift: bool) -> Option<Key> {
     })
 }
 
-/// The scroll offset a key sets, when it scrolls the page. Page Up and Page Down always do; Home and End
-/// do when the focus is on a control (they move the focus to the first or last one, and the page goes
-/// with it), while in the sidebar they pick the first or last section.
-fn key_scroll(vk: u32, l: &settings::Layout, focus_in_page: bool) -> Option<i32> {
+/// The scroll offset a key sets, when it scrolls the page: Page Up, Page Down, Home and End. The caller
+/// only asks for a focus on a control; Home and End in the sidebar pick the first or last section first.
+fn key_scroll(vk: u32, l: &settings::Layout) -> Option<i32> {
     let key = match vk {
         0x21 => PageKey::PageUp,
         0x22 => PageKey::PageDown,
-        0x24 if focus_in_page => PageKey::Home,
-        0x23 if focus_in_page => PageKey::End,
+        0x24 => PageKey::Home,
+        0x23 => PageKey::End,
         _ => return None,
     };
     Some(settings::scroll_for(l, key))
@@ -614,7 +628,7 @@ fn on_key(hwnd: HWND, vk: u32) -> Option<Do> {
         }
         if vk == 0x21 || vk == 0x22 {
             let l = current_layout(s, hwnd);
-            s.scroll = key_scroll(vk, &l, true).unwrap_or(l.scroll);
+            s.scroll = key_scroll(vk, &l).unwrap_or(l.scroll);
             invalidate(hwnd);
             return None;
         }
@@ -623,7 +637,7 @@ fn on_key(hwnd: HWND, vk: u32) -> Option<Do> {
         s.focus = settings::step(s.focus, key, s.cur, s.sections.len(), &s.controls);
         if let Hit::Opt(ci, _) = s.focus {
             let l = current_layout(s, hwnd);
-            s.scroll = key_scroll(vk, &l, true).unwrap_or_else(|| settings::reveal(&l, ci));
+            s.scroll = key_scroll(vk, &l).unwrap_or_else(|| settings::reveal(&l, ci));
         }
         invalidate(hwnd);
         // The sidebar entry under the focus is the section shown.
@@ -906,6 +920,19 @@ mod tests {
     }
 
     #[test]
+    fn opening_reopening_and_commands_read_once_around_the_raise() {
+        use std::cell::Cell;
+        let count = Cell::new(10u32);
+        let reads = Cell::new(0);
+        // The raise activates the window and the activation reads: no second read.
+        read_fresh_after_counted(|| count.get(), || count.set(count.get() + 1), || reads.set(reads.get() + 1));
+        assert_eq!(reads.get(), 0);
+        // The window was already active, nothing read: one read.
+        read_fresh_after_counted(|| count.get(), || {}, || reads.set(reads.get() + 1));
+        assert_eq!(reads.get(), 1);
+    }
+
+    #[test]
     fn a_new_section_clears_the_wheel_remainder_the_thumb_and_the_scroll() {
         let mut s = state(Vec::new());
         s.scroll = 300;
@@ -961,13 +988,11 @@ mod tests {
     #[test]
     fn page_and_end_keys_scroll_and_home_and_end_in_the_sidebar_do_not() {
         let l = tall_layout(100);
-        assert_eq!(key_scroll(0x22, &l, true), Some(settings::scroll_for(&l, PageKey::PageDown)));
-        assert_eq!(key_scroll(0x21, &l, false), Some(settings::scroll_for(&l, PageKey::PageUp)));
-        assert_eq!(key_scroll(0x24, &l, true), Some(0));
-        assert_eq!(key_scroll(0x23, &l, true), Some(l.max_scroll()));
-        assert_eq!(key_scroll(0x24, &l, false), None, "in the sidebar Home picks the first section");
-        assert_eq!(key_scroll(0x23, &l, false), None);
-        assert_eq!(key_scroll(0x41, &l, true), None);
+        assert_eq!(key_scroll(0x22, &l), Some(settings::scroll_for(&l, PageKey::PageDown)));
+        assert_eq!(key_scroll(0x21, &l), Some(settings::scroll_for(&l, PageKey::PageUp)));
+        assert_eq!(key_scroll(0x24, &l), Some(0));
+        assert_eq!(key_scroll(0x23, &l), Some(l.max_scroll()));
+        assert_eq!(key_scroll(0x41, &l), None);
     }
 
     #[test]
