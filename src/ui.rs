@@ -85,6 +85,13 @@ const TIMER_RECHECK: usize = 3;
 mod settings_view;
 mod settings_win;
 
+/// A page of the settings window from a fixed fixture (no window, no registry, no network), for the
+/// still renderer. `theme` names the palette in force for an Ultra build.
+#[cfg(feature = "shots")]
+pub(crate) fn settings_still(ultra: bool, theme: &str, section: crate::settings::Section) -> Vec<crate::settings::Control> {
+    settings_view::fixture(ultra, theme, section)
+}
+
 const CMD_STRIP: usize = 1001;
 const CMD_TOP: usize = 1002;
 const CMD_STATUS: usize = 1003;
