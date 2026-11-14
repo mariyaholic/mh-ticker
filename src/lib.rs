@@ -42,6 +42,7 @@ pub(crate) mod watch;
 pub(crate) mod panel;
 pub(crate) mod pins;
 pub(crate) mod ranges;
+pub(crate) mod settings;
 pub(crate) mod source;
 pub(crate) mod theme;
 pub(crate) mod ui;
