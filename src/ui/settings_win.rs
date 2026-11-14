@@ -14,7 +14,9 @@ use super::settings_view::{self, Env, MonitorFact};
 use super::*;
 use crate::settings::{self, Act, Control, Focus, Hit, Key, Paint, Section};
 use windows_sys::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
+use windows_sys::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
 use windows_sys::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForSystem};
+use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowLongPtrW, SetWindowLongPtrW, GWLP_HWNDPARENT};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, EnableWindow, SetFocus, TME_LEAVE, TRACKMOUSEEVENT};
 
 /// The refresh timer: picks up changes made through the menu, the tray, the hotkey or the feed.
@@ -35,10 +37,37 @@ struct Sw {
     zoom: u32,
     fonts: Option<(&'static str, u32, bool, panel::Fonts)>,
     tracking: bool,
+    /// The symbol the Symbols and Alerts pages are about (`Env::card`).
+    card: Option<String>,
+    /// Wheel movement not yet shown as whole pixels (`settings::wheel_step`).
+    wheel_rem: i64,
 }
 
 thread_local! {
     static SW: RefCell<Option<Sw>> = const { RefCell::new(None) };
+    /// The autostart flag and the monitor list. Reading them costs a registry call and a display
+    /// enumeration, so the 1 s refresh reuses them; they are read again when the window opens, is
+    /// activated, a command ran or the displays changed.
+    static SLOW: RefCell<Option<(bool, Vec<MonitorFact>)>> = const { RefCell::new(None) };
+}
+
+fn slow_facts(fresh: bool) -> (bool, Vec<MonitorFact>) {
+    if !fresh {
+        if let Some(c) = SLOW.with(|c| c.try_borrow().ok().and_then(|g| g.clone())) {
+            return c;
+        }
+    }
+    let monitors: Vec<MonitorFact> = dock::monitors()
+        .into_iter()
+        .map(|d| MonitorFact { w: d.bounds.right - d.bounds.left, h: d.bounds.bottom - d.bounds.top, device: d.device, primary: d.primary })
+        .collect();
+    let auto = autostart::enabled(config::profile().id);
+    SLOW.with(|c| {
+        if let Ok(mut g) = c.try_borrow_mut() {
+            *g = Some((auto, monitors.clone()));
+        }
+    });
+    (auto, monitors)
 }
 
 fn with_sw<R>(f: impl FnOnce(&mut Sw) -> R) -> Option<R> {
@@ -54,7 +83,8 @@ struct Snap {
     face: &'static str,
 }
 
-fn snapshot() -> Option<Snap> {
+fn snapshot(fresh: bool) -> Option<Snap> {
+    let card = with_sw(|s| s.card.clone()).flatten();
     let (cfg, ultra, open, picked, undo, status, adding, hotkey_failed, update_running, report_running, theme, face) = with_ui(|u| {
         let note = if u.view.note.is_empty() { theme::link_name(u.view.link).to_string() } else { u.view.note.clone() };
         (
@@ -75,10 +105,18 @@ fn snapshot() -> Option<Snap> {
     let list = config::menu_list(&cfg);
     let shown: Vec<bool> = list.iter().map(|r| config::is_shown(&cfg, &r.symbol)).collect();
     let alerts = if ultra { alerts_view(&list, &shown).unwrap_or_default() } else { AlertsView::default() };
-    let monitors = dock::monitors()
-        .into_iter()
-        .map(|d| MonitorFact { w: d.bounds.right - d.bounds.left, h: d.bounds.bottom - d.bounds.top, device: d.device, primary: d.primary })
-        .collect();
+    let (autostart, monitors) = slow_facts(fresh);
+    let autos = with_ui(|u| {
+        u.cfg
+            .rows
+            .iter()
+            .map(|r| {
+                let price = u.view.cells.iter().zip(&u.cfg.rows).find(|(_, x)| x.symbol == r.symbol).and_then(|(c, _)| c.quote.as_ref()).map(|q| q.price);
+                (r.symbol.clone(), config::auto_digits(&r.symbol, price))
+            })
+            .collect::<Vec<_>>()
+    })
+    .unwrap_or_default();
     let env = Env {
         ultra,
         open,
@@ -86,7 +124,7 @@ fn snapshot() -> Option<Snap> {
         undo,
         status: status.chars().take(90).collect(),
         meter: crate::source::meter_line(),
-        autostart: autostart::enabled(config::profile().id),
+        autostart,
         hotkey_failed,
         adding,
         monitors,
@@ -97,6 +135,8 @@ fn snapshot() -> Option<Snap> {
         update_running,
         report_running,
         version: format!("{} {}", config::profile().title(), env!("CARGO_PKG_VERSION")),
+        card,
+        autos,
     };
     Some(Snap { cfg, env, theme, face })
 }
@@ -109,11 +149,13 @@ fn apply(s: &mut Sw, snap: &Snap) -> bool {
     let controls = settings_view::build(&snap.cfg, &snap.env, s.sections[s.cur]);
     let zoom = snap.cfg.zoom(snap.env.ultra);
     let changed = controls != s.controls || !std::ptr::eq(s.theme, snap.theme) || s.face != snap.face || s.zoom != zoom;
-    s.controls = controls;
+    // The focus follows its option by control label and command, because a rebuild can insert or
+    // remove controls above it and an index would then point at a different control.
+    let old = std::mem::replace(&mut s.controls, controls);
     s.theme = snap.theme;
     s.face = snap.face;
     s.zoom = zoom;
-    s.focus = settings::settle(s.focus, s.sections.len(), &s.controls);
+    s.focus = settings::settle(s.focus, &old, s.cur, s.sections.len(), &s.controls);
     changed
 }
 
@@ -127,9 +169,31 @@ fn invalidate(hwnd: HWND) {
     unsafe { InvalidateRect(hwnd, null(), 0) };
 }
 
+/// Own the window by the strip while the panel is open, so it stays above the panel, and leave it
+/// unowned otherwise: an owned window follows its owner's topmost state, and a docked strip is
+/// topmost, which would keep the window above every other app.
+fn sync_owner(hwnd: HWND, open: bool) {
+    let want = if open { main_hwnd() as isize } else { 0 };
+    unsafe {
+        if GetWindowLongPtrW(hwnd, GWLP_HWNDPARENT) != want {
+            SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, want);
+        }
+    }
+}
+
 /// Re-read the config and repaint when something differs.
 fn refresh(hwnd: HWND) {
-    let Some(snap) = snapshot() else { return };
+    refresh_with(hwnd, false);
+}
+
+/// `refresh` that also re-reads the autostart flag and the monitor list.
+fn refresh_fresh(hwnd: HWND) {
+    refresh_with(hwnd, true);
+}
+
+fn refresh_with(hwnd: HWND, fresh: bool) {
+    let Some(snap) = snapshot(fresh) else { return };
+    sync_owner(hwnd, snap.env.open);
     if with_sw(|s| apply(s, &snap)).unwrap_or(false) {
         if let Some(t) = with_sw(|s| s.theme) {
             set_dark_caption(hwnd, t);
@@ -157,7 +221,7 @@ pub(super) fn open_settings(main: HWND) {
             }
         }
     }
-    let Some(snap) = snapshot() else { return };
+    let Some(snap) = snapshot(true) else { return };
     unsafe {
         let inst = GetModuleHandleW(null());
         let class = wide(&format!("{}_Settings", config::profile().id));
@@ -177,15 +241,30 @@ pub(super) fn open_settings(main: HWND) {
         RegisterClassW(&wc);
         let title = wide(&format!("{} settings", config::profile().title()));
         let style = WS_OVERLAPPEDWINDOW;
-        // The DPI of the monitor the strip is on, which is where the new window opens.
+        // The window opens on the monitor the strip is on, so its size uses that monitor's DPI.
         let mon = if main.is_null() { GetDpiForSystem().max(96) } else { window_dpi(main) };
         let eff = zoom::effective_dpi(mon, snap.cfg.zoom(snap.env.ultra));
         let (cw, ch) = settings::window_size(eff);
         let mut rc = RECT { left: 0, top: 0, right: cw, bottom: ch };
         AdjustWindowRectExForDpi(&mut rc, style, 0, 0, mon);
-        // The strip owns the window, so it always stays above the strip and above the expanded panel (which
-        // is topmost). WS_EX_APPWINDOW keeps a taskbar button and an Alt+Tab entry for an owned window.
-        let hwnd = CreateWindowExW(WS_EX_APPWINDOW, class.as_ptr(), title.as_ptr(), style, CW_USEDEFAULT, CW_USEDEFAULT, rc.right - rc.left, rc.bottom - rc.top, main, null_mut(), inst, null());
+        let (ww, wh) = (rc.right - rc.left, rc.bottom - rc.top);
+        let (x, y) = if main.is_null() {
+            (CW_USEDEFAULT, CW_USEDEFAULT)
+        } else {
+            let mut mi: MONITORINFO = std::mem::zeroed();
+            mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+            if GetMonitorInfoW(MonitorFromWindow(main, MONITOR_DEFAULTTONEAREST), &mut mi) != 0 {
+                let w = mi.rcWork;
+                settings::place(settings::Rc::new(w.left, w.top, w.right, w.bottom), ww, wh)
+            } else {
+                (CW_USEDEFAULT, CW_USEDEFAULT)
+            }
+        };
+        // Owned by the strip while the panel is open (so it stays above the panel), unowned otherwise;
+        // `sync_owner` keeps that true on every refresh. WS_EX_APPWINDOW keeps a taskbar button and an
+        // Alt+Tab entry for an owned window.
+        let owner = if snap.env.open { main } else { null_mut() };
+        let hwnd = CreateWindowExW(WS_EX_APPWINDOW, class.as_ptr(), title.as_ptr(), style, x, y, ww, wh, owner, null_mut(), inst, null());
         if hwnd.is_null() {
             return;
         }
@@ -204,6 +283,8 @@ pub(super) fn open_settings(main: HWND) {
             zoom: 100,
             fonts: None,
             tracking: false,
+            card: None,
+            wheel_rem: 0,
         };
         apply(&mut sw, &snap);
         set_dark_caption(hwnd, sw.theme);
@@ -234,6 +315,8 @@ fn activate(hwnd: HWND, act: Act) {
         match &act {
             Act::Cmd(id) => run_command(main, *id, listed),
             Act::Do(action) => run_action(main, action),
+            // Handled by the window before a command is chosen (`choose`); nothing to run.
+            Act::Card(_) => {}
         }
     }
     unsafe {
@@ -243,7 +326,7 @@ fn activate(hwnd: HWND, act: Act) {
         EnableWindow(hwnd, 1);
         SetFocus(hwnd);
     }
-    refresh(hwnd);
+    refresh_fresh(hwnd);
 }
 
 /// What activating the focused option or a clicked one means: a section change for the sidebar, a
@@ -251,18 +334,23 @@ fn activate(hwnd: HWND, act: Act) {
 enum Do {
     Section(usize),
     Run(Act),
+    /// Pick the symbol the pages are about (the window's own state, not a command).
+    Card(String),
 }
 
 fn choose(s: &mut Sw, at: Hit) -> Option<Do> {
     s.focus = at;
     match at {
         Hit::Nav(i) => (i != s.cur).then_some(Do::Section(i)),
-        Hit::Opt(ci, oi) => settings_view::opt_of(&s.controls, ci, oi).filter(|o| o.enabled).map(|o| Do::Run(o.act.clone())),
+        Hit::Opt(ci, oi) => settings_view::opt_of(&s.controls, ci, oi).filter(|o| o.enabled).map(|o| match &o.act {
+            Act::Card(sym) => Do::Card(sym.clone()),
+            act => Do::Run(act.clone()),
+        }),
     }
 }
 
 fn go_section(hwnd: HWND, i: usize) {
-    let Some(snap) = snapshot() else { return };
+    let Some(snap) = snapshot(true) else { return };
     with_sw(|s| {
         s.cur = i.min(s.sections.len() - 1);
         s.scroll = 0;
@@ -384,6 +472,10 @@ fn dispatch(hwnd: HWND, what: Option<Do>) {
     match what {
         Some(Do::Section(i)) => go_section(hwnd, i),
         Some(Do::Run(act)) => activate(hwnd, act),
+        Some(Do::Card(sym)) => {
+            with_sw(|s| s.card = Some(sym));
+            refresh(hwnd);
+        }
         None => {}
     }
 }
@@ -424,6 +516,18 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
         WM_TIMER if wp == TIMER_REFRESH => {
             refresh(hwnd);
             0
+        }
+        WM_ACTIVATE => {
+            // Coming back to the window picks up what changed meanwhile, the autostart flag and the
+            // displays included.
+            if (wp & 0xffff) != 0 {
+                refresh_fresh(hwnd);
+            }
+            DefWindowProcW(hwnd, msg, wp, lp)
+        }
+        WM_DISPLAYCHANGE => {
+            refresh_fresh(hwnd);
+            DefWindowProcW(hwnd, msg, wp, lp)
         }
         WM_SETTINGCHANGE | WM_SYSCOLORCHANGE | WM_THEMECHANGED => {
             refresh(hwnd);
@@ -471,7 +575,8 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
             let delta = ((wp >> 16) & 0xffff) as i16 as i32;
             with_sw(|s| {
                 let l = current_layout(s, hwnd);
-                s.scroll = l.scroll - settings::wheel_px(delta, eff_dpi(s, hwnd));
+                let dpi = eff_dpi(s, hwnd);
+                s.scroll = l.scroll - settings::wheel_step(delta, dpi, &mut s.wheel_rem);
             });
             invalidate(hwnd);
             0
@@ -483,6 +588,11 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
         }
         WM_DESTROY => {
             KillTimer(hwnd, TIMER_REFRESH);
+            SLOW.with(|c| {
+                if let Ok(mut g) = c.try_borrow_mut() {
+                    *g = None;
+                }
+            });
             SW.with(|c| {
                 if let Ok(mut g) = c.try_borrow_mut() {
                     *g = None;
@@ -524,6 +634,8 @@ mod tests {
             zoom: 100,
             fonts: None,
             tracking: false,
+            card: None,
+            wheel_rem: 0,
         }
     }
 
@@ -546,6 +658,12 @@ mod tests {
         assert!(choose(&mut s, Hit::Opt(1, 0)).is_none());
         assert!(matches!(choose(&mut s, Hit::Opt(2, 0)), Some(Do::Run(Act::Do(Action::Symbol(ref sym)))) if sym == "BTC="));
         assert!(choose(&mut s, Hit::Opt(9, 0)).is_none(), "a control that is gone runs nothing");
+    }
+
+    #[test]
+    fn choosing_a_card_chip_picks_the_symbol_and_runs_no_command() {
+        let mut s = state(vec![Control::choice("Symbol", "", vec![settings::opt("Gold", Act::Card("XAU=".into()))], Some(0))]);
+        assert!(matches!(choose(&mut s, Hit::Opt(0, 0)), Some(Do::Card(ref sym)) if sym == "XAU="));
     }
 
     #[test]

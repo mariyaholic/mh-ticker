@@ -2382,7 +2382,7 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
         item(MF_STRING, CMD_COPY_ALL, "Copy all prices");
         // Undo (W3 J2): one snapshot, so one line; it says what it would undo.
         match with_ui(|u| u.undo.kind()).flatten() {
-            Some(kind) => item(MF_STRING, CMD_UNDO, &format!("Undo the last {}{}", kind.label(), if ultra { "	Ctrl+Z" } else { "" })),
+            Some(kind) => item(MF_STRING, CMD_UNDO, &format!("Undo the last {}{}", kind.label(), if ultra { "\tCtrl+Z" } else { "" })),
             None => item(MF_STRING | MF_GRAYED, CMD_UNDO, "Undo"),
         }
         item(MF_STRING | if visible { MF_CHECKED } else { 0 }, CMD_STRIP, "Show strip");
