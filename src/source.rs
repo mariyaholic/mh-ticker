@@ -108,8 +108,30 @@ fn flag(v: Option<&Value>) -> bool {
 
 pub use crate::probe::parse_time;
 
+/// The instant of a quote's `last_time`, read against `now`. After a futures session ends, CNBC
+/// keeps printing thin re-stamps and writes today's date in front of the clock of the last one:
+/// on Saturday 14 Nov 2026 `@SP.1` read `2026-11-14T17:40:14.000-0500` while its last print was
+/// Friday 17:40 (the 1D chart has a bar at `20261113174000`, and `settleDate` is `2026-11-13`).
+/// A stamp more than [`crate::model::FUTURE_SKEW_S`] ahead of `now` is therefore read again with
+/// the `settleDate` as its date; when that is not in the past either, the time is unknown.
+pub fn quote_time(last_time: &str, settle_date: Option<&str>, now: f64) -> Option<f64> {
+    let ts = parse_time(last_time)?;
+    if ts <= now + crate::model::FUTURE_SKEW_S {
+        return Some(ts);
+    }
+    let settle = settle_date?.trim();
+    let clock = last_time.get(10..).filter(|c| c.starts_with('T'))?;
+    let fixed = parse_time(&format!("{settle}{clock}"))?;
+    (fixed <= now + crate::model::FUTURE_SKEW_S && ts - fixed < 7.0 * 86_400.0).then_some(fixed)
+}
+
 /// `restQuote` body -> quotes.
 pub fn parse_quotes(v: &Value) -> Vec<Quote> {
+    parse_quotes_at(v, now_s())
+}
+
+/// [`parse_quotes`] with the clock given, for the probe and for tests.
+pub fn parse_quotes_at(v: &Value, now: f64) -> Vec<Quote> {
     let rows = v.pointer("/FormattedQuoteResult/FormattedQuote").and_then(Value::as_array);
     rows.map(|rows| {
         rows.iter()
@@ -124,7 +146,8 @@ pub fn parse_quotes(v: &Value) -> Vec<Quote> {
                     price,
                     change_pct: r.get("change_pct").and_then(number),
                     prev_close: r.get("previous_day_closing").and_then(number),
-                    ts: r.get("last_time").and_then(Value::as_str).and_then(parse_time),
+                    ts: r.get("last_time").and_then(Value::as_str).and_then(|t| quote_time(t, r.get("settleDate").and_then(Value::as_str), now)),
+                    moved_at: None,
                     realtime: flag(r.get("realTime")),
                     open: positive(r.get("open")),
                     high: positive(r.get("high")),
@@ -745,13 +768,13 @@ impl Feed {
     /// What the governor says now: `(interval to wait, stale limit's interval)`. The second is 0 while
     /// no governor tick is on, which keeps the configured stale limit and the plain cadence exactly
     /// as 1.8 had them. Reads the board once; `quiet_for` comes from the caller's `Quiet`.
-    fn governed(&self, quiet_for: f64) -> (f64, f64) {
+    fn governed(&self, quiet_for: f64, closed: bool) -> (f64, f64) {
         let cadence = self.cadence();
         let Ok(b) = self.shared.lock() else { return (cadence, 0.0) };
         if !b.gov.any() {
             return (cadence, 0.0);
         }
-        let iv = crate::governor::interval(cadence, quiet_for, b.locked, b.armed, b.gov);
+        let iv = crate::governor::interval(cadence, crate::governor::with_closed(quiet_for, closed), b.locked, b.armed, b.gov);
         (iv, iv)
     }
 
@@ -767,6 +790,8 @@ impl Feed {
         let started = Instant::now();
         let mut quiet = crate::governor::Quiet::default();
         let mut seen_kick = self.shared.lock().map(|b| b.kick).unwrap_or(0);
+        // Every shown market was closed at the last answer (`governor::with_closed`).
+        let mut closed = false;
         loop {
             self.sync_rows();
             // Read before the request: a kick that lands while it is in flight ends the wait below.
@@ -785,29 +810,40 @@ impl Feed {
                     for row in &self.rows {
                         if !returned.contains(row.symbol.as_str()) { self.quotes.remove(&row.symbol); }
                     }
-                    for q in qs {
+                    let seen = now_s();
+                    for mut q in qs {
+                        q.moved_at = match self.quotes.get(&q.symbol) {
+                            Some(old) if old.price == q.price && old.moved_at.is_some() => old.moved_at,
+                            _ => Some(seen),
+                        };
                         self.quotes.insert(q.symbol.clone(), q);
                     }
                     let prices: Vec<f64> = self.rows.iter()
                         .map(|r| self.quotes.get(&r.symbol).map_or(f64::NAN, |q| q.price))
                         .collect();
                     let quiet_for = quiet.observe(started.elapsed().as_secs_f64(), &prices);
-                    governed_s = self.governed(quiet_for).1;
+                    governed_s = self.governed(quiet_for, closed).1;
                     let stale_after = crate::governor::stale_after(self.cfg.stale_after_s, governed_s);
-                    let cells = resolve(&self.rows, &self.quotes, now_s(), stale_after, self.cfg.delayed_grace_s);
-                    let lagging: Vec<&str> = cells.iter().filter(|c| c.stale).map(|c| c.label.as_str()).collect();
-                    if lagging.is_empty() {
-                        (Link::Live, String::new())
-                    } else {
-                        (Link::Partial, format!("no fresh price: {} (market closed?)", lagging.join(", ")))
+                    let now = now_s();
+                    let cells = resolve(&self.rows, &self.quotes, now, stale_after, self.cfg.delayed_grace_s);
+                    let stale = cells.iter().filter(|c| c.stale);
+                    let (shut, lagging): (Vec<_>, Vec<_>) = stale.partition(|c| crate::model::market_closed(c, Link::Partial, now));
+                    closed = !cells.is_empty() && shut.len() == cells.len();
+                    let names = |cs: &[&crate::model::Cell]| cs.iter().map(|c| c.label.as_str()).collect::<Vec<_>>().join(", ");
+                    match (shut.is_empty(), lagging.is_empty()) {
+                        (true, true) => (Link::Live, String::new()),
+                        (false, true) => (Link::Partial, format!("closed: {}", names(&shut))),
+                        (true, false) => (Link::Partial, format!("no fresh price: {}", names(&lagging))),
+                        (false, false) => (Link::Partial, format!("no fresh price: {}; closed: {}", names(&lagging), names(&shut))),
                     }
                 }
                 Err(e) => {
                     self.fails = self.fails.saturating_add(1);
+                    closed = false;
                     (Link::Down, format!("CNBC: {e}"))
                 }
             };
-            let (iv, _) = self.governed(quiet.quiet_for(started.elapsed().as_secs_f64()));
+            let (iv, _) = self.governed(quiet.quiet_for(started.elapsed().as_secs_f64()), closed);
             self.note_governed(governed_s, self.cadence());
             self.publish(link, note.clone());
             let cadence = self.cadence();
@@ -963,6 +999,19 @@ pub fn collect_bodies(rows: &[Row], day_rows: usize, current: &str) -> crate::pr
     b
 }
 
+/// The word the probe prints after a quote: ` CLOSED` for a market that has stopped, ` STALE` for a
+/// price that is old for any other reason, nothing for a fresh one. The probe only reaches here
+/// when the service answered, so the link counts as live.
+fn probe_state(c: &crate::model::Cell, now: f64) -> &'static str {
+    if crate::model::market_closed(c, Link::Live, now) {
+        " CLOSED"
+    } else if c.stale {
+        " STALE"
+    } else {
+        ""
+    }
+}
+
 /// `--probe`: one pass over the quotes and the bars, then the findings; with `dump` the raw answers
 /// are also saved in that folder (and nothing else is written). Returns true when any finding is a
 /// `WARN`, for a non-zero exit. Command line only: `lib::launch` never calls it for the running app.
@@ -972,7 +1021,7 @@ pub fn probe(cfg: &Config, dump: Option<&std::path::Path>) -> bool {
     match &b.quotes {
         Some(Ok(body)) => match serde_json::from_str::<Value>(body) {
             Ok(v) => {
-                let map: HashMap<_, _> = parse_quotes(&v).into_iter().map(|q| (q.symbol.clone(), q)).collect();
+                let map: HashMap<_, _> = parse_quotes_at(&v, now).into_iter().map(|q| (q.symbol.clone(), q)).collect();
                 for c in resolve(&cfg.rows, &map, now, cfg.stale_after_s, cfg.delayed_grace_s) {
                     match &c.quote {
                         Some(q) => println!(
@@ -982,7 +1031,7 @@ pub fn probe(cfg: &Config, dump: Option<&std::path::Path>) -> bool {
                             q.change_pct.map(crate::model::fmt_change).unwrap_or_default(),
                             q.name,
                             if q.realtime { "" } else { " DELAYED" },
-                            if c.stale { " STALE" } else { "" },
+                            probe_state(&c, now),
                             q.ts.map(|t| format!("{:.0}s", now - t)).unwrap_or_else(|| "?".into()),
                         ),
                         None => println!("{:<5} {:>12}  no quote", c.label, "-"),
@@ -1269,6 +1318,63 @@ mod tests {
         // `0.00` is how CNBC says "this symbol has no such value"; it must not draw as a price.
         assert_eq!((qs[1].high, qs[1].yr_lo, qs[1].volume), (None, None, None));
         assert_eq!(qs[1].currency, "");
+    }
+
+    /// The raw answer CNBC gave on Saturday 14 Nov 2026 at 17:18:36 UTC (an abridged copy: the
+    /// fields that carry a time, plus the price). The 1D charts of the same minute show the last
+    /// real prints on Friday 13 Nov at 16:59 and the thin re-stamps at 17:40 (`@SP.1`, `@DJ.1`).
+    const SATURDAY: &str = r#"{"FormattedQuoteResult":{"FormattedQuote":[
+      {"symbol":"@SP.1","last":"7,561.00","last_timedate":"5:40 PM EST","last_time":"2026-11-14T17:40:14.000-0500","realTime":"false","settleDate":"2026-11-13","timeZone":"EST"},
+      {"symbol":"@DJ.1","last":"52,347.00","last_timedate":"5:40 PM EST","last_time":"2026-11-14T17:40:32.000-0500","realTime":"false","settleDate":"2026-11-13","timeZone":"EST"},
+      {"symbol":"@ND.1","last":"27,927.25","last_timedate":"5:39 PM EST","last_time":"2026-11-14T17:39:07.000-0500","realTime":"false","settleDate":"2026-11-13","timeZone":"EST"},
+      {"symbol":"@CL.1","last":"88.92","last_timedate":"6:13 PM EST","last_time":"2026-11-14T18:13:44.000-0500","realTime":"false","settleDate":"2026-11-13","timeZone":"EST"},
+      {"symbol":"XAU=","last":"3,880.04","last_timedate":"9:19 AM EST","last_time":"2026-11-14T09:19:58.806-0500","realTime":"true","timeZone":"EST"},
+      {"symbol":"BTC.CB=","last":"65,161","last_timedate":"12:18 PM EST","last_time":"2026-11-14T12:18:28.000-0500","realTime":"true","timeZone":"EST"},
+      {"symbol":"EUR=","last":"1.0600","last_timedate":"4:59 PM EST","last_time":"2026-11-13T16:59:00.000-0500","realTime":"true","timeZone":"EST"}]}}"#;
+
+    #[test]
+    fn a_saturday_futures_stamp_is_read_with_its_settle_date() {
+        let now = parse_time("2026-11-14T17:18:36.000+0000").unwrap();
+        let qs = parse_quotes_at(&serde_json::from_str(SATURDAY).unwrap(), now);
+        let age = |sym: &str| now - qs.iter().find(|q| q.symbol == sym).unwrap().ts.unwrap();
+        // Friday 17:40:14 EST is 22:40:14 UTC, 18 h 38 min 22 s before the answer.
+        assert_eq!(age("@SP.1"), 18.0 * 3600.0 + 38.0 * 60.0 + 22.0);
+        assert_eq!(age("@DJ.1"), 18.0 * 3600.0 + 38.0 * 60.0 + 4.0);
+        assert_eq!(age("@ND.1"), 18.0 * 3600.0 + 39.0 * 60.0 + 29.0);
+        assert_eq!(age("@CL.1"), 18.0 * 3600.0 + 4.0 * 60.0 + 52.0);
+        // Stamps that were already in the past are read as sent.
+        assert!((age("XAU=") - (2.0 * 3600.0 + 58.0 * 60.0 + 37.194)).abs() < 1e-3);
+        assert_eq!(age("BTC.CB="), 8.0);
+        assert_eq!(age("EUR="), 19.0 * 3600.0 + 19.0 * 60.0 + 36.0);
+        assert!(qs.iter().all(|q| q.ts.is_some_and(|t| t <= now + crate::model::FUTURE_SKEW_S)));
+    }
+
+    #[test]
+    fn the_probe_names_a_closed_market_and_a_fault_apart() {
+        let now = parse_time("2026-11-14T17:18:36.000+0000").unwrap();
+        let qs = parse_quotes_at(&serde_json::from_str(SATURDAY).unwrap(), now);
+        let map: HashMap<_, _> = qs.into_iter().map(|q| (q.symbol.clone(), q)).collect();
+        let rows: Vec<Row> = ["@SP.1", "BTC.CB="].iter().map(|s| Row { label: (*s).into(), symbol: (*s).into(), digits: 0, name: String::new(), strip: true }).collect();
+        let cells = resolve(&rows, &map, now, 90.0, 900.0);
+        assert_eq!(probe_state(&cells[0], now), " CLOSED");
+        assert_eq!(probe_state(&cells[1], now), "");
+        let mut stuck = cells[0].clone();
+        stuck.quote.as_mut().unwrap().ts = None;
+        assert_eq!(probe_state(&stuck, now), " STALE");
+    }
+
+    #[test]
+    fn a_future_stamp_with_no_usable_settle_date_has_no_age() {
+        let now = parse_time("2026-11-14T17:18:36.000+0000").unwrap();
+        let future = "2026-11-14T17:40:14.000-0500";
+        assert_eq!(quote_time(future, None, now), None, "no settle date");
+        assert_eq!(quote_time(future, Some("2026-11-14"), now), None, "a settle date that is in the future too");
+        assert_eq!(quote_time(future, Some("junk"), now), None);
+        assert_eq!(quote_time(future, Some("2026-10-01"), now), None, "a settle date weeks away from the stamp");
+        // A few minutes ahead is clock skew and is read as sent.
+        let skew = "2026-11-14T12:21:36.000-0500";
+        assert_eq!(quote_time(skew, None, now), parse_time(skew));
+        assert_eq!(quote_time("2026-11-14", Some("2026-11-13"), now), None, "a bare date has no clock");
     }
 
     #[test]
@@ -1625,19 +1731,21 @@ mod tests {
         let shared = Arc::new(Mutex::new(Board::new(&rows)));
         let feed = test_feed(&shared, rows);
         for quiet in [0.0, 700.0, 4_000.0] {
-            assert_eq!(feed.governed(quiet), (3.0, 0.0), "off: the plain cadence, stale limit untouched");
+            assert_eq!(feed.governed(quiet, false), (3.0, 0.0), "off: the plain cadence, stale limit untouched");
         }
         {
             let mut b = shared.lock().unwrap();
             b.gov = crate::governor::Settings { slow_when_quiet: true, rest_when_locked: true };
         }
-        assert_eq!(feed.governed(0.0), (3.0, 3.0));
-        assert_eq!(feed.governed(700.0), (15.0, 15.0));
-        assert_eq!(feed.governed(2_000.0), (60.0, 60.0));
+        assert_eq!(feed.governed(0.0, false), (3.0, 3.0));
+        assert_eq!(feed.governed(700.0, false), (15.0, 15.0));
+        assert_eq!(feed.governed(2_000.0, false), (60.0, 60.0));
+        assert_eq!(feed.governed(0.0, true), (60.0, 60.0), "every market closed: slow from the first poll");
         shared.lock().unwrap().locked = true;
-        assert_eq!(feed.governed(0.0), (300.0, 300.0));
+        assert_eq!(feed.governed(0.0, false), (300.0, 300.0));
         shared.lock().unwrap().armed = true;
-        assert_eq!(feed.governed(2_000.0), (15.0, 15.0), "armed: never slower than 15 s, locked or not");
+        assert_eq!(feed.governed(2_000.0, false), (15.0, 15.0), "armed: never slower than 15 s, locked or not");
+        assert_eq!(feed.governed(0.0, true), (15.0, 15.0), "armed and closed: still looked at every 15 s");
         // The feed tells the board what it waits, and the board says when a wake is worth a kick.
         feed.note_governed(300.0, 3.0);
         let b = shared.lock().unwrap();

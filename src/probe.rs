@@ -271,7 +271,7 @@ fn bar_start(b: &Bodies, quotes: Option<&Value>, files: &[(String, Value)], out:
     let quote = quotes.and_then(quote_rows).and_then(|rows| rows.iter().find(|r| r.get("symbol").and_then(Value::as_str) == Some(sym.as_str())));
     let (Some(price), Some(tq)) = (
         quote.and_then(|r| num(r.get("last"))),
-        quote.and_then(|r| r.get("last_time")).and_then(Value::as_str).and_then(parse_time),
+        quote.and_then(|r| crate::source::quote_time(r.get("last_time")?.as_str()?, r.get("settleDate").and_then(Value::as_str), b.now)),
     ) else {
         return not_now(out, "the quote has no price or time");
     };

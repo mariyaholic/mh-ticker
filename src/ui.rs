@@ -44,7 +44,7 @@ use crate::dock;
 use crate::panel;
 use crate::ranges::{self, Range};
 use crate::theme::{self, Gradient, Theme};
-use crate::model::{fmt_change, fmt_price, Board, Cell, Link};
+use crate::model::{fmt_change, fmt_price, Board, Calm, Cell, Link};
 use std::cell::RefCell;
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicIsize, Ordering};
@@ -376,7 +376,7 @@ struct Ui {
     grad: Gradient,
     icon: HICON,
     /// What the current tray icon was drawn for: the link colour and the alert marker.
-    icon_link: Option<(Link, bool)>,
+    icon_link: Option<(Link, Calm, bool)>,
     dpi: u32,
     cfg: Config,
     board: Arc<Mutex<Board>>,
@@ -976,7 +976,7 @@ fn draw_strip(u: &Ui, dc: HDC) {
             TextOutW(dc, r.x, r.y, r.text.as_ptr(), r.text.len() as i32);
         }
         let (dx, dy, d) = u.frame.dot;
-        let brush = CreateSolidBrush(theme::link_color(u.theme, u.view.link));
+        let brush = CreateSolidBrush(theme::calm_color(u.theme, u.view.link, u.view.calm(crate::source::now_s())));
         let old_brush = SelectObject(dc, brush);
         let old_pen = SelectObject(dc, GetStockObject(NULL_PEN));
         Ellipse(dc, dx, dy, dx + d, dy + d);
@@ -1093,6 +1093,7 @@ fn draw_panel(u: &mut Ui, dc: HDC, w: i32, h: i32) {
         grad: &u.grad,
         dpi: pdpi(u),
         now,
+        offset_at: &local_offset_at,
         btn_hover: u.hover,
         pick_hover: u.pick_hover,
         chart_hover: u.chart_hover,
@@ -1357,11 +1358,16 @@ fn tooltip(view: &Board, pending: Option<&str>) -> String {
 /// [`tooltip`] with one more line while alerts cannot be checked, just under the title so the tray's
 /// length limit cuts prices rather than the warning.
 fn tooltip_with(view: &Board, pending: Option<&str>, blind: Option<&str>) -> String {
+    tooltip_at(view, pending, blind, crate::source::now_s())
+}
+
+/// [`tooltip_with`] at a given clock (UTC seconds), so a test can say what time it is.
+fn tooltip_at(view: &Board, pending: Option<&str>, blind: Option<&str>, now: f64) -> String {
     let mut s = String::new();
     if let Some(title) = pending {
         s.push_str(&format!("Alert: {title}\n"));
     }
-    s.push_str(&format!("{} - {}", config::profile().title(), theme::link_name(view.link)));
+    s.push_str(&format!("{} - {}", config::profile().title(), theme::calm_name(view.link, view.calm(now))));
     if let Some(line) = blind {
         s.push('\n');
         s.push_str(line);
@@ -1370,7 +1376,7 @@ fn tooltip_with(view: &Board, pending: Option<&str>, blind: Option<&str>) -> Str
         if let Some(q) = &c.quote {
             s.push_str(&format!("\n{} {}", c.label, fmt_price(q.price, c.digits)));
             if !q.source.is_empty() { s.push_str(&format!(" ({}; age unknown)", q.source)); }
-            else if crate::model::market_closed(c, view.link, crate::source::now_s()) { s.push_str(" (market closed)"); }
+            else if crate::model::market_closed(c, view.link, now) { s.push_str(" (closed)"); }
             else if c.stale { s.push_str(" (stale)"); }
         }
     }
@@ -1390,6 +1396,28 @@ mod tooltip_tests {
         assert_eq!(lit.lines().next(), Some("Alert: XAU above 4,100.00"));
         assert_eq!(lit.strip_prefix("Alert: XAU above 4,100.00\n"), Some(plain.as_str()));
     }
+
+    fn cell(label: &str, ts: Option<f64>, stale: bool) -> Cell {
+        let quote = crate::model::Quote { symbol: label.into(), price: 10.0, ts, realtime: true, ..Default::default() };
+        Cell { label: label.into(), digits: 0, quote: Some(quote), stale }
+    }
+
+    #[test]
+    fn a_closed_market_reads_closed_in_the_tooltip_and_a_fault_reads_stale() {
+        let now = 1_000_000.0;
+        let mut b = Board::new(&[]);
+        b.link = Link::Partial;
+        b.cells = vec![cell("S&P", Some(now - 20.0 * 3600.0), true), cell("BTC", Some(now - 2.0), false)];
+        let tip = tooltip_at(&b, None, None, now);
+        assert!(tip.contains("CNBC live, 1 closed"), "{tip}");
+        assert!(tip.contains("S&P 10 (closed)") && !tip.contains("stale"), "{tip}");
+        b.cells.push(cell("NAS", None, true));
+        let tip = tooltip_at(&b, None, None, now);
+        assert!(tip.contains("NAS 10 (stale)") && tip.contains("S&P 10 (closed)"), "{tip}");
+        assert!(!tip.contains("live, 1 closed"), "a fault keeps the link's own words: {tip}");
+        b.link = Link::Down;
+        assert!(tooltip_at(&b, None, None, now).contains("S&P 10 (stale)"), "a dead feed is not a closed market");
+    }
 }
 
 /// The tray tooltip as the window shows it now: a pending alert, and the gap line while one lasts.
@@ -1404,11 +1432,11 @@ fn tooltip_for(u: &Ui) -> String {
 /// Rebuild the tray icon when the link colour or the alert marker differs from what it was drawn
 /// for. True when it was rebuilt (the caller then pushes it to the tray).
 fn sync_icon(u: &mut Ui) -> bool {
-    let key = (u.view.link, u.alert_pending.is_some());
+    let key = (u.view.link, u.view.calm(crate::source::now_s()), u.alert_pending.is_some());
     if u.icon_link == Some(key) {
         return false;
     }
-    let fresh = make_icon(theme::link_color(u.theme, key.0), key.1);
+    let fresh = make_icon(theme::calm_color(u.theme, key.0, key.1), key.2);
     if !u.icon.is_null() {
         unsafe { DestroyIcon(u.icon) };
     }
@@ -1768,7 +1796,7 @@ fn on_feed(hwnd: HWND) {
         // could not be checked (`watch`), and what a mute or quiet hours swallowed (`hush`).
         let mut notices = FeedNotices::default();
         if u.profile.ultra {
-            let (armed, fresh) = alerts::checkable(&u.cfg, &u.view);
+            let (armed, fresh) = alerts::checkable(&u.cfg, &u.view, now);
             let interval = if u.view.governed_s > 0.0 { u.view.governed_s } else { u.cfg.poll_s };
             match u.watch.step(now, fresh, armed, watch::threshold(interval)) {
                 Some(watch::Event::Back { from, to, jump }) => {
@@ -2284,7 +2312,7 @@ fn menu(hwnd: HWND, at: Option<(i32, i32)>) {
 fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
     clear_pending(hwnd);
     let Some((visible, top, status, open, ultra, picked)) = with_ui(|u| {
-        let note = if u.view.note.is_empty() { theme::link_name(u.view.link).to_string() } else { u.view.note.clone() };
+        let note = if u.view.note.is_empty() { theme::calm_name(u.view.link, u.view.calm(crate::source::now_s())) } else { u.view.note.clone() };
         (u.cfg.strip_visible, u.cfg.topmost, note, u.mode != Mode::Strip, u.profile.ultra, u.pick_open)
     }) else {
         return;
@@ -3930,7 +3958,7 @@ fn on_key(hwnd: HWND, vk: u32) -> bool {
 fn sync_title(hwnd: HWND) {
     let next = with_ui(|u| {
         let locked = selected_row(u).and_then(|i| u.view.cells.get(i));
-        let name = spoken::window_name(u.profile.ultra, u.profile.title(), locked, &u.view.cells)?;
+        let name = spoken::window_name(u.profile.ultra, u.profile.title(), locked, &u.view.cells, u.view.link, crate::source::now_s())?;
         (name != u.title_set).then(|| {
             u.title_set = name.clone();
             name
@@ -4039,12 +4067,13 @@ fn apply_theme(hwnd: HWND) {
         u.font = make_font(&u.cfg, u.dpi);
         u.grad = Gradient::new(t);
         u.fonts = u.fonts.take().map(|_| panel::Fonts::new(face, pdpi(u), t.is_pixel()));
-        let fresh = make_icon(theme::link_color(t, u.view.link), u.alert_pending.is_some());
+        let calm = u.view.calm(crate::source::now_s());
+        let fresh = make_icon(theme::calm_color(t, u.view.link, calm), u.alert_pending.is_some());
         if !u.icon.is_null() {
             unsafe { DestroyIcon(u.icon) };
         }
         u.icon = fresh;
-        u.icon_link = Some((u.view.link, u.alert_pending.is_some()));
+        u.icon_link = Some((u.view.link, calm, u.alert_pending.is_some()));
         Some((u.icon, tooltip_for(u)))
     })
     .flatten()
@@ -4883,7 +4912,7 @@ pub fn run(cfg: Config, board: Arc<Mutex<Board>>) {
             face: face_of(theme, &cfg, profile.ultra),
             grad: Gradient::new(theme),
             icon: make_icon(theme::link_color(theme, Link::Down), false),
-            icon_link: Some((Link::Down, false)),
+            icon_link: Some((Link::Down, Calm::No, false)),
             dpi,
             cfg: cfg.clone(),
             board: board.clone(),

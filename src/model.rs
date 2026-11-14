@@ -17,6 +17,9 @@ pub struct Quote {
     pub prev_close: Option<f64>,
     /// UTC epoch seconds of the price; None = unknown (treated as stale).
     pub ts: Option<f64>,
+    /// UTC seconds when the feed last saw this CNBC price change (set by the feed, not by CNBC;
+    /// its first sight of a price counts as a move). None for a quote the feed has not stored. See [`restamped`].
+    pub moved_at: Option<f64>,
     /// False when CNBC marks the quote as delayed (its index futures, ~10 min).
     pub realtime: bool,
     // --- Fields the 3-second response already carries. Every one of them is `None`/empty when
@@ -202,26 +205,122 @@ impl Board {
     }
 }
 
+/// A quote time this far ahead of the clock counts as clock skew. Further ahead, the time is wrong
+/// and the quote has no known age (`is_stale` is true and `market_closed` is false for it).
+pub const FUTURE_SKEW_S: f64 = 300.0;
+
 pub fn is_stale(q: &Quote, now: f64, stale_after: f64, delayed_grace: f64) -> bool {
     let limit = stale_after + if q.realtime { 0.0 } else { delayed_grace };
-    q.ts.map(|t| now - t > limit).unwrap_or(true)
+    q.ts.map(|t| now - t > limit || now - t < -FUTURE_SKEW_S).unwrap_or(true) || restamped(q, now)
 }
 
 /// How old a CNBC quote must be, with the feed answering, before the card calls its market closed.
 /// CNBC's own `curmktstatus` field reads `REG_MKT` on a Saturday for gold, silver, FX, futures and
 /// bitcoin alike, so the state comes from the age of the quote. 15 minutes is past the 10-minute
-/// delay of the index futures and past any governed poll interval.
+/// delay of the index futures. A delayed quote is stale only after the stale limit plus the delayed
+/// grace (990 s with the defaults), so it reads closed from that age on, not from 15 minutes.
 pub const CLOSED_AFTER_S: f64 = 900.0;
 
-/// Is this card's market closed, as opposed to its feed dead? True for a stale CNBC quote that is at
-/// least [`CLOSED_AFTER_S`] old while the last request was answered (`link` is not `Down`): the
-/// service is up and this instrument has stopped printing. False with the link down (the age says
-/// nothing then), with no quote, with a fallback-provider quote (its age is unknown), and while the
-/// quote is fresh.
+/// Has CNBC re-stamped a price that did not move? True for a CNBC quote whose price has been the
+/// same for [`CLOSED_AFTER_S`] on the feed's own observations (`Quote::moved_at`), whatever time the
+/// quote carries. Futures print thin re-stamps after the session ends; a fresh-looking time on a
+/// frozen price must not count as a fresh price.
+pub fn restamped(q: &Quote, now: f64) -> bool {
+    q.source.is_empty() && q.moved_at.is_some_and(|m| now - m >= CLOSED_AFTER_S)
+}
+
+/// When this CNBC quote's market stopped, as UTC seconds: the quote's time when it is at least
+/// [`CLOSED_AFTER_S`] old, else the moment the price last moved when the quote is [`restamped`].
+/// `None` for a quote with no time, a time ahead of the clock, or a price that is still moving.
+pub fn closed_since(q: &Quote, now: f64) -> Option<f64> {
+    if !q.source.is_empty() {
+        return None;
+    }
+    q.ts.filter(|t| now - t >= CLOSED_AFTER_S).or_else(|| q.moved_at.filter(|_| restamped(q, now)))
+}
+
+/// Is this card's market closed, as opposed to its feed dead? True for a stale CNBC quote whose
+/// market has stopped ([`closed_since`]) while the last request was answered (`link` is not `Down`):
+/// the service is up and this instrument has stopped printing. False with the link down (the age
+/// says nothing then), with no quote, with a fallback-provider quote (its age is unknown), with a
+/// quote time ahead of the clock (unknown age, never age 0), and while the quote is fresh.
+///
+/// The test cannot tell a closed market from one feed that stopped for a single symbol while the
+/// others keep updating: that symbol also reads closed after 15 minutes. A request that fails, or a
+/// service that stops answering, is the only fault this rule separates from a closed market.
 pub fn market_closed(cell: &Cell, link: Link, now: f64) -> bool {
-    link != Link::Down
-        && cell.stale
-        && cell.quote.as_ref().is_some_and(|q| q.source.is_empty() && q.ts.is_some_and(|t| now - t >= CLOSED_AFTER_S))
+    link != Link::Down && cell.stale && cell.quote.as_ref().is_some_and(|q| closed_since(q, now).is_some())
+}
+/// How much of the board is closed, when closed is the only reason a price is not fresh. Every
+/// surface that names the link (the panel header, the strip's dot, the tray icon and tooltip) asks
+/// [`Board::calm`], so a closed market looks the same everywhere and a fault never does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Calm {
+    /// Nothing is closed, or some stale cell is a fault (no quote, a fallback quote, a quote of
+    /// unknown age, the link down): the link's own look applies.
+    No,
+    /// Every stale cell is a closed market and the other `n` rows are live.
+    Some(usize),
+    /// Every row is a closed market (`n` of them).
+    All(usize),
+}
+
+impl Board {
+    /// See [`Calm`]. `now` is UTC seconds.
+    pub fn calm(&self, now: f64) -> Calm {
+        if self.link == Link::Down {
+            return Calm::No;
+        }
+        let stale = self.cells.iter().filter(|c| c.stale).count();
+        let closed = self.cells.iter().filter(|c| market_closed(c, self.link, now)).count();
+        match (stale, closed) {
+            (0, _) | (_, 0) => Calm::No,
+            (s, c) if s != c => Calm::No,
+            (_, c) if c == self.cells.len() => Calm::All(c),
+            (_, c) => Calm::Some(c),
+        }
+    }
+}
+
+const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/// The local day and clock of the UTC instant `at`, as `Fri 17:40`; a time six days or more before
+/// `now` reads `Nov 6 17:40`, because a day name would then name a day that is not the last one.
+/// `offset_at(t)` is seconds east of UTC at `t`, so a time on the other side of a daylight-saving
+/// change is shown on its own clock.
+pub fn fmt_since(offset_at: &dyn Fn(f64) -> i32, now: f64, at: f64) -> String {
+    let t = if at.is_finite() { at.clamp(-1e12, 1e12) } else { now };
+    let local = t + offset_at(t) as f64;
+    let days = (local / 86_400.0).floor() as i64;
+    let minute = ((local / 60.0).floor() as i64).rem_euclid(1440);
+    let clock = format!("{:02}:{:02}", minute / 60, minute % 60);
+    if now - t >= 6.0 * 86_400.0 {
+        let (_, m, d) = crate::chartview::civil_from_days(days);
+        return format!("{} {d} {clock}", MONTHS[(m as usize - 1).min(11)]);
+    }
+    format!("{} {clock}", WEEKDAYS[(days + 4).rem_euclid(7) as usize])
+}
+
+/// The first of `options` (longest first) that `fits`, else the last one.
+pub fn first_fitting(options: &[String], fits: &dyn Fn(&str) -> bool) -> String {
+    options.iter().find(|o| fits(o)).or(options.last()).cloned().unwrap_or_default()
+}
+
+/// The words a closed card carries, longest first: `closed since Fri 17:40` with the source before
+/// it (`CNBC delayed · closed since Fri 17:40`) when `src` is given, then the words alone, then
+/// `closed` alone. `since` is [`closed_since`] and may be unknown, which leaves `closed`.
+pub fn closed_words(src: &str, since: Option<f64>, offset_at: &dyn Fn(f64) -> i32, now: f64) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(t) = since {
+        let words = format!("closed since {}", fmt_since(offset_at, now, t));
+        if !src.is_empty() {
+            out.push(format!("{src} \u{b7} {words}"));
+        }
+        out.push(words);
+    }
+    out.push("closed".into());
+    out
 }
 
 /// One cell per configured row, from the latest quotes keyed by symbol.
@@ -396,6 +495,88 @@ mod tests {
         assert!(!market_closed(&cell(Some(now - 86_400.0), "Metals.dev", true), Link::Live, now), "a fallback quote has no age");
         let none = Cell { quote: None, ..old };
         assert!(!market_closed(&none, Link::Live, now), "no quote");
+    }
+
+    #[test]
+    fn a_quote_time_ahead_of_the_clock_has_no_age() {
+        let now = 100_000.0;
+        let ahead = |s: f64| q("@SP.1", Some(now + s), false);
+        assert!(!is_stale(&ahead(FUTURE_SKEW_S), now, 90.0, 900.0), "a few minutes of skew is fresh");
+        assert!(is_stale(&ahead(FUTURE_SKEW_S + 1.0), now, 90.0, 900.0), "never age 0");
+        assert!(is_stale(&ahead(19_000.0), now, 90.0, 900.0), "the Saturday futures stamp, hours ahead");
+        let cell = Cell { label: "S&P".into(), digits: 2, quote: Some(ahead(19_000.0)), stale: true };
+        assert!(!market_closed(&cell, Link::Live, now), "unknown age is not a closed market");
+        assert_eq!(closed_since(cell.quote.as_ref().unwrap(), now), None);
+    }
+
+    #[test]
+    fn a_price_that_stopped_moving_under_a_fresh_stamp_is_a_closed_market() {
+        let now = 100_000.0;
+        let mut quote = q("@SP.1", Some(now - 4.0), true);
+        quote.moved_at = Some(now - CLOSED_AFTER_S + 1.0);
+        assert!(!restamped(&quote, now) && !is_stale(&quote, now, 90.0, 900.0), "unchanged for under 15 minutes");
+        quote.moved_at = Some(now - 3_600.0);
+        assert!(restamped(&quote, now), "the stamp is fresh, the price is an hour old");
+        assert!(is_stale(&quote, now, 90.0, 900.0), "so an alert cannot use it");
+        assert_eq!(closed_since(&quote, now), Some(now - 3_600.0));
+        let cell = Cell { label: "S&P".into(), digits: 2, quote: Some(quote.clone()), stale: true };
+        assert!(market_closed(&cell, Link::Live, now));
+        assert!(!market_closed(&cell, Link::Down, now));
+        let fallback = Quote { source: "Gold API", ..quote };
+        assert!(!restamped(&fallback, now), "a fallback quote has no observed history");
+    }
+
+    fn closed_cell(label: &str, age_s: f64, now: f64) -> Cell {
+        Cell { label: label.into(), digits: 2, quote: Some(q("@SP.1", Some(now - age_s), false)), stale: true }
+    }
+
+    #[test]
+    fn calm_is_closed_only_when_every_stale_cell_is_closed() {
+        let now = 1_000_000.0;
+        let mut b = Board::new(&[]);
+        b.link = Link::Partial;
+        let live = Cell { label: "BTC".into(), digits: 0, quote: Some(q("BTC", Some(now - 2.0), true)), stale: false };
+        b.cells = vec![closed_cell("S&P", 20.0 * 3600.0, now), live.clone()];
+        assert_eq!(b.calm(now), Calm::Some(1));
+        b.cells = vec![closed_cell("S&P", 20.0 * 3600.0, now), closed_cell("DOW", 20.0 * 3600.0, now)];
+        assert_eq!(b.calm(now), Calm::All(2));
+        // One stale cell that is not closed (a fault) keeps the amber look for the whole board.
+        let mut stuck = closed_cell("NAS", 100.0, now);
+        stuck.quote.as_mut().unwrap().ts = None;
+        b.cells.push(stuck);
+        assert_eq!(b.calm(now), Calm::No);
+        b.cells = vec![closed_cell("S&P", 20.0 * 3600.0, now), live];
+        b.link = Link::Down;
+        assert_eq!(b.calm(now), Calm::No, "a dead feed is a fault");
+        b.link = Link::Live;
+        b.cells = vec![];
+        assert_eq!(b.calm(now), Calm::No);
+    }
+
+    #[test]
+    fn closed_since_reads_as_a_local_day_and_clock() {
+        let sat = crate::probe::parse_time("2026-11-14T17:18:36.000+0000").unwrap();
+        let fri = crate::probe::parse_time("2026-11-13T17:00:00.000-0500").unwrap();
+        let est = |_: f64| -5 * 3600;
+        assert_eq!(fmt_since(&est, sat, fri), "Fri 17:00");
+        assert_eq!(fmt_since(&|_| 0, sat, fri), "Fri 22:00");
+        // Seven days back a day name would name the wrong day, so the date is given.
+        assert_eq!(fmt_since(&est, sat + 7.0 * 86_400.0, fri), "Nov 13 17:00");
+        assert_eq!(fmt_since(&est, sat, f64::NAN), "Sat 12:18");
+        let q = q("@SP.1", Some(fri), false);
+        let words = closed_words("CNBC delayed", closed_since(&q, sat), &est, sat);
+        assert_eq!(words, ["CNBC delayed \u{b7} closed since Fri 17:00", "closed since Fri 17:00", "closed"]);
+        assert_eq!(closed_words("", closed_since(&q, sat), &est, sat), ["closed since Fri 17:00", "closed"]);
+        assert_eq!(closed_words("CNBC", None, &est, sat), ["closed"]);
+    }
+
+    #[test]
+    fn the_first_option_that_fits_wins_and_the_last_is_the_fallback() {
+        let words = closed_words("CNBC", Some(0.0), &|_| 0, 100_000.0);
+        assert_eq!(first_fitting(&words, &|w| w.len() <= 40), words[0]);
+        assert_eq!(first_fitting(&words, &|w| w.len() <= 25), words[1]);
+        assert_eq!(first_fitting(&words, &|_| false), "closed");
+        assert_eq!(first_fitting(&[], &|_| true), "");
     }
 
     #[test]

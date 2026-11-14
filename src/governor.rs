@@ -6,6 +6,10 @@
 //!
 //! The rules, in the order they apply:
 //! - Quiet: no shown quote changed for 10 minutes, poll every 15 s; for 30 minutes, every 60 s.
+//! - Closed: every shown market is closed (`model::market_closed`). It counts as a quiet spell of
+//!   30 minutes at once ([`with_closed`]), so a weekend is polled every 60 s from its first poll on
+//!   instead of after half an hour. The first trade after the reopening is seen within 60 s, and it
+//!   restarts the quiet clock, so the poll after that is back at the base.
 //! - Locked session: one poll per 5 minutes.
 //! - Armed: while any alert is armed the answer is never slower than 15 s (or the user's own base,
 //!   when that is already slower). This rule wins over the two above.
@@ -36,6 +40,12 @@ impl Settings {
     pub fn any(self) -> bool {
         self.slow_when_quiet || self.rest_when_locked
     }
+}
+
+/// The quiet spell to hand to [`interval`]: a closed board (every shown market closed) has been quiet
+/// for at least [`QUIET_LONG_AFTER_S`], whatever the clock says. Anything else is `quiet_for` as given.
+pub fn with_closed(quiet_for: f64, closed: bool) -> f64 {
+    if closed { quiet_for.max(QUIET_LONG_AFTER_S) } else { quiet_for }
 }
 
 /// Seconds to wait before the next poll. `base` is the user's `Poll every` choice, `quiet_for` the
@@ -114,6 +124,22 @@ mod tests {
     const ON: Settings = Settings { slow_when_quiet: true, rest_when_locked: true };
     const OFF: Settings = Settings { slow_when_quiet: false, rest_when_locked: false };
     const QUIET_TIMES: [f64; 9] = [0.0, 1.0, 599.0, 600.0, 1_000.0, 1_799.0, 1_800.0, 86_400.0, f64::NAN];
+
+    #[test]
+    fn a_closed_board_polls_slowly_at_once_and_an_armed_alert_still_wins() {
+        let closed = |q: f64, armed: bool, set: Settings| interval(3.0, with_closed(q, true), false, armed, set);
+        assert_eq!(closed(0.0, false, ON), QUIET_SLOWER_S, "no half hour of waiting first");
+        assert_eq!(closed(f64::NAN, false, ON), QUIET_SLOWER_S);
+        assert_eq!(closed(0.0, true, ON), ARMED_CAP_S, "an armed alert is still looked at every 15 s");
+        assert_eq!(closed(0.0, false, OFF), 3.0, "both ticks off: the plain base");
+        // Open again: the same quiet clock gives the base, so the first trade is seen at the base.
+        assert_eq!(interval(3.0, with_closed(0.0, false), false, false, ON), 3.0);
+        // The wait never passes 60 s, so a reopening is seen within a minute.
+        for q in QUIET_TIMES {
+            assert!(interval(3.0, with_closed(q, true), true, false, ON) <= LOCKED_S);
+            assert!(interval(3.0, with_closed(q, true), false, false, ON) <= QUIET_SLOWER_S);
+        }
+    }
 
     #[test]
     fn the_governor_never_exceeds_fifteen_seconds_while_armed() {
