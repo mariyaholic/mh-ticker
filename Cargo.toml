@@ -36,6 +36,16 @@ name = "chart"
 path = "examples/chart.rs"
 required-features = ["shots"]
 
+[[example]]
+name = "wide"
+path = "examples/wide.rs"
+required-features = ["shots"]
+
+[[example]]
+name = "w3"
+path = "examples/w3.rs"
+required-features = ["shots"]
+
 [features]
 shots = ["dep:png"]
 

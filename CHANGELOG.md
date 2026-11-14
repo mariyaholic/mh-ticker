@@ -2,10 +2,10 @@
 
 ## unreleased - 1.9: know it is true   [claude.impl]
 
-**Files:** mostly `src/`: new `probe.rs`, `report.rs`, `meter.rs`, `governor.rs`, `watch.rs` and `retry.rs`; changed
+**Files:** mostly `src/`: new `probe.rs`, `report.rs`, `meter.rs`, `governor.rs`, `watch.rs`, `retry.rs`, `pins.rs`, `undo.rs` and `find.rs`; changed
 `alerts.rs`, `chartview.rs`, `config.rs`, `ranges.rs`, `source.rs`, `update.rs`, `panel.rs`, `ui.rs`, `shot.rs`
 and `Cargo.toml` (the `Win32_System_RemoteDesktop` feature). Also `examples/wide.rs`
-(new), `shots/wide-*.png` (new), `scripts/check-state-linux.sh`, `README.md`, `SOURCES.md`, `CHANGELOG.md`
+(new), `examples/w3.rs` (new), `shots/wide-*.png` (new), `shots/w3-strip-24-pinned-6.png` (new), `scripts/check-state-linux.sh`, `README.md`, `SOURCES.md`, `CHANGELOG.md`
 and `docs/1.9/`.
 
 **What.** The 1.9 packages, grouped by what you see. The first group adds no new feature; it makes the features
@@ -84,17 +84,41 @@ already here easier to check. The alerts group adds behaviour. Each group says w
     (`XAU above 4,200.00, 1.2 % away`) or `reached, 2.3 % past`. A level whose symbol is not on the strip is marked
     as unable to fire. *Clear all alerts...* asks first. A card with a level has a small amber dot. *Recent* keeps the
     last 50 entries, and *Copy list* copies them.
+- **Twenty-four symbols (both builds; the find keys and the chart on Ultra).**
+  - **Pin to strip.** The taskbar strip shows only the symbols you pin, and the panel still shows all of them.
+    Settings from before this version show every card. Use *Pin to strip* or *Unpin from strip* in a card's menu,
+    or *Show all on strip* in the Symbols menu. The last pinned card cannot be unpinned.
+  - **Undo.** The main menu has an *Undo the last ...* line, which names what it would undo: a removal, move, sort,
+    pin change or alert clear. Ctrl+Z does the same on Ultra. It steps back one change, is held in memory until you
+    quit, and never restores a webhook. It does not roll back other settings changed since, and it is dropped when
+    the cards change another way, such as an add or a rename.
+  - **Rename and decimals.** *Rename...* in a card's menu changes its label. Its alerts and its lock follow the new
+    label. *Reset name* goes back to the symbol's own name. *Decimals* sets 0 to 6 digits, or *Auto*, which uses the
+    symbol's own count or one worked out from its price.
+  - **Order the cards once.** Symbols > *Order the cards (once)* sorts by day move (biggest first), by name, or back
+    to the default order. It changes the saved order one time. It is not a live sort.
+  - **Find a card (Ultra).** `/` opens a prompt that matches a card's label or name. The first match is locked and
+    scrolled into view. Esc, empty text or no match changes nothing. Home and End lock the first and last card; on
+    Classic they keep paging the body, as in 1.8.
+  - **Chart (Ultra).** The header shows the change over the range on screen, such as `5Y +182 %`, in place of the
+    day's change (1D is unchanged). The range's high and low are marked. The chart cache holds 48 series, with a
+    2 MB ceiling on the bars. The chart reopens on the range you used last.
+  - **Fix.** A renamed card used to lose its quote, bars and sparkline until the next fetch, because rows were
+    matched by label. They are now matched by symbol.
 
-**Checked.** Under Wine: 334 tests pass, plus the one known Wine-only failure
+**Checked.** Under Wine: 387 tests pass, plus the one known Wine-only failure
 (`ui::tests::a_theme_switch_takes_the_new_themes_face`, because Wine has no Consolas). The Linux harness
-(`scripts/check-state-linux.sh`) passes 159. The 36 old stills are identical to the baseline (36 of 36), and 14 new
-stills were drawn. Both release exes are about 1.42 MB.
+(`scripts/check-state-linux.sh`) passes 191. The 36 old stills are identical to the baseline (36 of 36). The 14 wide
+stills were drawn, six of them again because the chart header changed, and the new still
+`shots/w3-strip-24-pinned-6.png` was drawn. Both release exes are about 1.49 MB.
 
 **Not verified.** The live CNBC and GitHub answers: `--probe`, the report and the release tag have not run
 against the services. On a real Windows desktop: the clipboard, the menu lines, a real clock change, the real
 fonts, and gzip byte counts against a capture. Also not verified: the real lock and unlock, and
 `WTSRegisterSessionNotification` on a real desktop; sleep and resume; a real 5xx from a webhook host; quitting with
 a POST in flight; and the poll governor's saving and bytes against the live feed.
+Also not verified: key presses (`/`, Ctrl+Z, Home and End), focus after the find prompt closes, and the strip
+with pins at each placement on a real taskbar. Menu entries were not clicked.
 
 ## 2026-11-14 — 1.8.0: alerts you can set and silence, a chart that reads, typed symbols   [claude.impl]
 

@@ -193,6 +193,11 @@ The table above is the 1.8 record. These are the changes in 1.9:
   as before by default.
 - A webhook POST that fails with a network error or a 5xx is sent once more after 3 seconds, to the same URL with the
   same body. A 4xx is never retried, and nothing is queued on disk.
+- The chart opens on the range used last (Ultra). If that range is not cached when the chart opens, its one range file
+  is requested then, with the same request and time to live as a tab click. Nothing is requested for it when it is
+  already cached and fresh.
+- The chart cache keeps 48 series (1.8 kept 12), with a 2 MB ceiling on the bars held. A range already fetched is less
+  often fetched again.
 
 ---
 

@@ -245,6 +245,76 @@ pub fn level_marks(lay: &Layout, levels: &[f64]) -> LevelMarks {
     out
 }
 
+/// The change over the bars on screen, in percent: the last close against the first open,
+/// `(c_last - o_first) / o_first * 100`. `None` for no bars, and, by P2's rule (`bar_change_pct`), for a
+/// first open that is zero or not finite, or a last close that is not finite: a number built on those
+/// would be nonsense, so the header shows none rather than one.
+pub fn range_change(bars: &[Bar]) -> Option<f64> {
+    let (first, last) = (bars.first()?, bars.last()?);
+    bar_change_pct(&Bar { c: last.c, ..*first })
+}
+
+/// The header's range change: `5Y +182 %`, `1M -3.4 %`, `6M +0.52 %`. The label, a space, the signed
+/// percent with a space before the sign of the percent (two decimals under 10 %, one under 100 %, none
+/// from 100 %), so a huge move stays short. A zero change is `+0.00 %`.
+pub fn range_change_text(label: &str, pct: f64) -> String {
+    // The thresholds sit where the rounded text changes length (9.995 prints as 10.00).
+    let decimals = if pct.abs() < 9.995 { 2 } else if pct.abs() < 99.95 { 1 } else { 0 };
+    format!("{label} {pct:+.decimals$} %")
+}
+
+/// The highest high and the lowest low among the bars on screen, as `((index, price), (index, price))`
+/// (the first bar that holds each). Bars with a non-finite high or low are skipped. `None` for no usable
+/// bar, and when the high does not exceed the low (one flat bar, or all flat): there is nothing to mark.
+pub fn extremes(bars: &[Bar]) -> Option<((usize, f64), (usize, f64))> {
+    let mut hi: Option<(usize, f64)> = None;
+    let mut lo: Option<(usize, f64)> = None;
+    for (i, b) in bars.iter().enumerate() {
+        let (h, l) = (b.h as f64, b.l as f64);
+        if h.is_finite() && hi.is_none_or(|(_, v)| h > v) {
+            hi = Some((i, h));
+        }
+        if l.is_finite() && lo.is_none_or(|(_, v)| l < v) {
+            lo = Some((i, l));
+        }
+    }
+    let (hi, lo) = (hi?, lo?);
+    (hi.1 > lo.1).then_some((hi, lo))
+}
+
+/// Do two rectangles share any pixel?
+pub fn overlaps(a: Rect, b: Rect) -> bool {
+    a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom
+}
+
+/// Where a `size` label for the mark at `anchor` goes: inside `bounds`, clear of every rectangle in
+/// `avoid` (alert level lines and their prices, the last-price line), `gap` pixels from the anchor.
+/// Tried in order: above (for a high) or below (for a low) the anchor, centred, then pushed left and
+/// right; then beside it, left and right; then on the other side. `None` when nowhere fits, and then
+/// the painter draws the marker without its text. Never returns a rectangle that leaves `bounds` or
+/// touches `avoid`.
+pub fn place_label(anchor: (i32, i32), size: (i32, i32), above: bool, bounds: Rect, avoid: &[Rect], gap: i32) -> Option<Rect> {
+    let (x, y) = anchor;
+    let (w, h) = size;
+    let up = y - gap - h;
+    let down = y + gap;
+    let (near, far) = if above { (up, down) } else { (down, up) };
+    let centred = x - w / 2;
+    let spots = [
+        (centred, near),
+        (x - w, near),
+        (x, near),
+        (x - w - gap, y - h / 2),
+        (x + gap, y - h / 2),
+        (centred, far),
+        (x - w, far),
+        (x, far),
+    ];
+    spots.iter().map(|&(l, t)| Rect::new(l, t, l + w, t + h)).find(|r| {
+        r.left >= bounds.left && r.right <= bounds.right && r.top >= bounds.top && r.bottom <= bounds.bottom && !avoid.iter().any(|a| overlaps(*r, *a))
+    })
+}
+
 /// Indices of the drawn candles that start a new session: `i >= 1` where
 /// `bars[i].dt - bars[i - 1].dt > 1.5 * bucket_s`. Bars are in time order; `bars` are the folded
 /// candles, so a candle's `dt` is already on a bucket boundary. Empty for fewer than two bars or a
@@ -1604,5 +1674,92 @@ mod tests {
         assert_eq!(days.len(), 10);
         assert_eq!(date_label(days[0].t(t0) + BIAS_S, date_zone(DAY_S, viewer), DateStyle::Full), "Nov 2 2026");
         assert_eq!(date_label(days[9].t(t0) + BIAS_S, date_zone(DAY_S, viewer), DateStyle::Full), "Nov 13 2026");
+    }
+
+    #[test]
+    fn range_change_is_the_last_close_against_the_first_open() {
+        let bars = [bar(0.0, 100.0, 120.0, 90.0, 110.0), bar(0.0, 110.0, 300.0, 100.0, 282.0)];
+        assert!((range_change(&bars).unwrap() - 182.0).abs() < 1e-9);
+        assert!((range_change(&[bar(0.0, 200.0, 200.0, 100.0, 100.0)]).unwrap() + 50.0).abs() < 1e-9, "one bar: its own change");
+        assert_eq!(range_change(&[bar(0.0, 100.0, 100.0, 100.0, 100.0)]), Some(0.0));
+    }
+
+    #[test]
+    fn range_change_returns_nothing_for_a_zero_or_non_finite_first_open_and_a_bad_close() {
+        assert_eq!(range_change(&[]), None);
+        assert_eq!(range_change(&[bar(0.0, 0.0, 5.0, 0.0, 5.0), bar(0.0, 5.0, 6.0, 5.0, 6.0)]), None, "zero open");
+        assert_eq!(range_change(&[bar(0.0, f32::NAN, 5.0, 1.0, 5.0)]), None);
+        assert_eq!(range_change(&[bar(0.0, f32::INFINITY, 5.0, 1.0, 5.0)]), None);
+        assert_eq!(range_change(&[bar(0.0, 5.0, 5.0, 1.0, 5.0), bar(0.0, 5.0, 5.0, 1.0, f32::NAN)]), None, "a NaN close");
+        // A later zero open is nobody's business: only the first bar's open counts.
+        assert!(range_change(&[bar(0.0, 10.0, 12.0, 9.0, 11.0), bar(0.0, 0.0, 1.0, 0.0, 12.0)]).is_some());
+    }
+
+    #[test]
+    fn the_header_text_names_the_range_and_keeps_big_moves_short() {
+        assert_eq!(range_change_text("5Y", 182.4), "5Y +182 %");
+        assert_eq!(range_change_text("1M", -13.449), "1M -13.4 %");
+        assert_eq!(range_change_text("6M", 0.517), "6M +0.52 %");
+        assert_eq!(range_change_text("1Y", 0.0), "1Y +0.00 %");
+        assert_eq!(range_change_text("5Y", -99.96), "5Y -100 %");
+        assert_eq!(range_change_text("5Y", 9.999), "5Y +10.0 %");
+    }
+
+    #[test]
+    fn extremes_find_the_first_highest_high_and_lowest_low_and_skip_what_is_not_a_number() {
+        let bars = [bar(0.0, 10.0, 12.0, 9.0, 11.0), bar(0.0, 11.0, 15.0, 10.0, 14.0), bar(0.0, 14.0, 15.0, 8.0, 9.0), bar(0.0, 9.0, f32::NAN, f32::NAN, 9.0)];
+        assert_eq!(extremes(&bars), Some(((1, 15.0), (2, 8.0))), "the first of equal highs");
+        assert_eq!(extremes(&[]), None);
+        assert_eq!(extremes(&[bar(0.0, 5.0, 5.0, 5.0, 5.0)]), None, "all flat: nothing to mark");
+        assert_eq!(extremes(&[bar(0.0, 1.0, f32::NAN, f32::NAN, 1.0)]), None);
+    }
+
+    #[test]
+    fn a_label_goes_above_a_high_and_below_a_low_inside_the_plot() {
+        let plot = Rect::new(0, 0, 400, 200);
+        let r = place_label((200, 100), (60, 12), true, plot, &[], 4).unwrap();
+        assert_eq!((r.left, r.top, r.right, r.bottom), (170, 84, 230, 96), "centred, above");
+        let r = place_label((200, 100), (60, 12), false, plot, &[], 4).unwrap();
+        assert_eq!((r.top, r.bottom), (104, 116), "centred, below");
+    }
+
+    #[test]
+    fn a_label_at_an_edge_is_moved_inside_and_never_leaves_the_plot() {
+        let plot = Rect::new(0, 0, 400, 200);
+        // At the top the label cannot go above: it goes below the anchor.
+        let top = place_label((200, 5), (60, 12), true, plot, &[], 4).unwrap();
+        assert!(top.top >= 5, "{top:?}");
+        // At the right edge it is pushed left, so it ends at or before the plot's edge.
+        let right = place_label((399, 100), (60, 12), true, plot, &[], 4).unwrap();
+        assert!(right.right <= 400 && right.left >= 0, "{right:?}");
+        for x in [0, 1, 30, 200, 399] {
+            for y in [0, 6, 100, 194, 199] {
+                for above in [true, false] {
+                    if let Some(r) = place_label((x, y), (60, 12), above, plot, &[], 4) {
+                        assert!(r.left >= 0 && r.top >= 0 && r.right <= 400 && r.bottom <= 200, "({x},{y}) {r:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_label_never_lands_on_an_alert_level_or_its_price() {
+        let plot = Rect::new(0, 0, 400, 200);
+        // A level line across the plot just above the anchor, and its price label at the right end.
+        let line = Rect::new(0, 82, 400, 86);
+        let price = Rect::new(340, 70, 396, 82);
+        let r = place_label((200, 100), (60, 12), true, plot, &[line, price], 4).unwrap();
+        assert!(!overlaps(r, line) && !overlaps(r, price), "{r:?}");
+        // Boxed in on every side: nothing fits, so there is no label (the marker still is).
+        let wall = [Rect::new(0, 0, 400, 200)];
+        assert_eq!(place_label((200, 100), (60, 12), true, plot, &wall, 4), None);
+        // Whatever the obstacles, the answer clears them.
+        for y in (10..190).step_by(7) {
+            let avoid = [Rect::new(0, y, 400, y + 3), Rect::new(330, y - 14, 396, y)];
+            if let Some(r) = place_label((350, 100), (60, 12), true, plot, &avoid, 4) {
+                assert!(avoid.iter().all(|a| !overlaps(r, *a)), "y {y}: {r:?}");
+            }
+        }
     }
 }

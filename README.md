@@ -62,6 +62,17 @@ Double click it. If prompted, simply select Run anyway.
 - **Pick ur symbols:** right click → *Symbols* and tick whatever u want from 23 of them (metals, crypto, us
   futures, oil, gas, copper, fx, the dollar index, us yields, vix, nikkei, dax, ftse, hang seng). the strip and
   the panel change right away, no restart. up to 24 at once, and *Reset to default* gets u back the original six
+- **Pin to strip:** the taskbar strip can show only the symbols you pick, while the panel still shows all of them.
+  Right click a card and choose *Pin to strip* or *Unpin from strip*. *Show all on strip* in the Symbols menu pins
+  every card again. The last pinned card cannot be unpinned, and a settings file from before this version shows every card.
+- **Rename a card:** right click a card and choose *Rename...*. Its alerts and its lock follow the new label. *Reset name*
+  goes back to the symbol's own name. *Decimals* sets how many digits the price shows (0 to 6), or *Auto*, which uses the
+  symbol's own count or one worked out from its price.
+- **Order the cards once:** Symbols → *Order the cards (once)* sorts them by day move (biggest first), by name, or back to
+  the default order. It changes the saved order one time and does not keep sorting.
+- **Undo:** the main menu has an *Undo the last ...* line that says what it would undo: a removal, move, sort, pin change or
+  alert clear. Ctrl+Z does the same on Ultra. It steps back one change, does not bring back a removed webhook, and is gone
+  when you quit.
 - **Add any symbol:** *Symbols* → *Add symbol...* and type a CNBC symbol like `AAPL`, `EUR=` or `@GC.1`. the app
   checks it with one request to CNBC before it adds it, and the name and first price come from CNBC. if the symbol
   isn't one CNBC knows, nothing is added. u can take it back off with *Symbols* → *Remove a symbol I added*, which
@@ -139,7 +150,8 @@ Double click it. If prompted, simply select Run anyway.
 - **Ranges (Ultra):** the tabs on the chart's second header line are `1D 5D 1M 6M 1Y 5Y`. `1D` is today. the others
   load the first time u click them, for the locked card, and refresh themselves when they get old. a range that
   fails says so and tries again after 30 seconds. `1M` and `6M` are daily bars trimmed to a month or half a year.
-  daily and longer bars keep the exchange's own dates for everyone, so they have no local/UTC switch
+  daily and longer bars keep the exchange's own dates for everyone, so they have no local/UTC switch. The chart opens on the range you used last. The header shows the change over the range
+  on screen (such as `5Y +182 %`) in place of the day's change, except on 1D, and the range's high and low are marked
 - **Volume (Ultra):** where CNBC sends volume, a strip of volume bars sits under the candles. FX, yields and spot
   metals don't have it, so there's no strip for them
 - **Alert levels on the chart (Ultra):** an alert level inside the chart's price range is a dashed line with its
@@ -205,7 +217,8 @@ Double click it. If prompted, simply select Run anyway.
   little more than the network carried. request headers aren't counted
 - **Keys in the open Ultra panel:** arrows move the lock between cards, Enter opens the locked card on CNBC, `C`
   opens the chart, `S` opens the symbol picker, Delete takes the locked card off the strip, and Ctrl+Left and
-  Ctrl+Right move it one place. the card menu has *Move left*, *Move right*, *Move first* and *Remove from strip*
+  Ctrl+Right move it one place. `/` opens a prompt that finds a card by its label or name, Home and End lock the first and
+  last card, and Ctrl+Z undoes the last removal, move, sort, pin change or alert clear. the card menu has *Move left*, *Move right*, *Move first* and *Remove from strip*
   too, and a click on a symbol on a docked Ultra strip locks that card and opens the panel on it
 - **Save failures:** if the settings can't be written (a read-only folder, say), the menu shows a greyed line saying
   so. it clears when a later save works

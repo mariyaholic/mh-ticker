@@ -28,8 +28,10 @@
 use crate::alerts;
 use crate::autostart;
 use crate::chartview;
+use crate::find;
 use crate::hotkey;
 use crate::keys;
+use crate::undo;
 use crate::update;
 use crate::watch;
 use crate::probe;
@@ -184,6 +186,14 @@ const CMD_STRIP_OPACITY: usize = 5440;
 /// The poll governor's two ticks (W2), in the Poll every submenu.
 const CMD_SLOW_QUIET: usize = 5450;
 const CMD_REST_LOCKED: usize = 5451;
+/// Symbols > Order the cards (W3 D5): once, by day move, by name, or back to the default order.
+const CMD_ORDER_MOVE: usize = 5460;
+const CMD_ORDER_NAME: usize = 5461;
+const CMD_ORDER_DEFAULT: usize = 5462;
+/// Symbols > Show all on strip: pin every card (W3 J1).
+const CMD_PIN_ALL: usize = 5463;
+/// Edit > Undo the last removal, move, sort, pin change or alert clear (W3 J2).
+const CMD_UNDO: usize = 5464;
 /// The session was locked or unlocked (`wparam` 7 or 8), sent once `register_session_notice` ran.
 const WM_WTSSESSION_CHANGE: u32 = 0x02B1;
 const WTS_SESSION_LOCK: usize = 7;
@@ -391,6 +401,11 @@ struct Ui {
     /// The slots shared with the `ranges` worker (see `ranges::Slots`). The only `Ui` field another
     /// thread can reach, and only through the `Arc`.
     range_slots: Arc<Mutex<ranges::Slots>>,
+    /// The one undo snapshot (W3 J2): the last removal, move, sort, pin change or alert clear. Memory
+    /// only, so a quit forgets it. Replaced by the next such action, emptied by `undo_last`, and dropped
+    /// by `apply_rows` when the cards change any other way (a snapshot of the cards would undo that too).
+    /// Never holds the webhook (`config::Snapshot` has no field for it).
+    undo: undo::Undo<config::Snapshot>,
     /// The picker strip is open (Ultra only).
     pick_open: bool,
     picker_scroll: i32,
@@ -838,9 +853,16 @@ fn layout(u: &Ui, avail: Option<i32>) -> Frame {
     unsafe {
         let dc = GetDC(u.hwnd);
         let old = SelectObject(dc, u.font);
-        let cells = &u.view.cells;
+        // The strip shows the pinned cards only (`config::strip_rows`; every card when none is pinned, as
+        // in 1.8). Pinned by label, because the board's cells and the config rows can differ for an
+        // instant. Its slots are numbered by the card's own index (`keys::remap_slots`), so a click
+        // finds the right card on the panel.
+        let pinned: Vec<bool> = u.view.cells.iter().map(|c| u.cfg.rows.iter().find(|r| r.label == c.label).is_none_or(|r| r.strip)).collect();
+        let on_strip = crate::pins::strip_indices(&pinned);
+        let shown: Vec<Cell> = on_strip.iter().map(|&i| u.view.cells[i].clone()).collect();
+        let cells = &shown;
         let t = u.theme;
-        let frame = match avail {
+        let mut frame = match avail {
             None => layout_row(dc, cells, u.dpi, t),
             Some(avail) => {
                 let rows = u.cfg.dock_rows.max(1) as usize;
@@ -859,6 +881,7 @@ fn layout(u: &Ui, avail: Option<i32>) -> Frame {
         };
         SelectObject(dc, old);
         ReleaseDC(u.hwnd, dc);
+        frame.slots = keys::remap_slots(std::mem::take(&mut frame.slots), &on_strip);
         frame
     }
 }
@@ -1981,10 +2004,8 @@ fn set_chart(hwnd: HWND, on: bool) {
         u.chart_hover = false;
         u.chart_at = None;
         u.chart_layout.set(None);
-        if !on {
-            // The pane reopens on the day, as it always did; the cache keeps what was fetched.
-            u.range = Range::D1;
-        }
+        // The pane reopens on the range last used (`chart_range`), so the range is not reset here; the
+        // cache keeps what was fetched.
         if on {
             u.pick_open = false;
             // Nothing locked yet: lock the first card, so the pane opens on a chart instead of an
@@ -2256,8 +2277,39 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
             } else {
                 None
             };
+            // Name and decimals (both builds). The actions carry the symbol, like the order entries.
+            let look = with_ui(|u| {
+                let r = u.cfg.rows.iter().find(|r| &r.label == label)?;
+                let price = u.view.cells.iter().find(|c| &c.label == label).and_then(|c| c.quote.as_ref()).map(|q| q.price);
+                Some((r.symbol.clone(), r.digits, config::auto_digits(&r.symbol, price), config::derived_label(&u.cfg, &r.symbol) != r.label))
+            })
+            .flatten();
+            let pin = with_ui(|u| {
+                let i = u.cfg.rows.iter().position(|r| &r.label == label)?;
+                let pinned: Vec<bool> = u.cfg.rows.iter().map(|r| r.strip).collect();
+                Some((u.cfg.rows[i].symbol.clone(), pinned[i], crate::pins::can_unpin(&pinned, i), pinned.len() > 1))
+            })
+            .flatten();
+            if let Some((symbol, pinned, can_unpin, several)) = pin {
+                AppendMenuW(m, MF_SEPARATOR, 0, null());
+                if pinned {
+                    dynamic(m, MF_STRING | if can_unpin { 0 } else { MF_GRAYED }, &mut commands, Action::Pin(symbol, false), "Unpin from strip");
+                } else {
+                    dynamic(m, MF_STRING | if several { 0 } else { MF_GRAYED }, &mut commands, Action::Pin(symbol, true), "Pin to strip");
+                }
+            }
+            if let Some((symbol, digits, auto, renamed)) = look {
+                AppendMenuW(m, MF_SEPARATOR, 0, null());
+                dynamic(m, MF_STRING, &mut commands, Action::Rename(symbol.clone()), "Rename...");
+                dynamic(m, MF_STRING | if renamed { 0 } else { MF_GRAYED }, &mut commands, Action::ResetName(symbol.clone()), "Reset name");
+                let dec = CreatePopupMenu();
+                dynamic(dec, MF_STRING | if digits == auto { MF_CHECKED } else { 0 }, &mut commands, Action::Digits(symbol.clone(), None), &format!("Auto ({auto})"));
+                for d in 0..=6u32 {
+                    dynamic(dec, MF_STRING | if digits == d && digits != auto { MF_CHECKED } else { 0 }, &mut commands, Action::Digits(symbol.clone(), Some(d)), &d.to_string());
+                }
+                add(m, MF_POPUP, dec as usize, &format!("Decimals: {digits}"));
+            }
             if let Some((symbol, pos, count)) = place {
-                use crate::menu_commands::Action;
                 AppendMenuW(m, MF_SEPARATOR, 0, null());
                 let grey = |off: bool| MF_STRING | if off { MF_GRAYED } else { 0 };
                 dynamic(m, grey(pos == 0), &mut commands, Action::Move(symbol.clone(), -1), "Move left");
@@ -2293,10 +2345,22 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
             dynamic(forget, MF_STRING | if last { MF_GRAYED } else { 0 }, &mut commands, crate::menu_commands::Action::Forget(r.symbol.clone()), &text);
         }
         add(syms, MF_POPUP | if custom.is_empty() { MF_GRAYED } else { 0 }, forget as usize, "Remove a symbol I added");
+        let order = CreatePopupMenu();
+        add(order, MF_STRING, CMD_ORDER_MOVE, "By day move, biggest first");
+        add(order, MF_STRING, CMD_ORDER_NAME, "By name, A to Z");
+        add(order, MF_STRING, CMD_ORDER_DEFAULT, "Default order");
+        add(syms, MF_POPUP | if n_shown <= 1 { MF_GRAYED } else { 0 }, order as usize, "Order the cards (once)");
+        let unpinned = with_ui(|u| u.cfg.rows.iter().any(|r| !r.strip)).unwrap_or(false);
+        add(syms, MF_STRING | if unpinned { 0 } else { MF_GRAYED }, CMD_PIN_ALL, "Show all on strip");
         add(syms, MF_STRING, CMD_RESET, "Reset to default");
         item(MF_STRING, CMD_PANEL, if open { "Back to taskbar" } else { "Expand view" });
         SetMenuDefaultItem(m, CMD_PANEL as u32, 0);
         add(m, MF_POPUP, syms as usize, &format!("Symbols ({n_shown})"));
+        // Undo (W3 J2): one snapshot, so one line; it says what it would undo.
+        match with_ui(|u| u.undo.kind()).flatten() {
+            Some(kind) => item(MF_STRING, CMD_UNDO, &format!("Undo the last {}{}", kind.label(), if ultra { "\tCtrl+Z" } else { "" })),
+            None => item(MF_STRING | MF_GRAYED, CMD_UNDO, "Undo"),
+        }
         // Poll interval: `poll_s` has always been in the config; nothing exposed it until now.
         let poll = CreatePopupMenu();
         for (i, secs) in POLL_CHOICES.iter().enumerate() {
@@ -2623,10 +2687,21 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
         use crate::menu_commands::Action;
         match action {
             Action::Symbol(symbol) => {
-                if with_ui(|u| config::toggle(&mut u.cfg, symbol)).unwrap_or(false) {
+                change_cards(hwnd, |cfg| toggle_kind(cfg, symbol));
+            }
+            Action::Rename(symbol) => rename_card(hwnd, symbol),
+            Action::ResetName(symbol) => relabel_card(hwnd, symbol, None),
+            Action::Digits(symbol, d) => {
+                let changed = with_ui(|u| {
+                    let price = u.view.cells.iter().zip(&u.cfg.rows).find(|(_, r)| &r.symbol == symbol).and_then(|(c, _)| c.quote.as_ref()).map(|q| q.price);
+                    config::set_digits(&mut u.cfg, symbol, *d, price)
+                })
+                .unwrap_or(false);
+                if changed {
                     apply_rows(hwnd);
                 }
             }
+            Action::Pin(symbol, on) => pin_card(hwnd, symbol, *on),
             Action::Remove(symbol) => remove_card(hwnd, symbol),
             Action::Move(symbol, delta) => reorder(hwnd, symbol, Some(*delta)),
             Action::MoveFirst(symbol) => reorder(hwnd, symbol, None),
@@ -2673,7 +2748,10 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
                 }
             }
             Action::ClearAlert(label) => {
-                with_ui(|u| u.cfg.alerts.retain(|a| &a.label != label));
+                with_ui(|u| {
+                    u.undo.put(undo::Kind::AlertClear, u.cfg.snapshot_alerts());
+                    u.cfg.alerts.retain(|a| &a.label != label)
+                });
                 save_cfg();
             }
             Action::AlertAt(label) => alert_at_price(hwnd, label),
@@ -2777,6 +2855,13 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
             apply_rows(hwnd);
         }
         CMD_ADD_SYMBOL => add_symbol(hwnd),
+        CMD_UNDO => undo_last(hwnd),
+        CMD_PIN_ALL => {
+            change_cards(hwnd, |cfg| (config::pin_all(cfg), Some(undo::Kind::Pin)));
+        }
+        CMD_ORDER_MOVE => order_cards(hwnd, config::OrderKey::DayMove),
+        CMD_ORDER_NAME => order_cards(hwnd, config::OrderKey::Name),
+        CMD_ORDER_DEFAULT => order_cards(hwnd, config::OrderKey::Default),
         c if (CMD_POLL..CMD_POLL + POLL_CHOICES.len()).contains(&c) => {
             let secs = POLL_CHOICES[c - CMD_POLL];
             with_ui(|u| {
@@ -3135,7 +3220,10 @@ fn alert_command(hwnd: HWND, cmd: usize) {
             );
             if alert_box(hwnd, "Clear all alerts", &ask, MB_YESNO | MB_ICONQUESTION) == IDYES {
                 // The box ran the message loop: act on what is set now, not on the count above.
-                with_ui(|u| u.cfg.alerts.clear());
+                with_ui(|u| {
+                    u.undo.put(undo::Kind::AlertClear, u.cfg.snapshot_alerts());
+                    u.cfg.alerts.clear()
+                });
                 save_cfg();
             }
         }
@@ -3579,7 +3667,10 @@ fn pane_menu(hwnd: HWND, at: (i32, i32)) -> bool {
     match cmd {
         CMD_PANE_ALERT => set_price_level(hwnd, &label, level),
         CMD_PANE_CLEAR => {
-            with_ui(|u| u.cfg.alerts.retain(|a| a.label != label));
+            with_ui(|u| {
+                u.undo.put(undo::Kind::AlertClear, u.cfg.snapshot_alerts());
+                u.cfg.alerts.retain(|a| a.label != label)
+            });
             save_cfg();
             unsafe { InvalidateRect(hwnd, null(), 0) };
         }
@@ -3612,6 +3703,9 @@ fn apply_placement(hwnd: HWND) {
 fn apply_rows(hwnd: HWND) {
     save_cfg();
     let Some(panel) = with_ui(|u| {
+        // The cards changed. An undoable action puts its snapshot back after this call; any other change
+        // makes a held snapshot of the cards stale.
+        u.undo.drop_rows();
         if let Ok(mut b) = u.board.lock() {
             b.set_rows(&u.cfg.rows);
             u.view = b.clone();
@@ -3645,6 +3739,64 @@ fn apply_rows(hwnd: HWND) {
     unsafe { PostMessageW(hwnd, WM_FEED, 0, 0) };
 }
 
+/// *Rename...*: ask for a label, then `relabel_card`. The prompt runs outside `with_ui`.
+fn rename_card(hwnd: HWND, symbol: &str) {
+    let Some(current) = with_ui(|u| u.cfg.rows.iter().find(|r| r.symbol == symbol).map(|r| r.label.clone())).flatten() else {
+        return;
+    };
+    let ask = format!("Name for {symbol} (up to {} characters, a taken name gets a number):", config::MAX_LABEL);
+    let Some(text) = prompt::ask(hwnd, "Rename card", &ask, &current, config::MAX_LABEL) else {
+        return;
+    };
+    relabel_card(hwnd, symbol, Some(text));
+}
+
+/// Give a card a new label (`Some(typed)`) or its derived one (`None`). The alerts and the lock follow
+/// in the same step (`config::rename` moves the alerts; the lock is moved here), so nothing is keyed by
+/// a label that no longer exists.
+fn relabel_card(hwnd: HWND, symbol: &str, typed: Option<String>) {
+    let changed = with_ui(|u| {
+        let old = u.cfg.rows.iter().find(|r| r.symbol == symbol).map(|r| r.label.clone())?;
+        let new = match &typed {
+            Some(t) => config::rename(&mut u.cfg, symbol, t),
+            None => config::reset_name(&mut u.cfg, symbol),
+        }?;
+        if u.selected.as_deref() == Some(old.as_str()) {
+            u.selected = Some(new);
+        }
+        Some(())
+    })
+    .flatten()
+    .is_some();
+    if changed {
+        apply_rows(hwnd);
+    }
+}
+
+/// *Pin to strip* / *Unpin from strip* for one card. The config refuses to unpin the last pinned card.
+fn pin_card(hwnd: HWND, symbol: &str, on: bool) {
+    change_cards(hwnd, |cfg| (config::set_pin(cfg, symbol, on), Some(undo::Kind::Pin)));
+}
+
+/// Rewrite the order of the shown cards once (*Order the cards*). The day moves are read from the board
+/// as it is now, fresh quotes only; a card with none keeps its relative place at the end. The lock is by
+/// label, so it follows its card, and the panel scrolls to keep it in view.
+fn order_cards(hwnd: HWND, key: config::OrderKey) {
+    let moves: std::collections::HashMap<String, f64> = with_ui(|u| {
+        u.view
+            .cells
+            .iter()
+            .zip(&u.cfg.rows)
+            .filter(|(c, _)| !c.stale)
+            .filter_map(|(c, r)| Some((r.symbol.clone(), c.quote.as_ref()?.change_pct?)))
+            .collect()
+    })
+    .unwrap_or_default();
+    if change_cards(hwnd, |cfg| (config::order_by(cfg, &moves, key), Some(undo::Kind::Sort))) {
+        reveal_lock(hwnd);
+    }
+}
+
 /// Hide `symbol` (the card menu's Remove and the Delete key). The lock passes to the card that takes the
 /// removed one's place when the locked card is the one going. A symbol that is no longer shown, or the
 /// last one, changes nothing.
@@ -3652,17 +3804,19 @@ fn remove_card(hwnd: HWND, symbol: &str) {
     let removed = with_ui(|u| {
         let label = u.cfg.rows.iter().find(|r| r.symbol == symbol).map(|r| r.label.clone());
         let next = label.as_deref().and_then(|l| neighbour_of(&u.view.cells, l));
+        let snap = u.cfg.snapshot_rows();
         if !config::remove(&mut u.cfg, symbol) {
-            return false;
+            return None;
         }
         if label.is_some() && u.selected == label {
             lock_card(u, next);
         }
-        true
+        Some(snap)
     })
-    .unwrap_or(false);
-    if removed {
+    .flatten();
+    if let Some(snap) = removed {
         apply_rows(hwnd);
+        keep_undo(undo::Kind::Remove, snap);
         reveal_lock(hwnd);
     }
 }
@@ -3670,14 +3824,97 @@ fn remove_card(hwnd: HWND, symbol: &str) {
 /// Move `symbol` along the strip: `Some(delta)` places, or `None` for the front. The saved order is
 /// `config`'s business; this applies it, then keeps the locked card in view.
 fn reorder(hwnd: HWND, symbol: &str, delta: Option<i32>) {
-    let changed = with_ui(|u| match delta {
-        Some(d) => config::move_row(&mut u.cfg, symbol, d),
-        None => config::move_first(&mut u.cfg, symbol),
-    })
-    .unwrap_or(false);
+    let changed = change_cards(hwnd, |cfg| {
+        let did = match delta {
+            Some(d) => config::move_row(cfg, symbol, d),
+            None => config::move_first(cfg, symbol),
+        };
+        (did, Some(undo::Kind::Move))
+    });
     if changed {
+        reveal_lock(hwnd);
+    }
+}
+
+/// `config::toggle` as a `change_cards` step: hiding a symbol can be undone, showing one cannot (it is
+/// not a removal, and undo would put the old list back over it).
+fn toggle_kind(cfg: &mut Config, symbol: &str) -> (bool, Option<undo::Kind>) {
+    let was_shown = config::is_shown(cfg, symbol);
+    (config::toggle(cfg, symbol), was_shown.then_some(undo::Kind::Remove))
+}
+
+/// Hold `snap` as the one undo snapshot. Called after `apply_rows`, which drops a stale one.
+fn keep_undo(kind: undo::Kind, snap: config::Snapshot) {
+    with_ui(|u| u.undo.put(kind, snap));
+}
+
+/// Change the cards and apply them. `f` makes the change and answers whether it changed anything and
+/// which kind of undo it is (`None`: a change undo does not cover, which also makes a held snapshot of
+/// the cards stale). The snapshot is taken before `f` and kept after the rows are applied.
+fn change_cards(hwnd: HWND, f: impl FnOnce(&mut Config) -> (bool, Option<undo::Kind>)) -> bool {
+    let done = with_ui(|u| {
+        let snap = u.cfg.snapshot_rows();
+        let (changed, kind) = f(&mut u.cfg);
+        changed.then_some((snap, kind))
+    })
+    .flatten();
+    let Some((snap, kind)) = done else { return false };
+    apply_rows(hwnd);
+    if let Some(kind) = kind {
+        keep_undo(kind, snap);
+    }
+    true
+}
+
+/// *Undo* (the menu line and Ctrl+Z): put the held snapshot back, once. Cards go through `apply_rows`;
+/// alerts are merged back and saved. The webhook is not in a snapshot, so it is never touched.
+fn undo_last(hwnd: HWND) {
+    let Some((kind, snap)) = with_ui(|u| u.undo.take()).flatten() else { return };
+    with_ui(|u| u.cfg.restore(snap));
+    if kind.is_rows() {
         apply_rows(hwnd);
         reveal_lock(hwnd);
+    } else {
+        save_cfg();
+        unsafe { InvalidateRect(hwnd, null(), 0) };
+    }
+}
+
+/// Home and End on Ultra: lock the first or last card and show it.
+fn lock_edge(hwnd: HWND, last: bool) {
+    with_ui(|u| {
+        let label = if last { u.view.cells.last() } else { u.view.cells.first() }.map(|c| c.label.clone());
+        lock_card(u, label);
+        u.hover_at = None;
+    });
+    reveal_lock(hwnd);
+    unsafe { InvalidateRect(hwnd, null(), 0) };
+}
+
+/// `/`: ask for a few letters, then lock the first card they match (`find::find`) and scroll to it.
+/// Cancel, empty text and a text nothing matches change nothing. The prompt runs outside `with_ui`.
+/// What the system does with the keyboard focus once the prompt closes is not verified.
+fn find_card(hwnd: HWND) {
+    let Some(text) = prompt::ask(hwnd, "Find a card", "Find a card by label or name:", "", config::MAX_NAME) else {
+        return;
+    };
+    let found = with_ui(|u| {
+        let cards: Vec<(&str, &str)> = u
+            .view
+            .cells
+            .iter()
+            .map(|c| (c.label.as_str(), u.cfg.rows.iter().find(|r| r.label == c.label).map_or("", |r| r.name.as_str())))
+            .collect();
+        let i = find::find(&cards, &text)?;
+        let label = u.view.cells.get(i)?.label.clone();
+        lock_card(u, Some(label));
+        u.hover_at = None;
+        Some(())
+    })
+    .flatten();
+    if found.is_some() {
+        reveal_lock(hwnd);
+        unsafe { InvalidateRect(hwnd, null(), 0) };
     }
 }
 
@@ -3716,6 +3953,7 @@ fn on_key(hwnd: HWND, vk: u32) -> bool {
         Copy(String),
         Remove(String),
         Shift(String, i32),
+        Undo,
     }
     let ctrl = unsafe { GetKeyState(VK_CONTROL as i32) } < 0;
     let todo = with_ui(|u| {
@@ -3750,6 +3988,7 @@ fn on_key(hwnd: HWND, vk: u32) -> bool {
             K::CopyAll => Do::Copy(crate::model::board_text(&u.view.cells)),
             K::Remove => Do::Remove(symbol_of(u, row?)?),
             K::Shift(d) => Do::Shift(symbol_of(u, row?)?, d),
+            K::Undo => Do::Undo,
         })
     })
     .flatten();
@@ -3766,6 +4005,7 @@ fn on_key(hwnd: HWND, vk: u32) -> bool {
         }
         Some(Do::Remove(sym)) => remove_card(hwnd, &sym),
         Some(Do::Shift(sym, d)) => reorder(hwnd, &sym, Some(d)),
+        Some(Do::Undo) => undo_last(hwnd),
     }
     true
 }
@@ -4296,16 +4536,25 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     InvalidateRect(hwnd, null(), 0);
                 }
                 Some(Act::Range(rg)) => {
-                    with_ui(|u| {
+                    let changed = with_ui(|u| {
                         if u.range != rg {
                             u.range = rg;
+                            // Remembered for the next time the pane opens (saved below, outside).
+                            u.cfg.chart_range = rg.to_saved();
                             // The candles are refolded and may be another series: the pointer's bar
                             // index means nothing now, and the old layout is not what is on screen.
                             u.chart_at = None;
                             u.chart_layout.set(None);
                             want_range(u);
+                            return true;
                         }
-                    });
+                        false
+                    })
+                    .unwrap_or(false);
+                    // Saved outside the closure: `with_ui` does no I/O.
+                    if changed {
+                        save_cfg();
+                    }
                     InvalidateRect(hwnd, null(), 0);
                 }
                 Some(Act::Select(label)) => {
@@ -4316,8 +4565,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     });
                     InvalidateRect(hwnd, null(), 0);
                 }
-                Some(Act::Symbol(sym)) if with_ui(|u| config::toggle(&mut u.cfg, &sym)).unwrap_or(false) => {
-                    apply_rows(hwnd)
+                Some(Act::Symbol(sym)) => {
+                    change_cards(hwnd, |cfg| toggle_kind(cfg, &sym));
                 }
                 Some(Act::Open(sym)) => open_cnbc(hwnd, &sym),
                 _ => {}
@@ -4403,9 +4652,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_KEYDOWN if [VK_PRIOR as usize, VK_NEXT as usize, VK_HOME as usize, VK_END as usize].contains(&wp) => {
+            // W3 J6: on Ultra with cards, Home and End lock the first and last card (and scroll to it);
+            // everywhere else, and for PgUp and PgDn, they page the body as in 1.8.
+            let edge = with_ui(|u| if u.mode == Mode::Panel { keys::edge(wp as u32, u.profile.ultra, u.view.cells.len()) } else { None }).flatten();
+            if let Some(last) = edge {
+                lock_edge(hwnd, last);
+                return 0;
+            }
             let step = with_ui(|u| (240 * u.dpi as i32 / 96).max(1)).unwrap_or(240);
             let delta = if wp == VK_PRIOR as usize { -step } else if wp == VK_NEXT as usize { step } else if wp == VK_HOME as usize { -i32::MAX } else { i32::MAX };
             scroll_picker(hwnd, delta);
+            0
+        }
+        WM_CHAR if with_ui(|u| u.mode == Mode::Panel && keys::opens_find(wp as u32, u.profile.ultra, GetKeyState(VK_CONTROL as i32) < 0)).unwrap_or(false) => {
+            find_card(hwnd);
             0
         }
         // P5: the card keys. `on_key` answers false for a key that means nothing right now (Classic's
@@ -4618,8 +4878,9 @@ pub fn run(cfg: Config, board: Arc<Mutex<Board>>) {
             open_hover: false,
             chart_at: None,
             chart_layout: std::cell::Cell::new(None),
-            range: Range::D1,
+            range: if profile.ultra { Range::from_saved(cfg.chart_range.as_deref()) } else { Range::D1 },
             book: ranges::Book::new(),
+            undo: undo::Undo::default(),
             range_slots: Arc::new(Mutex::new(ranges::Slots::default())),
             pick_open: false,
             picker_scroll: 0,
@@ -4861,7 +5122,7 @@ mod tests {
             quote: Some(crate::model::Quote { price, ..Default::default() }),
             stale: false,
         };
-        let row = |label: &str| config::Row { label: label.into(), symbol: format!("{label}="), digits: 2, name: String::new() };
+        let row = |label: &str| config::Row { label: label.into(), symbol: format!("{label}="), digits: 2, name: String::new(), strip: true };
         // B was right-clicked at index 1; then a new row N lands in front of it.
         let cells = [cell("N", 9.0), cell("A", 1.0), cell("B", 2.0)];
         let rows = [row("N"), row("A"), row("B")];
