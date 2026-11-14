@@ -44,6 +44,7 @@ fn quote(row: &Row, spec: QuoteSpec<'_>, now: f64) -> Quote {
         change_pct: Some(pct),
         prev_close: Some(prev),
         ts: Some(if realtime { now - 4.0 } else { now - 612.0 }),
+        moved_at: None,
         realtime,
         open: Some(prev),
         high: Some(high),
@@ -128,6 +129,7 @@ fn render(t: &Theme, phase: f64, now: f64, b: &Board, h: &History, dpi: u32) -> 
         grad: &grad,
         dpi,
         now,
+        offset_at: &tz_offset,
         btn_hover: false,
         pick_hover: false,
         chart_hover: false,
@@ -294,7 +296,7 @@ pub fn write_w3(dir: &Path) -> Result<usize, String> {
         r.strip = [0, 2, 4, 8, 13, 20].contains(&i);
     }
     let pinned: Vec<crate::model::Cell> = crate::config::strip_rows(&cfg).into_iter().map(|i| b24.cells[i].clone()).collect();
-    let (w, h, px) = crate::ui::strip_still(&pinned, t, 96, 2, 1_800);
+    let (w, h, px) = crate::ui::strip_still(&pinned, b24.link, now, t, 96, 2, 1_800);
     write_png(&dir.join("w3-strip-24-pinned-6.png"), w, h, &px)?;
     Ok(2)
 }
@@ -335,6 +337,11 @@ pub fn write_w4(dir: &Path) -> Result<usize, String> {
 
 /// The fixture's clock: UTC-4, a US equity day in summer.
 const TZ_S: i32 = -4 * 3_600;
+
+/// The card's local clock in the stills: the fixed zone, the same on every machine.
+fn tz_offset(_: f64) -> i32 {
+    TZ_S
+}
 
 /// One rendered panel with the candle pane open, from deterministic bars.
 ///
@@ -469,6 +476,7 @@ fn chart_fixture_px(
         grad: &grad,
         dpi,
         now,
+        offset_at: &tz_offset,
         btn_hover: false,
         pick_hover: false,
         chart_hover: false,
@@ -693,9 +701,9 @@ fn board_n(now: f64, n: usize) -> Board {
                 q.yr_lo = q.yr_lo.map(|v| v * scale);
                 q.change_pct = q.change_pct.map(|p| p * (1.0 + (i % 4) as f64 * 0.8) * if i % 3 == 1 { -1.0 } else { 1.0 });
             }
-            cell.stale = i == 7;
+            cell.stale = i == 7 || i == 13;
             if i == 7 {
-                // A weekend: the quote is 52 hours old, so the card reads "closed 52h" beside a long label.
+                // A weekend: the quote is 52 hours old, so the card reads "closed since" and a day beside a long label.
                 if let Some(q) = cell.quote.as_mut() {
                     q.ts = Some(now - 52.0 * 3600.0);
                     q.realtime = false;
@@ -709,6 +717,60 @@ fn board_n(now: f64, n: usize) -> Board {
         .collect();
     b.backfill = (0..n).map(|i| base.backfill[i % 6].iter().map(|&(t, v)| (t, v * (1.0 + (i / 6) as f64 * 0.07 - (i % 5) as f64 * 0.011))).collect()).collect();
     b.backfill_gen = 1;
+    b
+}
+
+/// A Saturday afternoon (UTC-4, the stills' zone) when the clock is `weekend_now()`: gold, silver and
+/// the three index futures stopped printing on Friday at 17:00, bitcoin is live.
+const WEEKEND_NOW: f64 = 1_792_252_800.0;
+const FRIDAY_1700: f64 = 1_792_184_400.0;
+
+/// The six-card board on a weekend: five closed markets and one live one, the case the card tag
+/// "closed since Fri 17:00" and the calm header are for.
+fn board_weekend(now: f64) -> Board {
+    let mut b = board(now);
+    for i in [0usize, 1, 3, 4, 5] {
+        b.cells[i].stale = true;
+        if let Some(q) = b.cells[i].quote.as_mut() {
+            q.ts = Some(FRIDAY_1700);
+        }
+    }
+    b
+}
+
+/// A weekday board in which gold and silver stopped printing 3 and 10 minutes ago: past the stale
+/// limit and short of the closed age, so their cards show `CNBC · 3m` and `CNBC · 10m` in the calm
+/// grey, the header says `CNBC live, 2 quiet`, and no card says `closed`.
+fn board_quiet(now: f64) -> Board {
+    let mut b = board(now);
+    for (i, age) in [(0usize, 180.0), (1, 600.0)] {
+        b.cells[i].stale = true;
+        if let Some(q) = b.cells[i].quote.as_mut() {
+            q.ts = Some(now - age);
+            q.realtime = true;
+        }
+    }
+    b
+}
+
+/// Every card closed, bitcoin included: the grey dot and the header "CNBC, markets closed".
+fn board_all_closed(now: f64) -> Board {
+    let mut b = board_weekend(now);
+    b.cells[2].stale = true;
+    if let Some(q) = b.cells[2].quote.as_mut() {
+        q.ts = Some(FRIDAY_1700);
+    }
+    b
+}
+
+/// A weekend board in which one card is a fault and not a closed market: its quote time is unknown,
+/// so the header keeps the link's amber and the strip prices that card in amber.
+fn board_fault(now: f64) -> Board {
+    let mut b = board_weekend(now);
+    b.cells[2].stale = true;
+    if let Some(q) = b.cells[2].quote.as_mut() {
+        q.ts = None;
+    }
     b
 }
 
@@ -743,13 +805,33 @@ pub fn write_wide(dir: &Path) -> Result<usize, String> {
     hist.record(&b24, now);
     put(&mut n, "wide-cards-24.png", render(t, 0.0, now, &b24, &hist, 96))?;
     for rows in 1..=3usize {
-        put(&mut n, &format!("wide-strip-24-rows{rows}.png"), crate::ui::strip_still(&b24.cells, t, 96, rows, 1_800))?;
+        put(&mut n, &format!("wide-strip-24-rows{rows}.png"), crate::ui::strip_still(&b24.cells, b24.link, now, t, 96, rows, 1_800))?;
     }
     let b6 = board(now);
     let mut hist6 = History::new();
     hist6.record(&b6, now);
     put(&mut n, "wide-192dpi-cards.png", render(t, 0.0, now, &b6, &hist6, 192))?;
-    put(&mut n, "wide-192dpi-strip-24-rows2.png", crate::ui::strip_still(&b24.cells, t, 192, 2, 3_600))?;
+    put(&mut n, "wide-192dpi-strip-24-rows2.png", crate::ui::strip_still(&b24.cells, b24.link, now, t, 192, 2, 3_600))?;
+    let bw = board_weekend(WEEKEND_NOW);
+    let mut histw = History::new();
+    histw.record(&bw, WEEKEND_NOW);
+    put(&mut n, "closed-weekend-cards.png", render(t, 0.0, WEEKEND_NOW, &bw, &histw, 96))?;
+    put(&mut n, "closed-weekend-strip.png", crate::ui::strip_still(&bw.cells, bw.link, WEEKEND_NOW, t, 96, 1, 900))?;
+    let ba = board_all_closed(WEEKEND_NOW);
+    let mut hista = History::new();
+    hista.record(&ba, WEEKEND_NOW);
+    put(&mut n, "closed-all-cards.png", render(t, 0.0, WEEKEND_NOW, &ba, &hista, 96))?;
+    put(&mut n, "closed-all-strip.png", crate::ui::strip_still(&ba.cells, ba.link, WEEKEND_NOW, t, 96, 1, 900))?;
+    let bq = board_quiet(WEEKEND_NOW);
+    let mut histq = History::new();
+    histq.record(&bq, WEEKEND_NOW);
+    put(&mut n, "closed-quiet-cards.png", render(t, 0.0, WEEKEND_NOW, &bq, &histq, 96))?;
+    put(&mut n, "closed-quiet-strip.png", crate::ui::strip_still(&bq.cells, bq.link, WEEKEND_NOW, t, 96, 1, 900))?;
+    let bf = board_fault(WEEKEND_NOW);
+    let mut histf = History::new();
+    histf.record(&bf, WEEKEND_NOW);
+    put(&mut n, "closed-fault-cards.png", render(t, 0.0, WEEKEND_NOW, &bf, &histf, 96))?;
+    put(&mut n, "closed-fault-strip.png", crate::ui::strip_still(&bf.cells, bf.link, WEEKEND_NOW, t, 96, 1, 900))?;
     chart_still(dir, "wide-pane-narrow.png", 96, panel::minimum(6, 0, 96, false, true).0, Some(40), "5D")?;
     chart_still(dir, "wide-192dpi-pane.png", 192, 1488 * 2, Some(40), "1D")?;
     n += 2;
@@ -852,6 +934,7 @@ impl Fixture {
             grad: &self.grad,
             dpi: self.dpi,
             now: self.now,
+            offset_at: &tz_offset,
             btn_hover: hot.btn,
             pick_hover: hot.pick,
             chart_hover: hot.chart_btn,
@@ -1153,7 +1236,46 @@ mod tests {
         }
     }
 
-    /// The 24-card board carries one closed market, so its picture shows the "closed 52h" tag.
+    /// The weekend board has five closed cards and one live one, and the header calls it calm.
+    #[test]
+    fn the_weekend_board_is_five_closed_markets_and_bitcoin() {
+        let b = board_weekend(WEEKEND_NOW);
+        let closed: Vec<&str> = b.cells.iter().filter(|c| crate::model::market_closed(c, b.link, WEEKEND_NOW)).map(|c| c.label.as_str()).collect();
+        assert_eq!(closed, ["XAU", "XAG", "DOW", "S&P", "NAS"]);
+        assert_eq!(b.calm(WEEKEND_NOW), crate::model::Calm::Some(5));
+        let q = b.cells[4].quote.as_ref().unwrap();
+        let words = crate::model::closed_words("CNBC delayed", crate::model::closed_since(q, WEEKEND_NOW), &tz_offset, WEEKEND_NOW);
+        assert_eq!(words, ["CNBC delayed \u{b7} closed since Fri 17:00", "closed since Fri 17:00", "closed"]);
+    }
+
+    /// Between the stale limit and the closed age the cards are calm and say no `closed`.
+    #[test]
+    fn the_quiet_board_is_calm_and_says_no_closed() {
+        let b = board_quiet(WEEKEND_NOW);
+        assert_eq!(b.calm(WEEKEND_NOW), crate::model::Calm::QuietSome { closed: 0, quiet: 2 });
+        assert!(b.cells.iter().all(|c| !crate::model::market_closed(c, b.link, WEEKEND_NOW)));
+        assert!(b.cells[..2].iter().all(|c| crate::model::calm_stale(c, b.link, WEEKEND_NOW)));
+        assert!(b.cells[..2].iter().all(|c| crate::model::closed_card_words(c, b.link, WEEKEND_NOW, None, &tz_offset).is_none()));
+        let t = &theme::ALL[0];
+        let quiet = crate::ui::strip_still(&b.cells, b.link, WEEKEND_NOW, t, 96, 1, 900);
+        let fresh = crate::ui::strip_still(&board(WEEKEND_NOW).cells, b.link, WEEKEND_NOW, t, 96, 1, 900);
+        assert_ne!(quiet.2, fresh.2, "the strip dims the quiet cards");
+    }
+
+    /// All six closed reads grey and "markets closed"; one fault among them keeps the link's own look.
+    #[test]
+    fn the_all_closed_and_fault_boards_read_differently() {
+        let all = board_all_closed(WEEKEND_NOW);
+        assert_eq!(all.calm(WEEKEND_NOW), crate::model::Calm::All(6));
+        let fault = board_fault(WEEKEND_NOW);
+        assert_eq!(fault.calm(WEEKEND_NOW), crate::model::Calm::No);
+        let t = &theme::ALL[0];
+        let grey = crate::ui::strip_still(&all.cells, all.link, WEEKEND_NOW, t, 96, 1, 900);
+        let amber = crate::ui::strip_still(&fault.cells, fault.link, WEEKEND_NOW, t, 96, 1, 900);
+        assert_ne!(grey.2, amber.2, "the strips differ");
+    }
+
+    /// The 24-card board carries one closed market, so its picture shows the closed card tag.
     #[test]
     fn the_wide_board_has_a_closed_market_card() {
         let now = 1_800_000_000.0;

@@ -25,7 +25,7 @@
 //!   the theme changes, never per frame, so a gradient costs no allocation while the panel is open —
 //!   including an animated one, which slides over pre-built brushes instead of rebuilding them.
 
-use crate::model::Link;
+use crate::model::{Calm, Link};
 use crate::updown::UpDown;
 use crate::contrast::SystemColours;
 use std::sync::{Mutex, OnceLock};
@@ -49,6 +49,42 @@ pub fn link_name(link: Link) -> &'static str {
         Link::Live => "CNBC live",
         Link::Partial => "CNBC, some prices not fresh",
         Link::Down => "offline",
+    }
+}
+
+/// [`link_color`], with a closed market given its own calm look: grey when every row is closed,
+/// the live green when the rest are live. A fault keeps the link's colour.
+pub fn calm_color(t: &Theme, link: Link, calm: Calm) -> COLORREF {
+    match calm {
+        Calm::No => link_color(t, link),
+        Calm::Some(_) | Calm::QuietSome { .. } => t.up,
+        Calm::All(_) | Calm::QuietAll { .. } => t.dim,
+    }
+}
+
+/// [`link_name`], saying "closed" when that is the only reason a price is not fresh and every such
+/// row reads closed. While some of them are still inside the calm window before that, the name gives
+/// the closed count and the quiet count, the same numbers as [`crate::spoken::summary_line`].
+pub fn calm_name(link: Link, calm: Calm) -> String {
+    match calm {
+        Calm::No => link_name(link).to_string(),
+        Calm::Some(n) => format!("CNBC live, {n} closed"),
+        Calm::All(1) => "CNBC, market closed".to_string(),
+        Calm::All(_) => "CNBC, markets closed".to_string(),
+        Calm::QuietSome { closed: 0, quiet } => format!("CNBC live, {quiet} quiet"),
+        Calm::QuietSome { closed, quiet } => format!("CNBC live, {closed} closed, {quiet} quiet"),
+        Calm::QuietAll { closed: 0, .. } => "CNBC, quiet".to_string(),
+        Calm::QuietAll { closed, quiet } => format!("CNBC, {closed} closed, {quiet} quiet"),
+    }
+}
+
+/// [`calm_name`] for a header with little room: a board with both closed and quiet cells gives one
+/// combined count instead of two.
+pub fn calm_name_short(link: Link, calm: Calm) -> String {
+    match calm {
+        Calm::QuietSome { closed, quiet } if closed > 0 => format!("CNBC live, {} not live", closed + quiet),
+        Calm::QuietAll { closed, quiet } if closed > 0 => format!("CNBC, {} not live", closed + quiet),
+        _ => calm_name(link, calm),
     }
 }
 
@@ -730,6 +766,28 @@ impl Drop for Gradient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_closed_market_has_its_own_calm_words_and_colour_and_a_fault_keeps_the_links() {
+        let t = &MIDNIGHT;
+        assert_eq!(calm_color(t, Link::Partial, Calm::No), link_color(t, Link::Partial));
+        assert_eq!(calm_color(t, Link::Partial, Calm::All(3)), t.dim);
+        assert_eq!(calm_color(t, Link::Partial, Calm::Some(2)), t.up);
+        assert_ne!(calm_color(t, Link::Partial, Calm::All(3)), link_color(t, Link::Partial), "not the amber of a fault");
+        assert_eq!(calm_name(Link::Partial, Calm::No), link_name(Link::Partial));
+        assert_eq!(calm_name(Link::Partial, Calm::Some(2)), "CNBC live, 2 closed");
+        assert_eq!(calm_name(Link::Partial, Calm::All(1)), "CNBC, market closed");
+        assert_eq!(calm_name(Link::Partial, Calm::All(6)), "CNBC, markets closed");
+        assert_eq!(calm_name(Link::Partial, Calm::QuietSome { closed: 0, quiet: 2 }), "CNBC live, 2 quiet");
+        assert_eq!(calm_name(Link::Partial, Calm::QuietAll { closed: 0, quiet: 2 }), "CNBC, quiet");
+        assert_eq!(calm_name(Link::Partial, Calm::QuietSome { closed: 1, quiet: 1 }), "CNBC live, 1 closed, 1 quiet");
+        assert_eq!(calm_name(Link::Partial, Calm::QuietAll { closed: 2, quiet: 1 }), "CNBC, 2 closed, 1 quiet");
+        assert_eq!(calm_name_short(Link::Partial, Calm::QuietSome { closed: 1, quiet: 1 }), "CNBC live, 2 not live");
+        assert_eq!(calm_name_short(Link::Partial, Calm::QuietAll { closed: 2, quiet: 1 }), "CNBC, 3 not live");
+        assert_eq!(calm_name_short(Link::Partial, Calm::QuietSome { closed: 0, quiet: 2 }), "CNBC live, 2 quiet");
+        assert_eq!(calm_color(t, Link::Partial, Calm::QuietAll { closed: 0, quiet: 2 }), t.dim);
+        assert_eq!(calm_color(t, Link::Partial, Calm::QuietSome { closed: 1, quiet: 1 }), t.up);
+    }
 
     #[test]
     fn unknown_theme_names_fall_back_to_the_classic_look() {

@@ -50,7 +50,7 @@ use crate::dock;
 use crate::panel;
 use crate::ranges::{self, Range};
 use crate::theme::{self, Gradient, Theme};
-use crate::model::{fmt_change, fmt_price, Board, Cell, Link};
+use crate::model::{fmt_change, fmt_price, Board, Calm, Cell, Link};
 use std::cell::RefCell;
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicIsize, Ordering};
@@ -382,7 +382,7 @@ struct Ui {
     grad: Gradient,
     icon: HICON,
     /// What the current tray icon was drawn for: the link colour and the alert marker.
-    icon_link: Option<(Link, bool)>,
+    icon_link: Option<(Link, Calm, bool)>,
     dpi: u32,
     cfg: Config,
     board: Arc<Mutex<Board>>,
@@ -820,19 +820,24 @@ fn make_icon(color: COLORREF, pending: bool) -> HICON {
     }
 }
 
-/// (label, price, price colour, change + colour) for one row of the board.
-fn cell_texts(c: &Cell, t: &Theme) -> (String, String, COLORREF, Option<(String, COLORREF)>) {
+/// (label, price, price colour, change + colour) for one row of the board. A stale cell that is calm
+/// (`model::calm_stale`: a quiet or closed market) dims to the grey of the theme's secondary text. A stale
+/// cell that is a fault (no known age, a fallback quote, a dead link) takes the amber of the theme
+/// and loses its change colours, so the two read differently on the strip.
+fn cell_texts(c: &Cell, t: &Theme, link: Link, now: f64) -> (String, String, COLORREF, Option<(String, COLORREF)>) {
     let label = match &c.quote {
         Some(q) if !q.source.is_empty() => format!("{} ({} ?)", c.label, q.source),
         _ => c.label.clone(),
     };
+    let fault = c.stale && !crate::model::calm_stale(c, link, now);
     match &c.quote {
         Some(q) => {
             let change = q.change_pct.map(|p| {
                 let col = if c.stale { t.dim } else if p >= 0.0 { t.up } else { t.down };
                 (fmt_change(p), col)
             });
-            (label, fmt_price(q.price, c.digits), if c.stale { t.dim } else { t.price }, change)
+            let price = if fault { t.amber } else if c.stale { t.dim } else { t.price };
+            (label, fmt_price(q.price, c.digits), price, change)
         }
         None => (label, "--".into(), t.dim, None),
     }
@@ -850,7 +855,7 @@ fn text_run(x: i32, y: i32, s: &str, color: COLORREF) -> Run {
 }
 
 /// Free mode: everything on one row.
-fn layout_row(dc: HDC, cells: &[Cell], dpi: u32, t: &Theme) -> Frame {
+fn layout_row(dc: HDC, cells: &[Cell], dpi: u32, t: &Theme, link: Link, now: f64) -> Frame {
     let s = |v: i32| v * dpi as i32 / 96;
     let (px, py) = (s(10), s(5));
     let (_, line_h) = text_size(dc, "Xg");
@@ -858,7 +863,7 @@ fn layout_row(dc: HDC, cells: &[Cell], dpi: u32, t: &Theme) -> Frame {
     let mut slots = Vec::new();
     let mut x = px;
     for (i, c) in cells.iter().enumerate() {
-        let (label, price, pc, change) = cell_texts(c, t);
+        let (label, price, pc, change) = cell_texts(c, t, link, now);
         // The symbol's own extent starts after the gap that separates it from the one before.
         let left = x + if i > 0 { text_size(dc, "    ").0 } else { 0 };
         let mut push = |t: String, col: COLORREF| {
@@ -886,7 +891,8 @@ fn layout_row(dc: HDC, cells: &[Cell], dpi: u32, t: &Theme) -> Frame {
 
 /// Dock mode: the first `k` rows of the board as a column-major grid with `rows` lines,
 /// label | right-aligned price | right-aligned change.
-fn layout_grid(dc: HDC, cells: &[Cell], dpi: u32, rows: usize, show_change: bool, t: &Theme) -> Frame {
+#[allow(clippy::too_many_arguments)] // a frame needs the device, cells, size, grid, look, link and clock; a bundling struct would be used once
+fn layout_grid(dc: HDC, cells: &[Cell], dpi: u32, rows: usize, show_change: bool, t: &Theme, link: Link, now: f64) -> Frame {
     let s = |v: i32| v * dpi as i32 / 96;
     let (px, py, gap_s, gap_l) = (s(7), s(3), s(5), s(12));
     let (_, line_h) = text_size(dc, "Xg");
@@ -897,7 +903,7 @@ fn layout_grid(dc: HDC, cells: &[Cell], dpi: u32, rows: usize, show_change: bool
         if ci > 0 {
             x += gap_l;
         }
-        let texts: Vec<_> = col.iter().map(|c| cell_texts(c, t)).collect();
+        let texts: Vec<_> = col.iter().map(|c| cell_texts(c, t, link, now)).collect();
         let lw = texts.iter().map(|t| text_size(dc, &t.0).0).max().unwrap_or(0);
         let pw = texts.iter().map(|t| text_size(dc, &t.1).0).max().unwrap_or(0);
         let cw = if show_change {
@@ -947,20 +953,20 @@ fn layout(u: &Ui, avail: Option<i32>) -> Frame {
         let cells = &shown;
         let t = u.theme;
         let mut frame = match avail {
-            None => layout_row(dc, cells, u.dpi, t),
+            None => layout_row(dc, cells, u.dpi, t, u.view.link, crate::source::now_s()),
             Some(avail) => {
                 let rows = u.cfg.dock_rows.max(1) as usize;
                 let mut pick = None;
                 'fit: for k in (1..=cells.len()).rev() {
                     for show_change in [true, false] {
-                        let f = layout_grid(dc, &cells[..k], u.dpi, rows, show_change, t);
+                        let f = layout_grid(dc, &cells[..k], u.dpi, rows, show_change, t, u.view.link, crate::source::now_s());
                         if f.w <= avail {
                             pick = Some(f);
                             break 'fit;
                         }
                     }
                 }
-                pick.unwrap_or_else(|| layout_grid(dc, &cells[..cells.len().min(1)], u.dpi, rows, false, t))
+                pick.unwrap_or_else(|| layout_grid(dc, &cells[..cells.len().min(1)], u.dpi, rows, false, t, u.view.link, crate::source::now_s()))
             }
         };
         SelectObject(dc, old);
@@ -982,7 +988,7 @@ fn draw_strip(u: &Ui, dc: HDC) {
             TextOutW(dc, r.x, r.y, r.text.as_ptr(), r.text.len() as i32);
         }
         let (dx, dy, d) = u.frame.dot;
-        let brush = CreateSolidBrush(theme::link_color(u.theme, u.view.link));
+        let brush = CreateSolidBrush(theme::calm_color(u.theme, u.view.link, u.view.calm(crate::source::now_s())));
         let old_brush = SelectObject(dc, brush);
         let old_pen = SelectObject(dc, GetStockObject(NULL_PEN));
         Ellipse(dc, dx, dy, dx + d, dy + d);
@@ -998,7 +1004,7 @@ fn draw_strip(u: &Ui, dc: HDC) {
 /// symbol without the change column, else the leading symbols), painted as `draw_strip` paints it, in
 /// the theme's background and the default strip font. Off-screen; only the `shots` feature has it.
 #[cfg(feature = "shots")]
-pub(crate) fn strip_still(cells: &[Cell], t: &Theme, dpi: u32, rows: usize, avail: i32) -> (u32, u32, Vec<u8>) {
+pub(crate) fn strip_still(cells: &[Cell], link: Link, now: f64, t: &Theme, dpi: u32, rows: usize, avail: i32) -> (u32, u32, Vec<u8>) {
     let cfg = Config::default();
     let font = make_font(&Config { placement: Some(Placement::TaskbarRight), ..cfg }, dpi);
     let frame = unsafe {
@@ -1008,14 +1014,14 @@ pub(crate) fn strip_still(cells: &[Cell], t: &Theme, dpi: u32, rows: usize, avai
         let mut pick = None;
         'fit: for k in (1..=cells.len()).rev() {
             for show_change in [true, false] {
-                let f = layout_grid(dc, &cells[..k], dpi, rows, show_change, t);
+                let f = layout_grid(dc, &cells[..k], dpi, rows, show_change, t, link, now);
                 if f.w <= avail {
                     pick = Some(f);
                     break 'fit;
                 }
             }
         }
-        let frame = pick.unwrap_or_else(|| layout_grid(dc, &cells[..cells.len().min(1)], dpi, rows, false, t));
+        let frame = pick.unwrap_or_else(|| layout_grid(dc, &cells[..cells.len().min(1)], dpi, rows, false, t, link, now));
         SelectObject(dc, old);
         DeleteDC(dc);
         ReleaseDC(null_mut(), screen);
@@ -1033,7 +1039,7 @@ pub(crate) fn strip_still(cells: &[Cell], t: &Theme, dpi: u32, rows: usize, avai
             TextOutW(dc, r.x, r.y, r.text.as_ptr(), r.text.len() as i32);
         }
         let (dx, dy, d) = frame.dot;
-        let brush = CreateSolidBrush(theme::link_color(t, Link::Live));
+        let brush = CreateSolidBrush(theme::calm_color(t, link, crate::model::calm_of(cells, link, now)));
         let old_brush = SelectObject(dc, brush);
         let old_pen = SelectObject(dc, GetStockObject(NULL_PEN));
         Ellipse(dc, dx, dy, dx + d, dy + d);
@@ -1099,6 +1105,7 @@ fn draw_panel(u: &mut Ui, dc: HDC, w: i32, h: i32) {
         grad: &u.grad,
         dpi: pdpi(u),
         now,
+        offset_at: &local_offset_at,
         btn_hover: u.hover,
         pick_hover: u.pick_hover,
         chart_hover: u.chart_hover,
@@ -1363,21 +1370,71 @@ fn tooltip(view: &Board, pending: Option<&str>) -> String {
 /// [`tooltip`] with one more line while alerts cannot be checked, just under the title so the tray's
 /// length limit cuts prices rather than the warning.
 fn tooltip_with(view: &Board, pending: Option<&str>, blind: Option<&str>) -> String {
+    tooltip_at(view, pending, blind, crate::source::now_s())
+}
+
+/// The tray tooltip holds this many UTF-16 units; the shell cuts the rest.
+const TIP_UNITS: usize = 127;
+
+/// [`tooltip_with`] at a given clock (UTC seconds), so a test can say what time it is.
+fn tooltip_at(view: &Board, pending: Option<&str>, blind: Option<&str>, now: f64) -> String {
+    tooltip_in(view, pending, blind, now, &local_offset_at)
+}
+
+/// [`tooltip_at`] with the zone given (`offset_at(t)` is seconds east of UTC at `t`). A row of a closed
+/// market says `closed since Fri 17:00` when the whole tooltip still fits the tray's limit with it,
+/// else `closed`; a calm row that is not yet closed shows its source and age (`CNBC 3m`). The tray
+/// holds [`TIP_UNITS`] units: when the short form is already over that, the closed rows drop their
+/// suffix (the title counts them) so the shell cuts fewer rows.
+fn tooltip_in(view: &Board, pending: Option<&str>, blind: Option<&str>, now: f64, offset_at: &dyn Fn(f64) -> i32) -> String {
     let mut s = String::new();
     if let Some(title) = pending {
         s.push_str(&format!("Alert: {title}\n"));
     }
-    s.push_str(&format!("{} - {}", config::profile().title(), theme::link_name(view.link)));
+    s.push_str(&format!("{} - {}", config::profile().title(), theme::calm_name(view.link, view.calm(now))));
     if let Some(line) = blind {
         s.push('\n');
         s.push_str(line);
     }
-    for c in &view.cells {
+    // Each row is its short form and, for a closed market, a longer one with the since-time.
+    let mut rows: Vec<(String, Option<String>)> = Vec::new();
+    for (i, c) in view.cells.iter().enumerate() {
         if let Some(q) = &c.quote {
-            s.push_str(&format!("\n{} {}", c.label, fmt_price(q.price, c.digits)));
-            if !q.source.is_empty() { s.push_str(&format!(" ({}; age unknown)", q.source)); }
-            else if crate::model::market_closed(c, view.link, crate::source::now_s()) { s.push_str(" (market closed)"); }
-            else if c.stale { s.push_str(" (stale)"); }
+            let mut row = format!("\n{} {}", c.label, fmt_price(q.price, c.digits));
+            let mut long = None;
+            if !q.source.is_empty() { row.push_str(&format!(" ({}; age unknown)", q.source)); }
+            else if crate::model::reads_closed(c, view.link, now) {
+                row.push_str(" (closed)");
+                long = crate::model::closed_since_shown(q, now, view.last_bar_at(i))
+                    .map(|t| format!("\n{} {} (closed since {})", c.label, fmt_price(q.price, c.digits), crate::model::fmt_since(offset_at, now, t)));
+            }
+            else if crate::model::calm_stale(c, view.link, now) {
+                let src = if q.realtime { "CNBC" } else { "CNBC delayed" };
+                row.push_str(&format!(" ({src} {})", crate::panel::fmt_age(now - q.ts.unwrap_or(now))));
+            }
+            else if c.stale { row.push_str(" (stale)"); }
+            rows.push((row, long));
+        }
+    }
+    let units = |t: &str| t.encode_utf16().count();
+    // A board whose short form is already over the limit drops the ` (closed)` suffix of its closed rows:
+    // the title counts them, and the shell would otherwise cut the last rows.
+    if units(&s) + rows.iter().map(|(r, _)| units(r)).sum::<usize>() > TIP_UNITS {
+        for (row, long) in rows.iter_mut() {
+            if long.is_some() {
+                *row = row.replace(" (closed)", "");
+                *long = None;
+            }
+        }
+    }
+    let mut total = units(&s) + rows.iter().map(|(r, _)| units(r)).sum::<usize>();
+    for (row, long) in rows {
+        match long {
+            Some(l) if total - units(&row) + units(&l) <= TIP_UNITS => {
+                total = total - units(&row) + units(&l);
+                s.push_str(&l);
+            }
+            _ => s.push_str(&row),
         }
     }
     s
@@ -1396,6 +1453,121 @@ mod tooltip_tests {
         assert_eq!(lit.lines().next(), Some("Alert: XAU above 4,100.00"));
         assert_eq!(lit.strip_prefix("Alert: XAU above 4,100.00\n"), Some(plain.as_str()));
     }
+
+    fn cell(label: &str, ts: Option<f64>, stale: bool) -> Cell {
+        let quote = crate::model::Quote { symbol: label.into(), price: 10.0, ts, realtime: true, ..Default::default() };
+        Cell { label: label.into(), digits: 0, quote: Some(quote), stale }
+    }
+
+    #[test]
+    fn every_surface_agrees_on_closed_at_every_age() {
+        use crate::alerts::overview;
+        use crate::config::{Alert, Config, Row};
+        let now = 1_000_000.0;
+        let est = |_: f64| -5 * 3600;
+        let rows = vec![Row { label: "XAU".into(), symbol: "XAU=".into(), digits: 2, name: String::new(), strip: true }];
+        let alert = Alert { label: "XAU".into(), above: Some(4200.0), ..Alert::default() };
+        let cfg = Config { alerts: vec![alert], rows, stale_after_s: 90.0, ..Config::default() };
+        // The stale limit is 90 s: a fresh card at 30 s, a calm age with no `closed` from 91 s to 899 s,
+        // and `closed` on every surface from 901 s.
+        for (age, closed) in [(30.0, false), (91.0, false), (300.0, false), (899.0, false), (901.0, true)] {
+            let c = cell("XAU", Some(now - age), age > 90.0);
+            let mut b = Board::new(&[]);
+            b.link = Link::Partial;
+            b.cells = vec![c.clone()];
+            let said = |text: &str| text.contains("closed");
+            let header = theme::calm_name(b.link, b.calm(now));
+            let tip = tooltip_at(&b, None, None, now);
+            let row = tip.lines().find(|l| l.starts_with("XAU")).unwrap().to_string();
+            let spoken = crate::spoken::spoken_line(&c, b.link, now);
+            let summary = crate::spoken::summary_line(&b.cells, b.link, now);
+            let over = overview(&cfg, &b, now)[0].text.clone();
+            let probe = crate::source::probe_state(&c, now);
+            let tag = crate::model::closed_card_words(&c, b.link, now, None, &est);
+            let ctx = format!("age {age}");
+            assert_eq!(said(&header), closed, "header {header}, {ctx}");
+            assert_eq!(said(&row), closed, "tooltip row {row}, {ctx}");
+            assert_eq!(said(&spoken), closed, "spoken {spoken}, {ctx}");
+            assert_eq!(said(&summary), closed, "summary {summary}, {ctx}");
+            assert_eq!(said(&over), closed, "overview {over}, {ctx}");
+            assert_eq!(probe == " CLOSED", closed, "probe {probe}, {ctx}");
+            assert_eq!(tag.as_ref().is_some_and(|w| w.last().map(String::as_str) == Some("closed")), closed, "card tag {tag:?}, {ctx}");
+            if age > 90.0 {
+                assert!(!tip.contains("stale") && !spoken.contains("stale") && !summary.contains("stale"), "{ctx}");
+                assert!(!probe.contains("STALE"), "{ctx}");
+                assert_ne!(header, theme::link_name(b.link), "the header stays calm, {ctx}");
+            }
+            if (91.0..=899.0).contains(&age) {
+                assert!(row.contains(&format!("CNBC {}", crate::panel::fmt_age(age))), "the calm age with its source: {row}, {ctx}");
+                assert!(header.contains("quiet"), "{header}, {ctx}");
+                assert_eq!(probe, " QUIET", "{ctx}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_board_with_closed_and_quiet_rows_gives_the_same_counts_everywhere() {
+        let now = 1_000_000.0;
+        let mut b = Board::new(&[]);
+        b.link = Link::Partial;
+        b.cells = vec![cell("S&P", Some(now - 5.0 * 3600.0), true), cell("XAU", Some(now - 300.0), true), cell("BTC", Some(now - 2.0), false)];
+        let header = theme::calm_name(b.link, b.calm(now));
+        let tip = tooltip_at(&b, None, None, now);
+        let summary = crate::spoken::summary_line(&b.cells, b.link, now);
+        assert_eq!(header, "CNBC live, 1 closed, 1 quiet");
+        assert!(tip.contains(&header), "{tip}");
+        assert!(summary.contains("1 closed, 1 quiet"), "{summary}");
+    }
+
+    #[test]
+    fn a_long_closed_board_drops_the_closed_suffix_to_fit_the_tray() {
+        let now = 1_000_000.0;
+        let mut b = Board::new(&[]);
+        b.link = Link::Partial;
+        b.cells = (0..6).map(|i| cell(&format!("MARKET{i}"), Some(now - 5.0 * 3600.0), true)).collect();
+        let tip = tooltip_in(&b, None, None, now, &|_| 0);
+        assert!(tip.encode_utf16().count() <= TIP_UNITS, "{tip}");
+        assert!(tip.contains("MARKET5 10"), "the last row is kept: {tip}");
+        assert!(tip.contains("markets closed"), "the title says it: {tip}");
+    }
+
+    #[test]
+    fn the_tooltip_adds_the_since_time_when_it_fits_the_tray() {
+        let now = crate::probe::parse_time("2026-11-14T17:18:36.000+0000").unwrap();
+        let fri = crate::probe::parse_time("2026-11-13T17:00:00.000-0500").unwrap();
+        let est = |_: f64| -5 * 3600;
+        let mut b = Board::new(&[]);
+        b.link = Link::Partial;
+        b.cells = vec![cell("S&P", Some(fri), true)];
+        let tip = tooltip_in(&b, None, None, now, &est);
+        assert!(tip.contains("S&P 10 (closed since Fri 17:00)"), "{tip}");
+        // Three long rows would pass the tray's limit, so the last one keeps the short word.
+        b.cells = (0..3).map(|i| cell(&format!("MARKET{i}"), Some(fri), true)).collect();
+        let tip = tooltip_in(&b, None, None, now, &est);
+        assert!(tip.encode_utf16().count() <= TIP_UNITS, "{tip}");
+        assert!(tip.contains("(closed)") && tip.contains("(closed since"), "the first rows that fit get the time: {tip}");
+        // A calm row that is not yet closed has its source and age and no since-time.
+        b.cells = vec![cell("XAU", Some(now - 300.0), true)];
+        let tip = tooltip_in(&b, None, None, now, &est);
+        assert!(tip.contains("XAU 10 (CNBC 5m)"), "{tip}");
+    }
+
+    #[test]
+    fn a_closed_market_reads_closed_in_the_tooltip_and_a_fault_reads_stale() {
+        let now = 1_000_000.0;
+        let mut b = Board::new(&[]);
+        b.link = Link::Partial;
+        b.cells = vec![cell("S&P", Some(now - 20.0 * 3600.0), true), cell("BTC", Some(now - 2.0), false)];
+        let tip = tooltip_at(&b, None, None, now);
+        assert!(tip.contains("CNBC live, 1 closed"), "{tip}");
+        assert!(tip.contains("S&P 10 (closed)") && !tip.contains("stale"), "{tip}");
+        b.cells.push(cell("NAS", None, true));
+        let tip = tooltip_at(&b, None, None, now);
+        assert!(tip.contains("NAS 10 (stale)") && tip.contains("S&P 10 (closed)"), "{tip}");
+        assert!(!tip.contains("live, 1 closed"), "a fault keeps the link's own words: {tip}");
+        b.link = Link::Down;
+        assert!(tooltip_at(&b, None, None, now).contains("S&P 10 (stale)"), "a dead feed is not a closed market");
+    }
 }
 
 /// The tray tooltip as the window shows it now: a pending alert, and the gap line while one lasts.
@@ -1410,11 +1582,12 @@ fn tooltip_for(u: &Ui) -> String {
 /// Rebuild the tray icon when the link colour or the alert marker differs from what it was drawn
 /// for. True when it was rebuilt (the caller then pushes it to the tray).
 fn sync_icon(u: &mut Ui) -> bool {
-    let key = (u.view.link, u.alert_pending.is_some());
+    // The key drops the closed count: the icon colour is the same for any count.
+    let key = (u.view.link, u.view.calm(crate::source::now_s()).look(), u.alert_pending.is_some());
     if u.icon_link == Some(key) {
         return false;
     }
-    let fresh = make_icon(theme::link_color(u.theme, key.0), key.1);
+    let fresh = make_icon(theme::calm_color(u.theme, key.0, key.1), key.2);
     if !u.icon.is_null() {
         unsafe { DestroyIcon(u.icon) };
     }
@@ -1774,7 +1947,7 @@ fn on_feed(hwnd: HWND) {
         // could not be checked (`watch`), and what a mute or quiet hours swallowed (`hush`).
         let mut notices = FeedNotices::default();
         if u.profile.ultra {
-            let (armed, fresh) = alerts::checkable(&u.cfg, &u.view);
+            let (armed, fresh) = alerts::checkable(&u.cfg, &u.view, now);
             let interval = if u.view.governed_s > 0.0 { u.view.governed_s } else { u.cfg.poll_s };
             match u.watch.step(now, fresh, armed, watch::threshold(interval)) {
                 Some(watch::Event::Back { from, to, jump }) => {
@@ -2290,7 +2463,7 @@ fn menu(hwnd: HWND, at: Option<(i32, i32)>) {
 fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
     clear_pending(hwnd);
     let Some((visible, top, status, open, ultra, picked)) = with_ui(|u| {
-        let note = if u.view.note.is_empty() { theme::link_name(u.view.link).to_string() } else { u.view.note.clone() };
+        let note = if u.view.note.is_empty() { theme::calm_name(u.view.link, u.view.calm(crate::source::now_s())) } else { u.view.note.clone() };
         (u.cfg.strip_visible, u.cfg.topmost, note, u.mode != Mode::Strip, u.profile.ultra, u.pick_open)
     }) else {
         return;
@@ -3946,7 +4119,7 @@ fn on_key(hwnd: HWND, vk: u32) -> bool {
 fn sync_title(hwnd: HWND) {
     let next = with_ui(|u| {
         let locked = selected_row(u).and_then(|i| u.view.cells.get(i));
-        let name = spoken::window_name(u.profile.ultra, u.profile.title(), locked, &u.view.cells)?;
+        let name = spoken::window_name(u.profile.ultra, u.profile.title(), locked, &u.view.cells, u.view.link, crate::source::now_s())?;
         (name != u.title_set).then(|| {
             u.title_set = name.clone();
             name
@@ -4055,12 +4228,13 @@ fn apply_theme(hwnd: HWND) {
         u.font = make_font(&u.cfg, u.dpi);
         u.grad = Gradient::new(t);
         u.fonts = u.fonts.take().map(|_| panel::Fonts::new(face, pdpi(u), t.is_pixel()));
-        let fresh = make_icon(theme::link_color(t, u.view.link), u.alert_pending.is_some());
+        let calm = u.view.calm(crate::source::now_s());
+        let fresh = make_icon(theme::calm_color(t, u.view.link, calm), u.alert_pending.is_some());
         if !u.icon.is_null() {
             unsafe { DestroyIcon(u.icon) };
         }
         u.icon = fresh;
-        u.icon_link = Some((u.view.link, u.alert_pending.is_some()));
+        u.icon_link = Some((u.view.link, calm.look(), u.alert_pending.is_some()));
         Some((u.icon, tooltip_for(u)))
     })
     .flatten()
@@ -4899,7 +5073,7 @@ pub fn run(cfg: Config, board: Arc<Mutex<Board>>) {
             face: face_of(theme, &cfg, profile.ultra),
             grad: Gradient::new(theme),
             icon: make_icon(theme::link_color(theme, Link::Down), false),
-            icon_link: Some((Link::Down, false)),
+            icon_link: Some((Link::Down, Calm::No, false)),
             dpi,
             cfg: cfg.clone(),
             board: board.clone(),
