@@ -1028,8 +1028,8 @@ pub fn collect_bodies(rows: &[Row], day_rows: usize, current: &str) -> crate::pr
 /// The word the probe prints after a quote: ` CLOSED` for a market that has stopped, ` STALE` for a
 /// price that is old for any other reason, nothing for a fresh one. The probe only reaches here
 /// when the service answered, so the link counts as live.
-fn probe_state(c: &crate::model::Cell, now: f64) -> &'static str {
-    if crate::model::market_closed(c, Link::Live, now) {
+pub(crate) fn probe_state(c: &crate::model::Cell, now: f64) -> &'static str {
+    if crate::model::reads_closed(c, Link::Live, now) {
         " CLOSED"
     } else if c.stale {
         " STALE"

@@ -220,8 +220,11 @@ pub fn is_stale(q: &Quote, now: f64, stale_after: f64, delayed_grace: f64) -> bo
 /// delay of the index futures. A delayed quote is stale only after the stale limit plus the delayed
 /// grace (990 s with the defaults), so it reads closed from that age on, not from 15 minutes. A
 /// realtime quote is stale after 90 s and reads closed 810 s later; the cell is a calm stale cell
-/// ([`calm_stale`]) in between. The poll governor does not depend on this age: it polls a closed
-/// board at its slowest step (60 s), which is always shorter than the normal alert gap.
+/// ([`calm_stale`]) in between, and every surface already says `closed` for it ([`reads_closed`]).
+/// The poll governor counts the board as closed when every row satisfies [`market_closed`], so it
+/// uses this age. A board with a 24-hour symbol such as BTC never counts as closed. A board that
+/// does count polls at the slowest step of its session (60 s, or 300 s when a session is locked),
+/// and that step is the longest wait before the first trade after a reopening shows.
 pub const CLOSED_AFTER_S: f64 = 900.0;
 
 /// Has CNBC re-stamped a price that did not move? True for a CNBC quote whose price has been the
@@ -231,7 +234,7 @@ pub const CLOSED_AFTER_S: f64 = 900.0;
 ///
 /// `moved_at` starts when the app first sees a price, so for the first [`CLOSED_AFTER_S`] after a
 /// start a re-stamped price has no history of its own. The alert check closes that window with the
-/// 1D bars (`alerts::restamp_at_start`): a quote time well after the end of the last kept bar, on a
+/// 1D bars (`Board::restamped_over_bars`): a quote time well after the end of the last kept bar, on a
 /// price equal to that bar's close, is a re-stamp.
 ///
 /// The rule also holds for a symbol whose market is open: a thinly traded stock or future that
@@ -266,11 +269,18 @@ pub fn calm_stale(cell: &Cell, link: Link, now: f64) -> bool {
     link != Link::Down && cell.stale && cell.quote.as_ref().is_some_and(|q| q.source.is_empty() && time_is_plausible(q, now))
 }
 
+/// The one test every surface uses before it writes the word `closed`: the panel header, the tooltip
+/// title and rows, the spoken line and summary, the alert overview, the card tag and the probe. It is
+/// [`calm_stale`], so the word appears from the moment a CNBC quote goes stale. A surface that also
+/// has a since-time ([`closed_since_shown`]) adds it once the quote is [`CLOSED_AFTER_S`] old.
+pub fn reads_closed(cell: &Cell, link: Link, now: f64) -> bool {
+    calm_stale(cell, link, now)
+}
+
 /// Seconds east of UTC on the US Eastern clock at the UTC instant `t`: -4 h from the second Sunday
 /// of March (07:00 UTC) to the first Sunday of November (06:00 UTC), else -5 h.
 fn eastern_offset_s(t: f64) -> f64 {
     let (y, _, _) = crate::chartview::civil_from_days((t / 86_400.0).floor() as i64);
-    let y = y as i64;
     // The n-th Sunday of a month: the first Sunday is on day 1 + (7 - weekday(day 1)) % 7, with Sunday 0.
     let sunday = |m: u32, n: i64| {
         let first = crate::chartview::days_from_civil(y, m, 1);
@@ -311,8 +321,9 @@ pub fn closed_since_shown(q: &Quote, now: f64, last_bar: Option<f64>) -> Option<
 }
 
 /// A quote time this many seconds after the end of the last kept 1D bar, on the price of that bar's
-/// close, is a re-stamp ([`Board::restamped_over_bars`]).
-pub const RESTAMP_AFTER_BAR_S: f64 = 600.0;
+/// close, is a re-stamp ([`Board::restamped_over_bars`]). The 1D chart refreshes every 600 s, so the
+/// margin is twice that: a live trade that the last bar has not caught up with yet is not a re-stamp.
+pub const RESTAMP_AFTER_BAR_S: f64 = 1_200.0;
 
 /// A weekday quote time more than this many seconds (4 hours) after the end of the last kept 1D bar is not
 /// capped to that bar: the chart is behind and the bar says nothing about the stop.
@@ -433,6 +444,18 @@ pub fn fmt_since(offset_at: &dyn Fn(f64) -> i32, now: f64, at: f64) -> String {
 /// The first of `options` (longest first) that `fits`, else the last one.
 pub fn first_fitting(options: &[String], fits: &dyn Fn(&str) -> bool) -> String {
     options.iter().find(|o| fits(o)).or(options.last()).cloned().unwrap_or_default()
+}
+
+/// The words a card's tag offers for a closed market, longest first, or `None` when the card does not
+/// read closed ([`reads_closed`]). The 90 to 900 s window after a realtime quote goes stale has no
+/// since-time yet, so it offers plain `closed`.
+pub fn closed_card_words(cell: &Cell, link: Link, now: f64, last_bar: Option<f64>, offset_at: &dyn Fn(f64) -> i32) -> Option<Vec<String>> {
+    if !reads_closed(cell, link, now) {
+        return None;
+    }
+    let q = cell.quote.as_ref()?;
+    let src = if q.realtime { "CNBC" } else { "CNBC delayed" };
+    Some(closed_words(src, closed_since_shown(q, now, last_bar), offset_at, now))
 }
 
 /// The words a closed card carries, longest first: `closed since Fri 17:40` with the source before

@@ -7,7 +7,7 @@
 //! the window is still recognisable. Classic never gets a price in its window name, so `window_name`
 //! answers `None` for it and the title stays as it always was.
 
-use crate::model::{fmt_price, market_closed, Cell, Link};
+use crate::model::{fmt_price, reads_closed, Cell, Link};
 
 /// A change this small reads as no move: `0.00` is how the card shows it.
 const FLAT: f64 = 0.005;
@@ -32,7 +32,7 @@ pub fn spoken_line(cell: &Cell, link: Link, now: f64) -> String {
         Some(p) => out.push_str(&format!(", down {} percent", percent(p))),
         None => out.push_str(", no day change"),
     }
-    if market_closed(cell, link, now) {
+    if reads_closed(cell, link, now) {
         out.push_str(", closed");
     } else if cell.stale {
         out.push_str(", stale");
@@ -49,8 +49,8 @@ pub fn summary_line(cells: &[Cell], link: Link, now: f64) -> String {
     let change = |c: &Cell| c.quote.as_ref().and_then(|q| q.change_pct).filter(|p| p.is_finite());
     let up = cells.iter().filter(|c| change(c).is_some_and(|p| p >= FLAT)).count();
     let down = cells.iter().filter(|c| change(c).is_some_and(|p| p <= -FLAT)).count();
-    let closed = cells.iter().filter(|c| market_closed(c, link, now)).count();
-    let stale = cells.iter().filter(|c| c.stale && c.quote.is_some() && !market_closed(c, link, now)).count();
+    let closed = cells.iter().filter(|c| reads_closed(c, link, now)).count();
+    let stale = cells.iter().filter(|c| c.stale && c.quote.is_some() && !reads_closed(c, link, now)).count();
     let mut out = format!("{} symbol{}", cells.len(), if cells.len() == 1 { "" } else { "s" });
     for (n, word) in [(up, "up"), (down, "down"), (closed, "closed"), (stale, "stale")] {
         if n > 0 {
