@@ -1052,7 +1052,7 @@ pub fn write_settings(dir: &Path) -> Result<usize, String> {
         let l = settings::layout(eff, w, h, sections.len(), &controls, 0);
         let fonts = Fonts::new(theme::font_of(c.theme, None), eff, c.theme.is_pixel());
         let focus = controls.iter().position(|k| k.focusable()).and_then(|ci| settings::entry_opt(&controls[ci]).map(|oi| Hit::Opt(ci, oi)));
-        let p = Paint { theme: c.theme, fonts: &fonts, title: "Settings", sections: &sections, cur, controls: &controls, layout: &l, focus, hover: None };
+        let p = Paint { theme: c.theme, fonts: &fonts, title: "Settings", sections: &sections, cur, controls: &controls, layout: &l, focus, hover: None, bar: Default::default() };
         let (pw, ph, px) = capture_with(w, h, |dc| settings::draw(dc, w, h, &p));
         write_png(&dir.join(c.file), pw, ph, &px)?;
         n += 1;
