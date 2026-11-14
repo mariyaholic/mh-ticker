@@ -28,6 +28,12 @@ pub const VK_DELETE: u32 = 0x2E;
 pub const VK_C: u32 = 0x43;
 pub const VK_S: u32 = 0x53;
 pub const VK_Z: u32 = 0x5A;
+// W4 M1: the chart and menu keys.
+pub const VK_A: u32 = 0x41;
+pub const VK_R: u32 = 0x52;
+pub const VK_APPS: u32 = 0x5D;
+pub const VK_F1: u32 = 0x70;
+pub const VK_F10: u32 = 0x79;
 
 /// A direction on the card grid.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,6 +67,20 @@ pub enum Action {
     Shift(i32),
     /// Put the held undo snapshot back (Ultra; Classic's undo is the menu line).
     Undo,
+    /// Move the chart's crosshair one candle: -1 left (older), +1 right (newer). Chart open and a lock.
+    Crosshair(i32),
+    /// The next range tab, wrapping from 5Y to 1D. Chart open.
+    NextRange,
+    /// Flip the chart's clock between local and UTC. Chart open.
+    FlipZone,
+    /// Ask for an alert at the crosshair's price (through the price prompt). Chart open and a lock.
+    AlertAtCrosshair,
+    /// The card menu for the locked card (the menu key with a lock).
+    CardMenu,
+    /// The main menu (F10, and the menu key with no lock).
+    MainMenu,
+    /// List the keys.
+    Help,
 }
 
 /// What `map` needs to know. Plain data, so the table is testable without a window.
@@ -133,8 +153,102 @@ pub fn map(vk: u32, ctrl: bool, state: State) -> Option<Action> {
         VK_DELETE if state.has_lock => Some(Action::Remove),
         VK_C => Some(Action::SetChart(!state.chart_open)),
         VK_S => Some(Action::SetPicker(!state.picker_open)),
+        // W4 M1. The chart keys answer only while the pane is open (and, for the two that act on a
+        // candle's price, only with a card locked), so with the chart closed they are `None` and the
+        // key goes back to the system as it always did.
+        VK_R if state.chart_open => Some(Action::NextRange),
+        VK_Z if state.chart_open => Some(Action::FlipZone),
+        VK_A if state.chart_open && state.has_lock => Some(Action::AlertAtCrosshair),
+        VK_APPS => Some(if state.has_lock { Action::CardMenu } else { Action::MainMenu }),
+        VK_F10 => Some(Action::MainMenu),
+        VK_F1 => Some(Action::Help),
         _ => None,
     }
+}
+
+/// `map` with the Shift key known: Shift+Left and Shift+Right move the chart's crosshair one candle
+/// (`Crosshair(-1)`, `Crosshair(1)`) while the pane is open and a card is locked. Everything else,
+/// including a plain arrow, is `map` unchanged, so the arrows keep their 1.8 meaning. Shift with any
+/// other key is that key's own answer.
+pub fn map_shifted(vk: u32, ctrl: bool, shift: bool, state: State) -> Option<Action> {
+    if shift && !ctrl && state.ultra && state.chart_open && state.has_lock {
+        match vk {
+            VK_LEFT => return Some(Action::Crosshair(-1)),
+            VK_RIGHT => return Some(Action::Crosshair(1)),
+            _ => {}
+        }
+    }
+    map(vk, ctrl, state)
+}
+
+/// The keys W4 added, which `is_bound` (P5's list) does not name and `ui.rs` routes to `map` too. The menu
+/// key is not one: Windows turns its key-up into the context-menu message, and `ui.rs` answers `map` there.
+pub fn is_reach_key(vk: u32) -> bool {
+    matches!(vk, VK_A | VK_R | VK_F1 | VK_F10)
+}
+
+/// Where the crosshair goes when a key moves it: one candle from `current` among `bars` drawn, never
+/// past either end. With no crosshair yet it starts from the newest candle (the right edge), so the
+/// first Shift+Left lands one candle in from it and the first Shift+Right on it. `None` with no
+/// candles. The result is a layout index, the same number a pointer over that candle gives
+/// (`Layout::index_at(Layout::x_of(i)) == i`).
+pub fn step_candle(current: Option<usize>, bars: usize, delta: i32) -> Option<usize> {
+    if bars == 0 {
+        return None;
+    }
+    let last = bars - 1;
+    let from = current.map_or(last, |c| c.min(last));
+    Some(if delta < 0 { from.saturating_sub(delta.unsigned_abs() as usize) } else { (from + delta as usize).min(last) })
+}
+
+/// One line of the key list: the keys as they are typed, what they do, and the action they map to
+/// (`None` for the keys `ui.rs` owns outside `map`: Esc, paging, `/`).
+pub struct Help {
+    pub keys: &'static str,
+    pub text: &'static str,
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub action: Option<Action>,
+}
+
+/// The key list, in reading order. `help_for` and F1's text are both read from it, so a key that is
+/// not here has no line, and a test fails for any action `map` can answer that has none.
+pub const HELP: [Help; 22] = [
+    Help { keys: "Arrows, nothing locked", text: "lock the first card", action: Some(Action::LockFirst) },
+    Help { keys: "Arrows", text: "move the lock", action: Some(Action::Move(Dir::Right)) },
+    Help { keys: "Home, End", text: "lock the first or the last card", action: None },
+    Help { keys: "Enter", text: "open the locked card on CNBC", action: Some(Action::OpenLocked) },
+    Help { keys: "C", text: "open or close the chart", action: Some(Action::SetChart(true)) },
+    Help { keys: "S", text: "open or close the symbol picker", action: Some(Action::SetPicker(true)) },
+    Help { keys: "Ctrl+C", text: "copy the locked card", action: Some(Action::CopyLocked) },
+    Help { keys: "Ctrl+C, nothing locked", text: "copy all prices", action: Some(Action::CopyAll) },
+    Help { keys: "Delete", text: "take the locked card off the strip", action: Some(Action::Remove) },
+    Help { keys: "Ctrl+Left, Ctrl+Right", text: "move the locked card in the order", action: Some(Action::Shift(1)) },
+    Help { keys: "Ctrl+Z", text: "undo the last change", action: Some(Action::Undo) },
+    Help { keys: "/", text: "find a symbol", action: None },
+    Help { keys: "Shift+Left, Shift+Right", text: "move the chart crosshair one candle", action: Some(Action::Crosshair(1)) },
+    Help { keys: "R", text: "next range on the chart", action: Some(Action::NextRange) },
+    Help { keys: "Z", text: "chart clock, local or UTC", action: Some(Action::FlipZone) },
+    Help { keys: "A", text: "alert at the crosshair price", action: Some(Action::AlertAtCrosshair) },
+    Help { keys: "Menu key", text: "menu for the locked card", action: Some(Action::CardMenu) },
+    Help { keys: "F10", text: "the main menu", action: Some(Action::MainMenu) },
+    Help { keys: "F1", text: "this list", action: Some(Action::Help) },
+    Help { keys: "Esc", text: "back to the taskbar", action: None },
+    Help { keys: "Page Up, Page Down", text: "scroll the panel", action: None },
+    Help { keys: "Mouse move", text: "takes the crosshair back", action: None },
+];
+
+/// Whether `action` has a line in the key list (the same variant; payloads do not matter).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn help_for(action: Action) -> Option<&'static Help> {
+    HELP.iter().find(|h| h.action.is_some_and(|a| std::mem::discriminant(&a) == std::mem::discriminant(&action)))
+}
+
+/// F1's text: one `keys: what` line per entry (Ultra only: Classic honours Ctrl+C and nothing else).
+pub fn help_text() -> String {
+    HELP.iter()
+        .map(|h| format!("{}: {}", h.keys, h.text))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// What Home and End mean (W3 J6). On Ultra with cards on the panel they lock the first (`false`) or the
@@ -435,5 +549,142 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn chart(has_lock: bool, chart_open: bool) -> State {
+        State { ultra: true, has_lock, picker_open: false, chart_open }
+    }
+
+    #[test]
+    fn the_chart_keys_answer_only_with_the_chart_open() {
+        for has_lock in [false, true] {
+            assert_eq!(map(VK_R, false, chart(has_lock, true)), Some(Action::NextRange));
+            assert_eq!(map(VK_Z, false, chart(has_lock, true)), Some(Action::FlipZone));
+            assert_eq!(map(VK_R, false, chart(has_lock, false)), None, "R with the chart closed");
+            assert_eq!(map(VK_Z, false, chart(has_lock, false)), None, "plain Z with the chart closed");
+            // Ctrl+Z stays undo, open or closed.
+            assert_eq!(map(VK_Z, true, chart(has_lock, true)), Some(Action::Undo));
+            assert_eq!(map(VK_Z, true, chart(has_lock, false)), Some(Action::Undo));
+            assert_eq!(map(VK_R, true, chart(has_lock, true)), None, "Ctrl+R");
+        }
+    }
+
+    #[test]
+    fn a_acts_on_the_crosshair_so_it_needs_the_chart_and_a_lock() {
+        assert_eq!(map(VK_A, false, chart(true, true)), Some(Action::AlertAtCrosshair));
+        assert_eq!(map(VK_A, false, chart(false, true)), None, "nothing locked");
+        assert_eq!(map(VK_A, false, chart(true, false)), None, "chart closed");
+        assert_eq!(map(VK_A, false, chart(false, false)), None);
+        assert_eq!(map(VK_A, true, chart(true, true)), None, "Ctrl+A");
+    }
+
+    #[test]
+    fn the_menu_key_opens_the_card_menu_with_a_lock_and_the_main_menu_without_one() {
+        for chart_open in [false, true] {
+            assert_eq!(map(VK_APPS, false, chart(true, chart_open)), Some(Action::CardMenu));
+            assert_eq!(map(VK_APPS, false, chart(false, chart_open)), Some(Action::MainMenu));
+            assert_eq!(map(VK_F10, false, chart(true, chart_open)), Some(Action::MainMenu));
+            assert_eq!(map(VK_F10, false, chart(false, chart_open)), Some(Action::MainMenu));
+            assert_eq!(map(VK_F1, false, chart(true, chart_open)), Some(Action::Help));
+            assert_eq!(map(VK_F1, false, chart(false, chart_open)), Some(Action::Help));
+        }
+    }
+
+    #[test]
+    fn classic_keeps_1_8s_keys_whatever_the_chart_state() {
+        for has_lock in [false, true] {
+            for chart_open in [false, true] {
+                let s = State { ultra: false, has_lock, picker_open: false, chart_open };
+                for vk in [VK_R, VK_Z, VK_A, VK_APPS, VK_F1, VK_F10, VK_LEFT, VK_RIGHT] {
+                    for shift in [false, true] {
+                        assert_eq!(map_shifted(vk, false, shift, s), None, "vk {vk:#x} shift {shift}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shift_arrows_move_the_crosshair_and_plain_arrows_keep_their_1_8_meaning() {
+        assert_eq!(map_shifted(VK_LEFT, false, true, chart(true, true)), Some(Action::Crosshair(-1)));
+        assert_eq!(map_shifted(VK_RIGHT, false, true, chart(true, true)), Some(Action::Crosshair(1)));
+        // Without the chart or without a lock, Shift+arrow is the plain arrow's answer.
+        for (has_lock, chart_open) in [(true, false), (false, true), (false, false)] {
+            let s = chart(has_lock, chart_open);
+            assert_eq!(map_shifted(VK_LEFT, false, true, s), map(VK_LEFT, false, s));
+        }
+        for dir_key in [VK_LEFT, VK_RIGHT, VK_UP, VK_DOWN] {
+            for s in [chart(true, true), chart(true, false), chart(false, true), chart(false, false)] {
+                assert_eq!(map_shifted(dir_key, false, false, s), map(dir_key, false, s), "plain {dir_key:#x}");
+            }
+        }
+        assert_eq!(map_shifted(VK_UP, false, true, chart(true, true)), map(VK_UP, false, chart(true, true)));
+        // Ctrl+Shift+arrow is the Ctrl arrow.
+        assert_eq!(map_shifted(VK_LEFT, true, true, chart(true, true)), Some(Action::Shift(-1)));
+        // Shift with another key changes nothing.
+        assert_eq!(map_shifted(VK_R, false, true, chart(true, true)), Some(Action::NextRange));
+    }
+
+    #[test]
+    fn the_new_keys_are_named_by_is_reach_key_and_p5s_list_is_untouched() {
+        for vk in [VK_A, VK_R, VK_F1, VK_F10] {
+            assert!(is_reach_key(vk) && !is_bound(vk), "{vk:#x}");
+        }
+        assert!(!is_reach_key(VK_APPS), "the menu key is answered on the context-menu message");
+        assert!(!is_reach_key(VK_Z) && !is_reach_key(VK_LEFT) && !is_reach_key(VK_ESCAPE));
+    }
+
+    #[test]
+    fn step_candle_starts_at_the_newest_and_stops_at_both_ends() {
+        assert_eq!(step_candle(None, 0, 1), None);
+        assert_eq!(step_candle(Some(3), 0, -1), None);
+        assert_eq!(step_candle(None, 10, 1), Some(9), "first Right: the newest");
+        assert_eq!(step_candle(None, 10, -1), Some(8), "first Left: one in from the newest");
+        assert_eq!(step_candle(Some(0), 10, -1), Some(0));
+        assert_eq!(step_candle(Some(9), 10, 1), Some(9));
+        assert_eq!(step_candle(Some(4), 10, -1), Some(3));
+        assert_eq!(step_candle(Some(4), 10, 1), Some(5));
+        assert_eq!(step_candle(Some(40), 10, -1), Some(8), "a stale index is brought back first");
+        assert_eq!(step_candle(None, 1, -1), Some(0));
+        for bars in 1..40usize {
+            for from in 0..bars + 3 {
+                for d in [-1, 1] {
+                    assert!(step_candle(Some(from), bars, d).unwrap() < bars);
+                }
+            }
+        }
+    }
+
+    /// Every action `map` or `map_shifted` can answer, for any key, modifier and state, has a line in
+    /// the key list, and every line names keys that really give its action.
+    #[test]
+    fn every_action_has_a_help_line_and_every_line_is_true() {
+        let mut seen = Vec::new();
+        for vk in 0..=255u32 {
+            for ctrl in [false, true] {
+                for shift in [false, true] {
+                    for ultra in [false, true] {
+                        for (has_lock, picker_open, chart_open) in [(false, false, false), (true, false, false), (false, false, true), (true, true, true)] {
+                            let s = State { ultra, has_lock, picker_open, chart_open };
+                            if let Some(a) = map_shifted(vk, ctrl, shift, s) {
+                                assert!(help_for(a).is_some(), "{a:?} (vk {vk:#x}) has no help line");
+                                seen.push(std::mem::discriminant(&a));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        seen.dedup();
+        assert!(seen.len() >= 15, "the sweep reached {} kinds of action", seen.len());
+        for h in HELP.iter().filter_map(|h| h.action.map(|a| (h, a))) {
+            assert_eq!(help_for(h.1).map(|x| x.keys), Some(h.0.keys), "{:?}", h.1);
+        }
+        let text = help_text();
+        assert_eq!(text.lines().count(), HELP.len());
+        for h in &HELP {
+            assert!(text.contains(h.keys) && text.contains(h.text));
+        }
+        assert!(!text.contains('\u{2014}'));
     }
 }

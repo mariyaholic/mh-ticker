@@ -33,7 +33,9 @@ use crate::hotkey;
 use crate::keys;
 use crate::undo;
 use crate::update;
+use crate::spoken;
 use crate::watch;
+use crate::zoom;
 use crate::probe;
 use crate::prompt;
 use crate::report;
@@ -58,7 +60,7 @@ use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::RemoteDesktop::{WTSRegisterSessionNotification, WTSUnRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION};
 use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, RegisterHotKey, UnregisterHotKey, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_ESCAPE, VK_PRIOR, VK_NEXT, VK_HOME, VK_END};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_SHIFT, RegisterHotKey, UnregisterHotKey, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_ESCAPE, VK_PRIOR, VK_NEXT, VK_HOME, VK_END};
 use windows_sys::Win32::UI::HiDpi::{GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
 use windows_sys::Win32::UI::Shell::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
@@ -175,6 +177,8 @@ const CMD_REPORT: usize = 5408;
 /// The report's checks finished off-thread (the text is in `Ui::report_result`). `WM_APP + 16` is
 /// free: P7 uses 14 and 15, and nothing else is above 15.
 const WM_REPORT: u32 = WM_APP + 16;
+/// The window's name should be re-read (the lock moved): `sync_title` compares and sets it. `WM_APP + 17`.
+const WM_TITLE: u32 = WM_APP + 17;
 /// Hotkey submenu: Off, `hotkey::PRESETS` at `CMD_HOTKEY + 1 + i`, and `CMD_HOTKEY_CUSTOM` for a
 /// configured combo that is none of them.
 const CMD_HOTKEY: usize = 5410;
@@ -194,6 +198,18 @@ const CMD_ORDER_DEFAULT: usize = 5462;
 const CMD_PIN_ALL: usize = 5463;
 /// Edit > Undo the last removal, move, sort, pin change or alert clear (W3 J2).
 const CMD_UNDO: usize = 5464;
+/// Accessibility submenu (W4): up and down colours (3), hollow up candles, follow the Windows contrast
+/// theme, follow the Windows animation setting, and panel zoom (`zoom::STEPS`).
+const CMD_UPDOWN: usize = 5470;
+const CMD_HOLLOW: usize = 5473;
+const CMD_CONTRAST: usize = 5474;
+const CMD_ANIMATE: usize = 5475;
+const CMD_ZOOM: usize = 5480;
+/// Typed settings (W4 M2): quiet hours `22:30-06:45`, a mute until a time, any hotkey. A cooldown is
+/// asked per symbol through `Action::Cooldown`.
+const CMD_QUIET_TYPE: usize = 5490;
+const CMD_MUTE_UNTIL: usize = 5491;
+const CMD_HOTKEY_TYPE: usize = 5492;
 /// The session was locked or unlocked (`wparam` 7 or 8), sent once `register_session_notice` ran.
 const WM_WTSSESSION_CHANGE: u32 = 0x02B1;
 const WTS_SESSION_LOCK: usize = 7;
@@ -386,6 +402,14 @@ struct Ui {
     /// Reset: pointer leaves, chart opens or closes (`set_chart`), the lock moves (`Act::Select`), the
     /// rows change (`apply_rows`), the zone flips (`Act::Zone`), the panel expands or collapses.
     chart_at: Option<chartview::Pointer>,
+    /// `chart_at` was set by Shift+Left or Shift+Right and sits on its candle's close (the painter
+    /// snaps it; `Scene::aim_snap`). Reset by the next pointer move or leave (which also repaint the
+    /// whole window, since the snapped row is not the stored one), and meaningless while `chart_at` is
+    /// `None`.
+    chart_key: bool,
+    /// The window name last set (`spoken::window_name`), so an unchanged name is never set again.
+    /// Empty until the first feed tick; stays empty on Classic, whose title is never touched.
+    title_set: String,
     /// The layout the pane was last painted with (`Scene::layout`); the pointer is answered from it.
     /// Cleared by the painter whenever the pane names no card, and with every reset of `chart_at`.
     /// While the pane names a card and draws no bars (loading, failed, no data) it holds the range
@@ -470,6 +494,9 @@ struct Ui {
     anim: Option<Instant>,
     /// False when Windows asks for no animation; every palette then holds phase 0.
     motion: bool,
+    /// The system colours while Windows is in a contrast theme (`read_contrast`), else `None`. The
+    /// contrast theme is built from them when `Config::follows_contrast` says this build follows.
+    system: Option<crate::contrast::SystemColours>,
 }
 
 /// The panel's back buffer, kept between frames.
@@ -540,6 +567,8 @@ fn toggle_lock(current: Option<&str>, clicked: String) -> Option<String> {
 /// is asked for. `apply_rows` does the same resets when the rows change under the lock.
 fn lock_card(u: &mut Ui, label: Option<String>) {
     u.selected = label;
+    // The window's name carries the locked card; a post, so the title is set outside this borrow.
+    unsafe { PostMessageW(u.hwnd, WM_TITLE, 0, 0) };
     u.open_hover = false;
     u.chart_at = None;
     u.chart_layout.set(None);
@@ -623,9 +652,42 @@ fn face_of(theme: &Theme, cfg: &Config, ultra: bool) -> &'static str {
 
 /// The palette the config names and the face that goes with it. Resolved together, because a face
 /// read off the palette still on screen is the previous theme's.
+#[cfg(test)]
 fn selected_look(cfg: &Config, ultra: bool) -> (&'static Theme, &'static str) {
-    let theme = theme::pick(ultra, &cfg.theme);
+    selected_look_with(cfg, ultra, None)
+}
+
+/// `selected_look` with the Windows contrast palette in force (`system`, from `read_contrast`): when
+/// the build follows contrast, it replaces the catalogue theme, and the up/down colours with it.
+fn selected_look_with(cfg: &Config, ultra: bool, system: Option<&crate::contrast::SystemColours>) -> (&'static Theme, &'static str) {
+    let theme = match system.filter(|_| cfg.follows_contrast(ultra)) {
+        Some(colours) => theme::system(colours),
+        None => theme::with_updown(theme::pick(ultra, &cfg.theme), cfg.updown_mode(ultra)),
+    };
     (theme, face_of(theme, cfg, ultra))
+}
+
+/// The system colours when Windows is in a contrast theme, else `None`. A failed query reads as no
+/// contrast theme, so the app never turns itself into the system palette on a guess.
+fn read_contrast() -> Option<crate::contrast::SystemColours> {
+    use windows_sys::Win32::UI::Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW};
+    let mut hc = HIGHCONTRASTW { cbSize: std::mem::size_of::<HIGHCONTRASTW>() as u32, dwFlags: 0, lpszDefaultScheme: std::ptr::null_mut() };
+    let ok = unsafe { SystemParametersInfoW(SPI_GETHIGHCONTRAST, hc.cbSize, &mut hc as *mut _ as _, 0) };
+    if ok == 0 || hc.dwFlags & HCF_HIGHCONTRASTON == 0 {
+        return None;
+    }
+    use windows_sys::Win32::Graphics::Gdi::*;
+    let c = |i| unsafe { GetSysColor(i) };
+    Some(crate::contrast::SystemColours {
+        window: c(COLOR_WINDOW),
+        window_text: c(COLOR_WINDOWTEXT),
+        button_face: c(COLOR_BTNFACE),
+        button_text: c(COLOR_BTNTEXT),
+        highlight: c(COLOR_HIGHLIGHT),
+        highlight_text: c(COLOR_HIGHLIGHTTEXT),
+        gray_text: c(COLOR_GRAYTEXT),
+        hotlight: c(COLOR_HOTLIGHT),
+    })
 }
 
 /// The panel's geometry, from one place. `draw` and every hit test call this, so a click lands
@@ -633,9 +695,17 @@ fn selected_look(cfg: &Config, ultra: bool) -> (&'static Theme, &'static str) {
 /// The panel's geometry. Content-sized unless it is open: an open panel takes its columns from the
 /// window's width, so a dragged edge reflows the cards instead of clipping them, and its height from
 /// the window's height, so the footer sits at the bottom of the frame.
+/// The DPI the panel is laid out and drawn at: the window's DPI times the panel zoom (`zoom`). The
+/// strip never zooms, so everything about the strip keeps `u.dpi`; everything about the open panel
+/// (geometry, fonts, hit tests, the scene) goes through here, which is why zoom 150 % at 96 DPI is
+/// the 144 DPI picture.
+fn pdpi(u: &Ui) -> u32 {
+    zoom::effective_dpi(u.dpi, u.cfg.zoom(u.profile.ultra))
+}
+
 fn panel_geo(u: &Ui) -> panel::Geo {
     let n = u.view.cells.len();
-    let natural = panel::geometry(n, catalog_len(u), u.dpi, picker_open(u));
+    let natural = panel::geometry(n, catalog_len(u), pdpi(u), picker_open(u));
     if u.mode != Mode::Panel {
         return natural;
     }
@@ -644,7 +714,7 @@ fn panel_geo(u: &Ui) -> panel::Geo {
     if rc.right <= 0 || rc.bottom <= 0 {
         return natural;
     }
-    let mut g = panel::geometry_in(rc.right, n, catalog_len(u), u.dpi, picker_open(u), u.chart);
+    let mut g = panel::geometry_in(rc.right, n, catalog_len(u), pdpi(u), picker_open(u), u.chart);
     panel::viewport(&mut g, rc.bottom, u.picker_scroll);
     g
 }
@@ -972,7 +1042,7 @@ fn draw_panel(u: &mut Ui, dc: HDC, w: i32, h: i32) {
     // The background's loop position. Each palette carries its own cycle length, and the clock only
     // runs in Ultra: the classic build keeps the one look it shipped with, so it holds phase 0. It is
     // also read from the panel being open, so a collapsed strip never carries a moving timer.
-    let phase = if clock_runs(u.profile.ultra, u.motion, u.theme) {
+    let phase = if clock_runs(u.profile.ultra, motion_now(u), u.theme) {
         let start = *u.anim.get_or_insert_with(Instant::now);
         (start.elapsed().as_secs_f64() / u.theme.cycle.unwrap_or(ANIM_CYCLE_S)) % 1.0
     } else {
@@ -1013,7 +1083,7 @@ fn draw_panel(u: &mut Ui, dc: HDC, w: i32, h: i32) {
         fonts: f,
         theme: u.theme,
         grad: &u.grad,
-        dpi: u.dpi,
+        dpi: pdpi(u),
         now,
         btn_hover: u.hover,
         pick_hover: u.pick_hover,
@@ -1032,6 +1102,8 @@ fn draw_panel(u: &mut Ui, dc: HDC, w: i32, h: i32) {
         chart_btn: u.profile.ultra,
         settings_btn: u.profile.ultra,
         alert_dots: &dots,
+        hollow_up: u.cfg.hollow(u.profile.ultra),
+        aim_snap: u.chart_key,
         // The chart shows the locked card and nothing else. It used to follow the pointer, which made
         // the pane change under the cursor on the way to it; a click is the one thing that moves it now.
         // With nothing locked the pane says so instead of guessing which card was meant.
@@ -1230,11 +1302,11 @@ fn hot_of(u: &Ui) -> panel::Hot {
 /// whole window. A moving background is drawn from the clock at paint time, so two partial paints of
 /// it would not match along their edge: it always repaints whole (it repaints every 100 ms anyway).
 fn hover_dirty(u: &Ui, g: &panel::Geo, was: &panel::Hot) -> Option<RECT> {
-    if clock_runs(u.profile.ultra, u.motion, u.theme) {
+    if clock_runs(u.profile.ultra, motion_now(u), u.theme) {
         return None;
     }
     let pane = u.chart_layout.get().map(|l| RECT { left: l.pane.left, top: l.pane.top, right: l.pane.right, bottom: l.pane.bottom });
-    panel::hot_dirty(g, u.dpi, selected_row(u), pane, was, &hot_of(u))
+    panel::hot_dirty(g, pdpi(u), selected_row(u), pane, was, &hot_of(u))
 }
 
 fn paint(u: &mut Ui) {
@@ -1728,6 +1800,7 @@ fn on_feed(hwnd: HWND) {
     if let Some((icon, tip)) = tray_update {
         tray(hwnd, NIM_MODIFY, icon, &tip);
     }
+    sync_title(hwnd);
     for (f, seq) in fired {
         alerts::balloon(hwnd, TRAY_ID, &f.title, &f.body);
         if let Some(url) = hook.clone() {
@@ -1875,7 +1948,8 @@ fn run_morph(hwnd: HWND, a: RECT, b: RECT, from: (HBITMAP, (i32, i32)), to: (HBI
     });
     let start = Instant::now();
     loop {
-        let t = (start.elapsed().as_secs_f64() * 1000.0 / ms).min(1.0);
+        // No duration is one step: the loop runs once, at the end state (`motion::Frames::One`).
+        let t = if ms <= 0.0 { 1.0 } else { (start.elapsed().as_secs_f64() * 1000.0 / ms).min(1.0) };
         let e = ease(t);
         with_ui(|u| {
             if let Some(m) = u.morph.as_mut() {
@@ -1905,6 +1979,19 @@ fn run_morph(hwnd: HWND, a: RECT, b: RECT, from: (HBITMAP, (i32, i32)), to: (HBI
     });
 }
 
+/// How long a morph takes now: the full time, or none when this build follows the Windows animation
+/// setting and Windows has animations off (`motion::frames`). Read fresh at each morph, outside any
+/// `with_ui` borrow, so a change made a moment ago already counts.
+fn morph_ms(full: f64) -> f64 {
+    let follow = with_ui(|u| u.cfg.follows_animation(u.profile.ultra)).unwrap_or(false);
+    crate::motion::frames(follow, allow_motion()).ms(full)
+}
+
+/// Whether backgrounds may move: Windows allows animation, or this build was told not to follow it.
+fn motion_now(u: &Ui) -> bool {
+    u.motion || !u.cfg.follows_animation(u.profile.ultra)
+}
+
 /// The panel's rect: centred in the work area of the monitor the strip is on.
 fn panel_rect(near: &RECT, w: i32, h: i32) -> RECT {
     unsafe {
@@ -1925,8 +2012,8 @@ fn panel_rect(near: &RECT, w: i32, h: i32) -> RECT {
 /// column. Records the move so closing the chart can undo exactly it.
 fn grow_target(hwnd: HWND, cur: RECT) -> Option<RECT> {
     let (natural, chart_max, gap) = with_ui(|u| {
-        let s = |v: i32| v * u.dpi as i32 / 96;
-        (panel::geometry(u.view.cells.len(), catalog_len(u), u.dpi, false), s(720), s(10))
+        let s = |v: i32| v * pdpi(u) as i32 / 96;
+        (panel::geometry(u.view.cells.len(), catalog_len(u), pdpi(u), false), s(720), s(10))
     })?;
     // Wide enough for the cards' natural grid plus a full chart pane; the pane takes what is left
     // over, so this is the one width where both are whole.
@@ -2021,7 +2108,7 @@ fn set_chart(hwnd: HWND, on: bool) {
         let to = with_ui(|u| (snapshot(hwnd, w, h, |dc| draw_panel(u, dc, w, h)), (w, h)));
         match (from, to) {
             (Some(from), Some(to)) => {
-                run_morph(hwnd, cur, to_rect, from, to, (255, 255), CHART_MS, ease_in_out);
+                run_morph(hwnd, cur, to_rect, from, to, (255, 255), morph_ms(CHART_MS), ease_in_out);
                 with_ui(|u| u.mode = Mode::Panel);
             }
             // The glide is a nicety; the frame is not. If a picture could not be taken, the window
@@ -2067,7 +2154,7 @@ fn expand(hwnd: HWND) {
             return None;
         }
         if u.fonts.is_none() {
-            u.fonts = Some(panel::Fonts::new(u.face, u.dpi, u.theme.is_pixel()));
+            u.fonts = Some(panel::Fonts::new(u.face, pdpi(u), u.theme.is_pixel()));
         }
         // Every expand starts the drift from the top of its loop.
         u.anim = None;
@@ -2108,7 +2195,7 @@ fn expand(hwnd: HWND) {
         SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         SetForegroundWindow(hwnd);
     }
-    run_morph(hwnd, a, b, from, to, (op, 255), EXPAND_MS, ease_out);
+    run_morph(hwnd, a, b, from, to, (op, 255), morph_ms(EXPAND_MS), ease_out);
     // A saved frame can sit on a monitor of another scale: `WM_DPICHANGED` arrived mid-morph and could
     // not lay anything out, so the panel is fitted again at the new scale (audit 1.8, finding 9).
     let b = with_ui(|u| {
@@ -2152,7 +2239,7 @@ fn collapse(hwnd: HWND) {
     .flatten() else {
         return;
     };
-    run_morph(hwnd, a, b, from, to, (255, op), COLLAPSE_MS, ease_in_out);
+    run_morph(hwnd, a, b, from, to, (255, op), morph_ms(COLLAPSE_MS), ease_in_out);
     // The strip is the window's mode again, so it can be laid out: if the morph crossed to a monitor
     // of another scale, the frame planned above is for the old one (audit 1.8, finding 9).
     let b = with_ui(|u| {
@@ -2190,7 +2277,7 @@ fn menu(hwnd: HWND, at: Option<(i32, i32)>) {
 fn settings_menu(hwnd: HWND) {
     let Some((x, y)) = with_ui(|u| {
         let g = panel_geo(u);
-        (g.gear_btn.left, g.gear_btn.bottom + 4 * u.dpi as i32 / 96)
+        (g.gear_btn.left, g.gear_btn.bottom + 4 * pdpi(u) as i32 / 96)
     }) else {
         return;
     };
@@ -2387,6 +2474,27 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
         add(m, MF_POPUP, sources as usize, "Data sources");
         item(MF_STRING, CMD_REFRESH, "Refresh now");
         item(MF_STRING, CMD_COPY_ALL, "Copy all prices");
+        let reach = reach_view();
+        {
+            let acc = CreatePopupMenu();
+            let on = |b: bool| MF_STRING | if b { MF_CHECKED } else { 0 };
+            if ultra {
+                for (i, mode) in crate::updown::UpDown::ALL.iter().enumerate() {
+                    add(acc, on(reach.updown == *mode), CMD_UPDOWN + i, mode.label());
+                }
+                add(acc, on(reach.hollow), CMD_HOLLOW, "Hollow up candles");
+                AppendMenuW(acc, MF_SEPARATOR, 0, null());
+            }
+            add(acc, on(reach.contrast), CMD_CONTRAST, "Follow the Windows contrast theme");
+            add(acc, on(reach.animate), CMD_ANIMATE, "Follow the Windows animation setting");
+            if ultra {
+                AppendMenuW(acc, MF_SEPARATOR, 0, null());
+                for (i, z) in crate::zoom::STEPS.iter().enumerate() {
+                    add(acc, on(reach.zoom == *z), CMD_ZOOM + i, &format!("Panel size {z} %"));
+                }
+            }
+            add(m, MF_POPUP, acc as usize, "Accessibility");
+        }
         if ultra {
             // Theme: four tier submenus, because 25 entries in one popup is a wall. The tier is a
             // rendering rule (`theme::Kind`), so the menu cannot disagree with the painter.
@@ -2449,6 +2557,13 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
                 // A level typed by hand: greyed without a fresh price, like the presets.
                 AppendMenuW(sub, MF_SEPARATOR, 0, null());
                 dynamic(sub, MF_STRING | if row.fresh { 0 } else { MF_GRAYED }, &mut commands, crate::menu_commands::Action::AlertAt(row.label.clone()), "at a price...");
+                // How long this symbol's alert waits before it can fire again, typed.
+                let cooldown = row.alert.as_ref().map(|a| a.cooldown_s);
+                let text = match cooldown {
+                    Some(c) => format!("cooldown {}...", crate::typed::cooldown_text(c)),
+                    None => "cooldown...".to_string(),
+                };
+                dynamic(sub, MF_STRING | if cooldown.is_some() { 0 } else { MF_GRAYED }, &mut commands, crate::menu_commands::Action::Cooldown(row.label.clone()), &text);
                 AppendMenuW(sub, MF_SEPARATOR, 0, null());
                 let line = row.alert.as_ref().map(|a| alerts::describe(a, row.digits)).filter(|d| !d.is_empty());
                 add(sub, MF_STRING | MF_GRAYED, 0, &line.unwrap_or_else(|| "nothing set".into()));
@@ -2496,6 +2611,7 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
             let mute = CreatePopupMenu();
             add(mute, MF_STRING, CMD_MUTE_1H, "For 1 hour");
             add(mute, MF_STRING, CMD_MUTE_8H, "For 8 hours");
+            add(mute, MF_STRING, CMD_MUTE_UNTIL, "Until a time...");
             add(mute, MF_STRING, CMD_MUTE_INDEF, "Until I turn it back on");
             AppendMenuW(mute, MF_SEPARATOR, 0, null());
             let (mute_title, is_muted) = match av.silence {
@@ -2511,6 +2627,9 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
             for (i, [from, to]) in alerts::QUIET_CHOICES.iter().enumerate() {
                 add(quiet, MF_STRING, CMD_QUIET + i, &format!("{} to {}", alerts::hhmm(*from), alerts::hhmm(*to)));
             }
+            let custom_quiet = av.quiet.filter(|w| w[0] != w[1] && !alerts::QUIET_CHOICES.contains(w));
+            let typed_text = custom_quiet.map_or("Type hours...".to_string(), |w| format!("{}...", crate::typed::span_text(w)));
+            add(quiet, MF_STRING | if custom_quiet.is_some() { MF_CHECKED } else { 0 }, CMD_QUIET_TYPE, &typed_text);
             let cur_quiet = match av.quiet {
                 None => Some(CMD_QUIET_OFF),
                 Some(w) => alerts::QUIET_CHOICES.iter().position(|c| *c == w).map(|i| CMD_QUIET + i),
@@ -2632,6 +2751,8 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
                 let shown = parsed.map(|c| hotkey::label(&c)).unwrap_or_else(|| text.chars().take(24).collect());
                 add(hk, MF_STRING, CMD_HOTKEY_CUSTOM, &format!("{shown}{note}"));
             }
+            AppendMenuW(hk, MF_SEPARATOR, 0, null());
+            add(hk, MF_STRING, CMD_HOTKEY_TYPE, "Type a hotkey...");
             let selected = match (&cfg_key, preset) {
                 (None, _) => CMD_HOTKEY,
                 (Some(_), Some(i)) => CMD_HOTKEY + 1 + i,
@@ -2754,7 +2875,8 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
                 });
                 save_cfg();
             }
-            Action::AlertAt(label) => alert_at_price(hwnd, label),
+            Action::AlertAt(label) => alert_at_price(hwnd, label, None),
+            Action::Cooldown(label) => type_cooldown(hwnd, label),
             Action::Copy(label) => {
                 if let Some((text, _)) = with_ui(|u| card_target(&u.view.cells, &u.cfg.rows, label)).flatten() {
                     copy_text(&text);
@@ -2873,6 +2995,27 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
             });
             save_cfg();
         }
+        c if ultra && (CMD_UPDOWN..CMD_UPDOWN + crate::updown::UpDown::ALL.len()).contains(&c) => {
+            with_ui(|u| u.cfg.updown = crate::updown::UpDown::ALL[c - CMD_UPDOWN].to_saved());
+            apply_theme(hwnd);
+        }
+        c if ultra && (CMD_ZOOM..CMD_ZOOM + zoom::STEPS.len()).contains(&c) => apply_zoom(hwnd, zoom::STEPS[c - CMD_ZOOM]),
+        CMD_ANIMATE => {
+            with_ui(|u| u.cfg.animate = Some(!u.cfg.follows_animation(u.profile.ultra)));
+            save_cfg();
+            sync_anim(hwnd);
+            unsafe { InvalidateRect(hwnd, null(), 0) };
+        }
+        CMD_CONTRAST => {
+            with_ui(|u| u.cfg.contrast = Some(!u.cfg.follows_contrast(u.profile.ultra)));
+            apply_theme(hwnd);
+            save_cfg();
+        }
+        CMD_HOLLOW if ultra => {
+            with_ui(|u| u.cfg.hollow_up = !u.cfg.hollow_up);
+            save_cfg();
+            unsafe { InvalidateRect(hwnd, null(), 0) };
+        }
         c if ultra && (CMD_THEME..CMD_THEME + theme::ALL.len()).contains(&c) => {
             with_ui(|u| u.cfg.theme = theme::ALL[c - CMD_THEME].name.to_string());
             apply_theme(hwnd);
@@ -2914,6 +3057,9 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
         c if (CMD_HOTKEY + 1..CMD_HOTKEY + 1 + hotkey::PRESETS.len()).contains(&c) => {
             set_hotkey(hwnd, Some(hotkey::PRESETS[c - CMD_HOTKEY - 1].to_string()));
         }
+        CMD_HOTKEY_TYPE => type_hotkey(hwnd),
+        CMD_QUIET_TYPE if ultra => type_quiet_hours(hwnd),
+        CMD_MUTE_UNTIL if ultra => type_mute_until(hwnd),
         // Choosing the configured combo again retries its registration.
         CMD_HOTKEY_CUSTOM => {
             let keep = with_ui(|u| u.cfg.hotkey.clone()).flatten();
@@ -3095,6 +3241,30 @@ fn alerts_view(list: &[config::Row], shown: &[bool]) -> Option<AlertsView> {
 }
 
 /// Write the config as it now stands. Kept out of `with_ui` closures: no I/O inside them.
+/// What the Accessibility submenu shows, read in one borrow.
+#[derive(Clone, Copy)]
+struct ReachView {
+    updown: crate::updown::UpDown,
+    hollow: bool,
+    contrast: bool,
+    animate: bool,
+    zoom: u32,
+}
+
+fn reach_view() -> ReachView {
+    with_ui(|u| {
+        let ultra = u.profile.ultra;
+        ReachView {
+            updown: u.cfg.updown_mode(ultra),
+            hollow: u.cfg.hollow(ultra),
+            contrast: u.cfg.follows_contrast(ultra),
+            animate: u.cfg.follows_animation(ultra),
+            zoom: u.cfg.zoom(ultra),
+        }
+    })
+    .unwrap_or(ReachView { updown: Default::default(), hollow: false, contrast: false, animate: false, zoom: 100 })
+}
+
 fn save_cfg() {
     if let Some(cfg) = with_ui(|u| {
         sync_gov(u);
@@ -3145,6 +3315,7 @@ fn alert_command(hwnd: HWND, cmd: usize) {
             with_ui(|u| u.cfg.quiet_hours = None);
             save_cfg();
         }
+
         c if (CMD_QUIET..CMD_QUIET + alerts::QUIET_CHOICES.len()).contains(&c) => {
             with_ui(|u| u.cfg.quiet_hours = Some(alerts::QUIET_CHOICES[c - CMD_QUIET]));
             save_cfg();
@@ -3595,12 +3766,83 @@ fn set_price_level(hwnd: HWND, label: &str, level: f64) {
 
 /// Alerts > symbol > *at a price...* (Ultra): the prompt opens on the current price; the typed text
 /// must parse (`alerts::parse_level`), then the side rule decides above or below.
-fn alert_at_price(hwnd: HWND, label: &str) {
+/// The typed settings (W4 M2). Each one reads its current value in one borrow, asks outside any
+/// borrow, and on a good entry writes through `save_cfg`. A bad entry shows one fixed sentence
+/// (`typed`) and changes nothing; nothing typed is echoed back into the message.
+fn refuse(hwnd: HWND, title: &str, sentence: &str) {
+    alert_box(hwnd, title, sentence, MB_OK | MB_ICONWARNING);
+}
+
+fn type_quiet_hours(hwnd: HWND) {
+    let initial = with_ui(|u| u.cfg.quiet_hours.filter(|w| w[0] != w[1]).map(crate::typed::span_text)).flatten().unwrap_or_else(|| "22:30-06:45".into());
+    let title = "Quiet hours";
+    let Some(typed) = prompt::ask(hwnd, title, "Quiet hours, start-end in 24-hour time (same start and end is off):", &initial, 16) else { return };
+    match crate::typed::parse_span(&typed) {
+        Ok(span) => {
+            with_ui(|u| u.cfg.quiet_hours = span);
+            save_cfg();
+        }
+        Err(why) => refuse(hwnd, title, why),
+    }
+}
+
+fn type_mute_until(hwnd: HWND) {
+    let title = "Mute until";
+    let Some(typed) = prompt::ask(hwnd, title, "Mute alerts until this time (24-hour, next time the clock reads it):", "", 8) else { return };
+    match crate::typed::parse_time(&typed) {
+        Ok(minute) => {
+            let now = crate::source::now_s();
+            let mut st: SYSTEMTIME = unsafe { std::mem::zeroed() };
+            unsafe { GetLocalTime(&mut st) };
+            let secs = (st.wHour as u32 % 24) * 3600 + (st.wMinute as u32 % 60) * 60 + st.wSecond as u32 % 60;
+            let until = crate::typed::mute_until(now, secs, minute);
+            with_ui(|u| {
+                u.cfg.alerts_muted = false;
+                u.cfg.alerts_mute_until = until;
+            });
+            save_cfg();
+        }
+        Err(why) => refuse(hwnd, title, why),
+    }
+}
+
+fn type_cooldown(hwnd: HWND, label: &str) {
+    let Some(current) = with_ui(|u| u.cfg.alerts.iter().find(|a| a.label == label).map(|a| a.cooldown_s)).flatten() else { return };
+    let title = format!("Cooldown for {label}");
+    let Some(typed) = prompt::ask(hwnd, &title, "Wait this long before the alert can fire again (90s, 15m, 2h):", &crate::typed::cooldown_text(current), 8) else { return };
+    match crate::typed::parse_cooldown(&typed) {
+        Ok(secs) => {
+            with_ui(|u| {
+                for a in u.cfg.alerts.iter_mut().filter(|a| a.label == label) {
+                    a.cooldown_s = secs;
+                }
+            });
+            save_cfg();
+        }
+        Err(why) => refuse(hwnd, &title, why),
+    }
+}
+
+fn type_hotkey(hwnd: HWND) {
+    let initial = with_ui(|u| u.cfg.hotkey.clone()).flatten().unwrap_or_else(|| hotkey::PRESETS[0].to_string());
+    let title = "Hotkey";
+    let Some(typed) = prompt::ask(hwnd, title, "Hotkey that opens and closes the panel (such as Ctrl+Alt+M):", &initial, 32) else { return };
+    match hotkey::parse(&typed) {
+        // Stored in the canonical spelling, so the menu matches it against the presets.
+        Some(combo) => set_hotkey(hwnd, Some(hotkey::label(&combo))),
+        None => refuse(hwnd, title, crate::typed::HOTKEY_REFUSED),
+    }
+}
+
+/// Ask for a level through the price prompt. `suggest` is what the box opens on (the crosshair's price
+/// when the key A asked); with none it opens on the current price, as the menu always did.
+fn alert_at_price(hwnd: HWND, label: &str, suggest: Option<f64>) {
     let Some((reference, digits)) = fresh_price(label) else { return };
     let now = fmt_price(reference, digits);
+    let initial = suggest.map_or_else(|| now.clone(), |v| fmt_price(v, digits));
     let title = format!("Alert for {label}");
     let text = format!("Alert when {label} reaches this price (now {now}):");
-    let Some(typed) = prompt::ask(hwnd, &title, &text, &now, LEVEL_PROMPT_LEN) else { return };
+    let Some(typed) = prompt::ask(hwnd, &title, &text, &initial, LEVEL_PROMPT_LEN) else { return };
     match alerts::parse_level_why(&typed) {
         Ok(level) => {
             // A level far from the price is read back in the symbol's digits and asked about first.
@@ -3954,15 +4196,22 @@ fn on_key(hwnd: HWND, vk: u32) -> bool {
         Remove(String),
         Shift(String, i32),
         Undo,
+        NextRange(Range),
+        Zone,
+        AlertAt(String, f64),
+        CardMenu((i32, i32)),
+        MainMenu,
+        Help,
     }
     let ctrl = unsafe { GetKeyState(VK_CONTROL as i32) } < 0;
+    let shift = unsafe { GetKeyState(VK_SHIFT as i32) } < 0;
     let todo = with_ui(|u| {
         if u.mode != Mode::Panel {
             return None;
         }
         let row = selected_row(u);
         let state = keys::State { ultra: u.profile.ultra, has_lock: row.is_some(), picker_open: picker_open(u), chart_open: u.chart };
-        let action = keys::map(vk, ctrl, state)?;
+        let action = keys::map_shifted(vk, ctrl, shift, state)?;
         let n = u.view.cells.len();
         let symbol_of = |u: &Ui, i: usize| u.view.cells.get(i).and_then(|c| u.cfg.rows.iter().find(|r| r.label == c.label)).map(|r| r.symbol.clone());
         use keys::Action as K;
@@ -3989,6 +4238,29 @@ fn on_key(hwnd: HWND, vk: u32) -> bool {
             K::Remove => Do::Remove(symbol_of(u, row?)?),
             K::Shift(d) => Do::Shift(symbol_of(u, row?)?, d),
             K::Undo => Do::Undo,
+            K::Crosshair(d) => {
+                // Answered from the layout the last paint stored (the candles on screen), like the pointer.
+                let lay = u.chart_layout.get().filter(|l| l.bars > 0)?;
+                let to = keys::step_candle(u.chart_at.map(|p| p.bar), lay.bars, d)?;
+                u.chart_at = lay.pointer_for_bar(to, (lay.lo + lay.hi) / 2.0, 1);
+                u.chart_key = true;
+                Do::Redraw
+            }
+            K::NextRange => {
+                let all = Range::ALL;
+                let at = all.iter().position(|r| *r == u.range).unwrap_or(0);
+                Do::NextRange(all[(at + 1) % all.len()])
+            }
+            K::FlipZone => Do::Zone,
+            K::AlertAtCrosshair => {
+                // The price the painter drew the crosshair at; no crosshair, nothing to ask about.
+                let (_, price) = u.chart_layout.get()?.cross?;
+                let c = u.view.cells.get(row?)?;
+                Do::AlertAt(c.label.clone(), alerts::round_level(price, c.digits))
+            }
+            K::CardMenu => Do::CardMenu(card_centre(u, row?)?),
+            K::MainMenu => Do::MainMenu,
+            K::Help => Do::Help,
         })
     })
     .flatten();
@@ -4006,8 +4278,79 @@ fn on_key(hwnd: HWND, vk: u32) -> bool {
         Some(Do::Remove(sym)) => remove_card(hwnd, &sym),
         Some(Do::Shift(sym, d)) => reorder(hwnd, &sym, Some(d)),
         Some(Do::Undo) => undo_last(hwnd),
+        Some(Do::NextRange(rg)) => set_range(hwnd, rg),
+        Some(Do::Zone) => flip_zone(hwnd),
+        Some(Do::AlertAt(label, level)) => alert_at_price(hwnd, &label, Some(level)),
+        Some(Do::CardMenu(at)) => menu(hwnd, Some(at)),
+        Some(Do::MainMenu) => menu(hwnd, None),
+        Some(Do::Help) => {
+            alert_box(hwnd, "Keys", &keys::help_text(), MB_OK | MB_ICONINFORMATION);
+        }
     }
     true
+}
+
+/// Set the window's name to the locked card as a sentence, or to the board's one line (`spoken`).
+/// Ultra only, and only when the text differs from what was set; called once per feed tick and when the
+/// lock moves, never from inside a borrow, because `SetWindowTextW` sends the window a message.
+/// Reviewed by code only: a screen reader and the Alt+Tab list are what read it.
+fn sync_title(hwnd: HWND) {
+    let next = with_ui(|u| {
+        let locked = selected_row(u).and_then(|i| u.view.cells.get(i));
+        let name = spoken::window_name(u.profile.ultra, u.profile.title(), locked, &u.view.cells)?;
+        (name != u.title_set).then(|| {
+            u.title_set = name.clone();
+            name
+        })
+    })
+    .flatten();
+    if let Some(name) = next {
+        let w = wide(&name);
+        unsafe { SetWindowTextW(hwnd, w.as_ptr()) };
+    }
+}
+
+/// The chart's clock, local or UTC (the zone button and the Z key). Saved outside the borrow.
+fn flip_zone(hwnd: HWND) {
+    let cfg = with_ui(|u| {
+        u.cfg.chart_utc = !u.cfg.chart_utc;
+        // Candles refold on the new clock, so the pointer's bar index no longer means the same candle.
+        u.chart_at = None;
+        u.cfg.clone()
+    });
+    if let Some(cfg) = cfg {
+        config::save(&cfg);
+    }
+    unsafe { InvalidateRect(hwnd, null(), 0) };
+}
+
+/// The chart's range (a tab click and the R key). Remembered for the next time the pane opens.
+fn set_range(hwnd: HWND, rg: Range) {
+    let changed = with_ui(|u| {
+        if u.range != rg {
+            u.range = rg;
+            u.cfg.chart_range = rg.to_saved();
+            // The candles are refolded and may be another series: the pointer's bar index means
+            // nothing now, and the old layout is not what is on screen.
+            u.chart_at = None;
+            u.chart_layout.set(None);
+            want_range(u);
+            return true;
+        }
+        false
+    })
+    .unwrap_or(false);
+    // Saved outside the closure: `with_ui` does no I/O.
+    if changed {
+        save_cfg();
+    }
+    unsafe { InvalidateRect(hwnd, null(), 0) };
+}
+
+/// The middle of card `row` in client pixels, for a menu opened by key.
+fn card_centre(u: &Ui, row: usize) -> Option<(i32, i32)> {
+    let r = panel::card_rect(&panel_geo(u), row);
+    Some(((r.left + r.right) / 2, (r.top + r.bottom) / 2))
 }
 
 /// Open or close the symbol picker: the panel grows or shrinks in place, staying centred.
@@ -4047,7 +4390,7 @@ fn scroll_picker(hwnd: HWND, delta: i32) {
 /// no repaint can be left using the previous palette's brush or font.
 fn apply_theme(hwnd: HWND) {
     let Some((icon, tip)) = with_ui(|u| {
-        let (t, face) = selected_look(&u.cfg, u.profile.ultra);
+        let (t, face) = selected_look_with(&u.cfg, u.profile.ultra, u.system.as_ref());
         if std::ptr::eq(u.theme, t) && face == u.face {
             return None;
         }
@@ -4062,7 +4405,7 @@ fn apply_theme(hwnd: HWND) {
         u.bg = unsafe { CreateSolidBrush(t.bg) };
         u.font = make_font(&u.cfg, u.dpi);
         u.grad = Gradient::new(t);
-        u.fonts = u.fonts.take().map(|_| panel::Fonts::new(face, u.dpi, t.is_pixel()));
+        u.fonts = u.fonts.take().map(|_| panel::Fonts::new(face, pdpi(u), t.is_pixel()));
         let fresh = make_icon(theme::link_color(t, u.view.link), u.alert_pending.is_some());
         if !u.icon.is_null() {
             unsafe { DestroyIcon(u.icon) };
@@ -4079,6 +4422,56 @@ fn apply_theme(hwnd: HWND) {
     tray(hwnd, NIM_MODIFY, icon, &tip);
     sync_anim(hwnd);
     unsafe { InvalidateRect(hwnd, null(), 0) };
+}
+
+/// Panel zoom changed (Accessibility > Panel size). Everything the open panel is laid out from changes,
+/// so nothing is repainted in part: fonts are rebuilt at the new effective DPI, the remembered and the
+/// saved frames (in the old scale's pixels) are dropped so the panel is content-sized again, and the
+/// whole window is invalidated.
+fn apply_zoom(hwnd: HWND, pct: u32) {
+    let open = with_ui(|u| {
+        if u.cfg.zoom(u.profile.ultra) == pct {
+            return None;
+        }
+        u.cfg.panel_zoom = zoom::to_saved(pct);
+        u.cfg.panel = None;
+        u.last_panel = None;
+        u.chart_grew = None;
+        u.fonts = u.fonts.take().map(|_| panel::Fonts::new(u.face, pdpi(u), u.theme.is_pixel()));
+        u.chart_at = None;
+        u.chart_layout.set(None);
+        u.hover_at = None;
+        u.picker_scroll = 0;
+        Some((u.mode == Mode::Panel).then(|| panel_geo(u)))
+    })
+    .flatten();
+    let Some(open) = open else { return };
+    save_cfg();
+    if let Some(g) = open {
+        unsafe {
+            let mut r: RECT = std::mem::zeroed();
+            GetWindowRect(hwnd, &mut r);
+            let b = panel_rect(&r, g.w, g.h);
+            SetWindowPos(hwnd, null_mut(), b.left, b.top, b.right - b.left, b.bottom - b.top, SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+    }
+    unsafe { InvalidateRect(hwnd, null(), 0) };
+}
+
+/// Windows changed its colours or its contrast theme: re-read them, and rebuild the look only when
+/// the system palette really differs from the one in use. Both messages arrive for one change, so the
+/// second finds nothing to do.
+fn on_system_colours(hwnd: HWND) {
+    let now = read_contrast();
+    let changed = with_ui(|u| {
+        let changed = u.system != now;
+        u.system = now;
+        changed
+    })
+    .unwrap_or(false);
+    if changed {
+        apply_theme(hwnd);
+    }
 }
 
 /// Whether the background clock runs at all. Three things can stop it, and each one is a promise:
@@ -4106,7 +4499,7 @@ fn allow_motion() -> bool {
 /// Start or stop the animation timer to match what is on screen: only an open panel running an
 /// animated theme needs one, so the strip and every still theme pay nothing for it.
 fn sync_anim(hwnd: HWND) {
-    let on = with_ui(|u| u.mode == Mode::Panel && clock_runs(u.profile.ultra, u.motion, u.theme))
+    let on = with_ui(|u| u.mode == Mode::Panel && clock_runs(u.profile.ultra, motion_now(u), u.theme))
         .unwrap_or(false);
     unsafe {
         if on {
@@ -4186,12 +4579,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             on_feed(hwnd);
             0
         }
+        WM_TITLE => {
+            sync_title(hwnd);
+            0
+        }
         WM_DOCK | WM_DISPLAYCHANGE => {
             relayout_and_place(hwnd);
             dock_check(hwnd);
             0
         }
+        WM_SYSCOLORCHANGE => {
+            on_system_colours(hwnd);
+            DefWindowProcW(hwnd, msg, wp, lp)
+        }
         WM_SETTINGCHANGE => {
+            on_system_colours(hwnd);
             let motion = allow_motion();
             let changed = with_ui(|u| {
                 let changed = u.motion != motion;
@@ -4310,7 +4712,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             // The floor is both panes when the chart is open: a narrower frame would have to fold
             // the card grid, and a pane opened by hand must not reflow the thing it sits beside.
             let Some((mode, min)) = with_ui(|u| {
-                let (w, h) = panel::minimum(u.view.cells.len(), catalog_len(u), u.dpi, false, u.chart);
+                let (w, h) = panel::minimum(u.view.cells.len(), catalog_len(u), pdpi(u), false, u.chart);
                 (u.mode, (w, h))
             }) else {
                 return 0;
@@ -4481,7 +4883,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     }
                     // The Open button on the locked card is the one way Ultra reaches CNBC from a card,
                     // and it is checked before the card under it: the button is *on* the card.
-                    Mode::Panel if panel::open_btn_at(&g, selected_row(u), u.dpi, x, y) => {
+                    Mode::Panel if panel::open_btn_at(&g, selected_row(u), pdpi(u), x, y) => {
                         match selected_row(u).and_then(|i| symbol_of(u, i)) {
                             Some(sym) => Act::Open(sym),
                             None => Act::Nothing,
@@ -4521,42 +4923,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     let on = !with_ui(|u| u.chart).unwrap_or(false);
                     set_chart(hwnd, on);
                 }
-                Some(Act::Zone) => {
-                    // Saved outside the closure: `with_ui` does no I/O.
-                    let cfg = with_ui(|u| {
-                        u.cfg.chart_utc = !u.cfg.chart_utc;
-                        // Candles refold on the new clock, so the pointer's bar index no longer means
-                        // the same candle.
-                        u.chart_at = None;
-                        u.cfg.clone()
-                    });
-                    if let Some(cfg) = cfg {
-                        config::save(&cfg);
-                    }
-                    InvalidateRect(hwnd, null(), 0);
-                }
-                Some(Act::Range(rg)) => {
-                    let changed = with_ui(|u| {
-                        if u.range != rg {
-                            u.range = rg;
-                            // Remembered for the next time the pane opens (saved below, outside).
-                            u.cfg.chart_range = rg.to_saved();
-                            // The candles are refolded and may be another series: the pointer's bar
-                            // index means nothing now, and the old layout is not what is on screen.
-                            u.chart_at = None;
-                            u.chart_layout.set(None);
-                            want_range(u);
-                            return true;
-                        }
-                        false
-                    })
-                    .unwrap_or(false);
-                    // Saved outside the closure: `with_ui` does no I/O.
-                    if changed {
-                        save_cfg();
-                    }
-                    InvalidateRect(hwnd, null(), 0);
-                }
+                Some(Act::Zone) => flip_zone(hwnd),
+                Some(Act::Range(rg)) => set_range(hwnd, rg),
                 Some(Act::Select(label)) => {
                     with_ui(|u| {
                         // The same card again unlocks it: a lock that cannot be undone is a trap.
@@ -4584,21 +4952,25 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     return (false, false, None);
                 }
                 let g = panel_geo(u);
-                let at = panel::hit(&g, u.view.cells.len(), u.dpi, x, y, now).map(snap).unwrap_or(away);
+                let at = panel::hit(&g, u.view.cells.len(), pdpi(u), x, y, now).map(snap).unwrap_or(away);
                 let btn = panel::in_rect(&g.btn, x, y);
                 let pick = u.profile.ultra && panel::in_rect(&g.pick_btn, x, y);
                 let chart_btn = u.profile.ultra && panel::in_rect(&g.chart_btn, x, y);
                 let gear = u.profile.ultra && panel::in_rect(&g.gear_btn, x, y);
-                let open = panel::open_btn_at(&g, selected_row(u), u.dpi, x, y);
+                let open = panel::open_btn_at(&g, selected_row(u), pdpi(u), x, y);
                 // Answered from the layout the last paint stored, so it cannot disagree with the pixels.
-                let band = (CHART_Y_BAND * u.dpi as i32 / 96).max(1);
+                let band = (CHART_Y_BAND * pdpi(u) as i32 / 96).max(1);
                 let aim = if u.profile.ultra && u.chart { u.chart_layout.get().and_then(|l| l.pointer_at(x, y, band)) } else { None };
                 let track = !u.tracking;
                 u.tracking = true;
                 let was = hot_of(u);
+                // A keyed crosshair is taken back by any pointer move: the first move forgets it and
+                // repaints everything, because its row on screen is the candle's close, not the stored one.
+                let was_key = std::mem::replace(&mut u.chart_key, false) && u.chart_at.is_some();
                 // Hover moves the crosshair and lights buttons, and nothing else. In particular it no
                 // longer re-targets the chart: that is the lock's job.
-                let changed = btn != u.hover
+                let changed = was_key
+                    || btn != u.hover
                     || pick != u.pick_hover
                     || chart_btn != u.chart_hover
                     || gear != u.gear_hover
@@ -4612,7 +4984,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 u.open_hover = open;
                 u.chart_at = aim;
                 u.hover_at = (at.row != usize::MAX).then_some(at);
-                (changed, track, changed.then(|| hover_dirty(u, &g, &was)).flatten())
+                (changed, track, (changed && !was_key).then(|| hover_dirty(u, &g, &was)).flatten())
             });
             if let Some((changed, track, dirty)) = state {
                 if track {
@@ -4631,6 +5003,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 u.tracking = false;
                 let (before, g) = (hot_of(u), panel_geo(u));
                 let was = u.hover || u.pick_hover || u.chart_hover || u.gear_hover || u.open_hover || u.hover_at.is_some() || u.chart_at.is_some();
+                let was_key = std::mem::replace(&mut u.chart_key, false) && u.chart_at.is_some();
                 u.hover = false;
                 u.pick_hover = false;
                 u.chart_hover = false;
@@ -4638,7 +5011,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 u.open_hover = false;
                 u.hover_at = None;
                 u.chart_at = None;
-                (was, was.then(|| hover_dirty(u, &g, &before)).flatten())
+                (was, (was && !was_key).then(|| hover_dirty(u, &g, &before)).flatten())
             });
             if let Some((true, dirty)) = was {
                 InvalidateRect(hwnd, dirty.as_ref().map_or(null(), |r| r as *const RECT), 0);
@@ -4647,7 +5020,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_MOUSEWHEEL => {
             let delta = ((wp >> 16) as u16 as i16) as i32;
-            let movement = with_ui(|u| wheel_movement(&mut u.wheel_remainder, delta, u.dpi)).unwrap_or(0);
+            let movement = with_ui(|u| {
+                let dpi = pdpi(u);
+                wheel_movement(&mut u.wheel_remainder, delta, dpi)
+            })
+            .unwrap_or(0);
             if movement != 0 { scroll_picker(hwnd, movement); }
             0
         }
@@ -4659,7 +5036,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 lock_edge(hwnd, last);
                 return 0;
             }
-            let step = with_ui(|u| (240 * u.dpi as i32 / 96).max(1)).unwrap_or(240);
+            let step = with_ui(|u| (240 * pdpi(u) as i32 / 96).max(1)).unwrap_or(240);
             let delta = if wp == VK_PRIOR as usize { -step } else if wp == VK_NEXT as usize { step } else if wp == VK_HOME as usize { -i32::MAX } else { i32::MAX };
             scroll_picker(hwnd, delta);
             0
@@ -4670,7 +5047,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         // P5: the card keys. `on_key` answers false for a key that means nothing right now (Classic's
         // Ultra-only keys, a strip, a morph), and that key goes back to the system untouched.
-        WM_KEYDOWN if keys::is_bound(wp as u32) => {
+        WM_KEYDOWN if keys::is_bound(wp as u32) || keys::is_reach_key(wp as u32) => {
+            if on_key(hwnd, wp as u32) { 0 } else { DefWindowProcW(hwnd, msg, wp, lp) }
+        }
+        // F10 arrives as a system key; on Ultra it opens the main menu instead of the (absent) system menu.
+        WM_SYSKEYDOWN if wp == keys::VK_F10 as usize => {
             if on_key(hwnd, wp as u32) { 0 } else { DefWindowProcW(hwnd, msg, wp, lp) }
         }
         WM_KEYDOWN if wp == VK_ESCAPE as usize => {
@@ -4685,7 +5066,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             // lParam is screen coordinates (client ones for WM_CONTEXTMENU from a menu key are
             // not sent), and -1 means the keyboard opened it, with no card to act on.
             let at = if lp == -1 {
-                None
+                // The menu key (and Shift+F10): the locked card's menu when a card is locked, as
+                // `keys::map` says, else the main menu.
+                let ctrl = GetKeyState(VK_CONTROL as i32) < 0;
+                with_ui(|u| {
+                    let row = selected_row(u);
+                    let state = keys::State { ultra: u.profile.ultra, has_lock: row.is_some(), picker_open: picker_open(u), chart_open: u.chart };
+                    match (u.mode == Mode::Panel).then(|| keys::map(keys::VK_APPS, ctrl, state)).flatten() {
+                        Some(keys::Action::CardMenu) => card_centre(u, row?),
+                        _ => None,
+                    }
+                })
+                .flatten()
             } else {
                 let mut pt = POINT { x: (lp & 0xffff) as i16 as i32, y: ((lp >> 16) & 0xffff) as i16 as i32 };
                 ScreenToClient(hwnd, &mut pt);
@@ -4738,7 +5130,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 // The recorded frames are in the old scale's pixels and could never match again.
                 u.chart_grew = None;
                 u.font = make_font(&u.cfg, dpi);
-                u.fonts = u.fonts.take().map(|_| panel::Fonts::new(u.face, dpi, u.theme.is_pixel()));
+                u.fonts = u.fonts.take().map(|_| panel::Fonts::new(u.face, zoom::effective_dpi(dpi, u.cfg.zoom(u.profile.ultra)), u.theme.is_pixel()));
                 (u.mode == Mode::Panel).then(|| panel_geo(u))
             })
             .flatten();
@@ -4846,7 +5238,8 @@ pub fn run(cfg: Config, board: Arc<Mutex<Board>>) {
             b.set_fallback(cfg.fallback_enabled);
         }
         let view = board.lock().map(|b| b.clone()).unwrap_or_else(|_| Board::new(&cfg.rows));
-        let theme = theme::pick(profile.ultra, &cfg.theme);
+        let system = read_contrast();
+        let (theme, _) = selected_look_with(&cfg, profile.ultra, system.as_ref());
         let ui = Ui {
             hwnd,
             profile,
@@ -4877,6 +5270,8 @@ pub fn run(cfg: Config, board: Arc<Mutex<Board>>) {
             gear_hover: false,
             open_hover: false,
             chart_at: None,
+            chart_key: false,
+            title_set: String::new(),
             chart_layout: std::cell::Cell::new(None),
             range: if profile.ultra { Range::from_saved(cfg.chart_range.as_deref()) } else { Range::D1 },
             book: ranges::Book::new(),
@@ -4909,6 +5304,7 @@ pub fn run(cfg: Config, board: Arc<Mutex<Board>>) {
             back: None,
             anim: None,
             motion: allow_motion(),
+            system,
         };
         let (icon, tip) = (ui.icon, tooltip(&ui.view, None));
         let range_slots = ui.range_slots.clone();

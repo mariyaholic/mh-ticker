@@ -980,6 +980,20 @@ mod tests {
         assert!(check(&mut cfg, &board(3900.0, false), 50_000.0).is_empty());
     }
 
+    /// Quiet hours typed as `22:30-06:45` reach `quiet` as the window they name: wrapping midnight,
+    /// the end excluded, and equal ends storing nothing (which is off).
+    #[test]
+    fn typed_quiet_hours_wrap_midnight_and_equal_ends_are_off() {
+        let [from, to] = crate::typed::parse_span("22:30-06:45").unwrap().unwrap();
+        assert!(quiet(23 * 60, [from, to]) && quiet(0, [from, to]) && quiet(6 * 60 + 44, [from, to]));
+        assert!(!quiet(6 * 60 + 45, [from, to]) && !quiet(22 * 60 + 29, [from, to]) && quiet(22 * 60 + 30, [from, to]));
+        assert_eq!(crate::typed::parse_span("08:00-08:00"), Ok(None));
+        let cfg = Config { quiet_hours: crate::typed::parse_span("22:30-06:45").unwrap(), ..Config::default() };
+        assert_eq!(silence(&cfg, 0.0, 23 * 60), Some(Silence::Quiet));
+        let off = Config { quiet_hours: crate::typed::parse_span("08:00-08:00").unwrap(), ..Config::default() };
+        assert_eq!(silence(&off, 0.0, 8 * 60), None);
+    }
+
     fn fresh_cfg(alerts: Vec<Alert>) -> Config {
         Config { alerts, stale_after_s: 1_000_000.0, ..Config::default() }
     }

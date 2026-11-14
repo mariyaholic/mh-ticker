@@ -702,6 +702,10 @@ pub struct Scene<'a> {
     /// Per card: it has an alert level set, and a small dot says so beside its label (Ultra only; an
     /// empty slice draws nothing, which is what every still shows). Missing entries read as false.
     pub alert_dots: &'a [bool],
+    /// Up candles are drawn as outlines (Ultra's `hollow_up`, and always in a contrast theme).
+    pub hollow_up: bool,
+    /// The crosshair was set by a key: it sits on its candle's close instead of at the pointer's row.
+    pub aim_snap: bool,
     /// Position in an animated background's cycle, 0..1. Ignored by every other theme, so the caller
     /// can always pass a clock.
     pub phase: f64,
@@ -837,6 +841,40 @@ fn short_date(s: &str) -> Option<String> {
     Some(format!("{d} {}", MON.get(m.checked_sub(1)?)?))
 }
 
+/// A button or chip fill. A solid accent fill stays solid in every theme (its text is the card
+/// colour, the same system pair reversed in the contrast theme). A `tinted` fill (the hover and "on"
+/// tint, `Theme::btn`) becomes an outline in the contrast theme: the window colour is the only background it may draw text on, so a hover or
+/// an "on" state is shown by a frame, not by a tint.
+fn plate(dc: HDC, sc: &Scene, r: RECT, radius: i32, fill: COLORREF, tinted: bool) {
+    let t = sc.theme;
+    if t.contrast && tinted {
+        let edge = (sc.dpi as i32 / 96).max(1) * 2;
+        fill_round(dc, r, radius, t.accent);
+        let inner = RECT { left: r.left + edge, top: r.top + edge, right: r.right - edge, bottom: r.bottom - edge };
+        fill_round(dc, inner, (radius - edge).max(0), t.card);
+    } else {
+        fill_round(dc, r, radius, fill);
+    }
+}
+
+/// An up candle's body as an outline: `edge` pixels thick on every side, so a rise differs from a
+/// fall by shape. A body too small to have an inside stays a solid fill (it has no room for both).
+fn hollow_body(dc: HDC, x: i32, top: i32, w: i32, bottom: i32, col: COLORREF, edge: i32) {
+    let edge = edge.max(1);
+    if w <= 2 * edge + 1 || bottom - top <= 2 * edge + 1 {
+        fill_rect(dc, RECT { left: x, top, right: x + w, bottom }, col);
+        return;
+    }
+    for r in [
+        RECT { left: x, top, right: x + w, bottom: top + edge },
+        RECT { left: x, top: bottom - edge, right: x + w, bottom },
+        RECT { left: x, top: top + edge, right: x + edge, bottom: bottom - edge },
+        RECT { left: x + w - edge, top: top + edge, right: x + w, bottom: bottom - edge },
+    ] {
+        fill_rect(dc, r, col);
+    }
+}
+
 fn card(dc: HDC, sc: &Scene, r: RECT, i: usize, c: &Cell) {
     let t = sc.theme;
     let s = |v: i32| v * sc.dpi as i32 / 96;
@@ -845,8 +883,15 @@ fn card(dc: HDC, sc: &Scene, r: RECT, i: usize, c: &Cell) {
     // The border is a second, inset fill rather than a pen, so it is the same two pixels on every
     // edge and the corners stay round at any dpi.
     let locked = sc.select && sc.selected == Some(i);
-    if locked {
-        let edge = s(2).max(2);
+    if t.contrast && !locked {
+        // The card is the window colour like the panel, so it needs a frame to be a card at all.
+        fill_round(dc, r, radius, t.guide);
+        let edge = s(1).max(1);
+        let inner = RECT { left: r.left + edge, top: r.top + edge, right: r.right - edge, bottom: r.bottom - edge };
+        fill_round(dc, inner, (radius - edge).max(0), t.card);
+    } else if locked {
+        // Heavier than the contrast theme's one-pixel frame, so "locked" is still a shape.
+        let edge = if t.contrast { s(4).max(3) } else { s(2).max(2) };
         fill_round(dc, r, radius, t.accent);
         let inner = RECT { left: r.left + edge, top: r.top + edge, right: r.right - edge, bottom: r.bottom - edge };
         fill_round(dc, inner, (radius - edge).max(0), t.card);
@@ -974,7 +1019,7 @@ fn open_button(dc: HDC, sc: &Scene, card: RECT) {
     let r = open_btn_rect(card, sc.dpi);
     // Idle it is a chip (the picker's "on" look); under the pointer it fills with the accent, so the
     // one clickable thing on the card announces itself.
-    fill_round(dc, r, if t.is_pixel() { 0 } else { s(8) }, if sc.open_hover { t.accent } else { t.btn });
+    plate(dc, sc, r, if t.is_pixel() { 0 } else { s(8) }, if sc.open_hover { t.accent } else { t.btn }, !sc.open_hover);
     let label = "Open on CNBC";
     let (tw, th) = (text_width(dc, sc.fonts.small, label), line_height(dc, sc.fonts.small));
     text(
@@ -1030,7 +1075,7 @@ fn picker(dc: HDC, sc: &Scene, g: &Geo, p: &Picker) {
     for (i, r) in g.chips.iter().enumerate() {
         let Some(row) = p.list.get(i) else { continue };
         let on = p.shown.get(i).copied().unwrap_or(false);
-        fill_round(dc, *r, if t.is_pixel() { 0 } else { s(8) }, if on { t.btn } else { t.card });
+        plate(dc, sc, *r, if t.is_pixel() { 0 } else { s(8) }, if on { t.btn } else { t.card }, on);
         let label = &row.label;
         let (tw, th) = (text_width(dc, sc.fonts.small, label), line_height(dc, sc.fonts.small));
         text(
@@ -1073,7 +1118,7 @@ pub fn draw(dc: HDC, w: i32, h: i32, sc: &Scene) {
 
     if sc.picker_btn {
         if sc.pick_hover {
-            fill_round(dc, g.pick_btn, radius(8), t.btn);
+            plate(dc, sc, g.pick_btn, radius(8), t.btn, true);
         }
         // three stacked bars: the catalogue
         let (px, py) = ((g.pick_btn.left + g.pick_btn.right) / 2, (g.pick_btn.top + g.pick_btn.bottom) / 2);
@@ -1084,11 +1129,11 @@ pub fn draw(dc: HDC, w: i32, h: i32, sc: &Scene) {
         }
     }
     if sc.btn_hover {
-        fill_round(dc, g.btn, radius(8), t.btn);
+        plate(dc, sc, g.btn, radius(8), t.btn, true);
     }
     if sc.settings_btn {
         if sc.gear_hover {
-            fill_round(dc, g.gear_btn, radius(8), t.btn);
+            plate(dc, sc, g.gear_btn, radius(8), t.btn, true);
         }
         let c = ((g.gear_btn.left + g.gear_btn.right) / 2, (g.gear_btn.top + g.gear_btn.bottom) / 2);
         gear(dc, c, s(8), if sc.gear_hover { t.price } else { t.label });
@@ -1098,7 +1143,7 @@ pub fn draw(dc: HDC, w: i32, h: i32, sc: &Scene) {
         // panel, so it has to look pressable in both states.
         let hot = sc.chart.is_some();
         if hot || sc.chart_hover {
-            fill_round(dc, g.chart_btn, radius(8), t.btn);
+            plate(dc, sc, g.chart_btn, radius(8), t.btn, true);
         }
         // Three candles, tallest in the middle: a chart, at 12 px.
         let (px, py) = ((g.chart_btn.left + g.chart_btn.right) / 2, (g.chart_btn.top + g.chart_btn.bottom) / 2);
@@ -1198,6 +1243,7 @@ fn candles(dc: HDC, sc: &Scene, r: RECT, c: &Chart) {
             zone_btn: chartview::Rect::default(),
             tabs,
             vol: None,
+            cross: None,
         }));
     }
     if c.bars.is_empty() {
@@ -1302,7 +1348,7 @@ fn candles(dc: HDC, sc: &Scene, r: RECT, c: &Chart) {
     // at the end for the pointer.
     let n = bars.len();
     let (step, body, wick) = candle_metrics(plot.right - plot.left, n as i32, sc.dpi);
-    let lay = Layout {
+    let mut lay = Layout {
         pane: chartview::Rect::new(r.left, r.top, r.right, r.bottom),
         plot: chartview::Rect::new(plot.left, plot.top, plot.right, plot.bottom),
         step,
@@ -1315,6 +1361,7 @@ fn candles(dc: HDC, sc: &Scene, r: RECT, c: &Chart) {
         zone_btn,
         tabs,
         vol,
+        cross: None,
     };
     // Coloured by the day's direction, the same one the header and the card report. Only when the
     // day's change is unknown does it fall back to the bars: the last close against the first open.
@@ -1435,7 +1482,12 @@ fn candles(dc: HDC, sc: &Scene, r: RECT, c: &Chart) {
         fill_rect(dc, RECT { left: wx, top: y0.min(y1), right: wx + wick, bottom: y1.max(y0 + 1) }, col);
         let (b0, b1) = (lay.y_of(b.o.max(b.c) as f64), lay.y_of(b.o.min(b.c) as f64));
         let bx = x - body / 2;
-        fill_rect(dc, RECT { left: bx, top: b0.min(b1), right: bx + body, bottom: b1.max(b0 + 1) }, col);
+        let (top, bottom) = (b0.min(b1), b1.max(b0 + 1));
+        if (sc.hollow_up || t.contrast) && b.c > b.o {
+            hollow_body(dc, bx, top, body, bottom, col, wick);
+        } else {
+            fill_rect(dc, RECT { left: bx, top, right: bx + body, bottom }, col);
+        }
     }
     // The volume strip: one bar per candle, in the candle's colour, bottom-aligned.
     if let Some(v) = vol {
@@ -1521,7 +1573,17 @@ fn candles(dc: HDC, sc: &Scene, r: RECT, c: &Chart) {
     // The crosshair, when the pointer is on a candle: a vertical line through it and a horizontal at
     // the pointer's row. `bar` is clamped because the pointer was taken from the previous frame and
     // a resize can have refolded the bars since.
-    let hover = sc.chart_at.filter(|p| p.y >= plot.top && p.y < plot.bottom).map(|p| (p.bar.min(n - 1), p.y));
+    // A crosshair set by key (`aim_snap`) sits on its candle's close; one set by the pointer stays where
+    // the pointer is.
+    let hover = sc
+        .chart_at
+        .map(|p| {
+            let bar = p.bar.min(n - 1);
+            let y = if sc.aim_snap { lay.y_of(bars[bar].c as f64).clamp(plot.top, plot.bottom - 1) } else { p.y };
+            (bar, y)
+        })
+        .filter(|&(_, y)| y >= plot.top && y < plot.bottom);
+    lay.cross = hover.and_then(|(bar, y)| lay.price_at(y).map(|price| (bar, price)));
     if let Some((bar, y)) = hover {
         let x = lay.x_of(bar);
         pen_line(dc, PS_DOT, t.accent, (x, plot.top), (x, plot.bottom));
@@ -1579,7 +1641,7 @@ fn range_tabs(dc: HDC, sc: &Scene, r: RECT, c: &Chart, lh: i32) -> [chartview::R
         let rc = RECT { left: right - w, top, right, bottom };
         let lit = *rg == c.range;
         if lit {
-            fill_round(dc, rc, if t.is_pixel() { 0 } else { s(4) }, t.btn);
+            plate(dc, sc, rc, if t.is_pixel() { 0 } else { s(4) }, t.btn, true);
         }
         text(dc, sc.fonts.small, rc.left + s(5), top + (bottom - top - lh) / 2, rg.label(), if lit { t.price } else { t.label });
         out[k] = chartview::Rect::new(rc.left, rc.top, rc.right, rc.bottom);

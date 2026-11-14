@@ -217,6 +217,24 @@ pub struct Config {
     /// times and never a price. Off by default.
     #[serde(skip_serializing_if = "is_false")]
     pub gap_notice: bool,
+    /// Which colours mean up and down (`updown::UpDown`): `red_green` or `blue_orange`. Unset and any
+    /// other text are the default, green up and red down. Ultra only; Classic keeps its palette.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updown: Option<String>,
+    /// Up candles are drawn as outlines, so a rise differs from a fall by shape. Ultra only.
+    #[serde(skip_serializing_if = "is_false")]
+    pub hollow_up: bool,
+    /// Follow the Windows contrast theme (`theme::from_system`). Unset = the build's default: on
+    /// (`auto`) for Ultra, off for Classic, whose pixels stay as they were until the user ticks it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contrast: Option<bool>,
+    /// Follow the Windows animation setting for the panel's open and close. Unset = the build's
+    /// default: `auto` for Ultra, on (always animate) for Classic, which stays as it was.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub animate: Option<bool>,
+    /// The panel's zoom in percent (75, 90, 100, 125, 150). Unset and any other number read as 100.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub panel_zoom: Option<u32>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -350,6 +368,11 @@ impl Default for Config {
             slow_when_quiet: None,
             rest_when_locked: None,
             gap_notice: false,
+            updown: None,
+            hollow_up: false,
+            contrast: None,
+            animate: None,
+            panel_zoom: None,
         }
     }
 }
@@ -361,6 +384,35 @@ impl Config {
         crate::governor::Settings {
             slow_when_quiet: self.slow_when_quiet.unwrap_or(ultra),
             rest_when_locked: self.rest_when_locked.unwrap_or(ultra),
+        }
+    }
+
+    /// The up/down colours in force. Classic never changes its palette, whatever the file says.
+    pub fn updown_mode(&self, ultra: bool) -> crate::updown::UpDown {
+        if ultra { crate::updown::UpDown::from_saved(self.updown.as_deref()) } else { crate::updown::UpDown::GreenRed }
+    }
+
+    /// Up candles are outlines. Ultra only.
+    pub fn hollow(&self, ultra: bool) -> bool {
+        ultra && self.hollow_up
+    }
+
+    /// Follow the Windows contrast theme: what the user chose, else on for Ultra and off for Classic.
+    pub fn follows_contrast(&self, ultra: bool) -> bool {
+        self.contrast.unwrap_or(ultra)
+    }
+
+    /// Follow the Windows animation setting: what the user chose, else on for Ultra. Classic's
+    /// default is "always animate", which is what it did before the setting existed.
+    pub fn follows_animation(&self, ultra: bool) -> bool {
+        self.animate.unwrap_or(ultra)
+    }
+
+    /// The panel zoom in percent. Ultra only, and only a listed step; anything else is 100.
+    pub fn zoom(&self, ultra: bool) -> u32 {
+        match self.panel_zoom {
+            Some(z) if ultra => crate::zoom::from_saved(Some(z)),
+            _ => 100,
         }
     }
 
@@ -1403,6 +1455,35 @@ mod tests {
         assert_eq!(crate::ranges::Range::from_saved(back.chart_range.as_deref()), crate::ranges::Range::Y5);
         let odd: Config = serde_json::from_str(r#"{"chart_range":"7Q"}"#).unwrap();
         assert_eq!(crate::ranges::Range::from_saved(odd.chart_range.as_deref()), crate::ranges::Range::D1);
+    }
+
+    #[test]
+    fn the_w4_settings_default_to_1_8_and_a_1_8_file_means_the_same() {
+        let c: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!((c.updown.clone(), c.hollow_up, c.contrast, c.animate, c.panel_zoom), (None, false, None, None, None));
+        for ultra in [false, true] {
+            assert_eq!(c.updown_mode(ultra), crate::updown::UpDown::GreenRed);
+            assert!(!c.hollow(ultra));
+            assert_eq!(c.zoom(ultra), 100);
+        }
+        // Ultra follows Windows on its own; Classic does not until it is ticked.
+        assert!(c.follows_contrast(true) && !c.follows_contrast(false));
+        assert!(c.follows_animation(true) && !c.follows_animation(false));
+        let json = serde_json::to_string(&c).unwrap();
+        for key in ["updown", "hollow_up", "contrast", "animate", "panel_zoom"] {
+            assert!(!json.contains(key), "{key} is written only when chosen");
+        }
+        // Classic keeps its palette and size whatever a hand-edited file says.
+        let set: Config = serde_json::from_str(r#"{"updown":"blue_orange","hollow_up":true,"panel_zoom":150}"#).unwrap();
+        assert_eq!(set.updown_mode(true), crate::updown::UpDown::BlueOrange);
+        assert!(set.hollow(true) && set.zoom(true) == 150);
+        assert_eq!(set.updown_mode(false), crate::updown::UpDown::GreenRed);
+        assert!(!set.hollow(false) && set.zoom(false) == 100);
+        // A number that is not a step reads as 100.
+        let odd: Config = serde_json::from_str(r#"{"panel_zoom":137}"#).unwrap();
+        assert_eq!(odd.zoom(true), 100);
+        let ticked = Config { contrast: Some(true), animate: Some(false), ..Config::default() };
+        assert!(ticked.follows_contrast(false) && !ticked.follows_animation(true));
     }
 
     fn moves(list: &[(&str, f64)]) -> std::collections::HashMap<String, f64> {

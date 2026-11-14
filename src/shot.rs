@@ -151,6 +151,8 @@ fn render(t: &Theme, phase: f64, now: f64, b: &Board, h: &History, dpi: u32) -> 
         settings_btn: false,
         alert: None,
         alert_dots: &[],
+        hollow_up: false,
+        aim_snap: false,
         phase,
     };
     capture(w, hh, &sc)
@@ -297,6 +299,40 @@ pub fn write_w3(dir: &Path) -> Result<usize, String> {
     Ok(2)
 }
 
+/// W4's pictures, written into `dir` beside the others and never over them. The panel with the pane
+/// open (1,488 px, 96 dpi, the S&P card locked) in each up and down palette on the midnight theme, and
+/// blue and orange with hollow up candles. Returns how many files were written.
+pub fn write_w4(dir: &Path) -> Result<usize, String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let mid = theme::resolve("midnight");
+    let mut n = 0;
+    for (name, mode, hollow) in [
+        ("w4-updown-red_green.png", crate::updown::UpDown::RedGreen, false),
+        ("w4-updown-blue_orange.png", crate::updown::UpDown::BlueOrange, false),
+        ("w4-updown-blue_orange-hollow.png", crate::updown::UpDown::BlueOrange, true),
+    ] {
+        let t = theme::with_updown(mid, mode);
+        let (w, h, px) = chart_fixture_px(t, 96, 1488, None, Some(200), false, None, false, false, "", hollow);
+        write_png(&dir.join(name), w, h, &px)?;
+        n += 1;
+    }
+    // Panel zoom: the pane fixture at 75 % and 150 % of 96 dpi, the window scaled with it.
+    for z in [75u32, 150] {
+        let (w, h, px) = chart_fixture_px(mid, crate::zoom::effective_dpi(96, z), 1488 * z as i32 / 100, None, Some(200), false, None, false, false, "", false);
+        write_png(&dir.join(format!("w4-zoom-{z}.png")), w, h, &px)?;
+        n += 1;
+    }
+    // The contrast theme, from the two fixed system palettes (never the machine's own), with a candle
+    // under the crosshair. Up candles are outlines there whatever the setting says.
+    for (name, colours) in [("w4-contrast-black.png", crate::contrast::HC_BLACK), ("w4-contrast-white.png", crate::contrast::HC_WHITE)] {
+        let t = theme::system(&colours);
+        let (w, h, px) = chart_fixture_px(t, 96, 1488, None, Some(200), false, None, false, false, "", false);
+        write_png(&dir.join(name), w, h, &px)?;
+        n += 1;
+    }
+    Ok(n)
+}
+
 /// The fixture's clock: UTC-4, a US equity day in summer.
 const TZ_S: i32 = -4 * 3_600;
 
@@ -341,6 +377,28 @@ fn write_chart_fixture(
     note: &str,
 ) -> Result<PathBuf, String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let (pw, ph, px8) = chart_fixture_px(t, dpi, w, hover, bar, refs, range, volume, levels, note, false);
+    let path = dir.join(format!("chart-{}.png", t.name));
+    write_png(&path, pw, ph, &px8)?;
+    Ok(path)
+}
+
+/// The pixels of the chart fixture: the panel with the pane open, from deterministic bars. `hollow`
+/// draws up candles as outlines (`Scene::hollow_up`).
+#[allow(clippy::too_many_arguments)]
+fn chart_fixture_px(
+    t: &Theme,
+    dpi: u32,
+    w: i32,
+    hover: Option<usize>,
+    bar: Option<usize>,
+    refs: bool,
+    range: Option<Range>,
+    volume: bool,
+    levels: bool,
+    note: &str,
+    hollow: bool,
+) -> (u32, u32, Vec<u8>) {
     let now = 1_792_052_981.0;
     let mut b = board(now);
     // 390 one-minute bars is 6.5 h, the length of a US equity day.
@@ -452,6 +510,8 @@ fn write_chart_fixture(
         settings_btn: true,
         alert: None,
         alert_dots: &[],
+        hollow_up: hollow,
+        aim_snap: false,
         phase: 0.0,
     };
     if let Some(bar) = bar {
@@ -467,10 +527,7 @@ fn write_chart_fixture(
             sc.chart_at = lay.pointer_at(lay.x_of(i), close, 2);
         }
     }
-    let (pw, ph, px8) = capture(g.w, g.h, &sc);
-    let path = dir.join(format!("chart-{}.png", t.name));
-    write_png(&path, pw, ph, &px8)?;
-    Ok(path)
+    capture(g.w, g.h, &sc)
 }
 
 /// The pointer's moment on a card, snapped to five minutes the way the live hit-test does: the pane
@@ -826,6 +883,8 @@ impl Fixture {
             settings_btn: true,
             alert: None,
             alert_dots: &[],
+            hollow_up: false,
+        aim_snap: false,
             phase: 0.0,
         }
     }
@@ -1152,5 +1211,81 @@ mod tests {
         let aimed = Hot { aim: Some(crate::chartview::Pointer { bar: 3, y: 100 }), ..none };
         assert!(panel::hot_dirty(&g, 96, Some(0), None, &none, &aimed).is_none());
         assert!(panel::hot_dirty(&g, 96, None, None, &none, &Hot { open: true, ..none }).is_none());
+    }
+
+    fn rgba(c: u32) -> [u8; 4] {
+        [(c & 0xff) as u8, (c >> 8 & 0xff) as u8, (c >> 16 & 0xff) as u8, 255]
+    }
+
+    fn pane_px(t: &Theme, hollow: bool) -> Vec<u8> {
+        chart_fixture_px(t, 96, 1488, None, None, false, None, false, false, "", hollow).2
+    }
+
+    /// `red_green` changes only the two direction colours: swapping them in the default picture gives
+    /// the `red_green` picture exactly. Checked on a retro theme, whose bitmap face and square
+    /// corners have no antialiasing, so every pixel is a theme colour and none is a blend.
+    #[test]
+    fn red_green_changes_only_the_two_direction_colours() {
+        let t = theme::resolve("pc98");
+        let swapped = theme::with_updown(t, crate::updown::UpDown::RedGreen);
+        let (up, down) = (rgba(t.up), rgba(t.down));
+        let mut was = pane_px(t, false);
+        let now = pane_px(swapped, false);
+        let mut seen = 0;
+        for p in was.chunks_exact_mut(4) {
+            if p == up {
+                p.copy_from_slice(&down);
+                seen += 1;
+            } else if p == down {
+                p.copy_from_slice(&up);
+                seen += 1;
+            }
+        }
+        assert!(seen > 500, "the picture shows direction colours ({seen} px)");
+        assert!(diff(&was, &now, 1488).is_empty(), "only up and down moved");
+    }
+
+    /// Hollow up candles: the outline stays, the inside is not painted. Every pixel that changed was
+    /// an up-coloured pixel of the filled picture, and some did change.
+    #[test]
+    fn hollow_up_candles_remove_only_up_coloured_pixels() {
+        let t = theme::resolve("pc98");
+        let (filled, hollow) = (pane_px(t, false), pane_px(t, true));
+        let moved = diff(&filled, &hollow, 1488);
+        assert!(!moved.is_empty(), "some up candle is wide enough to be hollow");
+        let up = rgba(t.up);
+        for (x, y) in moved {
+            let i = (y as usize * 1488 + x as usize) * 4;
+            assert_eq!(&filled[i..i + 4], &up, "pixel ({x},{y}) was not an up pixel");
+        }
+    }
+
+    /// Zoom 150 % at 96 dpi is byte for byte the 144 dpi picture at 100 %, and 100 % is the plain 96 dpi
+    /// picture: the zoom is only a DPI multiplier, so the panel needs no second code path. Checked on the
+    /// resting panel and on the pane, on a flat theme and a retro one.
+    #[test]
+    fn zoom_150_at_96_dpi_is_the_144_dpi_picture_and_100_is_the_baseline() {
+        let now = 1_792_052_981.0;
+        let b = board(now);
+        let mut hist = History::new();
+        hist.record(&b, now);
+        for name in ["midnight", "pc98"] {
+            let t = theme::resolve(name);
+            for (base, z) in [(96u32, 150u32), (96, 125), (144, 100), (96, 100), (120, 150)] {
+                let eff = crate::zoom::effective_dpi(base, z);
+                let zoomed = render(t, 0.0, now, &b, &hist, eff);
+                let plain = render(t, 0.0, now, &b, &hist, (base as u64 * z as u64 / 100) as u32);
+                if (base as u64 * z as u64).is_multiple_of(100) {
+                    assert!(zoomed == plain, "{name}: zoom {z} at {base} dpi differs from {} dpi", base * z / 100);
+                }
+            }
+            assert!(render(t, 0.0, now, &b, &hist, crate::zoom::effective_dpi(96, 100)) == render(t, 0.0, now, &b, &hist, 96), "{name}: 100 % is the baseline");
+            let a = chart_fixture_px(t, crate::zoom::effective_dpi(96, 150), 1488 * 3 / 2, None, None, false, None, false, false, "", false);
+            let c = chart_fixture_px(t, 144, 1488 * 3 / 2, None, None, false, None, false, false, "", false);
+            assert!(a == c, "{name}: the pane at zoom 150 is the pane at 144 dpi");
+            let big = render(t, 0.0, now, &b, &hist, 144);
+            let small = render(t, 0.0, now, &b, &hist, 96);
+            assert!(big.0 > small.0 && big.1 > small.1, "{name}: a larger scale is a larger panel");
+        }
     }
 }

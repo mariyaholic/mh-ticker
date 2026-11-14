@@ -148,7 +148,7 @@ Double click it. If prompted, simply select Run anyway.
   shows the date too). daily and longer ranges say `check dates` when their dates don't fall on the day boundary,
   which can mean the feed's dates are off. neither note shows while a candle is under the pointer, and 1D has none
 - **Ranges (Ultra):** the tabs on the chart's second header line are `1D 5D 1M 6M 1Y 5Y`. `1D` is today. the others
-  load the first time u click them, for the locked card, and refresh themselves when they get old. a range that
+  load the first time u click them (or press `R` on the chart), for the locked card, and refresh themselves when they get old. a range that
   fails says so and tries again after 30 seconds. `1M` and `6M` are daily bars trimmed to a month or half a year.
   daily and longer bars keep the exchange's own dates for everyone, so they have no local/UTC switch. The chart opens on the range you used last. The header shows the change over the range
   on screen (such as `5Y +182 %`) in place of the day's change, except on 1D, and the range's high and low are marked
@@ -189,15 +189,36 @@ Double click it. If prompted, simply select Run anyway.
   checked and shows up in *Recent*, but it makes no balloon and sends nothing to the webhook. when the mute or the quiet
   hours end, one balloon says how many alerts came in meanwhile, like `3 alerts while muted. See Alerts > Recent.`
   (nothing if there were none)
+- **Typed settings:** a few settings take text you type, not only the presets.
+  - *Hotkey* → *Type a hotkey...* (both builds): letters, digits, `F1` to `F24`, Space, Home, End, Insert, Delete, PageUp
+    and PageDown, with at least one of Ctrl, Alt or Win.
+  - *Alerts* → *Quiet hours* → *Type hours...* (Ultra): a span such as `22:30-06:45`. it can run past midnight, and equal
+    ends mean off.
+  - *Alerts* → *Mute* → *Until a time...* (Ultra): a 24-hour time, which ends the mute the next time the clock reads it.
+  - an alert's own submenu has *cooldown...* (Ultra): `90s`, `15m` or `2h`, from 30 seconds to 24 hours. a bare number is minutes.
+  - a bad entry is refused with a sentence that says what to type, and nothing is changed
 - **Webhook (Ultra):** *Alerts* → *Paste URL from clipboard* reads the URL u copied, checks it and asks before saving.
   the menu shows only its host. *Send a test alert* checks it works, and *Remove* deletes it. the URL is the password
   for that channel, so the app never shows or logs all of it. a POST that fails with a network error or a 5xx is tried
   once more after 3 seconds, and the log says `sent on retry` if that works. a 4xx is never retried. quitting waits up
   to 2 seconds for a POST still on its way
+- **Accessibility:** right click → *Accessibility*. the first two ticks are on both builds, and both start off on Classic.
+  - *Follow the Windows contrast theme*: with a Windows contrast theme on, Ultra draws in the system's colours, and shows
+    direction by shape and sign as well as colour (up candles are hollow, and the sign says which way the price moved).
+    Ultra follows it by default. **Classic has this tick and it starts off**, so Classic looks as it always did until u tick it.
+  - *Follow the Windows animation setting*: with Windows animations off, the panel opens and closes in one step. Ultra
+    follows it by default. **Classic has this tick and it starts off**, so Classic keeps its glide until u tick it.
+  - *Hollow up candles* (Ultra): up candles are outlines.
+  - the up and down colours (Ultra): *Green up, red down* (as before), *Red up, green down*, or *Blue up, orange down*.
+    only the two direction colours change. if the secondary text is too faint for u, the Windows contrast theme is the answer.
+  - *Panel size* (Ultra): 75, 90, 100, 125 or 150 %. it scales the panel's text, cards and chart. the strip keeps its size.
+- **Window name (Ultra):** the name Windows shows in Alt+Tab and on the taskbar thumbnail carries the locked card as a
+  sentence, such as `Gold 4,012.30, up 0.4 percent - MH Ticker Ultra`, with `stale` added when the price is stale. with
+  nothing locked it reads the count of symbols up and down. Classic's name never changes.
 - **Start with Windows:** right click → tick *Start with Windows* and it starts when u sign in. untick it to stop.
   it's a `Run` entry for ur own account (no admin needed), and the menu reads the tick each time it opens
 - **Hotkey:** right click → *Hotkey* → *Off*, one of four presets (`Ctrl+Alt+M`, `Ctrl+Alt+T`, `Ctrl+Shift+F12`,
-  `Ctrl+Alt+Space`), or a custom one from the config. the key opens and closes the panel from anywhere. if another
+  `Ctrl+Alt+Space`), or a custom one from the config. *Type a hotkey...* takes any combination in the config's form, such as `Ctrl+Shift+M`, on both builds. the key opens and closes the panel from anywhere. if another
   app already has the combination, the entry says so
 - **Refresh now:** right click → *Refresh now* fetches every price and chart range at once, instead of waiting for
   the next poll. the backoff after a source that keeps failing still applies
@@ -219,7 +240,11 @@ Double click it. If prompted, simply select Run anyway.
   opens the chart, `S` opens the symbol picker, Delete takes the locked card off the strip, and Ctrl+Left and
   Ctrl+Right move it one place. `/` opens a prompt that finds a card by its label or name, Home and End lock the first and
   last card, and Ctrl+Z undoes the last removal, move, sort, pin change or alert clear. the card menu has *Move left*, *Move right*, *Move first* and *Remove from strip*
-  too, and a click on a symbol on a docked Ultra strip locks that card and opens the panel on it
+  too, and a click on a symbol on a docked Ultra strip locks that card and opens the panel on it.
+  **Chart keys (Ultra, chart open):** Shift+Left and Shift+Right move the crosshair from candle to candle, and it snaps to
+  the candle's close. plain arrows still move the lock. `R` changes the range, `Z` flips the zone, and `A` sets an alert at
+  the crosshair price through the prompt. the menu key opens the card menu, `F10` opens the main menu, and `F1` lists every
+  key. a pointer move takes the crosshair back
 - **Save failures:** if the settings can't be written (a read-only folder, say), the menu shows a greyed line saying
   so. it clears when a later save works
 - **Quit or whatever else:** Right click the strip or the tray icon (or use the cog in the Ultra panel). u get *Expand view*, *Symbols*,
@@ -271,6 +296,10 @@ whats in there:
   wins if both are set). `gap_notice` true sends the "could not be checked" webhook notice. both are off when missing, which is the default
 - `alert_once`, `alerts_muted`, `alerts_mute_until` (seconds since 1970, UTC) and `quiet_hours` (`[from, to]` in
   minutes of the local day, or missing) (Ultra): what the *Alerts* menu sets for *Fire once*, *Mute* and *Quiet hours*
+- `updown` (Ultra): `red_green` or `blue_orange`. left out means green up and red down, as before.
+- `hollow_up` (Ultra): `true` draws up candles as outlines.
+- `contrast` and `animate`: `true` or `false`. left out means Ultra follows Windows, and Classic has both ticks off.
+- `panel_zoom` (Ultra): 75, 90, 100, 125 or 150. any other value is 100.
 - `webhook` (Ultra): a URL to also POST alerts to. **this is a secret** - the URL is the password for that
   channel, so dont paste it anywhere public. set it from *Alerts* → *Paste URL from clipboard* or here. the app
   never prints it (menus and `--probe` show the host at most)

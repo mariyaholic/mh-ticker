@@ -126,6 +126,10 @@ pub struct Layout {
     /// `right` are the plot's; time ticks hang under its `bottom`, not under `plot.bottom`.
     /// `plot` is then the PRICE plot (shortened), so `y_of` and `price_at` mean what they always did.
     pub vol: Option<Rect>,
+    /// The candle and price the painter drew the crosshair at this frame (`None` with no crosshair).
+    /// Written by the painter after it has resolved a keyed crosshair onto its candle's close, so
+    /// *Alert at the crosshair* asks for the price on screen, not for one the key handler guessed.
+    pub cross: Option<(usize, f64)>,
 }
 
 impl Layout {
@@ -183,6 +187,17 @@ impl Layout {
     /// The pointer for client position `(x, y)`, or `None` when it is not over a candle's slot inside
     /// the plot. `y` is snapped down to a multiple of `quant` pixels counted from `plot.top`
     /// (`quant < 1` is treated as 1), so a mouse move inside one band does not change the `Pointer`.
+    /// The crosshair for candle `bar` set by a key: the pointer a mouse over that candle's slot, at the
+    /// height of `price` (clamped into the plot), would give, so a keyed crosshair and a pointer one name
+    /// the same layout index. `None` for a candle that is not drawn.
+    pub fn pointer_for_bar(&self, bar: usize, price: f64, quant: i32) -> Option<Pointer> {
+        if bar >= self.bars {
+            return None;
+        }
+        let y = self.y_of(price).clamp(self.plot.top, (self.plot.bottom - 1).max(self.plot.top));
+        self.pointer_at(self.x_of(bar), y, quant)
+    }
+
     pub fn pointer_at(&self, x: i32, y: i32, quant: i32) -> Option<Pointer> {
         let bar = self.index_at(x)?;
         if !self.plot.contains(x, y) {
@@ -900,6 +915,7 @@ mod tests {
             zone_btn: Rect::new(60, 12, 100, 28),
             tabs: [Rect::default(); 6],
             vol: None,
+            cross: None,
         }
     }
 
@@ -1335,6 +1351,57 @@ mod tests {
             zone_btn: Rect::default(),
             tabs: [Rect::default(); 6],
             vol: None,
+            cross: None,
+        }
+    }
+
+    /// A crosshair set by key and one set by the pointer give the same layout index, at every width and
+    /// scale, and a keyed one is always inside the plot.
+    #[test]
+    fn a_keyed_crosshair_and_a_pointer_one_name_the_same_candle() {
+        for dpi in [96, 120, 144, 192] {
+            for plot_w in [296, 650, 1_200] {
+                for n in [1, 8, 78, 390] {
+                    let l = layout_for(plot_w, n, dpi);
+                    // The painter draws only the candles that fit (`newest_that_fit`).
+                    if n as i32 * l.step > plot_w {
+                        continue;
+                    }
+                    let mut at = None;
+                    for _ in 0..n + 2 {
+                        at = crate::keys::step_candle(at, n, -1);
+                        let i = at.unwrap();
+                        let keyed = l.pointer_for_bar(i, 6_700.0, 2).unwrap();
+                        let by_pointer = l.pointer_at(l.x_of(i), keyed.y, 2).unwrap();
+                        assert_eq!(keyed, by_pointer, "dpi {dpi} w {plot_w} n {n} candle {i}");
+                        assert_eq!(keyed.bar, i);
+                        assert!(l.plot.contains(l.x_of(i), keyed.y));
+                    }
+                    assert_eq!(at, Some(0), "walking left ends on the oldest candle");
+                    assert_eq!(l.pointer_for_bar(n, 6_700.0, 2), None, "past the last candle");
+                    // A price off the top or bottom of the window is held inside the plot.
+                    assert!(l.pointer_for_bar(0, 1e9, 2).is_some() && l.pointer_for_bar(0, -1e9, 2).is_some());
+                }
+            }
+        }
+    }
+
+    /// Zoom is a DPI multiplier (`zoom::effective_dpi`), so P2's `index_at(x_of(i)) == i` must hold at the
+    /// effective DPI of every zoom step, on every real DPI.
+    #[test]
+    fn every_candle_round_trips_at_every_zoom_step() {
+        for dpi in [96, 120, 144, 192] {
+            for z in crate::zoom::STEPS {
+                let eff = crate::zoom::effective_dpi(dpi, z);
+                for plot_w in [296, 650, 1_200, 2_000] {
+                    for n in [1, 4, 8, 24, 78, 96, 390] {
+                        let l = layout_for(plot_w, n, eff);
+                        for i in 0..n {
+                            assert_eq!(l.index_at(l.x_of(i)), Some(i), "dpi {dpi} zoom {z} ({eff}) w {plot_w} n {n} candle {i}");
+                        }
+                    }
+                }
+            }
         }
     }
 
