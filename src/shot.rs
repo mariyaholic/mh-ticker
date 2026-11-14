@@ -1031,6 +1031,7 @@ pub fn write_settings(dir: &Path) -> Result<usize, String> {
         case("settings-classic-system.png", false, theme::classic(), "midnight", Section::System, 96, 100, false),
         case("settings-ultra-display-midnight.png", true, mid, "midnight", Section::Display, 96, 100, false),
         case("settings-ultra-display-midnight-full.png", true, mid, "midnight", Section::Display, 96, 100, true),
+        case("settings-ultra-symbols-midnight-full.png", true, mid, "midnight", Section::Symbols, 96, 100, true),
         case("settings-ultra-alerts-midnight-full.png", true, mid, "midnight", Section::Alerts, 96, 100, true),
         case("settings-ultra-display-pc98.png", true, pc, "pc98", Section::Display, 96, 100, false),
         case("settings-ultra-chart-pc98.png", true, pc, "pc98", Section::Chart, 96, 100, false),
@@ -1052,7 +1053,7 @@ pub fn write_settings(dir: &Path) -> Result<usize, String> {
         let l = settings::layout(eff, w, h, sections.len(), &controls, 0);
         let fonts = Fonts::new(theme::font_of(c.theme, None), eff, c.theme.is_pixel());
         let focus = controls.iter().position(|k| k.focusable()).and_then(|ci| settings::entry_opt(&controls[ci]).map(|oi| Hit::Opt(ci, oi)));
-        let p = Paint { theme: c.theme, fonts: &fonts, title: "Settings", sections: &sections, cur, controls: &controls, layout: &l, focus, hover: None };
+        let p = Paint { theme: c.theme, fonts: &fonts, title: "Settings", sections: &sections, cur, controls: &controls, layout: &l, focus, hover: None, bar: Default::default() };
         let (pw, ph, px) = capture_with(w, h, |dc| settings::draw(dc, w, h, &p));
         write_png(&dir.join(c.file), pw, ph, &px)?;
         n += 1;
