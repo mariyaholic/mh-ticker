@@ -399,6 +399,39 @@ fn about(env: &Env) -> Vec<Control> {
     v
 }
 
+/// The page the still renderer draws: the default config with `theme`, two displays, an alert on the
+/// first two symbols and a webhook host.
+#[cfg(feature = "shots")]
+pub(super) fn fixture(ultra: bool, theme_name: &str, section: Section) -> Vec<Control> {
+    let mut cfg = Config::default();
+    cfg.theme = theme_name.to_string();
+    cfg.hotkey = Some(hotkey::PRESETS[0].to_string());
+    cfg.alerts = cfg.rows.iter().take(2).map(|r| config::Alert { label: r.label.clone(), ..Default::default() }).collect();
+    let mut env = Env { ultra, ..Env::default() };
+    env.status = "live".into();
+    env.meter = "data used this month: 12 MB".into();
+    env.autostart = true;
+    env.version = format!("{} {}", if ultra { "MH Ticker Ultra" } else { "MH Ticker" }, env!("CARGO_PKG_VERSION"));
+    env.monitors = vec![
+        MonitorFact { device: "A".into(), primary: true, w: 2560, h: 1440 },
+        MonitorFact { device: "B".into(), primary: false, w: 1920, h: 1080 },
+    ];
+    env.alerts.host = Some("hooks.example.com".into());
+    env.alerts.rows = cfg
+        .rows
+        .iter()
+        .enumerate()
+        .map(|(i, r)| AlertsRow {
+            label: r.label.clone(),
+            digits: r.digits,
+            enabled: (0..alerts::PRESETS.len()).map(|k| (k + i) % 4 != 0).collect(),
+            fresh: true,
+            alert: cfg.alerts.iter().find(|a| a.label == r.label).cloned(),
+        })
+        .collect();
+    build(&cfg, &env, section)
+}
+
 /// The option a control would run, for tests and for the window's activation.
 pub(super) fn opt_of(controls: &[Control], ci: usize, oi: usize) -> Option<&Opt> {
     controls.get(ci)?.opts.get(oi)

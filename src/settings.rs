@@ -457,6 +457,8 @@ pub struct Palette {
     pub dim: COLORREF,
     pub chip: COLORREF,
     pub chip_text: COLORREF,
+    /// Text of a disabled option, on the chip fill.
+    pub off_text: COLORREF,
     pub hover: COLORREF,
     pub hover_text: COLORREF,
     pub on: COLORREF,
@@ -484,6 +486,25 @@ fn readable(want: COLORREF, fill: COLORREF, min: f64) -> COLORREF {
     if contrast_ratio(want, fill) >= min { want } else { ink_on(fill) }
 }
 
+fn mix(a: COLORREF, b: COLORREF, k: u32, of: u32) -> COLORREF {
+    let ch = |shift: u32| {
+        let (x, y) = ((a >> shift) & 0xff, (b >> shift) & 0xff);
+        ((x * (of - k) + y * k) / of) << shift
+    };
+    ch(0) | ch(8) | ch(16)
+}
+
+/// The quietest colour that still reads on `fill` at `min` to 1: `want` when it already does, else the
+/// first blend from `fill` toward `want` (or toward black or white when `want` cannot get there) that
+/// does. A theme whose own dim colour is too faint therefore gets a quiet grey, not full-strength text.
+fn soft(want: COLORREF, fill: COLORREF, min: f64) -> COLORREF {
+    if contrast_ratio(want, fill) >= min {
+        return want;
+    }
+    let toward = if contrast_ratio(want, fill) >= contrast_ratio(ink_on(fill), fill) { want } else { ink_on(fill) };
+    (1..=32).map(|k| mix(fill, toward, k, 32)).find(|c| contrast_ratio(*c, fill) >= min).unwrap_or(ink_on(fill))
+}
+
 pub fn palette(t: &Theme) -> Palette {
     let page = t.bg;
     let side = t.card;
@@ -494,9 +515,10 @@ pub fn palette(t: &Theme) -> Palette {
         page,
         side,
         text: readable(t.label, page, 4.5),
-        dim: readable(t.dim, page, 4.5),
+        dim: soft(t.dim, page, 4.5),
         chip,
         chip_text: readable(t.label, chip, 4.5),
+        off_text: soft(t.dim, chip, 4.5),
         hover,
         hover_text: readable(t.price, hover, 4.5),
         on,
@@ -635,7 +657,7 @@ pub fn draw(dc: HDC, w: i32, h: i32, p: &Paint) {
                     } else {
                         let selected = o.on;
                         let (fill, ink) = if !o.enabled {
-                            (pal.chip, pal.dim)
+                            (pal.chip, pal.off_text)
                         } else if selected {
                             (pal.on, pal.on_text)
                         } else if hovered {
@@ -645,7 +667,7 @@ pub fn draw(dc: HDC, w: i32, h: i32, p: &Paint) {
                         };
                         plate(dc, *r, s(8), fill);
                         if contrast || !selected {
-                            outline(dc, *r, s(8), if o.enabled { pal.line } else { pal.dim }, if contrast { s(2) } else { 1 });
+                            outline(dc, *r, s(8), if o.enabled { pal.line } else { pal.off_text }, if contrast { s(2) } else { 1 });
                         }
                         put(dc, f.small, Rc::new(r.left + s(6), r.top, r.right - s(6), r.bottom), &o.label, ink, Align::Center);
                     }
@@ -674,13 +696,13 @@ fn draw_switch(dc: HDC, f: &Fonts, r: Rc, on: bool, hovered: bool, enabled: bool
     let fill = if !enabled { pal.chip } else if on { pal.on } else if hovered { pal.hover } else { pal.chip };
     plate(dc, track, r.height(), fill);
     if !on || contrast {
-        outline(dc, track, r.height(), if enabled { pal.text } else { pal.dim }, if contrast { 2 * one } else { 1 });
+        outline(dc, track, r.height(), if enabled { pal.text } else { pal.off_text }, if contrast { 2 * one } else { 1 });
     }
     let knob_x = if on { track.right - d - 3 * one } else { track.left + 3 * one };
-    let knob = if !enabled { pal.dim } else if on { pal.on_text } else { pal.text };
+    let knob = if !enabled { pal.off_text } else if on { pal.on_text } else { pal.text };
     panel::fill_ellipse(dc, knob_x, track.top + 3 * one, d, knob);
     let word = if on { "On" } else { "Off" };
-    put(dc, f.small, Rc::new(track.right + 8 * one, r.top, r.right.max(track.right + 40 * one), r.bottom), word, if enabled { pal.text } else { pal.dim }, Align::Left);
+    put(dc, f.small, Rc::new(track.right + 8 * one, r.top, r.right.max(track.right + 40 * one), r.bottom), word, if enabled { pal.text } else { pal.off_text }, Align::Left);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -934,6 +956,7 @@ mod tests {
             for (name, fg, bg, min) in [
                 ("text on page", p.text, p.page, 4.5),
                 ("dim on page", p.dim, p.page, 4.5),
+                ("disabled chip text", p.off_text, p.chip, 4.5),
                 ("text on side", readable(t.label, p.side, 4.5), p.side, 4.5),
                 ("chip text", p.chip_text, p.chip, 4.5),
                 ("hover text", p.hover_text, p.hover, 4.5),
