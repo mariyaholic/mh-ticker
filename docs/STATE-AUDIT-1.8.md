@@ -26,11 +26,11 @@ message-sending window function), then for what its own message loop can dispatc
 | 2 | Medium | Fallback toggle writes a settings copy from before its confirmation box | fixed | `ui::tests::the_fallback_toggle_writes_what_happened_during_its_confirmation` |
 | 3 | Low | A webhook result loses "test" once its log line is gone | fixed | `ui::tests::a_webhook_result_knows_a_test_without_its_log_line` |
 | 4 | Low | "Alerts (n)" counts alerts on hidden symbols the submenu does not list | fixed | `ui::tests::the_alerts_count_is_of_listed_symbols_only` |
-| 5 | Low | Card menu Copy/Open act on an index captured when the menu opened | open | none |
-| 6 | Low | The tray alert marker stays lit while the panel is open | open | none |
+| 5 | Low | Card menu Copy/Open act on an index captured when the menu opened | fixed (responsiveness pass) | `ui::tests::the_card_menu_copy_and_open_follow_the_card_not_its_old_index` |
+| 6 | Low | The tray alert marker stays lit while the panel is open | fixed (responsiveness pass) | `ui::tests::an_alert_does_not_light_the_marker_while_the_panel_is_in_front` |
 | 7 | Low | A second *Add symbol* prompt from the tray silently drops the first one's symbol | fixed in review (a box says so) | none |
-| 8 | Low | Menu snapshots (`open`, `picked`) go stale when the hotkey or a tray click changes the mode during the menu | open (carried from 1.7.1) | none |
-| 9 | Low | A morph across monitors of different DPI lays the strip out at the old DPI until the next feed tick | open | none |
+| 8 | Low | Menu snapshots (`open`, `picked`) go stale when the hotkey or a tray click changes the mode during the menu | fixed (responsiveness pass) | `ui::tests::the_menu_acts_on_the_mode_it_is_chosen_in_not_the_one_it_opened_in` |
+| 9 | Low | A morph across monitors of different DPI lays the strip out at the old DPI until the next feed tick | fixed (responsiveness pass) | `ui::tests::a_morph_across_a_scale_change_replans_its_end_frame` |
 
 ### 1. Medium: *Refresh now* does not reach the range book (fixed)
 
@@ -76,7 +76,7 @@ message-sending window function), then for what its own message loop can dispatc
 - Expected: the count matches the listed rows. The hidden symbol's alert is kept (it fires again when the
   symbol is shown again, and is listed then); this is the existing policy and is unchanged.
 
-### 5. Low: card menu Copy/Open by index (open)
+### 5. Low: card menu Copy/Open by index (fixed)
 
 - Where: `src/ui.rs:1909`, `1910`, dispatched by `CMD_COPY + i` / `CMD_OPEN + i`.
 - Trigger: right-click a card; while the menu is open a lookup finishes (`WM_LOOKUP` -> `add_custom` ->
@@ -86,7 +86,7 @@ message-sending window function), then for what its own message loop can dispatc
   `menu_commands`). Not fixed: it needs a new `menu_commands::Action` variant in a module the Linux harness
   pins, and the trigger is narrow.
 
-### 6. Low: alert marker while the panel is open (open)
+### 6. Low: alert marker while the panel is open (fixed)
 
 - Where: `src/ui.rs:1377` sets `alert_pending`; only `expand` and a menu clear it.
 - Trigger: panel open, an alert fires. The tray marker and the tooltip line stay until a menu opens or the
@@ -104,7 +104,7 @@ message-sending window function), then for what its own message loop can dispatc
 - Fixed in review: the busy branch now shows that box and names the symbol that was not added. A
   message box path, so it has no unit test; the decision itself (`AddStep::Busy`) is unchanged.
 
-### 8. Low: stale menu snapshot (open, from 1.7.1)
+### 8. Low: stale menu snapshot (fixed, from 1.7.1)
 
 - Where: `src/ui.rs:1961` (`CMD_PANEL` text from `open`), `src/ui.rs:2330` (`CMD_POS` guarded by `!open`).
 - Trigger: tray menu open with the strip showing; the global hotkey expands the panel during the menu; the
@@ -113,7 +113,7 @@ message-sending window function), then for what its own message loop can dispatc
   hotkey does nothing (harmless). Expected: re-read the mode after the menu closes, as `Action::Monitor`
   already does.
 
-### 9. Low: morph across DPI (open)
+### 9. Low: morph across DPI (fixed)
 
 - Where: `WM_DPICHANGED` (`src/ui.rs:3848`) runs synchronously inside `run_morph` while the mode is
   `Morph`, so `relayout_and_place` does nothing, and `collapse` computed `strip_rect` and the frame before
@@ -152,3 +152,21 @@ message-sending window function), then for what its own message loop can dispatc
 
 Real Windows: the modal-loop interleavings (feed, hotkey and tray during a box, menu or prompt), the
 cross-DPI morph, the prompt's keyboard behaviour, a real webhook endpoint and live CNBC range files.
+
+## Responsiveness pass (fixes of findings 5, 6, 8, 9)
+
+Done on `wip/responsive`; the measurements, the candidates ruled out and the full reasoning are in
+`docs/1.8/notes/responsive.md`. Each fix was written test first and the test was seen to fail against the
+old behaviour.
+
+- 5: `Action::Copy(label)` and `Action::Open(symbol)` carry the card through `menu_commands`; `card_target`
+  resolves by label. The `CMD_COPY` and `CMD_OPEN` index ranges are gone.
+- 6: a fired alert does not light the tray marker while the panel is open and in front (`marks_tray`).
+  P1's "until the panel is expanded or a menu is opened" is not contradicted: a marker lit with the panel
+  already open would never meet an expand. An open panel behind another window still lights it.
+- 8: `CMD_PANEL` and the Position entries read the mode when chosen (`panel_step`, `position_applies`).
+  The check-mark toggles keep acting on the state the user saw.
+- 9: `collapse` and `expand` re-plan the end frame when the scale changed during the morph
+  (`settled_frame`).
+- Also: ten `config::save` calls moved out of `with_ui` closures (`save_cfg`), and two machines named
+  (back buffer, hover rectangle) in `STATE-MACHINES.md`.

@@ -36,9 +36,9 @@ const BAR_DEDUP_S: f64 = 45.0;
 const CHIP_COLS: usize = 4;
 
 pub struct Fonts {
-    big: HFONT,
-    mid: HFONT,
-    small: HFONT,
+    pub(crate) big: HFONT,
+    pub(crate) mid: HFONT,
+    pub(crate) small: HFONT,
 }
 
 fn font(face: &[u16], pt: i32, weight: u32, dpi: u32, pixel: bool) -> HFONT {
@@ -388,6 +388,65 @@ pub fn open_btn_at(g: &Geo, selected: Option<usize>, dpi: u32, x: i32, y: i32) -
         return false;
     }
     selected.is_some_and(|i| in_rect(&open_btn_rect(card_rect(g, i), dpi), x, y))
+}
+
+/// Everything a mouse move can change on the open panel, as flags and indices, so two of them can be
+/// compared and the difference turned into the rectangle that has to be repainted ([`hot_dirty`]).
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub struct Hot {
+    pub btn: bool,
+    pub pick: bool,
+    pub chart_btn: bool,
+    pub gear: bool,
+    pub open: bool,
+    /// The candle under the pointer (and the crosshair, tags and legend that follow it).
+    pub aim: Option<Pointer>,
+    /// The card whose sparkline the pointer is on (and its crosshair plate). The snapped moment is
+    /// part of the comparison but not of the region: the plate is inside the card either way.
+    pub card: Option<Hover>,
+}
+
+/// The smallest rectangle that has to be repainted when the hover state goes from `was` to `now`:
+/// the union of what each differing part draws. `pane` is the candle pane's rectangle from the last
+/// frame's layout. The answer is `None`, which stands for "repaint everything", when a part changed
+/// that has no rectangle to name (an aimed pointer with no pane, an Open button with no locked card).
+/// When nothing differs it is `Some` of a rectangle with no area.
+///
+/// Every part's own rectangle is padded by two device pixels because `fill_round` and the dotted
+/// pen run one pixel past the rectangle they are given.
+pub fn hot_dirty(g: &Geo, dpi: u32, selected: Option<usize>, pane: Option<RECT>, was: &Hot, now: &Hot) -> Option<RECT> {
+    let mut out: Option<RECT> = None;
+    let mut add = |r: RECT| {
+        let r = RECT { left: r.left - 2, top: r.top - 2, right: r.right + 2, bottom: r.bottom + 2 };
+        out = Some(match out {
+            None => r,
+            Some(o) => RECT { left: o.left.min(r.left), top: o.top.min(r.top), right: o.right.max(r.right), bottom: o.bottom.max(r.bottom) },
+        });
+    };
+    if was.btn != now.btn {
+        add(g.btn);
+    }
+    if was.pick != now.pick {
+        add(g.pick_btn);
+    }
+    if was.chart_btn != now.chart_btn {
+        add(g.chart_btn);
+    }
+    if was.gear != now.gear {
+        add(g.gear_btn);
+    }
+    if was.open != now.open {
+        add(open_btn_rect(card_rect(g, selected?), dpi));
+    }
+    if was.aim != now.aim {
+        add(pane?);
+    }
+    if was.card != now.card {
+        for row in [was.card, now.card].into_iter().flatten().map(|h| h.row) {
+            add(card_rect(g, row));
+        }
+    }
+    Some(out.unwrap_or(RECT { left: 0, top: 0, right: 0, bottom: 0 }))
 }
 
 fn utf16(s: &str) -> Vec<u16> {

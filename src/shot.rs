@@ -566,3 +566,310 @@ pub fn write_all(dir: &Path) -> Result<usize, String> {
     }
     Ok(n)
 }
+
+/// The chart fixture as an owned value, so a test or a timing loop can build a scene, change one hover
+/// part, and draw again. Same data as `write_chart_fixture` with a locked card: the S&P row, 1488 px
+/// wide at 96 dpi, the first theme, the pane open on `range` (`None` is the closed panel).
+pub struct Fixture {
+    board: Board,
+    hist: History,
+    fonts: Fonts,
+    grad: Gradient,
+    layout: std::cell::Cell<Option<crate::chartview::Layout>>,
+    charted: Vec<Bar>,
+    t0: f64,
+    bar_s: f64,
+    label: String,
+    last: Option<f64>,
+    range: Option<Range>,
+    row: usize,
+    now: f64,
+    pub w: i32,
+    pub h: i32,
+}
+
+impl Fixture {
+    pub fn new(range: Option<&str>) -> Result<Fixture, String> {
+        let t = &theme::ALL[0];
+        let rg = match range {
+            Some(r) => Some(Range::parse(r).ok_or_else(|| format!("no range named {r}"))?),
+            None => None,
+        };
+        let (dpi, w) = (96, 1488);
+        let now = 1_792_052_981.0;
+        let mut b = board(now);
+        let (n, t0) = (390, now - 390.0 * 60.0);
+        let bars: Vec<Vec<Bar>> = b.cells.iter().enumerate().map(|(i, c)| walk(c.quote.as_ref().map(|q| q.price).unwrap_or(100.0), n, i as u64 + 1)).collect();
+        b.bars_t0 = vec![t0; b.cells.len()];
+        b.bars = bars.iter().map(|v| std::sync::Arc::from(v.as_slice())).collect();
+        let row = b.cells.iter().position(|c| c.label == "S&P").unwrap_or(0);
+        let label = b.cells[row].label.clone();
+        let last = b.cells[row].quote.as_ref().map(|q| q.price);
+        let (mut chart_t0, mut charted, mut bar_s) = (t0, bars[row].clone(), 60.0);
+        if let Some(rg) = rg.filter(|r| *r != Range::D1) {
+            (chart_t0, charted, bar_s) = long_series(rg, now, last.unwrap_or(100.0), row as u64 + 1, true);
+        }
+        let mut hist = History::new();
+        hist.record(&b, now);
+        let g = panel::geometry_in(w, b.cells.len(), 0, dpi, false, rg.is_some());
+        Ok(Fixture {
+            hist,
+            fonts: Fonts::new(theme::font_of(t, None), dpi, t.is_pixel()),
+            grad: Gradient::new(t),
+            layout: std::cell::Cell::new(None),
+            board: b,
+            charted,
+            t0: chart_t0,
+            bar_s,
+            label,
+            last,
+            range: rg,
+            row,
+            now,
+            w: g.w,
+            h: g.h,
+        })
+    }
+
+    /// The panel's geometry as the app computes it for this fixture.
+    pub fn geo(&self) -> panel::Geo {
+        panel::geometry_in(self.w, self.board.cells.len(), 0, 96, false, self.range.is_some())
+    }
+
+    /// The scene with the hover state `hot` applied.
+    pub fn scene<'a>(&'a self, hot: &panel::Hot) -> Scene<'a> {
+        let rg = self.range.unwrap_or(Range::D1);
+        Scene {
+            title: "MH Ticker Ultra",
+            board: &self.board,
+            hist: &self.hist,
+            fonts: &self.fonts,
+            theme: &theme::ALL[0],
+            grad: &self.grad,
+            dpi: 96,
+            now: self.now,
+            btn_hover: hot.btn,
+            pick_hover: hot.pick,
+            chart_hover: hot.chart_btn,
+            gear_hover: hot.gear,
+            open_hover: hot.open,
+            select: true,
+            keys_hint: false,
+            selected: Some(self.row),
+            hover: hot.card,
+            chart_at: hot.aim,
+            layout: &self.layout,
+            picker: None,
+            picker_scroll: 0,
+            picker_btn: true,
+            chart: self.range.map(|_| Chart {
+                label: &self.label,
+                digits: 2,
+                t0: self.t0,
+                bars: &self.charted,
+                last: self.last,
+                unavailable: false,
+                range: rg,
+                status: Status::Ready,
+                bar_s: self.bar_s,
+                tabs: true,
+                tz_offset_s: TZ_S,
+                tz_label: "local",
+                prev: None,
+                day_hi: None,
+                day_lo: None,
+                change_pct: None,
+                levels: &[],
+            }),
+            chart_btn: true,
+            settings_btn: true,
+            alert: None,
+            phase: 0.0,
+        }
+    }
+
+    /// The pane's rectangle from the last frame drawn (the layout the pointer is answered from).
+    pub fn pane(&self) -> Option<windows_sys::Win32::Foundation::RECT> {
+        self.layout.get().map(|l| windows_sys::Win32::Foundation::RECT { left: l.pane.left, top: l.pane.top, right: l.pane.right, bottom: l.pane.bottom })
+    }
+
+    /// A pointer aimed at the middle candle's middle row, from the layout the last frame stored.
+    pub fn aim_middle(&self) -> Option<crate::chartview::Pointer> {
+        let lay = self.layout.get()?;
+        lay.pointer_at(lay.x_of(lay.bars / 2), (lay.plot.top + lay.plot.bottom) / 2, 2)
+    }
+
+    /// One frame as RGBA pixels.
+    pub fn frame(&self, hot: &panel::Hot) -> Vec<u8> {
+        capture(self.w, self.h, &self.scene(hot)).2
+    }
+
+    pub fn selected(&self) -> usize {
+        self.row
+    }
+}
+
+/// What `examples/perf.rs` times: the milliseconds one frame of the panel takes to draw (the same
+/// `panel::draw` the app calls, into an off-screen bitmap, no PNG), with the candle pane open on
+/// `range` (`1D`..`5Y`), or closed when `range` is `None`. `hovered` aims the crosshair at a candle,
+/// as a hover repaint does; `clipped` clips the back buffer to the pane and copies only the pane, as
+/// the region a hover invalidates does. Each frame ends with the copy to the screen DC, as `paint` does.
+pub fn bench_draw(range: Option<&str>, hovered: bool, clipped: bool, iters: u32) -> Result<f64, String> {
+    let fx = Fixture::new(range)?;
+    let none = panel::Hot::default();
+    unsafe {
+        let screen = GetDC(std::ptr::null_mut());
+        let dc = CreateCompatibleDC(screen);
+        let bmp = CreateCompatibleBitmap(screen, fx.w, fx.h);
+        let old = SelectObject(dc, bmp);
+        panel::draw(dc, fx.w, fx.h, &fx.scene(&none));
+        let hot = panel::Hot { aim: if hovered { fx.aim_middle() } else { None }, ..none };
+        let sc = fx.scene(&hot);
+        panel::draw(dc, fx.w, fx.h, &sc);
+        if clipped {
+            if let Some(p) = fx.pane() {
+                let rgn = CreateRectRgn(p.left, p.top, p.right, p.bottom);
+                SelectClipRgn(dc, rgn);
+                DeleteObject(rgn);
+            }
+        }
+        // The paint also copies to the window: the whole of it, or the pane when the draw is clipped.
+        let part = match (clipped, fx.pane()) {
+            (true, Some(p)) => p,
+            _ => windows_sys::Win32::Foundation::RECT { left: 0, top: 0, right: fx.w, bottom: fx.h },
+        };
+        let start = std::time::Instant::now();
+        for _ in 0..iters {
+            panel::draw(dc, fx.w, fx.h, &sc);
+            BitBlt(screen, part.left, part.top, part.right - part.left, part.bottom - part.top, dc, part.left, part.top, SRCCOPY);
+        }
+        let ms = start.elapsed().as_secs_f64() * 1000.0 / iters.max(1) as f64;
+        SelectObject(dc, old);
+        DeleteObject(bmp);
+        DeleteDC(dc);
+        ReleaseDC(std::ptr::null_mut(), screen);
+        Ok(ms)
+    }
+}
+
+/// Microseconds one GDI text measurement takes (`GetTextExtentPoint32W` on a short string, the call
+/// `panel::text` makes after every `TextOutW`), and one `TextOutW`.
+pub fn bench_text(iters: u32) -> (f64, f64) {
+    let t = &theme::ALL[0];
+    let fonts = Fonts::new(theme::font_of(t, None), 96, t.is_pixel());
+    unsafe {
+        let screen = GetDC(std::ptr::null_mut());
+        let dc = CreateCompatibleDC(screen);
+        let bmp = CreateCompatibleBitmap(screen, 400, 100);
+        let old = SelectObject(dc, bmp);
+        let f = SelectObject(dc, fonts.small);
+        let txt: Vec<u16> = "5,432.10".encode_utf16().collect();
+        let mut sz = windows_sys::Win32::Foundation::SIZE { cx: 0, cy: 0 };
+        let a = std::time::Instant::now();
+        for _ in 0..iters {
+            GetTextExtentPoint32W(dc, txt.as_ptr(), txt.len() as i32, &mut sz);
+        }
+        let measure = a.elapsed().as_secs_f64() * 1e6 / iters as f64;
+        let a = std::time::Instant::now();
+        for _ in 0..iters {
+            TextOutW(dc, 4, 4, txt.as_ptr(), txt.len() as i32);
+        }
+        let out = a.elapsed().as_secs_f64() * 1e6 / iters as f64;
+        SelectObject(dc, f);
+        SelectObject(dc, old);
+        DeleteObject(bmp);
+        DeleteDC(dc);
+        ReleaseDC(std::ptr::null_mut(), screen);
+        (measure, out)
+    }
+}
+
+/// Microseconds one `chartview::fitted_to` takes over `n` one-minute bars into a `plot_w`-pixel
+/// plot (the climb through the ladder included).
+pub fn bench_fold(n: usize, plot_w: i32, iters: u32) -> f64 {
+    let bars = walk(5_000.0, n, 7);
+    let start = std::time::Instant::now();
+    let mut keep = 0;
+    for _ in 0..iters {
+        keep += crate::chartview::fitted_to(&bars, plot_w, 0.0, TZ_S, 60.0, crate::chartview::MONTH_S).0.len();
+    }
+    std::hint::black_box(keep);
+    start.elapsed().as_secs_f64() * 1e6 / iters.max(1) as f64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::panel::Hot;
+
+    /// Every pixel that differs between two frames, as (x, y).
+    fn diff(a: &[u8], b: &[u8], w: i32) -> Vec<(i32, i32)> {
+        a.chunks_exact(4)
+            .zip(b.chunks_exact(4))
+            .enumerate()
+            .filter(|(_, (p, q))| p != q)
+            .map(|(i, _)| (i as i32 % w, i as i32 / w))
+            .collect()
+    }
+
+    /// The rectangle `hot_dirty` names for a move between two hover states must hold every pixel that
+    /// move changes, or a partial repaint would leave a stale mark on screen. Checked against the real
+    /// painter, one hover part at a time and in pairs, with the pane open and closed.
+    #[test]
+    fn a_hover_change_repaints_inside_the_rectangle_it_names() {
+        for range in [None, Some("5D")] {
+            let fx = Fixture::new(range).unwrap();
+            let g = fx.geo();
+            let none = Hot::default();
+            let base = fx.frame(&none);
+            let sel = fx.selected();
+            let at = Some(panel::Hover { row: sel, t: 1_792_052_981.0 - 1_800.0 });
+            let mut cases: Vec<(&str, Hot)> = vec![
+                ("minimise", Hot { btn: true, ..none }),
+                ("picker", Hot { pick: true, ..none }),
+                ("chart toggle", Hot { chart_btn: true, ..none }),
+                ("settings", Hot { gear: true, ..none }),
+                ("open button", Hot { open: true, ..none }),
+                ("card crosshair", Hot { card: at, ..none }),
+            ];
+            if range.is_some() {
+                let aim = fx.aim_middle().expect("the first frame stores the pane's layout");
+                cases.push(("candle crosshair", Hot { aim: Some(aim), ..none }));
+                cases.push(("candle and card", Hot { aim: Some(aim), card: at, ..none }));
+            }
+            for (name, hot) in cases {
+                let pane = fx.pane();
+                let now = fx.frame(&hot);
+                let r = panel::hot_dirty(&g, 96, Some(sel), pane, &none, &hot).expect("a rectangle for this change");
+                let moved = diff(&base, &now, fx.w);
+                // The chart toggle is already lit while the pane is open, so hovering it changes nothing then.
+                let invisible = name == "chart toggle" && range.is_some();
+                assert!(invisible || !moved.is_empty(), "{name}: the change must be visible, or the case tests nothing");
+                for (x, y) in &moved {
+                    assert!(panel::in_rect(&r, *x, *y), "{name} ({range:?}): pixel ({x},{y}) changed outside ({},{},{},{})", r.left, r.top, r.right, r.bottom);
+                }
+                // And back again: leaving repaints the same place.
+                let r2 = panel::hot_dirty(&g, 96, Some(sel), pane, &hot, &none).unwrap();
+                assert_eq!((r.left, r.top, r.right, r.bottom), (r2.left, r2.top, r2.right, r2.bottom), "{name}: enter and leave name the same place");
+                // A partial repaint is only worth having when it is partial.
+                let area = ((r.right - r.left) as i64) * ((r.bottom - r.top) as i64);
+                // (Two parts at once are one bounding box and can be large; a pointer is over a card or
+                // the pane, so that pair is only a coverage check.)
+                assert!(name.contains(" and ") || area * 2 < (fx.w as i64) * (fx.h as i64), "{name}: the rectangle should be under half the window");
+            }
+        }
+    }
+
+    /// No change, no area; an aimed pointer with no pane to name has no rectangle at all.
+    #[test]
+    fn nothing_changed_is_an_empty_rectangle_and_an_unnameable_change_is_everything() {
+        let fx = Fixture::new(Some("5D")).unwrap();
+        let g = fx.geo();
+        let none = Hot::default();
+        let r = panel::hot_dirty(&g, 96, Some(0), None, &none, &none).unwrap();
+        assert_eq!((r.right - r.left, r.bottom - r.top), (0, 0));
+        let aimed = Hot { aim: Some(crate::chartview::Pointer { bar: 3, y: 100 }), ..none };
+        assert!(panel::hot_dirty(&g, 96, Some(0), None, &none, &aimed).is_none());
+        assert!(panel::hot_dirty(&g, 96, None, None, &none, &Hot { open: true, ..none }).is_none());
+    }
+}

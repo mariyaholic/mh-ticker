@@ -131,3 +131,20 @@ Not done in this cycle:
 - CNBC range shapes are not verified live. `--probe` is the check.
 - The `Cargo.toml` version is still 1.7.1 in this tree. The 1.8.0 bump has not been made.
 - The next-features packages are not started.
+
+## Responsiveness pass
+
+One writer built it, the orchestrator checked it, and nothing was sent back. This documentation pass followed.
+
+The writer's notes are in [notes/responsive.md](notes/responsive.md). The painter was measured under Wine. A hover
+had been repainting the whole panel; it now repaints only the rectangle the hover changed, and a test checks that
+every changed pixel falls inside that rectangle. Settings saves moved out of the UI state borrow at all ten sites,
+the picker's list is built only while the picker is open, and the four items the audit had left open are fixed.
+Candle re-folding and text measurement were measured and ruled out.
+
+Under Wine the candle pane's hover repaint went from 3.32 ms to 2.37 ms a frame on 1D. Those are ratios between runs
+under Wine, not Windows timings, and nothing was measured on a Windows desktop. Still unverified: the real GDI cost of
+a partial repaint, the move across monitors of different DPI, and the Focus Assist case for the tray marker.
+
+After this pass the Wine suite passes 246 tests, up from 240 at the end of the cycle. The Linux harness is still 107,
+and the stills are still 36 of 36 identical.

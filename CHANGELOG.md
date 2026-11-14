@@ -65,6 +65,15 @@
     menu and the strip. *Remove a symbol I added* removes it again, and its alerts with it.
   - The strip shows up to 24 symbols, up from 12. Each shown symbol adds quote requests on every refresh, so
     traffic grows with the number shown. The cost at 24 was not measured.
+- **Responsiveness (both builds).**
+  - A hover repaints only the part that changed: a button, the candle pane, or the cards the pointer left and
+    entered. Under Wine the candle pane's hover repaint went from 3.32 ms to 2.37 ms a frame on 1D, and from
+    3.94 ms to 2.79 ms on 5Y. Full repaints are unchanged. These Wine numbers are ratios between runs, not Windows timings.
+  - The catalogue is no longer copied on every frame. The picker's list is built only while the picker is open,
+    which took 3.9 us a frame with 23 rows, and now takes nothing with the picker closed.
+  - Every settings save now happens outside the UI state borrow. This keeps a rule true. It does not make anything faster.
+  - Measured and ruled out: re-folding the candle series on each repaint (165 us for 4,000 one-minute bars, under a
+    tenth of a frame) and text measurement on each feed tick (0.33 us a call). Neither was changed.
 - **Fixes from the state audit (both builds unless noted).**
   - *Refresh now* asks again at once for a failed longer range. It used to wait out a 30 second back-off.
   - The fallback toggle writes the settings as they are after its confirmation box. The old copy could bring a
@@ -73,15 +82,15 @@
   - `Alerts (n)` in the menu counts only the symbols the submenu lists.
   - A second *Add symbol* prompt from the tray now says a lookup is already running, instead of dropping its
     symbol silently.
-  - Left open, and recorded in the audit: the card menu's *Copy* and *Open* act on the position the card had when
-    the menu opened (rare, Ultra); the tray marker stays lit while the panel is open; a menu opened before a hotkey
-    or tray click changes the mode can show stale entries; and a move across monitors of different DPI lays out
-    the strip at the old DPI until the next refresh.
+  - The card menu's *Copy* and *Open* act on the card you clicked, even if the strip has moved since the menu opened (Ultra).
+  - The tray marker no longer lights for an alert that fires while the panel is open in front. It still lights when the panel is behind another window (Ultra).
+  - A menu opened before a hotkey or tray click changed the panel's mode acts on the mode you choose, so *Expand view* does nothing once the panel is already open.
+  - Moving the panel to a monitor with a different DPI lays the strip out at the new scale straight away, not at the next refresh.
 
-**Checked.** Under Wine: 240 tests pass. The one failure is the known
+**Checked.** Under Wine: 246 tests pass. The one failure is the known
 `ui::tests::a_theme_switch_takes_the_new_themes_face` (Wine has no Consolas). The Linux harness
 (`scripts/check-state-linux.sh`) passes 107. Clippy is clean apart from the expected `windres not found`
-line. The 36 theme stills are identical to the baseline, so Classic has not drifted. The native Windows CI
+line. The theme stills are 36 of 36 identical to the baseline, so Classic has not drifted. The native Windows CI
 run is green.
 
 **Not verified.** Nothing was clicked on a Windows desktop. Tests ran under Wine and on the native Windows
