@@ -199,6 +199,51 @@ pub fn min_size(dpi: u32) -> (i32, i32) {
     (px(560, dpi), px(360, dpi))
 }
 
+/// Estimated width of one character of a hint (small font) at 96 DPI.
+const HINT_CHAR_W: i32 = 7;
+/// Height of one label line and of one hint line at 96 DPI.
+const LABEL_LINE: i32 = 20;
+const HINT_LINE: i32 = 16;
+
+/// The width of the label column for a window `w` pixels wide at `dpi`.
+pub fn label_width(dpi: u32, w: i32) -> i32 {
+    let s = |v: i32| px(v, dpi);
+    let side_w = s(176).min(w / 3).max(1);
+    let pad = s(20);
+    let inner_l = side_w + pad;
+    let inner_r = (w - pad - s(10)).max(inner_l + s(120));
+    let avail = inner_r - inner_l;
+    (avail * 36 / 100).clamp(s(120), s(220)).min(avail / 2)
+}
+
+/// Break `text` into lines of at most `width` pixels, estimating `char_w` pixels per character. A word
+/// longer than a line stays whole on a line of its own.
+pub fn wrap(text: &str, width: i32, char_w: i32) -> Vec<String> {
+    let max = (width / char_w.max(1)).max(1) as usize;
+    let mut lines: Vec<String> = Vec::new();
+    for word in text.split_whitespace() {
+        match lines.last_mut() {
+            Some(last) if last.chars().count() + 1 + word.chars().count() <= max => {
+                last.push(' ');
+                last.push_str(word);
+            }
+            _ => lines.push(word.to_string()),
+        }
+    }
+    lines
+}
+
+/// The label and hint of a control, wrapped to a label column `lw` pixels wide at `dpi`.
+pub fn label_lines(c: &Control, lw: i32, dpi: u32) -> (Vec<String>, Vec<String>) {
+    (wrap(&c.label, lw, px(CHAR_W, dpi)), wrap(&c.hint, lw, px(HINT_CHAR_W, dpi)))
+}
+
+/// The height of the label block of a control: its label lines and hint lines.
+pub fn label_block_h(c: &Control, lw: i32, dpi: u32) -> i32 {
+    let (l, h) = label_lines(c, lw, dpi);
+    l.len() as i32 * px(LABEL_LINE, dpi) + h.len() as i32 * px(HINT_LINE, dpi)
+}
+
 /// One laid-out control. `opts` has one rectangle per option (empty for a header or a note).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Row {
@@ -241,8 +286,7 @@ pub fn layout(dpi: u32, w: i32, h: i32, nav_n: usize, controls: &[Control], scro
     let pad = s(20);
     let inner_l = side_w + pad;
     let inner_r = (w - pad - s(10)).max(inner_l + s(120));
-    let avail = inner_r - inner_l;
-    let lw = (avail * 36 / 100).clamp(s(120), s(220)).min(avail / 2);
+    let lw = label_width(dpi, w);
     let ctl_l = inner_l + lw + s(12);
     let ctl_r = inner_r;
     let ctl_w = (ctl_r - ctl_l).max(s(60));
@@ -264,7 +308,7 @@ pub fn layout(dpi: u32, w: i32, h: i32, nav_n: usize, controls: &[Control], scro
                 Row { bounds: Rc::new(inner_l, y, inner_r, y + hgt), label: Rc::new(inner_l, y, inner_r, y + hgt), opts: Vec::new() }
             }
             Kind::Toggle => {
-                let hgt = s(48);
+                let hgt = s(48).max(label_block_h(c, lw, dpi) + s(12));
                 let top = y + (hgt - s(24)) / 2;
                 Row {
                     bounds: Rc::new(inner_l, y, inner_r, y + hgt),
@@ -288,7 +332,7 @@ pub fn layout(dpi: u32, w: i32, h: i32, nav_n: usize, controls: &[Control], scro
                     x += cw + gap;
                 }
                 let lines = line + 1;
-                let hgt = (lines * chip_h + (lines - 1) * gap + s(18)).max(s(48));
+                let hgt = (lines * chip_h + (lines - 1) * gap + s(18)).max(s(48)).max(label_block_h(c, lw, dpi) + s(12));
                 Row {
                     bounds: Rc::new(inner_l, y, inner_r, y + hgt),
                     label: Rc::new(inner_l, y, inner_l + lw, y + hgt),
@@ -311,6 +355,17 @@ pub fn layout(dpi: u32, w: i32, h: i32, nav_n: usize, controls: &[Control], scro
     }
     l.scroll = scroll;
     l
+}
+
+/// The pixels a wheel `delta` scrolls at `dpi`: 48 px per notch (a delta of 120) at 96 DPI, scaled
+/// continuously so the small deltas of a precision touchpad or a smooth-scroll mouse count.
+pub fn wheel_px(delta: i32, dpi: u32) -> i32 {
+    (delta as i64 * 48 * dpi as i64 / 96 / 120) as i32
+}
+
+/// Whether the theme's page is dark, which decides the caption bar colour.
+pub fn is_dark(t: &Theme) -> bool {
+    ink_on(t.bg) == WHITE
 }
 
 /// The scroll offset that brings control `ci` fully into view, given the layout it was measured in.
@@ -457,8 +512,15 @@ pub struct Palette {
     pub dim: COLORREF,
     pub chip: COLORREF,
     pub chip_text: COLORREF,
-    /// Text of a disabled option, on the chip fill.
+    /// Text of a disabled option, on the chip fill. Always dimmer than `chip_text`.
     pub off_text: COLORREF,
+    /// The outline of an enabled option: at least 3 to 1 against the page (WCAG 1.4.11).
+    pub edge: COLORREF,
+    /// The outline of a disabled option: always fainter than `edge`.
+    pub off_line: COLORREF,
+    /// Hints and notes: the dim colour, or full text colour under a Windows contrast theme, where the
+    /// dim colour is also the disabled colour.
+    pub hint: COLORREF,
     pub hover: COLORREF,
     pub hover_text: COLORREF,
     pub on: COLORREF,
@@ -511,14 +573,20 @@ pub fn palette(t: &Theme) -> Palette {
     let chip = t.card;
     let on = t.accent;
     let hover = t.btn;
+    let chip_text = readable(t.label, chip, 4.5);
+    let text = readable(t.label, page, 4.5);
+    let off_text = if t.contrast { soft(t.dim, chip, 4.5) } else { mix(chip, chip_text, 11, 32) };
     Palette {
         page,
         side,
-        text: readable(t.label, page, 4.5),
+        text,
         dim: soft(t.dim, page, 4.5),
         chip,
-        chip_text: readable(t.label, chip, 4.5),
-        off_text: soft(t.dim, chip, 4.5),
+        chip_text,
+        off_text,
+        edge: if t.contrast { text } else { soft(t.dim, page, 3.0) },
+        off_line: if t.contrast { off_text } else { mix(page, off_text, 1, 2) },
+        hint: if t.contrast { text } else { soft(t.dim, page, 4.5) },
         hover,
         hover_text: readable(t.price, hover, 4.5),
         on,
@@ -640,14 +708,19 @@ pub fn draw(dc: HDC, w: i32, h: i32, p: &Paint) {
                 let y = row.bounds.bottom - s(4);
                 panel::fill_rect(dc, RECT { left: row.bounds.left, top: y, right: row.bounds.right, bottom: y + 1 }, pal.line);
             }
-            Kind::Note => put(dc, f.small, row.label, &c.label, pal.dim, Align::Left),
+            Kind::Note => put(dc, f.small, row.label, &c.label, pal.hint, Align::Left),
             _ => {
-                let has_hint = !c.hint.is_empty();
                 let lab = row.label;
-                let (top, bottom) = if has_hint { (Rc::new(lab.left, lab.top + s(6), lab.right, lab.top + s(26)), Rc::new(lab.left, lab.top + s(26), lab.right, lab.top + s(44))) } else { (lab, Rc::default()) };
-                put(dc, f.mid, top, &c.label, pal.text, Align::Left);
-                if has_hint {
-                    put(dc, f.small, bottom, &c.hint, pal.dim, Align::Left);
+                let (names, hints) = label_lines(c, lab.width(), p.layout.dpi);
+                let block = names.len() as i32 * s(LABEL_LINE) + hints.len() as i32 * s(HINT_LINE);
+                let mut y = lab.top + (lab.height() - block) / 2;
+                for line in &names {
+                    put(dc, f.mid, Rc::new(lab.left, y, lab.right, y + s(LABEL_LINE)), line, pal.text, Align::Left);
+                    y += s(LABEL_LINE);
+                }
+                for line in &hints {
+                    put(dc, f.small, Rc::new(lab.left, y, lab.right, y + s(HINT_LINE)), line, pal.hint, Align::Left);
+                    y += s(HINT_LINE);
                 }
                 for (oi, (o, r)) in c.opts.iter().zip(&row.opts).enumerate() {
                     let here = Hit::Opt(ci, oi);
@@ -667,7 +740,7 @@ pub fn draw(dc: HDC, w: i32, h: i32, p: &Paint) {
                         };
                         plate(dc, *r, s(8), fill);
                         if contrast || !selected {
-                            outline(dc, *r, s(8), if o.enabled { pal.line } else { pal.off_text }, if contrast { s(2) } else { 1 });
+                            outline(dc, *r, s(8), if o.enabled { pal.edge } else { pal.off_line }, if contrast { s(2) } else { 1 });
                         }
                         put(dc, f.small, Rc::new(r.left + s(6), r.top, r.right - s(6), r.bottom), &o.label, ink, Align::Center);
                     }
@@ -696,7 +769,7 @@ fn draw_switch(dc: HDC, f: &Fonts, r: Rc, on: bool, hovered: bool, enabled: bool
     let fill = if !enabled { pal.chip } else if on { pal.on } else if hovered { pal.hover } else { pal.chip };
     plate(dc, track, r.height(), fill);
     if !on || contrast {
-        outline(dc, track, r.height(), if enabled { pal.text } else { pal.off_text }, if contrast { 2 * one } else { 1 });
+        outline(dc, track, r.height(), if enabled { pal.text } else { pal.off_line }, if contrast { 2 * one } else { 1 });
     }
     let knob_x = if on { track.right - d - 3 * one } else { track.left + 3 * one };
     let knob = if !enabled { pal.off_text } else if on { pal.on_text } else { pal.text };
@@ -945,18 +1018,81 @@ mod tests {
         assert_eq!(settle(Hit::Opt(40, 0), 6, &controls), Hit::Opt(7, 1), "the control is gone");
     }
 
-    #[test]
-    fn the_palette_reads_on_every_theme_and_both_contrast_palettes() {
+    fn every_palette() -> Vec<Theme> {
         let mut themes: Vec<Theme> = theme::ALL.to_vec();
-        themes.push(theme::classic().clone());
+        themes.push(*theme::classic());
         themes.push(*theme::system(&crate::contrast::HC_BLACK));
         themes.push(*theme::system(&crate::contrast::HC_WHITE));
-        for t in &themes {
+        themes
+    }
+
+    #[test]
+    fn disabled_text_and_outline_are_dimmer_than_enabled_ones() {
+        for t in &every_palette() {
+            let p = palette(t);
+            let (off, on) = (contrast_ratio(p.off_text, p.chip), contrast_ratio(p.chip_text, p.chip));
+            assert!(off < on, "{}: disabled text {off:.2} is not dimmer than enabled text {on:.2}", t.name);
+            let (off, on) = (contrast_ratio(p.off_line, p.page), contrast_ratio(p.edge, p.page));
+            assert!(off < on, "{}: disabled outline {off:.2} is not fainter than enabled outline {on:.2}", t.name);
+            assert!(contrast_ratio(p.off_text, p.chip) < contrast_ratio(p.hint, p.page).max(contrast_ratio(p.dim, p.page)), "{}: disabled text is as strong as a hint", t.name);
+        }
+    }
+
+    #[test]
+    fn small_wheel_deltas_scroll_and_a_notch_is_48_px_at_96_dpi() {
+        assert_eq!(wheel_px(120, 96), 48);
+        assert_eq!(wheel_px(-120, 96), -48);
+        assert_eq!(wheel_px(120, 192), 96);
+        assert!(wheel_px(30, 96) > 0, "a quarter notch moves the page");
+        assert_eq!(wheel_px(8 * 15, 96), 8 * 6);
+        let sum: i32 = (0..8).map(|_| wheel_px(15, 96)).sum();
+        assert_eq!(sum, wheel_px(120, 96), "eight small steps add up to one notch");
+        assert_eq!(wheel_px(0, 96), 0);
+    }
+
+    #[test]
+    fn the_caption_follows_the_page_brightness() {
+        assert!(is_dark(theme::resolve("midnight")));
+        let hc_black = theme::system(&crate::contrast::HC_BLACK);
+        let hc_white = theme::system(&crate::contrast::HC_WHITE);
+        assert!(is_dark(hc_black));
+        assert!(!is_dark(hc_white));
+    }
+
+    #[test]
+    fn wrap_breaks_on_words_and_keeps_a_long_word_whole() {
+        assert_eq!(wrap("", 100, 8), Vec::<String>::new());
+        assert_eq!(wrap("Show strip", 200, 8), ["Show strip"]);
+        assert_eq!(wrap("Follow the Windows contrast theme", 160, 8), ["Follow the Windows", "contrast theme"]);
+        assert_eq!(wrap("Supercalifragilistic word", 40, 8), ["Supercalifragilistic", "word"]);
+        for line in wrap("one two three four five six seven", 96, 8) {
+            assert!(line.chars().count() <= 12, "{line}");
+        }
+    }
+
+    #[test]
+    fn a_long_label_makes_its_row_taller_and_the_label_block_fits() {
+        let long = Control::toggle("Follow the Windows contrast theme and then some more words", "a hint that also runs long enough to wrap onto lines", false, Act::Cmd(1), true);
+        let short = Control::toggle("Show strip", "", false, Act::Cmd(1), true);
+        for eff in scales() {
+            let (w, h) = window_size(eff);
+            let l = layout(eff, w, h, 6, &[long.clone(), short.clone()], 0);
+            let lw = label_width(eff, w);
+            assert_eq!(l.rows[0].label.width(), lw);
+            assert!(l.rows[0].bounds.height() > l.rows[1].bounds.height(), "the long label grows its row at {eff}");
+            assert!(label_block_h(&long, lw, eff) <= l.rows[0].bounds.height(), "label block fits its row at {eff}");
+        }
+    }
+
+    #[test]
+    fn the_palette_reads_on_every_theme_and_both_contrast_palettes() {
+        for t in &every_palette() {
             let p = palette(t);
             for (name, fg, bg, min) in [
                 ("text on page", p.text, p.page, 4.5),
                 ("dim on page", p.dim, p.page, 4.5),
-                ("disabled chip text", p.off_text, p.chip, 4.5),
+                ("enabled chip edge", p.edge, p.page, 3.0),
+                ("hint", p.hint, p.page, 4.5),
                 ("text on side", readable(t.label, p.side, 4.5), p.side, 4.5),
                 ("chip text", p.chip_text, p.chip, 4.5),
                 ("hover text", p.hover_text, p.hover, 4.5),

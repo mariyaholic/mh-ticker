@@ -13,6 +13,7 @@
 use super::settings_view::{self, Env, MonitorFact};
 use super::*;
 use crate::settings::{self, Act, Control, Focus, Hit, Key, Paint, Section};
+use windows_sys::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
 use windows_sys::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForSystem};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, EnableWindow, SetFocus, TME_LEAVE, TRACKMOUSEEVENT};
 
@@ -32,7 +33,7 @@ struct Sw {
     theme: &'static Theme,
     face: &'static str,
     zoom: u32,
-    fonts: Option<(&'static str, u32, panel::Fonts)>,
+    fonts: Option<(&'static str, u32, bool, panel::Fonts)>,
     tracking: bool,
 }
 
@@ -116,6 +117,12 @@ fn apply(s: &mut Sw, snap: &Snap) -> bool {
     changed
 }
 
+/// A dark caption for a dark theme, so the title bar does not stay light over dark content.
+fn set_dark_caption(hwnd: HWND, t: &Theme) {
+    let dark: i32 = settings::is_dark(t) as i32;
+    unsafe { DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE as u32, &dark as *const i32 as _, 4) };
+}
+
 fn invalidate(hwnd: HWND) {
     unsafe { InvalidateRect(hwnd, null(), 0) };
 }
@@ -124,6 +131,9 @@ fn invalidate(hwnd: HWND) {
 fn refresh(hwnd: HWND) {
     let Some(snap) = snapshot() else { return };
     if with_sw(|s| apply(s, &snap)).unwrap_or(false) {
+        if let Some(t) = with_sw(|s| s.theme) {
+            set_dark_caption(hwnd, t);
+        }
         invalidate(hwnd);
     }
 }
@@ -137,7 +147,7 @@ fn window_dpi(hwnd: HWND) -> u32 {
 }
 
 /// Open the window, or bring the open one to the front.
-pub(super) fn open_settings(_main: HWND) {
+pub(super) fn open_settings(main: HWND) {
     if let Some(h) = with_sw(|s| s.hwnd) {
         unsafe {
             if IsWindow(h) != 0 {
@@ -167,12 +177,15 @@ pub(super) fn open_settings(_main: HWND) {
         RegisterClassW(&wc);
         let title = wide(&format!("{} settings", config::profile().title()));
         let style = WS_OVERLAPPEDWINDOW;
-        let mon = GetDpiForSystem().max(96);
+        // The DPI of the monitor the strip is on, which is where the new window opens.
+        let mon = if main.is_null() { GetDpiForSystem().max(96) } else { window_dpi(main) };
         let eff = zoom::effective_dpi(mon, snap.cfg.zoom(snap.env.ultra));
         let (cw, ch) = settings::window_size(eff);
         let mut rc = RECT { left: 0, top: 0, right: cw, bottom: ch };
         AdjustWindowRectExForDpi(&mut rc, style, 0, 0, mon);
-        let hwnd = CreateWindowExW(0, class.as_ptr(), title.as_ptr(), style, CW_USEDEFAULT, CW_USEDEFAULT, rc.right - rc.left, rc.bottom - rc.top, null_mut(), null_mut(), inst, null());
+        // The strip owns the window, so it always stays above the strip and above the expanded panel (which
+        // is topmost). WS_EX_APPWINDOW keeps a taskbar button and an Alt+Tab entry for an owned window.
+        let hwnd = CreateWindowExW(WS_EX_APPWINDOW, class.as_ptr(), title.as_ptr(), style, CW_USEDEFAULT, CW_USEDEFAULT, rc.right - rc.left, rc.bottom - rc.top, main, null_mut(), inst, null());
         if hwnd.is_null() {
             return;
         }
@@ -193,6 +206,7 @@ pub(super) fn open_settings(_main: HWND) {
             tracking: false,
         };
         apply(&mut sw, &snap);
+        set_dark_caption(hwnd, sw.theme);
         SW.with(|c| *c.borrow_mut() = Some(sw));
         SetTimer(hwnd, TIMER_REFRESH, REFRESH_MS, None);
         ShowWindow(hwnd, SW_SHOWNORMAL);
@@ -286,13 +300,13 @@ fn paint(hwnd: HWND) {
             let old = SelectObject(mem, bmp);
             with_sw(|s| {
                 let eff = eff_dpi(s, hwnd);
-                let wanted = (s.face, eff);
-                if s.fonts.as_ref().map(|(f, d, _)| (*f, *d)) != Some(wanted) {
-                    s.fonts = Some((s.face, eff, panel::Fonts::new(s.face, eff, s.theme.is_pixel())));
+                let wanted = (s.face, eff, s.theme.is_pixel());
+                if s.fonts.as_ref().map(|(f, d, px, _)| (*f, *d, *px)) != Some(wanted) {
+                    s.fonts = Some((s.face, eff, s.theme.is_pixel(), panel::Fonts::new(s.face, eff, s.theme.is_pixel())));
                 }
                 let l = settings::layout(eff, w, h, s.sections.len(), &s.controls, s.scroll);
                 s.scroll = l.scroll;
-                if let Some((_, _, fonts)) = &s.fonts {
+                if let Some((_, _, _, fonts)) = &s.fonts {
                     let p = Paint {
                         theme: s.theme,
                         fonts,
@@ -389,7 +403,9 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
             let info = lp as *mut MINMAXINFO;
             if !info.is_null() {
                 let dpi = window_dpi(hwnd);
-                let (cw, ch) = settings::min_size(dpi);
+                // The layout runs at the effective DPI, so the smallest size does too.
+                let eff = with_sw(|s| eff_dpi(s, hwnd)).unwrap_or(dpi);
+                let (cw, ch) = settings::min_size(eff);
                 let mut rc = RECT { left: 0, top: 0, right: cw, bottom: ch };
                 AdjustWindowRectExForDpi(&mut rc, WS_OVERLAPPEDWINDOW, 0, 0, dpi);
                 (*info).ptMinTrackSize = POINT { x: rc.right - rc.left, y: rc.bottom - rc.top };
@@ -452,10 +468,10 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
             0
         }
         WM_MOUSEWHEEL => {
-            let notches = ((wp >> 16) & 0xffff) as i16 as i32 / 120;
+            let delta = ((wp >> 16) & 0xffff) as i16 as i32;
             with_sw(|s| {
                 let l = current_layout(s, hwnd);
-                s.scroll = l.scroll - notches * 48 * eff_dpi(s, hwnd) as i32 / 96;
+                s.scroll = l.scroll - settings::wheel_px(delta, eff_dpi(s, hwnd));
             });
             invalidate(hwnd);
             0
