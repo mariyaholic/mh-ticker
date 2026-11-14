@@ -44,6 +44,7 @@ fn quote(row: &Row, spec: QuoteSpec<'_>, now: f64) -> Quote {
         change_pct: Some(pct),
         prev_close: Some(prev),
         ts: Some(if realtime { now - 4.0 } else { now - 612.0 }),
+        moved_at: None,
         realtime,
         open: Some(prev),
         high: Some(high),
@@ -128,6 +129,7 @@ fn render(t: &Theme, phase: f64, now: f64, b: &Board, h: &History, dpi: u32) -> 
         grad: &grad,
         dpi,
         now,
+        offset_at: &tz_offset,
         btn_hover: false,
         pick_hover: false,
         chart_hover: false,
@@ -336,6 +338,11 @@ pub fn write_w4(dir: &Path) -> Result<usize, String> {
 /// The fixture's clock: UTC-4, a US equity day in summer.
 const TZ_S: i32 = -4 * 3_600;
 
+/// The card's local clock in the stills: the fixed zone, the same on every machine.
+fn tz_offset(_: f64) -> i32 {
+    TZ_S
+}
+
 /// One rendered panel with the candle pane open, from deterministic bars.
 ///
 /// This exists because the live feed can be closed (a weekend) or blocked (rate limited), and the
@@ -469,6 +476,7 @@ fn chart_fixture_px(
         grad: &grad,
         dpi,
         now,
+        offset_at: &tz_offset,
         btn_hover: false,
         pick_hover: false,
         chart_hover: false,
@@ -695,7 +703,7 @@ fn board_n(now: f64, n: usize) -> Board {
             }
             cell.stale = i == 7;
             if i == 7 {
-                // A weekend: the quote is 52 hours old, so the card reads "closed 52h" beside a long label.
+                // A weekend: the quote is 52 hours old, so the card reads "closed since" and a day beside a long label.
                 if let Some(q) = cell.quote.as_mut() {
                     q.ts = Some(now - 52.0 * 3600.0);
                     q.realtime = false;
@@ -709,6 +717,24 @@ fn board_n(now: f64, n: usize) -> Board {
         .collect();
     b.backfill = (0..n).map(|i| base.backfill[i % 6].iter().map(|&(t, v)| (t, v * (1.0 + (i / 6) as f64 * 0.07 - (i % 5) as f64 * 0.011))).collect()).collect();
     b.backfill_gen = 1;
+    b
+}
+
+/// A Saturday afternoon (UTC-4, the stills' zone) when the clock is `weekend_now()`: gold, silver and
+/// the three index futures stopped printing on Friday at 17:00, bitcoin is live.
+const WEEKEND_NOW: f64 = 1_792_252_800.0;
+const FRIDAY_1700: f64 = 1_792_184_400.0;
+
+/// The six-card board on a weekend: five closed markets and one live one, the case the card tag
+/// "closed since Fri 17:00" and the calm header are for.
+fn board_weekend(now: f64) -> Board {
+    let mut b = board(now);
+    for i in [0usize, 1, 3, 4, 5] {
+        b.cells[i].stale = true;
+        if let Some(q) = b.cells[i].quote.as_mut() {
+            q.ts = Some(FRIDAY_1700);
+        }
+    }
     b
 }
 
@@ -750,6 +776,11 @@ pub fn write_wide(dir: &Path) -> Result<usize, String> {
     hist6.record(&b6, now);
     put(&mut n, "wide-192dpi-cards.png", render(t, 0.0, now, &b6, &hist6, 192))?;
     put(&mut n, "wide-192dpi-strip-24-rows2.png", crate::ui::strip_still(&b24.cells, t, 192, 2, 3_600))?;
+    let bw = board_weekend(WEEKEND_NOW);
+    let mut histw = History::new();
+    histw.record(&bw, WEEKEND_NOW);
+    put(&mut n, "closed-weekend-cards.png", render(t, 0.0, WEEKEND_NOW, &bw, &histw, 96))?;
+    put(&mut n, "closed-weekend-strip.png", crate::ui::strip_still(&bw.cells, t, 96, 1, 900))?;
     chart_still(dir, "wide-pane-narrow.png", 96, panel::minimum(6, 0, 96, false, true).0, Some(40), "5D")?;
     chart_still(dir, "wide-192dpi-pane.png", 192, 1488 * 2, Some(40), "1D")?;
     n += 2;
@@ -852,6 +883,7 @@ impl Fixture {
             grad: &self.grad,
             dpi: self.dpi,
             now: self.now,
+            offset_at: &tz_offset,
             btn_hover: hot.btn,
             pick_hover: hot.pick,
             chart_hover: hot.chart_btn,
@@ -1152,7 +1184,19 @@ mod tests {
         }
     }
 
-    /// The 24-card board carries one closed market, so its picture shows the "closed 52h" tag.
+    /// The weekend board has five closed cards and one live one, and the header calls it calm.
+    #[test]
+    fn the_weekend_board_is_five_closed_markets_and_bitcoin() {
+        let b = board_weekend(WEEKEND_NOW);
+        let closed: Vec<&str> = b.cells.iter().filter(|c| crate::model::market_closed(c, b.link, WEEKEND_NOW)).map(|c| c.label.as_str()).collect();
+        assert_eq!(closed, ["XAU", "XAG", "DOW", "S&P", "NAS"]);
+        assert_eq!(b.calm(WEEKEND_NOW), crate::model::Calm::Some(5));
+        let q = b.cells[4].quote.as_ref().unwrap();
+        let words = crate::model::closed_words("CNBC delayed", crate::model::closed_since(q, WEEKEND_NOW), &tz_offset, WEEKEND_NOW);
+        assert_eq!(words, ["CNBC delayed \u{b7} closed since Fri 17:00", "closed since Fri 17:00", "closed"]);
+    }
+
+    /// The 24-card board carries one closed market, so its picture shows the closed card tag.
     #[test]
     fn the_wide_board_has_a_closed_market_card() {
         let now = 1_800_000_000.0;
