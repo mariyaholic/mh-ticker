@@ -13,6 +13,8 @@ pub(crate) enum Action {
     /// Card menu: move this symbol to the front.
     MoveFirst(String),
     Alert(String, usize),
+    /// Alerts submenu, per symbol (Ultra): the fast-move choice `alerts::FAST_MOVES[k]`; the current one again turns it off.
+    Fast(String, usize),
     ClearAlert(String),
     /// Alerts submenu, per symbol (Ultra): ask for a price level for this label.
     AlertAt(String),

@@ -102,6 +102,18 @@ pub struct Board {
     /// *Refresh now* counter. The UI bumps it with `wrapping_add(1)`; `Feed::wait` captures it on
     /// entry and returns when it differs, and the chart thread makes rows with no bars due at once.
     pub kick: u64,
+    /// The poll governor's inputs, written by the UI (`governor` has the rules). Both ticks off is
+    /// the Classic default: the feed then waits exactly `poll_s`.
+    pub gov: crate::governor::Settings,
+    /// The session is locked (written by the UI on the session notification).
+    pub locked: bool,
+    /// Some alert has a level or a fast-move set (written by the UI).
+    pub armed: bool,
+    /// The interval the feed is waiting out now, written by the feed; 0 while the governor is off.
+    /// The stale rule follows it (`governor::stale_after`).
+    pub governed_s: f64,
+    /// The feed is waiting longer than `poll_s` because of the governor, so a wake is worth a kick.
+    pub slowed: bool,
 }
 
 fn empty_cell(r: &Row) -> Cell {
@@ -125,6 +137,11 @@ impl Board {
             bars_gen: 0,
             poll_s: 3.0,
             kick: 0,
+            gov: crate::governor::Settings::default(),
+            locked: false,
+            armed: false,
+            governed_s: 0.0,
+            slowed: false,
         }
     }
 

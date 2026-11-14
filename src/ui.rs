@@ -31,6 +31,7 @@ use crate::chartview;
 use crate::hotkey;
 use crate::keys;
 use crate::update;
+use crate::watch;
 use crate::probe;
 use crate::prompt;
 use crate::report;
@@ -52,6 +53,7 @@ use windows_sys::Win32::System::SystemInformation::GetLocalTime;
 use windows_sys::Win32::Graphics::Dwm::{DwmFlush, DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND};
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::RemoteDesktop::{WTSRegisterSessionNotification, WTSUnRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION};
 use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, RegisterHotKey, UnregisterHotKey, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_ESCAPE, VK_PRIOR, VK_NEXT, VK_HOME, VK_END};
@@ -109,6 +111,17 @@ const CMD_HOOK_PASTE: usize = 5211;
 const CMD_HOOK_TEST: usize = 5212;
 const CMD_HOOK_REMOVE: usize = 5213;
 const CMD_LOG_CLEAR: usize = 5214;
+/// Repeat mode (W2): *Every cooldown* and *Each crossing* beside *Fire once, then clear* (`CMD_ALERT_ONCE`).
+const CMD_REPEAT_COOLDOWN: usize = 5215;
+const CMD_REPEAT_CROSSING: usize = 5216;
+/// Tell the webhook when alerts could not be checked (default off).
+const CMD_GAP_NOTICE: usize = 5217;
+/// Copy the Recent list as text.
+const CMD_LOG_COPY: usize = 5218;
+/// Clear every alert, after asking.
+const CMD_ALERTS_CLEAR_ALL: usize = 5219;
+/// The last fixed entry of the Alerts submenu (the dispatch range ends here).
+const CMD_ALERT_LAST: usize = CMD_ALERTS_CLEAR_ALL;
 /// A second "Send a test alert" inside this many seconds is refused (one request in flight).
 const TEST_ALERT_GAP_S: u64 = 15;
 
@@ -168,6 +181,13 @@ const CMD_HOTKEY_CUSTOM: usize = 5415;
 const CMD_STRIP_ROWS: usize = 5420;
 const CMD_STRIP_TEXT: usize = 5430;
 const CMD_STRIP_OPACITY: usize = 5440;
+/// The poll governor's two ticks (W2), in the Poll every submenu.
+const CMD_SLOW_QUIET: usize = 5450;
+const CMD_REST_LOCKED: usize = 5451;
+/// The session was locked or unlocked (`wparam` 7 or 8), sent once `register_session_notice` ran.
+const WM_WTSSESSION_CHANGE: u32 = 0x02B1;
+const WTS_SESSION_LOCK: usize = 7;
+const WTS_SESSION_UNLOCK: usize = 8;
 
 /// Rows in the taskbar grid offered by the Strip submenu (`cfg.dock_rows`).
 const STRIP_ROWS: [u32; 3] = [1, 2, 3];
@@ -395,6 +415,10 @@ struct Ui {
     alert_pending: Option<String>,
     /// The last 10 alerts and what became of them (memory only). Cleared by its menu entry.
     alert_log: alerts::Log,
+    /// Whether alerts could be checked on each feed tick (`watch`): a span that was not is a Recent line.
+    watch: watch::Watch,
+    /// When a mute or quiet hours began, so their end can say what they swallowed.
+    hush: watch::Hush,
     /// When "Send a test alert" last started a POST; a second click inside `TEST_ALERT_GAP_S` is
     /// refused. Time-based on purpose: no result message can leave it stuck.
     test_alert_at: Option<Instant>,
@@ -953,6 +977,12 @@ fn draw_panel(u: &mut Ui, dc: HDC, w: i32, h: i32) {
     } else {
         String::new()
     };
+    // A card with a level set carries a dot (Ultra only; with no alerts nothing is drawn).
+    let dots: Vec<bool> = if u.profile.ultra && !u.cfg.alerts.is_empty() {
+        u.view.cells.iter().map(|c| u.cfg.alerts.iter().any(|a| a.label == c.label && alerts::has_level(a))).collect()
+    } else {
+        Vec::new()
+    };
     let scene = panel::Scene {
         title: u.profile.title(),
         board: &u.view,
@@ -978,6 +1008,7 @@ fn draw_panel(u: &mut Ui, dc: HDC, w: i32, h: i32) {
         picker_btn: u.profile.ultra,
         chart_btn: u.profile.ultra,
         settings_btn: u.profile.ultra,
+        alert_dots: &dots,
         // The chart shows the locked card and nothing else. It used to follow the pointer, which made
         // the pane change under the cursor on the way to it; a click is the one thing that moves it now.
         // With nothing locked the pane says so instead of guessing which card was meant.
@@ -1217,11 +1248,21 @@ fn paint(u: &mut Ui) {
 
 /// The tray tooltip. A pending alert leads: `Alert: XAU above 4,100.00`.
 fn tooltip(view: &Board, pending: Option<&str>) -> String {
+    tooltip_with(view, pending, None)
+}
+
+/// [`tooltip`] with one more line while alerts cannot be checked, just under the title so the tray's
+/// length limit cuts prices rather than the warning.
+fn tooltip_with(view: &Board, pending: Option<&str>, blind: Option<&str>) -> String {
     let mut s = String::new();
     if let Some(title) = pending {
         s.push_str(&format!("Alert: {title}\n"));
     }
     s.push_str(&format!("{} - {}", config::profile().title(), theme::link_name(view.link)));
+    if let Some(line) = blind {
+        s.push('\n');
+        s.push_str(line);
+    }
     for c in &view.cells {
         if let Some(q) = &c.quote {
             s.push_str(&format!("\n{} {}", c.label, fmt_price(q.price, c.digits)));
@@ -1247,6 +1288,15 @@ mod tooltip_tests {
     }
 }
 
+/// The tray tooltip as the window shows it now: a pending alert, and the gap line while one lasts.
+fn tooltip_for(u: &Ui) -> String {
+    let blind = u
+        .watch
+        .blind_since()
+        .map(|since| watch::blind_tip(&alerts::local_hhmm(&local_offset_at, crate::source::now_s(), since)));
+    tooltip_with(&u.view, u.alert_pending.as_deref(), blind.as_deref())
+}
+
 /// Rebuild the tray icon when the link colour or the alert marker differs from what it was drawn
 /// for. True when it was rebuilt (the caller then pushes it to the tray).
 fn sync_icon(u: &mut Ui) -> bool {
@@ -1268,7 +1318,7 @@ fn refresh_tray(hwnd: HWND) {
     let Some((icon, tip)) = with_ui(|u| {
         sync_icon(u);
         u.tip_at = Some(Instant::now());
-        (u.icon, tooltip(&u.view, u.alert_pending.as_deref()))
+        (u.icon, tooltip_for(u))
     }) else {
         return;
     };
@@ -1425,11 +1475,22 @@ fn relayout_and_place(hwnd: HWND) {
 /// start, the failure is posted the same way.
 fn post_alert(hwnd: HWND, url: String, title: String, body: String, seq: u64, test: bool) {
     let target = hwnd as isize;
-    let started = alerts::spawn_post(url, title, body, Box::new(move |err| unsafe {
-        PostMessageW(target as HWND, WM_ALERT, alert_wparam(err.is_some(), test), seq as LPARAM);
+    let started = alerts::spawn_post(url, title, body, Box::new(move |err, retried| unsafe {
+        PostMessageW(target as HWND, WM_ALERT, alert_wparam_retry(err.is_some(), test, retried), seq as LPARAM);
     }));
     if !started {
         unsafe { PostMessageW(hwnd, WM_ALERT, alert_wparam(true, test), seq as LPARAM) };
+    }
+}
+
+/// POST the gap notice (no log line; `WM_ALERT` bit 3 says so, and the note names it).
+fn post_notice(hwnd: HWND, url: String, text: String) {
+    let target = hwnd as isize;
+    let started = alerts::spawn_post(url, "MH Ticker".into(), text, Box::new(move |err, retried| unsafe {
+        PostMessageW(target as HWND, WM_ALERT, alert_wparam_retry(err.is_some(), false, retried) | 8, 0);
+    }));
+    if !started {
+        unsafe { PostMessageW(hwnd, WM_ALERT, alert_wparam(true, false) | 8, 0) };
     }
 }
 
@@ -1437,16 +1498,25 @@ fn post_alert(hwnd: HWND, url: String, title: String, body: String, seq: u64, te
 /// with the result because the log line it belongs to may be gone by the time it arrives (the list was
 /// cleared, or ten newer alerts pushed it out), and the note must still say which it was.
 fn alert_wparam(failed: bool, test: bool) -> usize {
-    failed as usize | (test as usize) << 1
+    alert_wparam_retry(failed, test, false)
+}
+
+/// [`alert_wparam`] with bit 2 = the second try was needed (`sent on retry`, or a failure after it).
+fn alert_wparam_retry(failed: bool, test: bool, retried: bool) -> usize {
+    failed as usize | (test as usize) << 1 | (retried as usize) << 2
 }
 
 /// The footer note for a webhook result decoded from `WM_ALERT`'s `wparam`.
 fn webhook_note(wp: usize) -> String {
-    let (failed, test) = (wp & 1 != 0, wp & 2 != 0);
+    let (failed, test, retried) = (wp & 1 != 0, wp & 2 != 0, wp & 4 != 0);
+    if wp & 8 != 0 {
+        return if failed { "gap notice: webhook failed" } else { "gap notice: webhook sent" }.to_string();
+    }
     let what = if test { "test alert" } else { "alert" };
     match (failed, test) {
         (true, true) => "test alert: webhook failed".to_string(),
         (true, false) => "alert kept here: webhook failed".to_string(),
+        (false, _) if retried => format!("{what}: webhook sent on retry"),
         (false, _) => format!("{what}: webhook sent"),
     }
 }
@@ -1477,11 +1547,66 @@ fn want_range(u: &mut Ui) {
     }
 }
 
+/// Hand the poll governor what the UI owns: its two ticks and whether any alert is armed. Called from
+/// `save_cfg` (so every settings or alert change gets here) and from `on_feed`. A change that
+/// could shorten a governed wait ends it now, through the feed's `kick`. State only: no window call,
+/// no I/O.
+fn sync_gov(u: &mut Ui) {
+    let set = u.cfg.governor(u.profile.ultra);
+    let armed = u.profile.ultra && alerts::armed(&u.cfg.alerts);
+    if let Ok(mut b) = u.board.lock() {
+        let changed = b.gov != set || b.armed != armed;
+        b.gov = set;
+        b.armed = armed;
+        if changed && b.slowed {
+            b.kick = b.kick.wrapping_add(1);
+        }
+    }
+}
+
+/// The user is here (expand, the hotkey, an unlock): end a governed wait and put the quiet clock back
+/// to the base poll at once, by the same `kick` as *Refresh now*. Nothing happens while both governor
+/// ticks are off, so Classic's polling is exactly what it was. Takes the board out of `with_ui` first
+/// and bumps it outside.
+fn wake_feed() {
+    let Some(board) = with_ui(|u| u.board.clone()) else { return };
+    if let Ok(mut b) = board.lock() {
+        if b.gov.any() {
+            b.kick = b.kick.wrapping_add(1);
+        }
+    };
+}
+
+/// `WM_WTSSESSION_CHANGE`: record the lock in the board (state only), then wake the feed on an unlock.
+fn session_changed(locked: bool) {
+    let Some(board) = with_ui(|u| u.board.clone()) else { return };
+    if let Ok(mut b) = board.lock() {
+        b.locked = locked;
+    }
+    if !locked {
+        wake_feed();
+    }
+}
+
+/// Ask Windows to send `WM_WTSSESSION_CHANGE` for this window (this session only).
+fn register_session_notice(hwnd: HWND) {
+    unsafe { WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) };
+}
+
+/// What one feed tick has to say beyond the alerts that fired.
+#[derive(Default)]
+struct FeedNotices {
+    /// The balloon for the end of a mute or quiet hours.
+    digest: Option<String>,
+    /// The webhook line for a gap (only when the user asked for it).
+    gap: Option<String>,
+}
+
 /// Pull the latest board, refresh the tray icon colour and tooltip, redraw. The tray tooltip (an
 /// Explorer round trip) refreshes at most every 5 s unless the link colour changed, and a hidden
 /// strip is not re-measured.
 fn on_feed(hwnd: HWND) {
-    let Some((tray_update, fired, hook, save)) = with_ui(|u| {
+    let Some((tray_update, fired, hook, save, notices)) = with_ui(|u| {
         if let Ok(b) = u.board.lock() {
             let sources = |board: &Board| board.cells.iter()
                 .map(|c| c.quote.as_ref().map(|q| q.source).unwrap_or(""))
@@ -1490,11 +1615,15 @@ fn on_feed(hwnd: HWND) {
             u.view = b.clone();
         }
         let now = crate::source::now_s();
+        // The stale limit follows the governed interval (`governor::stale_after`), so a quote one
+        // slow poll old is not stale; with the governor off it is the configured limit as before.
+        let stale_after = crate::governor::stale_after(u.cfg.stale_after_s, u.view.governed_s);
         for cell in &mut u.view.cells {
             if let Some(q) = &cell.quote {
-                cell.stale |= crate::model::is_stale(q, now, u.cfg.stale_after_s, u.cfg.delayed_grace_s);
+                cell.stale |= crate::model::is_stale(q, now, stale_after, u.cfg.delayed_grace_s);
             }
         }
+        sync_gov(u);
         u.hist.record(&u.view, now);
         want_range(u);
         // Alerts run after the view is current, so a balloon names the price the strip is showing.
@@ -1506,7 +1635,7 @@ fn on_feed(hwnd: HWND) {
         let mut deliver: Vec<(alerts::Fired, u64)> = Vec::new();
         let mut save = false;
         if u.profile.ultra && !u.cfg.alerts.is_empty() {
-            let fired = alerts::check(&mut u.cfg, &u.view, now);
+            let fired = alerts::check_with(&mut u.cfg, &u.view, now, &|label| u.hist.series_of(label));
             if !fired.is_empty() {
                 // Written after the closure: `with_ui` does no I/O.
                 save = true;
@@ -1531,14 +1660,42 @@ fn on_feed(hwnd: HWND) {
                 }
             }
         }
+        // What the feed tick can tell the user about alerts, without a timer: a span in which they
+        // could not be checked (`watch`), and what a mute or quiet hours swallowed (`hush`).
+        let mut notices = FeedNotices::default();
+        if u.profile.ultra {
+            let (armed, fresh) = alerts::checkable(&u.cfg, &u.view);
+            let interval = if u.view.governed_s > 0.0 { u.view.governed_s } else { u.cfg.poll_s };
+            match u.watch.step(now, fresh, armed, watch::threshold(interval)) {
+                Some(watch::Event::Back { from, to, jump }) => {
+                    let (f, t) = (alerts::local_hhmm(&local_offset_at, now, from), alerts::local_hhmm(&local_offset_at, now, to));
+                    let line = watch::gap_line(&f, &t, jump);
+                    u.alert_log.push(to, line.clone(), alerts::Outcome::Gap);
+                    u.alert_note = Some(line);
+                    if u.cfg.gap_notice && alerts::silence(&u.cfg, now, local_minute()).is_none() {
+                        notices.gap = Some(watch::gap_notice(&f, &t));
+                    }
+                    u.tip_at = None;
+                }
+                Some(watch::Event::Blind { .. }) => u.tip_at = None,
+                None => {}
+            }
+            let silenced = alerts::silence(&u.cfg, now, local_minute()).is_some();
+            if let Some(since) = u.hush.step(now, silenced) {
+                if let Some(text) = alerts::digest(&u.alert_log.newest_first(), since) {
+                    u.alert_note = Some(text.clone());
+                    notices.digest = Some(text);
+                }
+            }
+        }
         let relinked = sync_icon(u);
         let due = relinked || u.tip_at.is_none_or(|t| t.elapsed() >= TIP_EVERY);
         let tray_update = due.then(|| {
             u.tip_at = Some(Instant::now());
-            (u.icon, tooltip(&u.view, u.alert_pending.as_deref()))
+            (u.icon, tooltip_for(u))
         });
         let fired = deliver;
-        (tray_update, fired, u.cfg.webhook.clone(), save)
+        (tray_update, fired, u.cfg.webhook.clone(), save, notices)
     }) else {
         return;
     };
@@ -1553,6 +1710,14 @@ fn on_feed(hwnd: HWND) {
         if let Some(url) = hook.clone() {
             post_alert(hwnd, url, f.title, f.body, seq, false);
         }
+    }
+    // One balloon when a mute or quiet hours ended, one POST per gap and only if asked for. Neither
+    // carries a price.
+    if let Some(text) = notices.digest {
+        alerts::balloon(hwnd, TRAY_ID, config::profile().title(), &text);
+    }
+    if let (Some(text), Some(url)) = (notices.gap, hook) {
+        post_notice(hwnd, url, text);
     }
     match with_ui(|u| u.mode) {
         Some(Mode::Strip) if unsafe { IsWindowVisible(hwnd) } != 0 => relayout_and_place(hwnd),
@@ -1875,6 +2040,7 @@ fn fit_panel(r: RECT) -> RECT {
 /// Strip -> panel.
 fn expand(hwnd: HWND) {
     clear_pending(hwnd);
+    wake_feed();
     let Some((a, b, from, to, op, dpi0)) = with_ui(|u| {
         if u.mode != Mode::Strip {
             return None;
@@ -2144,6 +2310,12 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
             (CMD_POLL + cur_poll) as u32,
             MF_BYCOMMAND,
         );
+        // The governor (W2): the choice above is the pace while prices move; these two only ever slow it,
+        // and never below one poll in 15 s while an alert is armed.
+        let gov = with_ui(|u| u.cfg.governor(u.profile.ultra)).unwrap_or_default();
+        AppendMenuW(poll, MF_SEPARATOR, 0, null());
+        add(poll, MF_STRING | if gov.slow_when_quiet { MF_CHECKED } else { 0 }, CMD_SLOW_QUIET, "Slow down when nothing moves");
+        add(poll, MF_STRING | if gov.rest_when_locked { MF_CHECKED } else { 0 }, CMD_REST_LOCKED, "Rest while the PC is locked");
         add(m, MF_POPUP, poll as usize, &format!("Poll every {poll_s} s"));
         let sources = CreatePopupMenu();
         let fallback = with_ui(|u| u.cfg.fallback_enabled).unwrap_or(false);
@@ -2203,6 +2375,13 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
                     let on = row.enabled.get(k).copied().unwrap_or(false);
                     dynamic(sub, MF_STRING | if on { 0 } else { MF_GRAYED }, &mut commands, crate::menu_commands::Action::Alert(row.label.clone(), k), p.label);
                 }
+                // The fast move: from the hour of samples held, so it needs no fresh price to be set.
+                AppendMenuW(sub, MF_SEPARATOR, 0, null());
+                let cur_fast = row.alert.as_ref().map_or(0, |a| a.fast as usize);
+                for k in 0..alerts::FAST_MOVES.len() {
+                    let text = format!("fast move {}", alerts::fast_label(k));
+                    dynamic(sub, MF_STRING | if cur_fast == k + 1 { MF_CHECKED } else { 0 }, &mut commands, crate::menu_commands::Action::Fast(row.label.clone(), k), &text);
+                }
                 // A level typed by hand: greyed without a fresh price, like the presets.
                 AppendMenuW(sub, MF_SEPARATOR, 0, null());
                 dynamic(sub, MF_STRING | if row.fresh { 0 } else { MF_GRAYED }, &mut commands, crate::menu_commands::Action::AlertAt(row.label.clone()), "at a price...");
@@ -2218,7 +2397,37 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
                 add(al, MF_GRAYED, 0, "(no symbols shown)");
             }
             AppendMenuW(al, MF_SEPARATOR, 0, null());
-            add(al, MF_STRING | if av.once { MF_CHECKED } else { 0 }, CMD_ALERT_ONCE, "Fire once, then clear");
+            // At a glance: everything that is set, how far each level is, and Clear all.
+            let glance = CreatePopupMenu();
+            if av.overview.is_empty() {
+                add(glance, MF_STRING | MF_GRAYED, 0, "(nothing set)");
+            }
+            for line in &av.overview {
+                add(glance, MF_STRING | MF_GRAYED, 0, &line.text.replace('&', "&&"));
+            }
+            AppendMenuW(glance, MF_SEPARATOR, 0, null());
+            add(glance, MF_STRING | if av.overview.is_empty() { MF_GRAYED } else { 0 }, CMD_ALERTS_CLEAR_ALL, "Clear all alerts...");
+            let cannot_fire = av.overview.iter().filter(|l| l.warn).count();
+            let glance_title = if cannot_fire > 0 {
+                format!("At a glance ({}, {cannot_fire} cannot fire)", av.overview.len())
+            } else {
+                format!("At a glance ({})", av.overview.len())
+            };
+            add(al, MF_POPUP, glance as usize, &glance_title);
+            // Repeat: how an alert comes back after it has fired. Every cooldown is 1.8's rule.
+            let repeat = CreatePopupMenu();
+            add(repeat, MF_STRING, CMD_REPEAT_COOLDOWN, "Every cooldown");
+            add(repeat, MF_STRING, CMD_ALERT_ONCE, "Fire once, then clear");
+            add(repeat, MF_STRING, CMD_REPEAT_CROSSING, "Each crossing");
+            let (cur_repeat, repeat_word) = if av.once {
+                (CMD_ALERT_ONCE, "once")
+            } else if av.crossing {
+                (CMD_REPEAT_CROSSING, "each crossing")
+            } else {
+                (CMD_REPEAT_COOLDOWN, "every cooldown")
+            };
+            CheckMenuRadioItem(repeat, CMD_REPEAT_COOLDOWN as u32, CMD_REPEAT_CROSSING as u32, cur_repeat as u32, MF_BYCOMMAND);
+            add(al, MF_POPUP, repeat as usize, &format!("Repeat \u{b7} {repeat_word}"));
             // Mute. A timed mute ends by the clock; the label says when, in this PC's local time.
             let mute = CreatePopupMenu();
             add(mute, MF_STRING, CMD_MUTE_1H, "For 1 hour");
@@ -2259,6 +2468,13 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
             let has_hook = av.host.is_some();
             add(hook, MF_STRING | if has_hook { 0 } else { MF_GRAYED }, CMD_HOOK_TEST, "Send a test alert");
             add(hook, MF_STRING | if has_hook { 0 } else { MF_GRAYED }, CMD_HOOK_REMOVE, "Remove");
+            AppendMenuW(hook, MF_SEPARATOR, 0, null());
+            add(
+                hook,
+                MF_STRING | if has_hook { 0 } else { MF_GRAYED } | if av.gap_notice { MF_CHECKED } else { 0 },
+                CMD_GAP_NOTICE,
+                "Say when alerts could not be checked",
+            );
             add(al, MF_POPUP, hook as usize, "Webhook");
             // Recent alerts, newest first.
             let recent = CreatePopupMenu();
@@ -2266,9 +2482,10 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
                 add(recent, MF_STRING | MF_GRAYED, 0, "(nothing yet)");
             }
             for e in &av.log {
-                add(recent, MF_STRING | MF_GRAYED, 0, &alerts::entry_line(e, &local_offset_at, av.now));
+                add(recent, MF_STRING | MF_GRAYED, 0, &alerts::entry_line(e, &local_offset_at, av.now).replace('&', "&&"));
             }
             AppendMenuW(recent, MF_SEPARATOR, 0, null());
+            add(recent, MF_STRING | if av.log.is_empty() { MF_GRAYED } else { 0 }, CMD_LOG_COPY, "Copy list");
             add(recent, MF_STRING | if av.log.is_empty() { MF_GRAYED } else { 0 }, CMD_LOG_CLEAR, "Clear list");
             add(al, MF_POPUP, recent as usize, &format!("Recent ({})", av.log.len()));
             add(m, MF_POPUP, al as usize, &format!("Alerts ({})", alerted.len()));
@@ -2417,15 +2634,40 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
                 let changed = with_ui(|u| {
                     let def = alerts::PRESETS.get(*k)?;
                     let cell = u.view.cells.iter().find(|c| &c.label == label)?;
-                    let reference = alerts::reference_price(cell, &u.cfg, crate::source::now_s())?;
+                    let reference = alerts::reference_price(cell, &u.cfg, u.view.governed_s, crate::source::now_s())?;
                     let level = alerts::preset_level(def.preset, cell, reference)?;
                     if !u.cfg.alerts.iter().any(|a| &a.label == label) {
-                        u.cfg.alerts.push(config::Alert { label: label.clone(), once: u.cfg.alert_once, ..Default::default() });
+                        u.cfg.alerts.push(config::Alert { label: label.clone(), once: u.cfg.alert_once, crossing: u.cfg.alert_crossing, ..Default::default() });
                     }
                     let a = u.cfg.alerts.iter_mut().find(|a| &a.label == label)?;
                     alerts::apply_level(a, level);
                     Some(())
                 }).flatten().is_some();
+                if changed {
+                    save_cfg();
+                }
+            }
+            Action::Fast(label, k) => {
+                let changed = with_ui(|u| {
+                    if *k >= alerts::FAST_MOVES.len() || !u.cfg.rows.iter().any(|r| &r.label == label) {
+                        return false;
+                    }
+                    if !u.cfg.alerts.iter().any(|a| &a.label == label) {
+                        u.cfg.alerts.push(config::Alert {
+                            label: label.clone(),
+                            once: u.cfg.alert_once,
+                            crossing: u.cfg.alert_crossing,
+                            ..Default::default()
+                        });
+                    }
+                    let Some(a) = u.cfg.alerts.iter_mut().find(|a| &a.label == label) else { return false };
+                    // The current choice again turns it off. Either way the alert starts armed.
+                    a.fast = if a.fast as usize == k + 1 { 0 } else { (k + 1) as u8 };
+                    a.last = 0.0;
+                    a.latched = 0;
+                    true
+                })
+                .unwrap_or(false);
                 if changed {
                     save_cfg();
                 }
@@ -2592,6 +2834,13 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
             let keep = with_ui(|u| u.cfg.hotkey.clone()).flatten();
             set_hotkey(hwnd, keep);
         }
+        CMD_SLOW_QUIET | CMD_REST_LOCKED => {
+            with_ui(|u| {
+                let now = u.cfg.governor(u.profile.ultra);
+                if cmd == CMD_SLOW_QUIET { u.cfg.slow_when_quiet = Some(!now.slow_when_quiet) } else { u.cfg.rest_when_locked = Some(!now.rest_when_locked) }
+            });
+            save_cfg();
+        }
         c if (CMD_STRIP_ROWS..CMD_STRIP_ROWS + STRIP_ROWS.len()).contains(&c) => {
             with_ui(|u| u.cfg.dock_rows = STRIP_ROWS[c - CMD_STRIP_ROWS]);
             apply_strip(hwnd);
@@ -2609,7 +2858,7 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
             apply_strip(hwnd);
         }
         CMD_PICK if ultra => apply_picker(hwnd, !picked),
-        c if ultra && (CMD_ALERT_ONCE..=CMD_LOG_CLEAR).contains(&c) => alert_command(hwnd, c),
+        c if ultra && (CMD_ALERT_ONCE..=CMD_ALERT_LAST).contains(&c) => alert_command(hwnd, c),
         _ => {}
     }
 }
@@ -2620,7 +2869,7 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
 fn armed_labels(alerts: &[config::Alert], shown_labels: &[&str]) -> Vec<String> {
     alerts
         .iter()
-        .filter(|a| a.above.is_some() || a.below.is_some() || a.day_move.is_some())
+        .filter(|a| alerts::has_level(a))
         .filter(|a| shown_labels.contains(&a.label.as_str()))
         .map(|a| a.label.clone())
         .collect()
@@ -2694,6 +2943,7 @@ struct AlertsView {
     /// UTC seconds now.
     now: f64,
     once: bool,
+    crossing: bool,
     quiet: Option<[u16; 2]>,
     /// Whether alerts are silenced right now, and why.
     silence: Option<alerts::Silence>,
@@ -2701,6 +2951,9 @@ struct AlertsView {
     host: Option<String>,
     /// Newest first.
     log: Vec<alerts::Entry>,
+    /// Everything that is set, with distances (`alerts::overview`).
+    overview: Vec<alerts::OverviewLine>,
+    gap_notice: bool,
     /// One per shown symbol.
     rows: Vec<AlertsRow>,
 }
@@ -2724,7 +2977,7 @@ fn alerts_view(list: &[config::Row], shown: &[bool]) -> Option<AlertsView> {
             .filter(|(_, on)| **on)
             .map(|(r, _)| {
                 let cell = u.view.cells.iter().find(|c| c.label == r.label);
-                let reference = cell.and_then(|c| alerts::reference_price(c, &u.cfg, now));
+                let reference = cell.and_then(|c| alerts::reference_price(c, &u.cfg, u.view.governed_s, now));
                 let enabled = alerts::PRESETS
                     .iter()
                     .map(|p| match (cell, reference) {
@@ -2744,10 +2997,13 @@ fn alerts_view(list: &[config::Row], shown: &[bool]) -> Option<AlertsView> {
         AlertsView {
             now,
             once: u.cfg.alert_once,
+            crossing: u.cfg.alert_crossing,
             quiet: u.cfg.quiet_hours,
             silence: alerts::mute_state(&u.cfg, now),
             host: u.cfg.webhook.as_deref().map(crate::webhook_host::redact),
             log: u.alert_log.newest_first(),
+            overview: alerts::overview(&u.cfg, &u.view, now),
+            gap_notice: u.cfg.gap_notice,
             rows,
         }
     })
@@ -2755,7 +3011,10 @@ fn alerts_view(list: &[config::Row], shown: &[bool]) -> Option<AlertsView> {
 
 /// Write the config as it now stands. Kept out of `with_ui` closures: no I/O inside them.
 fn save_cfg() {
-    if let Some(cfg) = with_ui(|u| u.cfg.clone()) {
+    if let Some(cfg) = with_ui(|u| {
+        sync_gov(u);
+        u.cfg.clone()
+    }) {
         config::save(&cfg);
     }
 }
@@ -2770,11 +3029,17 @@ fn alert_box(hwnd: HWND, title: &str, text: &str, flags: u32) -> i32 {
 fn alert_command(hwnd: HWND, cmd: usize) {
     let now = crate::source::now_s();
     match cmd {
-        CMD_ALERT_ONCE => {
+        CMD_ALERT_ONCE | CMD_REPEAT_COOLDOWN | CMD_REPEAT_CROSSING => {
+            // One radio: the choice is both the default for new alerts and the mode of every alert set.
             with_ui(|u| {
-                u.cfg.alert_once = !u.cfg.alert_once;
-                let once = u.cfg.alert_once;
-                u.cfg.alerts.iter_mut().for_each(|a| a.once = once);
+                let (once, crossing) = (cmd == CMD_ALERT_ONCE, cmd == CMD_REPEAT_CROSSING);
+                u.cfg.alert_once = once;
+                u.cfg.alert_crossing = crossing;
+                for a in &mut u.cfg.alerts {
+                    a.once = once;
+                    a.crossing = crossing;
+                    a.latched = 0;
+                }
             });
             save_cfg();
         }
@@ -2847,6 +3112,32 @@ fn alert_command(hwnd: HWND, cmd: usize) {
         }
         CMD_LOG_CLEAR => {
             with_ui(|u| u.alert_log.clear());
+        }
+        CMD_LOG_COPY => {
+            // Clipboard I/O after the borrow is released.
+            let text = with_ui(|u| alerts::log_text(&u.alert_log.newest_first(), &local_offset_at, now));
+            if let Some(text) = text.filter(|t| !t.is_empty()) {
+                copy_text(&text);
+            }
+        }
+        CMD_GAP_NOTICE => {
+            with_ui(|u| u.cfg.gap_notice = !u.cfg.gap_notice);
+            save_cfg();
+        }
+        CMD_ALERTS_CLEAR_ALL => {
+            let n = with_ui(|u| u.cfg.alerts.iter().filter(|a| alerts::has_level(a)).count()).unwrap_or(0);
+            if n == 0 {
+                return;
+            }
+            let ask = format!(
+                "Clear all {n} alert{}?\n\nEvery level, day move and fast move you have set is removed. The Recent list stays.",
+                if n == 1 { "" } else { "s" }
+            );
+            if alert_box(hwnd, "Clear all alerts", &ask, MB_YESNO | MB_ICONQUESTION) == IDYES {
+                // The box ran the message loop: act on what is set now, not on the count above.
+                with_ui(|u| u.cfg.alerts.clear());
+                save_cfg();
+            }
         }
         _ => {}
     }
@@ -3179,7 +3470,7 @@ fn on_lookup(hwnd: HWND) {
 fn fresh_price(label: &str) -> Option<(f64, u32)> {
     with_ui(|u| {
         let cell = u.view.cells.iter().find(|c| c.label == label)?;
-        Some((alerts::reference_price(cell, &u.cfg, crate::source::now_s())?, cell.digits))
+        Some((alerts::reference_price(cell, &u.cfg, u.view.governed_s, crate::source::now_s())?, cell.digits))
     })
     .flatten()
 }
@@ -3187,7 +3478,7 @@ fn fresh_price(label: &str) -> Option<(f64, u32)> {
 /// Set `level` on `label`'s alert, creating the alert (with the *Fire once* setting) if it has none.
 fn put_level(u: &mut Ui, label: &str, level: alerts::Level) {
     if !u.cfg.alerts.iter().any(|a| a.label == label) {
-        u.cfg.alerts.push(config::Alert { label: label.to_string(), once: u.cfg.alert_once, ..Default::default() });
+        u.cfg.alerts.push(config::Alert { label: label.to_string(), once: u.cfg.alert_once, crossing: u.cfg.alert_crossing, ..Default::default() });
     }
     if let Some(a) = u.cfg.alerts.iter_mut().find(|a| a.label == label) {
         alerts::apply_level(a, level);
@@ -3538,7 +3829,7 @@ fn apply_theme(hwnd: HWND) {
         }
         u.icon = fresh;
         u.icon_link = Some((u.view.link, u.alert_pending.is_some()));
-        Some((u.icon, tooltip(&u.view, u.alert_pending.as_deref())))
+        Some((u.icon, tooltip_for(u)))
     })
     .flatten()
     else {
@@ -3683,7 +3974,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let failed = wp & 1 != 0;
             let seq = lp as u64;
             with_ui(|u| {
-                let outcome = if failed { alerts::Outcome::SendFailed } else { alerts::Outcome::Sent };
+                // A gap notice has no log line of its own; seq 0 is never a live entry.
+                let outcome = match (failed, wp & 4 != 0) {
+                    (true, _) => alerts::Outcome::SendFailed,
+                    (false, true) => alerts::Outcome::SentOnRetry,
+                    (false, false) => alerts::Outcome::Sent,
+                };
                 u.alert_log.set_outcome(seq, outcome);
                 u.alert_note = Some(webhook_note(wp));
             });
@@ -3737,11 +4033,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         // during a morph (which blocks this thread, so only a stale mode could say Morph here).
         m if m == hotkey::WM_HOTKEY => {
             if wp as i32 == HOTKEY_ID {
+                wake_feed();
                 match with_ui(|u| u.mode) {
                     Some(Mode::Strip) => expand(hwnd),
                     Some(Mode::Panel) => collapse(hwnd),
                     _ => {}
                 }
+            }
+            0
+        }
+        WM_WTSSESSION_CHANGE => {
+            match wp {
+                WTS_SESSION_LOCK => session_changed(true),
+                WTS_SESSION_UNLOCK => session_changed(false),
+                _ => {}
             }
             0
         }
@@ -4212,14 +4517,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_DESTROY => {
             STRIP.store(0, Ordering::Relaxed);
             UnregisterHotKey(hwnd, HOTKEY_ID);
+            WTSUnRegisterSessionNotification(hwnd);
             tray_delete(hwnd);
             save_cfg();
+            // A webhook POST still in flight gets up to two seconds (its retry goes at once); nothing
+            // in flight costs nothing. After the icon and the save, so the quit already looks done.
+            alerts::wait_for_posts();
             PostQuitMessage(0);
             0
         }
         _ => {
             // Explorer restarted: the tray icon is gone and must be re-added, and the taskbar moved.
-            let recreated = with_ui(|u| (u.taskbar_created, u.icon, tooltip(&u.view, u.alert_pending.as_deref())));
+            let recreated = with_ui(|u| (u.taskbar_created, u.icon, tooltip_for(u)));
             if let Some((tc, icon, tip)) = recreated {
                 if tc != 0 && msg == tc {
                     tray(hwnd, NIM_ADD, icon, &tip);
@@ -4272,6 +4581,8 @@ pub fn run(cfg: Config, board: Arc<Mutex<Board>>) {
         // The UI owns the poll cadence: the feed reads it from the board each pass.
         if let Ok(mut b) = board.lock() {
             b.poll_s = cfg.poll_s;
+            b.gov = cfg.governor(profile.ultra);
+            b.armed = profile.ultra && alerts::armed(&cfg.alerts);
             b.set_fallback(cfg.fallback_enabled);
         }
         let view = board.lock().map(|b| b.clone()).unwrap_or_else(|_| Board::new(&cfg.rows));
@@ -4320,6 +4631,8 @@ pub fn run(cfg: Config, board: Arc<Mutex<Board>>) {
             alert_note: None,
             alert_pending: None,
             alert_log: alerts::Log::default(),
+            watch: watch::Watch::default(),
+            hush: watch::Hush::default(),
             test_alert_at: None,
             tracking: false,
             prev_fg: null_mut(),
@@ -4344,6 +4657,7 @@ pub fn run(cfg: Config, board: Arc<Mutex<Board>>) {
         tray(hwnd, NIM_ADD, icon, &tip);
         apply_visibility(hwnd);
         register_hotkey(hwnd);
+        register_session_notice(hwnd);
 
         SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, null_mut(), Some(on_win_event), 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
         SetTimer(hwnd, TIMER_DOCK, 500, None);
@@ -4516,6 +4830,9 @@ mod tests {
         assert_eq!(webhook_note(alert_wparam(true, false)), "alert kept here: webhook failed");
         assert_eq!(webhook_note(alert_wparam(false, false)), "alert: webhook sent");
         assert_eq!(alert_wparam(true, false), 1, "bit 0 is still the failure, as before");
+        assert_eq!(webhook_note(alert_wparam_retry(false, false, true)), "alert: webhook sent on retry");
+        assert_eq!(webhook_note(alert_wparam_retry(false, true, true)), "test alert: webhook sent on retry");
+        assert_eq!(webhook_note(alert_wparam_retry(true, false, true)), "alert kept here: webhook failed", "a failure after the retry is a failure");
         let mut log = alerts::Log::default();
         let seq = log.push(0.0, alerts::TEST_TITLE.into(), alerts::Outcome::Shown);
         log.clear();

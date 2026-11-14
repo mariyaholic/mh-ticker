@@ -606,7 +606,8 @@ impl Feed {
                 return;
             }
             let now = now_s();
-            let mut cells = resolve(&self.rows, &self.quotes, now, self.cfg.stale_after_s, self.cfg.delayed_grace_s);
+            let stale_after = crate::governor::stale_after(self.cfg.stale_after_s, b.governed_s);
+            let mut cells = resolve(&self.rows, &self.quotes, now, stale_after, self.cfg.delayed_grace_s);
             if link == Link::Down { for cell in &mut cells { cell.stale = true; } }
             // Keep a recent fallback until CNBC supplies a fresh response; never turn receipt
             // time into market freshness, and expire fallback if its refresh stops succeeding.
@@ -737,11 +738,41 @@ impl Feed {
         }
     }
 
+    /// What the governor says now: `(interval to wait, stale limit's interval)`. The second is 0 while
+    /// no governor tick is on, which keeps the configured stale limit and the plain cadence exactly
+    /// as 1.8 had them. Reads the board once; `quiet_for` comes from the caller's `Quiet`.
+    fn governed(&self, quiet_for: f64) -> (f64, f64) {
+        let cadence = self.cadence();
+        let Ok(b) = self.shared.lock() else { return (cadence, 0.0) };
+        if !b.gov.any() {
+            return (cadence, 0.0);
+        }
+        let iv = crate::governor::interval(cadence, quiet_for, b.locked, b.armed, b.gov);
+        (iv, iv)
+    }
+
+    /// Tell the board what the feed is waiting out, so the UI's stale rule and a wake can follow it.
+    fn note_governed(&self, governed_s: f64, base: f64) {
+        if let Ok(mut b) = self.shared.lock() {
+            b.governed_s = governed_s;
+            b.slowed = governed_s > base + 0.5;
+        }
+    }
+
     fn run(mut self) {
+        let started = Instant::now();
+        let mut quiet = crate::governor::Quiet::default();
+        let mut seen_kick = self.shared.lock().map(|b| b.kick).unwrap_or(0);
         loop {
             self.sync_rows();
             // Read before the request: a kick that lands while it is in flight ends the wait below.
             let acted = self.shared.lock().map(|b| b.kick).unwrap_or(0);
+            // A wake (expand, hotkey, unlock, Refresh now) puts the quiet clock back to base.
+            if acted != seen_kick {
+                seen_kick = acted;
+                quiet.reset(started.elapsed().as_secs_f64());
+            }
+            let mut governed_s = 0.0;
             let (link, note) = match self.client.quotes(&self.rows) {
                 Ok(qs) => {
                     self.fails = 0;
@@ -753,8 +784,13 @@ impl Feed {
                     for q in qs {
                         self.quotes.insert(q.symbol.clone(), q);
                     }
-                    let cells =
-                        resolve(&self.rows, &self.quotes, now_s(), self.cfg.stale_after_s, self.cfg.delayed_grace_s);
+                    let prices: Vec<f64> = self.rows.iter()
+                        .map(|r| self.quotes.get(&r.symbol).map_or(f64::NAN, |q| q.price))
+                        .collect();
+                    let quiet_for = quiet.observe(started.elapsed().as_secs_f64(), &prices);
+                    governed_s = self.governed(quiet_for).1;
+                    let stale_after = crate::governor::stale_after(self.cfg.stale_after_s, governed_s);
+                    let cells = resolve(&self.rows, &self.quotes, now_s(), stale_after, self.cfg.delayed_grace_s);
                     let lagging: Vec<&str> = cells.iter().filter(|c| c.stale).map(|c| c.label.as_str()).collect();
                     if lagging.is_empty() {
                         (Link::Live, String::new())
@@ -767,10 +803,12 @@ impl Feed {
                     (Link::Down, format!("CNBC: {e}"))
                 }
             };
+            let (iv, _) = self.governed(quiet.quiet_for(started.elapsed().as_secs_f64()));
+            self.note_governed(governed_s, self.cadence());
             self.publish(link, note.clone());
             let cadence = self.cadence();
             let wait = if self.fails == 0 {
-                cadence
+                iv
             } else {
                 (cadence * 2f64.powi(self.fails.min(6) as i32)).min(60.0)
             };
@@ -1567,6 +1605,58 @@ mod tests {
         feed.wait(Duration::from_secs(30), 0);
         t.join().unwrap();
         assert!(started.elapsed() < Duration::from_secs(2), "wait ignored the kick: {:?}", started.elapsed());
+    }
+
+    fn test_feed(shared: &Arc<Mutex<Board>>, rows: Vec<Row>) -> Feed {
+        Feed { cfg: Config::default(), rows, rows_gen: 0, shared: shared.clone(), notify: Arc::new(|| {}),
+            client: Client::new().unwrap(), quotes: HashMap::new(), chart: Vec::new(),
+            backfill: Vec::new(), backfill_gen: 0, bars_next: Instant::now(), bars_due: Vec::new(), fails: 0 }
+    }
+
+    /// The governor as the feed reads it from the board: nothing changes with both ticks off (Classic),
+    /// a quiet market and a locked session slow the wait, and an armed alert holds it to 15 s.
+    #[test]
+    fn the_feed_waits_the_governed_interval_only_when_a_tick_is_on() {
+        let rows = Config::default().rows[..2].to_vec();
+        let shared = Arc::new(Mutex::new(Board::new(&rows)));
+        let feed = test_feed(&shared, rows);
+        for quiet in [0.0, 700.0, 4_000.0] {
+            assert_eq!(feed.governed(quiet), (3.0, 0.0), "off: the plain cadence, stale limit untouched");
+        }
+        {
+            let mut b = shared.lock().unwrap();
+            b.gov = crate::governor::Settings { slow_when_quiet: true, rest_when_locked: true };
+        }
+        assert_eq!(feed.governed(0.0), (3.0, 3.0));
+        assert_eq!(feed.governed(700.0), (15.0, 15.0));
+        assert_eq!(feed.governed(2_000.0), (60.0, 60.0));
+        shared.lock().unwrap().locked = true;
+        assert_eq!(feed.governed(0.0), (300.0, 300.0));
+        shared.lock().unwrap().armed = true;
+        assert_eq!(feed.governed(2_000.0), (15.0, 15.0), "armed: never slower than 15 s, locked or not");
+        // The feed tells the board what it waits, and the board says when a wake is worth a kick.
+        feed.note_governed(300.0, 3.0);
+        let b = shared.lock().unwrap();
+        assert_eq!((b.governed_s, b.slowed), (300.0, true));
+        drop(b);
+        feed.note_governed(0.0, 3.0);
+        let b = shared.lock().unwrap();
+        assert_eq!((b.governed_s, b.slowed), (0.0, false));
+    }
+
+    /// A quote one slow poll old is not stale in the cells the feed publishes; ungoverned it is.
+    #[test]
+    fn publish_uses_the_governed_stale_limit() {
+        let rows = Config::default().rows[..1].to_vec();
+        let shared = Arc::new(Mutex::new(Board::new(&rows)));
+        let mut feed = test_feed(&shared, rows.clone());
+        let q = Quote { symbol: rows[0].symbol.clone(), price: 1.0, ts: Some(now_s() - 250.0), realtime: true, ..Quote::default() };
+        feed.quotes.insert(q.symbol.clone(), q);
+        feed.publish(Link::Live, String::new());
+        assert!(shared.lock().unwrap().cells[0].stale, "250 s old against the configured 90 s");
+        shared.lock().unwrap().governed_s = 300.0;
+        feed.publish(Link::Live, String::new());
+        assert!(!shared.lock().unwrap().cells[0].stale, "one 300 s poll old is not stale");
     }
 
     #[test]

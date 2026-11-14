@@ -172,6 +172,12 @@ impl History {
         }
     }
 
+    /// The held samples of the row labelled `label`, oldest first (the fast-move alert reads these).
+    pub fn series_of(&self, label: &str) -> Vec<(f64, f64)> {
+        let i = self.labels.iter().position(|l| l == label);
+        i.and_then(|i| self.rows.get(i)).map(|r| r.iter().copied().collect()).unwrap_or_default()
+    }
+
     fn row(&self, i: usize) -> Option<&VecDeque<(f64, f64)>> {
         self.rows.get(i)
     }
@@ -698,6 +704,9 @@ pub struct Scene<'a> {
     /// The last alert outcome. Replaces the footer hint, because Focus Assist can swallow the
     /// tray balloon and the panel is then the only place the alert is visible.
     pub alert: Option<&'a str>,
+    /// Per card: it has an alert level set, and a small dot says so beside its label (Ultra only; an
+    /// empty slice draws nothing, which is what every still shows). Missing entries read as false.
+    pub alert_dots: &'a [bool],
     /// Position in an animated background's cycle, 0..1. Ignored by every other theme, so the caller
     /// can always pass a clock.
     pub phase: f64,
@@ -850,7 +859,13 @@ fn card(dc: HDC, sc: &Scene, r: RECT, i: usize, c: &Cell) {
         fill_round(dc, r, radius, t.card);
     }
     let (ix, rx) = (r.left + s(14), r.right - s(14));
-    text(dc, sc.fonts.mid, ix, r.top + s(8), &c.label, t.label);
+    let label_w = text(dc, sc.fonts.mid, ix, r.top + s(8), &c.label, t.label);
+    // A level is set on this symbol: a dot after the label, in the amber the pane's level lines use.
+    if sc.alert_dots.get(i).copied().unwrap_or(false) {
+        let d = s(6).max(4);
+        let (x, y) = (ix + label_w + s(6), r.top + s(8) + s(9) - d / 2);
+        fill_round(dc, RECT { left: x, top: y, right: x + d, bottom: y + d }, d / 2, t.amber);
+    }
     match &c.quote {
         None => {
             text(dc, sc.fonts.big, ix, r.top + s(28), "--", t.dim);

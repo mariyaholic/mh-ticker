@@ -2,13 +2,14 @@
 
 ## unreleased - 1.9: know it is true   [claude.impl]
 
-**Files:** mostly `src/`: new `probe.rs`, `report.rs` and `meter.rs`; changed `alerts.rs`, `chartview.rs`,
-`config.rs`, `ranges.rs`, `source.rs`, `update.rs`, `panel.rs`, `ui.rs` and `shot.rs`. Also `examples/wide.rs`
+**Files:** mostly `src/`: new `probe.rs`, `report.rs`, `meter.rs`, `governor.rs`, `watch.rs` and `retry.rs`; changed
+`alerts.rs`, `chartview.rs`, `config.rs`, `ranges.rs`, `source.rs`, `update.rs`, `panel.rs`, `ui.rs`, `shot.rs`
+and `Cargo.toml` (the `Win32_System_RemoteDesktop` feature). Also `examples/wide.rs`
 (new), `shots/wide-*.png` (new), `scripts/check-state-linux.sh`, `README.md`, `SOURCES.md`, `CHANGELOG.md`
 and `docs/1.9/`.
 
-**What.** The first 1.9 package, grouped by what you see. It adds no new feature. It makes the features already
-here easier to check. Each group says which build gets it: Classic is `MH_Ticker.exe`, Ultra is `MH_Ticker_Ultra.exe`.
+**What.** The 1.9 packages, grouped by what you see. The first group adds no new feature; it makes the features
+already here easier to check. The alerts group adds behaviour. Each group says which build gets it: Classic is `MH_Ticker.exe`, Ultra is `MH_Ticker_Ultra.exe`.
 
 - **Checking the feed (both builds).**
   - `--probe` judges each assumption and prints PASS, WARN or NOTE. It checks the quote fields, an unknown
@@ -52,15 +53,48 @@ here easier to check. Each group says which build gets it: Classic is `MH_Ticker
     fires once more, with a fresh stamp.
 - **Pictures (in the repository, not in the exes).** Fourteen new pictures, `shots/wide-*`: 24 cards, 24 symbols
   on one, two and three strip rows, the narrow pane, 192 DPI, and each range. The 36 existing pictures are unchanged.
+- **Alerts that say when they cannot see (the governor: both builds; the alert parts: Ultra).**
+  - **Poll governor.** When nothing moves, quotes are polled less often: every 15 s once no shown quote has changed
+    for 10 minutes, and every 60 s after 30 minutes. With the PC locked and no alert armed, one poll every 5 minutes.
+    While an alert is armed, the wait is never longer than 15 s. Any change, expanding a card, the hotkey, an unlock
+    or *Refresh now* goes back to the normal poll at once. Two ticks under *Poll every* turn it on or off: *Slow down
+    when nothing moves* and *Rest while the PC is locked*. Ultra has both on unless a choice is saved. Classic has both
+    off, so it polls as it did in 1.8 unless the user ticks them. The governor never polls more often than *Poll every*.
+    A source that keeps failing still backs off as before, so it can wait longer than 15 s while an alert is armed.
+  - **Scripted saving.** In a scripted two-hour run, a market that moved for five minutes and was then quiet made
+    2,400 polls at a 3 s base. The governor made 465, or 720 with an alert armed. Bytes were not measured.
+  - **Not checked.** When no alert on a shown symbol has a fresh price for longer than the larger of 5 minutes and
+    ten polls, the tooltip gets a line, and Recent gets one line when checking is back, for example
+    `02:10 to 02:31 not checked (no fresh price)`. After a sleep the line says `no checks ran, the PC slept`. A gap
+    needs every armed alert on a shown symbol to be blind. An optional webhook notice (*Say when alerts could not be
+    checked*, off by default) sends one message when checking is back, `Alerts could not be checked from 02:10 to 02:31.`
+    It never carries a price, and it is not sent while alerts are muted or in quiet hours.
+  - **Mute digest.** When a mute or quiet hours end, one balloon says how many alerts came in meanwhile, for example
+    `3 alerts while muted. See Alerts > Recent.` Nothing is shown when there were none. No timer was added.
+  - **Webhook retry.** A POST that fails with a network error or a 5xx is tried once more after 3 s. A 4xx is never
+    retried, and a second failure is final. A retry that gets through is logged as `sent on retry`. Quitting waits up
+    to 2 s for a POST still in flight, and a waiting retry is sent at once.
+  - **Each crossing.** The *Repeat* submenu has *Every cooldown* (still the default), *Fire once, then clear* and
+    *Each crossing*. A crossing alert fires when the price crosses its level, and fires again only after the price
+    has gone back past the level by 0.1 %. If the first fresh quote is already beyond the level, it fires once.
+  - **Fast move.** An alert can watch for a move of 1 % in 5 minutes, 2 % in 15 minutes or 3 % in 60 minutes. It is
+    judged from the price history already held, and needs the whole window covered by fresh samples with no gap
+    longer than three polls. In every repeat mode, a stale or fallback quote fires nothing.
+  - **Alerts at a glance.** *Alerts* → *At a glance* lists every level and move set, with its distance
+    (`XAU above 4,200.00, 1.2 % away`) or `reached, 2.3 % past`. A level whose symbol is not on the strip is marked
+    as unable to fire. *Clear all alerts...* asks first. A card with a level has a small amber dot. *Recent* keeps the
+    last 50 entries, and *Copy list* copies them.
 
-**Checked.** Under Wine: 284 tests pass, plus the one known Wine-only failure
+**Checked.** Under Wine: 334 tests pass, plus the one known Wine-only failure
 (`ui::tests::a_theme_switch_takes_the_new_themes_face`, because Wine has no Consolas). The Linux harness
-(`scripts/check-state-linux.sh`) passes 136. The 36 old stills are identical to the baseline, and 14 new stills
-were drawn. Both release exes are about 1.39 MB.
+(`scripts/check-state-linux.sh`) passes 159. The 36 old stills are identical to the baseline (36 of 36), and 14 new
+stills were drawn. Both release exes are about 1.42 MB.
 
 **Not verified.** The live CNBC and GitHub answers: `--probe`, the report and the release tag have not run
 against the services. On a real Windows desktop: the clipboard, the menu lines, a real clock change, the real
-fonts, and gzip byte counts against a capture.
+fonts, and gzip byte counts against a capture. Also not verified: the real lock and unlock, and
+`WTSRegisterSessionNotification` on a real desktop; sleep and resume; a real 5xx from a webhook host; quitting with
+a POST in flight; and the poll governor's saving and bytes against the live feed.
 
 ## 2026-11-14 — 1.8.0: alerts you can set and silence, a chart that reads, typed symbols   [claude.impl]
 
