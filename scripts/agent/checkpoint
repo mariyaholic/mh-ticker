@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# checkpoint "<what is done>" "<what is next>"
+#
+# Records one resumable step of long or delegated work. Run it from anywhere inside this
+# repository or a git worktree of it. It runs the repository's fast check quietly, counts
+# open TODO(finish) hand-off markers, appends an entry to .progress.md at the worktree root
+# (ignored by git), then stages everything and commits it as "checkpoint: <done>".
+# It never pushes. A failing check is recorded in the entry and never blocks the commit.
+#
+# Environment:
+#   CHECKPOINT_CHECK  overrides the check command; set it to "" to record "n/a"
+#   CHECKPOINT_SRC    space-separated paths searched for markers (default: whole worktree)
+
+set -u
+
+usage='usage: checkpoint "<what is done>" "<what is next>"'
+if [ $# -lt 2 ] || [ -z "$1" ] || [ -z "$2" ]; then
+  echo "$usage" >&2
+  exit 2
+fi
+done_text=$1
+next_text=$2
+
+root=$(git rev-parse --show-toplevel 2>/dev/null) || {
+  echo "checkpoint: not inside a git worktree" >&2
+  exit 1
+}
+cd "$root" || exit 1
+
+# The fast check chosen for this repository. An empty value means there is none.
+DEFAULT_CHECK='cargo check --locked --workspace --all-targets'
+check_cmd=${CHECKPOINT_CHECK-$DEFAULT_CHECK}
+
+# Output of the last check, kept in this worktree's private git dir for diagnosis.
+check_log="$(git rev-parse --git-dir)/checkpoint-check.log"
+if [ -z "$check_cmd" ]; then
+  check=n/a
+  : >"$check_log"
+elif bash -c "$check_cmd" >"$check_log" 2>&1; then
+  check=clean
+else
+  check=FAILING
+fi
+
+# Built from two halves so this script never matches its own search.
+marker="TODO(fin""ish)"
+# shellcheck disable=SC2086
+todo_count=$(git grep --untracked -I -n -F "$marker" -- ${CHECKPOINT_SRC:-.} \
+  ':(exclude)scripts/agent' ':(exclude)*.md' 2>/dev/null | wc -l | tr -d ' ')
+
+{
+  printf '## %s UTC  check: %s  TODO(finish): %s\n' "$(date -u +%H:%M)" "$check" "$todo_count"
+  printf -- '- done: %s\n' "$done_text"
+  printf -- '- next: %s\n\n' "$next_text"
+} >>"$root/.progress.md"
+
+git add -A
+if git diff --cached --quiet; then
+  echo "checkpoint: check $check, TODO(finish) $todo_count, nothing new to commit"
+  exit 0
+fi
+if ! git commit -q -m "checkpoint: $done_text"; then
+  echo "checkpoint: git commit failed; the entry is in .progress.md, changes stay staged" >&2
+  exit 1
+fi
+echo "checkpoint $(git rev-parse --short HEAD)  check $check  TODO(finish) $todo_count"
+[ "$check" = FAILING ] && echo "checkpoint: check output is in $check_log" >&2
+exit 0

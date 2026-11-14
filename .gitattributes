@@ -1,3 +1,4 @@
 # Keep sources LF on every machine (Windows git defaults to CRLF checkouts)
 * text=auto eol=lf
 *.png binary
+scripts/agent/* text eol=lf
