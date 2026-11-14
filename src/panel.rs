@@ -657,6 +657,8 @@ pub struct Scene<'a> {
     pub grad: &'a Gradient,
     pub dpi: u32,
     pub now: f64,
+    /// Seconds east of UTC at a UTC instant: the local clock a card names when its market closed.
+    pub offset_at: &'a dyn Fn(f64) -> i32,
     /// The minimise button is under the pointer.
     pub btn_hover: bool,
     /// The picker toggle is under the pointer.
@@ -916,13 +918,25 @@ fn card(dc: HDC, sc: &Scene, r: RECT, i: usize, c: &Cell) {
             // label. Volume is the first thing to go, because it is the least load-bearing number
             // on the card and "CNBC delayed" already uses the width.
             let src = if !q.source.is_empty() { q.source } else if q.realtime { "CNBC" } else { "CNBC delayed" };
-            let closed = crate::model::market_closed(c, sc.board.link, sc.now);
-            let tag = if !q.source.is_empty() { format!("{src} \u{b7} age unknown") } else { match q.ts {
-                Some(ts) if closed => format!("{src} \u{b7} closed {}", fmt_age(sc.now - ts)),
-                Some(ts) => format!("{src} \u{b7} {}", fmt_age(sc.now - ts)),
-                None => src.to_string(),
-            }};
+            // Stale and calm (`calm_stale`): a CNBC quote with a known time that went quiet while the
+            // service answers. It shows its age in the grey of the dim text from the stale limit on, and
+            // the tag says `closed` only once `market_closed` holds. Only a stale price that is not calm
+            // (feed down, fallback quote, unknown time) takes the amber of a fault.
+            let calm = crate::model::calm_stale(c, sc.board.link, sc.now);
             let room = rx - ix - text_width(dc, sc.fonts.mid, &c.label) - s(10);
+            // A closed market is a calm state with its own words ("CNBC · closed since Fri 17:40",
+            // then shorter ones when the card is narrow); before that the tag is the source and age,
+            // and a quote time ahead of the clock has no age to show.
+            let tag = if !q.source.is_empty() {
+                format!("{src} \u{b7} age unknown")
+            } else if let Some(words) = crate::model::closed_card_words(c, sc.board.link, sc.now, sc.board.last_bar_at(i), sc.offset_at) {
+                crate::model::first_fitting(&words, &|w| text_width(dc, sc.fonts.small, w) <= room)
+            } else {
+                match q.ts {
+                    Some(ts) if sc.now - ts >= -crate::model::FUTURE_SKEW_S => format!("{src} \u{b7} {}", fmt_age(sc.now - ts)),
+                    _ => src.to_string(),
+                }
+            };
             let tag = match q.volume {
                 Some(v) => {
                     let with = format!("{tag} \u{b7} {}", fmt_vol(v));
@@ -933,7 +947,7 @@ fn card(dc: HDC, sc: &Scene, r: RECT, i: usize, c: &Cell) {
             // The Open button takes the tag's corner on a locked card; the tag is the first thing to
             // give way, as it already is for the volume.
             if !locked {
-                text_right(dc, sc.fonts.small, rx, r.top + s(10), &tag, if c.stale { t.amber } else { t.dim });
+                text_right(dc, sc.fonts.small, rx, r.top + s(10), &tag, if c.stale && !calm { t.amber } else { t.dim });
             }
             let pw = text(dc, sc.fonts.big, ix, r.top + s(26), &fmt_price(q.price, c.digits), if c.stale { t.dim } else { t.price });
             if !q.currency.is_empty() {
@@ -1114,9 +1128,16 @@ pub fn draw(dc: HDC, w: i32, h: i32, sc: &Scene) {
     let lh = line_height(dc, sc.fonts.mid);
     let d = s(8);
     let dx = g.pad + s(2) + tw + s(14);
-    fill_ellipse(dc, dx, ty + (lh - d) / 2, d, crate::theme::link_color(t, sc.board.link));
+    let calm = sc.board.calm(sc.now);
+    fill_ellipse(dc, dx, ty + (lh - d) / 2, d, crate::theme::calm_color(t, sc.board.link, calm));
     let sh = line_height(dc, sc.fonts.small);
-    text(dc, sc.fonts.small, dx + d + s(7), ty + (lh - sh) / 2, crate::theme::link_name(sc.board.link), t.label);
+    let nx = dx + d + s(7);
+    let room = (if sc.picker_btn { g.pick_btn.left } else { w - g.pad }) - s(6) - nx;
+    let mut name = crate::theme::calm_name(sc.board.link, calm);
+    if text_width(dc, sc.fonts.small, &name) > room {
+        name = crate::theme::calm_name_short(sc.board.link, calm);
+    }
+    text(dc, sc.fonts.small, nx, ty + (lh - sh) / 2, &name, t.label);
 
     if sc.picker_btn {
         if sc.pick_hover {
