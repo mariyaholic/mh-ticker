@@ -752,7 +752,7 @@ pub fn overview(cfg: &Config, board: &Board, now: f64) -> Vec<OverviewLine> {
             .find(|c| c.label == a.label && !c.stale)
             .and_then(|c| c.quote.as_ref())
             .filter(|q| q.source.is_empty() && q.price.is_finite() && !crate::model::is_stale(q, now, stale_after, cfg.delayed_grace_s));
-        let closed = board.cells.iter().any(|c| c.label == a.label && crate::model::market_closed(c, board.link, now));
+        let closed = board.cells.iter().any(|c| c.label == a.label && crate::model::reads_closed(c, board.link, now));
         let none = if closed { "closed" } else { "no fresh price" };
         let tail = |s: String| if shown { s } else { format!("{s} (not on the strip, cannot fire)") };
         let mut push = |text: String| out.push(OverviewLine { text: tail(text), warn: !shown });
@@ -1865,7 +1865,10 @@ mod tests {
     #[test]
     fn the_overview_never_guesses_a_distance_from_a_stale_or_fallback_price() {
         let cfg = overview_cfg(vec![Alert { label: "XAU".into(), above: Some(4200.0), ..Alert::default() }]);
-        assert_eq!(overview(&cfg, &board(4150.0, true), 100.0)[0].text, "XAU above 4,200.00, no fresh price");
+        let mut unknown = board(4150.0, true);
+        unknown.cells[0].quote.as_mut().unwrap().ts = None;
+        assert_eq!(overview(&cfg, &unknown, 100.0)[0].text, "XAU above 4,200.00, no fresh price", "a stale price of unknown age is a fault");
+        assert_eq!(overview(&cfg, &board(4150.0, true), 100.0)[0].text, "XAU above 4,200.00, closed", "a stale CNBC price of known age reads closed");
         let mut fb = board(4150.0, false);
         fb.cells[0].quote.as_mut().unwrap().source = "Gold API";
         assert_eq!(overview(&cfg, &fb, 100.0)[0].text, "XAU above 4,200.00, no fresh price");

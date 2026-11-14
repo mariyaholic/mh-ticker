@@ -918,17 +918,15 @@ fn card(dc: HDC, sc: &Scene, r: RECT, i: usize, c: &Cell) {
             // label. Volume is the first thing to go, because it is the least load-bearing number
             // on the card and "CNBC delayed" already uses the width.
             let src = if !q.source.is_empty() { q.source } else if q.realtime { "CNBC" } else { "CNBC delayed" };
-            let closed = crate::model::market_closed(c, sc.board.link, sc.now);
             // Stale and calm: closed, or quiet for less than the closed age. Only a stale price that
             // is neither (feed down, fallback quote, unknown time) takes the amber of a fault.
-            let calm = crate::model::calm_stale(c, sc.board.link, sc.now);
+            let calm = crate::model::reads_closed(c, sc.board.link, sc.now);
             let room = rx - ix - text_width(dc, sc.fonts.mid, &c.label) - s(10);
             // A closed market is a calm state with its own words ("closed since Fri 17:40", then
             // "closed" when the card is narrow); a quote time ahead of the clock has no age to show.
             let tag = if !q.source.is_empty() {
                 format!("{src} \u{b7} age unknown")
-            } else if closed {
-                let words = crate::model::closed_words(src, crate::model::closed_since_shown(q, sc.now, sc.board.last_bar_at(i)), sc.offset_at, sc.now);
+            } else if let Some(words) = crate::model::closed_card_words(c, sc.board.link, sc.now, sc.board.last_bar_at(i), sc.offset_at) {
                 crate::model::first_fitting(&words, &|w| text_width(dc, sc.fonts.small, w) <= room)
             } else {
                 match q.ts {

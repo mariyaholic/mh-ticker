@@ -885,6 +885,7 @@ fn layout_row(dc: HDC, cells: &[Cell], dpi: u32, t: &Theme, link: Link, now: f64
 
 /// Dock mode: the first `k` rows of the board as a column-major grid with `rows` lines,
 /// label | right-aligned price | right-aligned change.
+#[allow(clippy::too_many_arguments)] // a frame needs the device, cells, size, grid, look, link and clock; a bundling struct would be used once
 fn layout_grid(dc: HDC, cells: &[Cell], dpi: u32, rows: usize, show_change: bool, t: &Theme, link: Link, now: f64) -> Frame {
     let s = |v: i32| v * dpi as i32 / 96;
     let (px, py, gap_s, gap_l) = (s(7), s(3), s(5), s(12));
@@ -1381,7 +1382,7 @@ fn tooltip_at(view: &Board, pending: Option<&str>, blind: Option<&str>, now: f64
         if let Some(q) = &c.quote {
             s.push_str(&format!("\n{} {}", c.label, fmt_price(q.price, c.digits)));
             if !q.source.is_empty() { s.push_str(&format!(" ({}; age unknown)", q.source)); }
-            else if crate::model::market_closed(c, view.link, now) { s.push_str(" (closed)"); }
+            else if crate::model::reads_closed(c, view.link, now) { s.push_str(" (closed)"); }
             else if c.stale { s.push_str(" (stale)"); }
         }
     }
@@ -1405,6 +1406,43 @@ mod tooltip_tests {
     fn cell(label: &str, ts: Option<f64>, stale: bool) -> Cell {
         let quote = crate::model::Quote { symbol: label.into(), price: 10.0, ts, realtime: true, ..Default::default() };
         Cell { label: label.into(), digits: 0, quote: Some(quote), stale }
+    }
+
+    #[test]
+    fn every_surface_agrees_on_closed_at_every_age() {
+        use crate::alerts::overview;
+        use crate::config::{Alert, Config, Row};
+        let now = 1_000_000.0;
+        let est = |_: f64| -5 * 3600;
+        let rows = vec![Row { label: "XAU".into(), symbol: "XAU=".into(), digits: 2, name: String::new(), strip: true }];
+        let alert = Alert { label: "XAU".into(), above: Some(4200.0), ..Alert::default() };
+        let cfg = Config { alerts: vec![alert], rows, stale_after_s: 90.0, ..Config::default() };
+        for (age, closed) in [(91.0, true), (300.0, true), (899.0, true), (901.0, true), (30.0, false)] {
+            let c = cell("XAU", Some(now - age), age > 90.0);
+            let mut b = Board::new(&[]);
+            b.link = Link::Partial;
+            b.cells = vec![c.clone()];
+            let said = |text: &str| text.contains("closed");
+            let header = theme::calm_name(b.link, b.calm(now));
+            let tip = tooltip_at(&b, None, None, now);
+            let row = tip.lines().find(|l| l.starts_with("XAU")).unwrap().to_string();
+            let spoken = crate::spoken::spoken_line(&c, b.link, now);
+            let summary = crate::spoken::summary_line(&b.cells, b.link, now);
+            let over = overview(&cfg, &b, now)[0].text.clone();
+            let probe = crate::source::probe_state(&c, now);
+            let tag = crate::model::closed_card_words(&c, b.link, now, None, &est);
+            let ctx = format!("age {age}");
+            assert_eq!(said(&header), closed, "header {header}, {ctx}");
+            assert_eq!(said(&row), closed, "tooltip row {row}, {ctx}");
+            assert_eq!(said(&spoken), closed, "spoken {spoken}, {ctx}");
+            assert_eq!(said(&summary), closed, "summary {summary}, {ctx}");
+            assert_eq!(said(&over), closed, "overview {over}, {ctx}");
+            assert_eq!(probe == " CLOSED", closed, "probe {probe}, {ctx}");
+            assert_eq!(tag.as_ref().is_some_and(|w| w.last().map(String::as_str) == Some("closed")), closed, "card tag {tag:?}, {ctx}");
+            if closed {
+                assert!(!tip.contains("stale") && !spoken.contains("stale") && !summary.contains("stale"), "{ctx}");
+            }
+        }
     }
 
     #[test]
