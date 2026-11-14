@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 /// The strip, dock grid and panel stay readable up to this many symbols.
 pub const MAX_ROWS: usize = 24;
@@ -545,8 +545,77 @@ fn parse_settings(text: &str) -> Result<Config, serde_json::Error> {
     serde_json::from_str(text)
 }
 
+/// What start-up found on disk.
+#[derive(Debug)]
+pub enum Loaded {
+    /// The settings file was read (or there was none and the defaults were written).
+    Read(Config),
+    /// The settings file would not parse. Its bytes were moved, unchanged, to `kept`; the defaults
+    /// are loaded and written to the settings path.
+    Defaulted { cfg: Config, kept: PathBuf },
+}
+
+impl Loaded {
+    pub fn into_config(self) -> Config {
+        match self {
+            Loaded::Read(cfg) | Loaded::Defaulted { cfg, .. } => cfg,
+        }
+    }
+}
+
+/// The file name (never the folder, which carries the user name) a settings file that would not
+/// parse was kept under in this run. `None` when nothing was kept. Read by the menu's greyed line.
+static KEPT_AS: Mutex<Option<String>> = Mutex::new(None);
+
+pub fn kept_bad_config() -> Option<String> {
+    KEPT_AS.lock().ok().and_then(|k| k.clone())
+}
+
+/// Start-up load. A settings file that will not parse is kept beside the new one rather than
+/// replaced or refused: see [`load_or_keep`]. Only a file that cannot be read at all, or cannot be
+/// moved aside, is an `Err`.
 pub fn load() -> Result<Config, String> {
-    load_from(&path())
+    let loaded = load_or_keep(&path())?;
+    if let Loaded::Defaulted { kept, .. } = &loaded {
+        if let Ok(mut k) = KEPT_AS.lock() {
+            *k = kept.file_name().map(|n| n.to_string_lossy().into_owned());
+        }
+    }
+    Ok(loaded.into_config())
+}
+
+/// The settings for a command-line probe: read like [`load`], but nothing is ever written or moved.
+/// A missing file is the defaults; one that will not parse is an `Err`.
+pub fn load_readonly() -> Result<Config, String> {
+    let p = path();
+    match std::fs::read_to_string(&p) {
+        Ok(text) => parse_settings(&text).map_err(|e| format!("Invalid settings (line {}, column {})", e.line(), e.column())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
+        Err(_) => Err("Could not read the settings file".to_string()),
+    }
+}
+
+/// [`load_from`], except that a file whose text is not UTF-8 or does not parse is renamed to the
+/// first free `<stem>.bad.json`, `<stem>.bad-2.json`, ... in the same folder (the bytes are never
+/// rewritten, and an earlier kept file is never replaced), and the defaults are loaded and saved
+/// at `p`. If the file cannot be moved it stays where it is and the result is an `Err`.
+fn load_or_keep(p: &Path) -> Result<Loaded, String> {
+    let bad = match std::fs::read(p) {
+        Ok(bytes) => std::str::from_utf8(&bytes).map_or(true, |t| parse_settings(t).is_err()),
+        Err(_) => false,
+    };
+    if !bad {
+        return load_from(p).map(Loaded::Read);
+    }
+    let stem = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "settings".into());
+    let kept = (1..100)
+        .map(|n| p.with_file_name(if n == 1 { format!("{stem}.bad.json") } else { format!("{stem}.bad-{n}.json") }))
+        .find(|k| !k.exists())
+        .ok_or_else(|| "Too many kept settings files; remove some".to_string())?;
+    std::fs::rename(p, &kept).map_err(|_| "Could not keep the unreadable settings file; it was not changed".to_string())?;
+    let cfg = Config::default();
+    save_to(p, &cfg);
+    Ok(Loaded::Defaulted { cfg, kept })
 }
 
 fn load_from(p: &Path) -> Result<Config, String> {
@@ -666,6 +735,30 @@ mod tests {
         let utc: Config = serde_json::from_str(r#"{"chart_utc":true}"#).unwrap();
         assert!(utc.chart_utc);
         assert!(serde_json::to_string(&utc).unwrap().contains(r#""chart_utc":true"#));
+    }
+
+    #[test]
+    fn a_config_that_will_not_parse_is_kept_and_defaults_load() {
+        let root = std::env::var_os("TICKER_TEST_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+        let dir = root.join(format!("mh-ticker-keep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        let bytes: &[u8] = b"{\"rows\": [ \"webhook\": \"https://hooks.example/x\" ,, \xff";
+        std::fs::write(&path, bytes).unwrap();
+        let Loaded::Defaulted { cfg, kept } = load_or_keep(&path).unwrap() else { panic!("expected defaults") };
+        assert_eq!(serde_json::to_value(&cfg).unwrap(), serde_json::to_value(Config::default()).unwrap());
+        assert_eq!(kept.file_name().unwrap(), "settings.bad.json");
+        assert_eq!(std::fs::read(&kept).unwrap(), bytes, "the original bytes survive");
+        assert!(parse_settings(&std::fs::read_to_string(&path).unwrap()).is_ok());
+        // A second bad file does not replace the first kept one.
+        std::fs::write(&path, "{nope").unwrap();
+        let Loaded::Defaulted { kept: second, .. } = load_or_keep(&path).unwrap() else { panic!("expected defaults") };
+        assert_eq!(second.file_name().unwrap(), "settings.bad-2.json");
+        assert_eq!(std::fs::read(&kept).unwrap(), bytes);
+        // A good file is read as before, and nothing is kept.
+        assert!(matches!(load_or_keep(&path).unwrap(), Loaded::Read(_)));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

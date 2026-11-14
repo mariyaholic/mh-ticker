@@ -68,7 +68,8 @@ Double click it. If prompted, simply select Run anyway.
   also removes its alerts
 - **Traffic:** every symbol on the strip is one more quote in each refresh, so the data grows with the number u
   show. the cost at 24 hasn't been measured yet. all of it goes to CNBC, except the optional fallback providers
-  and one request to `api.github.com` for the update check below, which only happens when u click it
+  and one request to `api.github.com` for the update check below, which only happens when u click it. the
+  diagnostics report (below) makes the same requests as `--probe` once, to the same hosts, only when u click it
 - **Move it:** right click → *Position*, since not everyone has free space on the left of their taskbar:
   - **Auto** (default) - Stays in the taskbar and finds the space itself. it uses the left of start while theres
     room there, otherwise next to the tray, and if ur taskbar has no room at all (auto-hide or a vertical one) it
@@ -121,6 +122,10 @@ Double click it. If prompted, simply select Run anyway.
   low, close and change, with a crosshair and the price on the axis. the previous close is a dashed line marked
   `prev`, the day's high and low are small ticks on the right edge, and a faint dotted line marks where the
   market was shut. the day's change sits beside the last price
+- **Suspect data (Ultra):** the chart's second header line can say `as of 14:05`. that means the data is past its
+  refresh time and the refresh hasn't come back, so it's older than the chart looks (once it's nearly a day old it
+  shows the date too). daily and longer ranges say `check dates` when their dates don't fall on the day boundary,
+  which can mean the feed's dates are off. neither note shows while a candle is under the pointer, and 1D has none
 - **Ranges (Ultra):** the tabs on the chart's second header line are `1D 5D 1M 6M 1Y 5Y`. `1D` is today. the others
   load the first time u click them, for the locked card, and refresh themselves when they get old. a range that
   fails says so and tries again after 30 seconds. `1M` and `6M` are daily bars trimmed to a month or half a year.
@@ -138,6 +143,9 @@ Double click it. If prompted, simply select Run anyway.
   Discord/Slack/ntfy. it fires once per cooldown and **never on a stale price** (a market closed at a level would
   otherwise ping u forever). *Fire once* clears a level after it fires. Focus Assist eats balloons, so the tray icon
   gets a marker and its tooltip names the alert, and the *Recent* list keeps the last 10 with what happened to each
+- **Typed levels (Ultra):** in *at a price...* a comma only groups thousands, so `4,200.50` works. `4200,5`, `4,20`
+  and `,500` are refused and the menu says why. a level more than 20 % away from the price asks first, and the question
+  repeats the level and the price, so a slip like `42,005` for 4200.5 gets caught. a level within 20 % is set at once
 - **Mute and quiet hours (Ultra):** *Alerts* → *Mute* for 1 hour, 8 hours or until u turn it back on. *Quiet hours*
   is off or a window of 22:00 to 07:00, 23:00 to 08:00 or 00:00 to 09:00, by ur PC's clock. a muted or quiet alert is still
   checked and shows up in *Recent*, but it makes no balloon and sends nothing to the webhook
@@ -155,9 +163,16 @@ Double click it. If prompted, simply select Run anyway.
   the text size (small, default, large, larger) and the opacity (100 down to 60 %). changes apply at once
 - **Check for updates:** right click → *Check for updates*. the app asks GitHub once for the latest release and
   tells u whether it's newer. if it is, it offers to open the download page. nothing else from GitHub's answer is
-  used. it never checks by itself, only when u click
+  used. it never checks by itself, only when u click. the request names the app `MH-Ticker` and nothing else about u
 - **Copy all prices:** right click → *Copy all prices* puts the whole board on the clipboard, one symbol per line,
   tab-separated. in the open Ultra panel, Ctrl+C copies the locked card's line, or every price if nothing is locked
+- **Copy diagnostics report:** right click → *Copy diagnostics report* runs the same checks as `--probe` and puts the
+  result on the clipboard as text: the app version, window and display details, the settings path (with ur user name
+  taken out), the webhook as its host only, and the data meter. it's for pasting into a message when something looks
+  wrong. the menu says `checking...` while it runs, and a second click waits for the first one to finish
+- **Data meter:** a greyed line above the version line in the menu shows how much the app has downloaded, like
+  `Data: 3.1 MB this hour, 41 MB since start`. it counts what the app reads after compression is undone, so it's a
+  little more than the network carried. request headers aren't counted
 - **Keys in the open Ultra panel:** arrows move the lock between cards, Enter opens the locked card on CNBC, `C`
   opens the chart, `S` opens the symbol picker, Delete takes the locked card off the strip, and Ctrl+Left and
   Ctrl+Right move it one place. the card menu has *Move left*, *Move right*, *Move first* and *Remove from strip*
@@ -179,6 +194,12 @@ Double click it. If prompted, simply select Run anyway.
 in the menu takes u there). **Ultra keeps its own `config_ultra.json`** in the same folder, so the two builds
 never overwrite each other. if u edit it by hand, restart the app after. anything the menus change (symbols, poll, theme, font, alerts, strip,
 hotkey, position, chart time zone) takes effect at once, with no restart.
+
+If the settings file is there but won't load (it isn't UTF-8 text, or it isn't valid JSON), the app doesn't overwrite
+it. it renames it beside the new one as `config.bad.json` (`config_ultra.bad.json` for Ultra), or `config.bad-2.json`
+and so on after that, with the bytes unchanged, and loads the defaults. the menu has a greyed line naming the kept file.
+the kept file may still hold ur webhook URL, so check it before u share it.
+
 whats in there:
 - `rows`: the symbols that show, each with a `label`, the cnbc `symbol`, `digits` and an optional `name`
 - `catalog`: the list the Symbols menu shows, same fields. any symbol cnbc's quote pages have works, like
@@ -211,8 +232,15 @@ whats in there:
   least one of `Ctrl`, `Alt` or `Win`. the menu's presets are the usual choice
 
 `MH_Ticker --probe` does one pass over the prices, the day's bars and (for the first row) each chart range file,
-prints it and exits - handy for checking a new symbol actually works before u add it, and for checking the ranges
-on a machine with a connection
+judges each assumption as PASS, WARN or NOTE, prints it and exits - handy for checking a new symbol actually works
+before u add it, and for checking the ranges on a machine with a connection. a WARN exits with 1, so a script can
+use it. a NOTE never fails the run; it marks a check the answers can't show, like bar times while the market is shut.
+`--probe` reads the settings but never writes them.
+
+`MH_Ticker --probe --dump <folder>` does the same and also saves the raw answers into that folder as files (the
+quotes, the unknown-symbol answer, the day files, the range files and the release answer), for making test fixtures.
+the folder is created if it's missing. it never writes the settings or the webhook. it only works from the command
+line, and it needs both the folder and `--probe`; without them it exits with 2 and says why
 
 ## Building it Yourself
 

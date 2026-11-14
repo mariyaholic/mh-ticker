@@ -1,5 +1,67 @@
 # Changelog — MH Ticker
 
+## unreleased - 1.9: know it is true   [claude.impl]
+
+**Files:** mostly `src/`: new `probe.rs`, `report.rs` and `meter.rs`; changed `alerts.rs`, `chartview.rs`,
+`config.rs`, `ranges.rs`, `source.rs`, `update.rs`, `panel.rs`, `ui.rs` and `shot.rs`. Also `examples/wide.rs`
+(new), `shots/wide-*.png` (new), `scripts/check-state-linux.sh`, `README.md`, `SOURCES.md`, `CHANGELOG.md`
+and `docs/1.9/`.
+
+**What.** The first 1.9 package, grouped by what you see. It adds no new feature. It makes the features already
+here easier to check. Each group says which build gets it: Classic is `MH_Ticker.exe`, Ultra is `MH_Ticker_Ultra.exe`.
+
+- **Checking the feed (both builds).**
+  - `--probe` judges each assumption and prints PASS, WARN or NOTE. It checks the quote fields, an unknown
+    symbol, the time spelling, whether a bar's time is its start or its end, the stamps of daily bars, volume,
+    and the release tag. It also lists response field names the parser ignores. A WARN makes the run exit with 1.
+    A NOTE never fails a run. It marks a check the answers cannot show, such as bar start while the market is shut.
+  - `--probe` reads the settings and never writes them.
+  - `--probe --dump <folder>` (command line only) saves the raw answers into the folder for test fixtures. It
+    creates the folder if it is missing. It never writes the settings or the webhook. Without a folder, or without
+    `--probe`, it exits with 2 and says why.
+  - *Copy diagnostics report* (in the right-click menu): runs the same checks and puts the text on the clipboard.
+    It gives the version, window mode, DPI, placement, counts, the settings path with the user name removed, the
+    kept settings file if there is one, the hotkey, autostart, the webhook as its host only, and the data meter.
+    While it runs the menu shows a greyed "checking" line. A second click is ignored until it finishes.
+- **The data meter (both builds).** A greyed menu line above the version line, for example
+  `Data: 3.1 MB this hour, 41 MB since start`. It counts response bytes as they are read, after gzip is undone, so
+  it is higher than the compressed bytes on the wire. Request headers are not counted. It makes no request of its own.
+- **The chart says when it is suspect (Ultra).** The chart's second header line can show `as of 14:05`, when the
+  series is past its refresh time and the refresh has not come back. Older data also shows its date. Daily and
+  longer ranges show `check dates` when their stamps do not fall on a day boundary. Neither note shows while a
+  candle is under the pointer, and 1D has no note.
+- **Local time per instant (Ultra).** Each candle and each alert time is read on the clock in force at its own
+  instant. Candles on either side of a clock change each sit on their own local midnight. The mute label shows the
+  right hour after a change. Daily ranges keep the exchange's dates.
+- **Typed levels (Ultra).** Commas in a level must group thousands. `4,200.50` is read as 4200.50. `4200,5`,
+  `4,20`, `1,2345` and `,500` are refused, and the menu gives the reason. A level more than 20 % from the price
+  asks before it is set, and the question echoes the level and the price in the symbol's digits. A level within
+  20 % is set at once, as before.
+- **A settings file that will not load is kept (both builds).** A file that is not UTF-8 or does not parse is
+  renamed beside the new one, to `config.bad.json` (or `config_ultra.bad.json`), then `.bad-2.json` and so on.
+  Its bytes are moved, not rewritten. The defaults load and a greyed menu line names the kept file. If the rename
+  fails, the file stays and the error is reported as before.
+- **Hardening (both builds, the chart items Ultra only).**
+  - A price that is NaN or infinite prints as `--`, in the card text and in *Copy all prices*.
+  - A NaN price is drawn in the middle of the chart's plot, and an infinite one is held inside it.
+  - At one-hour candles in the narrowest pane, the oldest candles that cannot fit are dropped, so no candle is
+    drawn past the right edge.
+  - The update check identifies itself as `MH-Ticker`: no version number and no browser string. CNBC requests
+    keep their browser string.
+  - A wall clock set back no longer silences an alert until the clock catches up. The alert counts as cooled and
+    fires once more, with a fresh stamp.
+- **Pictures (in the repository, not in the exes).** Fourteen new pictures, `shots/wide-*`: 24 cards, 24 symbols
+  on one, two and three strip rows, the narrow pane, 192 DPI, and each range. The 36 existing pictures are unchanged.
+
+**Checked.** Under Wine: 284 tests pass, plus the one known Wine-only failure
+(`ui::tests::a_theme_switch_takes_the_new_themes_face`, because Wine has no Consolas). The Linux harness
+(`scripts/check-state-linux.sh`) passes 136. The 36 old stills are identical to the baseline, and 14 new stills
+were drawn. Both release exes are about 1.39 MB.
+
+**Not verified.** The live CNBC and GitHub answers: `--probe`, the report and the release tag have not run
+against the services. On a real Windows desktop: the clipboard, the menu lines, a real clock change, the real
+fonts, and gzip byte counts against a capture.
+
 ## 2026-11-14 — 1.8.0: alerts you can set and silence, a chart that reads, typed symbols   [claude.impl]
 
 **Files:** most of `src/` (`alerts.rs`, `chartview.rs`, `ranges.rs`, `keys.rs`, `hotkey.rs`, `update.rs`,

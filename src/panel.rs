@@ -453,6 +453,46 @@ fn utf16(s: &str) -> Vec<u16> {
     s.encode_utf16().collect()
 }
 
+/// A record of every string the panel draws (position, width, font), for the fit tests and for
+/// nothing else: it exists only in test builds and in the `shots` feature, so neither shipped exe
+/// has it, and it costs nothing unless a test switched it on.
+#[cfg(any(test, feature = "shots"))]
+#[allow(dead_code)] // read by the tests; the `shots` feature alone only writes it
+pub(crate) mod trace {
+    use std::cell::RefCell;
+
+    #[derive(Clone, Debug)]
+    pub struct Run {
+        pub x: i32,
+        pub y: i32,
+        pub w: i32,
+        pub font: isize,
+        pub text: String,
+    }
+
+    thread_local! {
+        static LOG: RefCell<Option<Vec<Run>>> = const { RefCell::new(None) };
+    }
+
+    /// Start recording on this thread (drops anything recorded before).
+    pub fn start() {
+        LOG.with(|l| *l.borrow_mut() = Some(Vec::new()));
+    }
+
+    /// Stop recording and hand back what was drawn since `start`.
+    pub fn take() -> Vec<Run> {
+        LOG.with(|l| l.borrow_mut().take().unwrap_or_default())
+    }
+
+    pub(super) fn push(x: i32, y: i32, w: i32, font: isize, text: &str) {
+        LOG.with(|l| {
+            if let Some(v) = l.borrow_mut().as_mut() {
+                v.push(Run { x, y, w, font, text: text.to_string() });
+            }
+        });
+    }
+}
+
 /// Draw `s` with its top-left at (x, y); returns its width.
 fn text(dc: HDC, font: HFONT, x: i32, y: i32, s: &str, color: COLORREF) -> i32 {
     unsafe {
@@ -463,6 +503,8 @@ fn text(dc: HDC, font: HFONT, x: i32, y: i32, s: &str, color: COLORREF) -> i32 {
         let mut sz = SIZE { cx: 0, cy: 0 };
         GetTextExtentPoint32W(dc, t.as_ptr(), t.len() as i32, &mut sz);
         SelectObject(dc, old);
+        #[cfg(any(test, feature = "shots"))]
+        trace::push(x, y, sz.cx, font as isize, s);
         sz.cx
     }
 }
@@ -477,6 +519,8 @@ fn text_right(dc: HDC, font: HFONT, right: i32, y: i32, s: &str, color: COLORREF
         SetTextColor(dc, color);
         TextOutW(dc, right - sz.cx, y, t.as_ptr(), t.len() as i32);
         SelectObject(dc, old);
+        #[cfg(any(test, feature = "shots"))]
+        trace::push(right - sz.cx, y, sz.cx, font as isize, s);
     }
 }
 
@@ -579,10 +623,15 @@ pub struct Chart<'a> {
     /// Draw the range tabs and store them in the layout. False reproduces the pane from before
     /// ranges (the shot fixture's default).
     pub tabs: bool,
-    /// Seconds east of UTC the pane's clock runs on (0 = UTC). Candles are cut and labelled on it.
-    pub tz_offset_s: i32,
+    /// The clock the pane runs on (seconds east of UTC, 0 = UTC), which may change once inside the
+    /// series. Candles are cut and labelled on it, each bar on the clock of its own instant.
+    pub zone: chartview::Zone,
     /// The zone's name as the header shows it ("local" or "UTC"); it is the click target that flips it.
     pub tz_label: &'a str,
+    /// What the reader should know about the data on screen (`as of 14:05`, `check dates`), or "".
+    /// Drawn on the header's second line while no candle is hovered; the hover legend takes the line
+    /// over, and the whole pane repaints when the hover changes, so the note comes back with it.
+    pub note: &'a str,
     /// Previous close, for the dashed reference line. `None` when the quote has none (or sends 0).
     pub prev: Option<f64>,
     /// The day's high and low, drawn as short ticks on the axis. `None` as above.
@@ -1181,11 +1230,12 @@ fn candles(dc: HDC, sc: &Scene, r: RECT, c: &Chart) {
     }
     // The clock the buckets, the axis and the legend are read on: the viewer's for intraday bars, the
     // exchange's own date for daily and longer ones (see `chartview::date_zone`).
-    let zone = chartview::date_zone(c.bar_s, c.tz_offset_s);
+    let zone = chartview::date_zone_of(c.bar_s, c.zone);
     // 1D folds minutes into at most hours, as it always has; the long ranges start at the series' own
     // spacing and climb to a month.
     let coarsest = if c.range == Range::D1 { 3_600.0 } else { chartview::MONTH_S };
     let (bars, bucket) = chartview::fitted_to(c.bars, full.right - full.left, c.t0, zone, c.bar_s, coarsest);
+    let bars = chartview::newest_that_fit(bars, full.right - full.left, sc.dpi);
     let span = chartview::bucket_name(bucket);
     // Volume: when any drawn candle has some, the bottom fifth of the plot is a strip for it and the
     // price plot is that much shorter. No volume anywhere: no strip, and `plot == full`.
@@ -1274,13 +1324,12 @@ fn candles(dc: HDC, sc: &Scene, r: RECT, c: &Chart) {
     // date labels (a new day on the long intraday range) are placed first, so a clock label beside a
     // day boundary gives way to the date and not the other way round.
     let base = lay.base();
-    let tz = zone as f64;
     let mut ticks: Vec<(i32, String, bool)> = Vec::new();
     if bucket >= chartview::DAY_S {
         // Candles of a day or more: month starts ("Oct"), or year starts ("2025") when the months
         // would not fit, or dates when the window is under two months.
         let measure = |label: &str| text_width(dc, sc.fonts.small, label);
-        for (i, label) in chartview::date_ticks(&bars, c.t0, zone, step, &measure, s(8)) {
+        for (i, label) in chartview::date_ticks(&bars, c.t0, zone.first(), step, &measure, s(8)) {
             ticks.push((lay.x_of(i), label, false));
         }
     } else {
@@ -1291,10 +1340,10 @@ fn candles(dc: HDC, sc: &Scene, r: RECT, c: &Chart) {
         let (mut prev_key, mut prev_day) = (None, None);
         for (i, b) in bars.iter().enumerate() {
             let tb = b.t(c.t0);
-            let key = ((tb + tz) / every).floor();
+            let key = ((tb + zone.at(tb) as f64) / every).floor();
             let crossed = prev_key.is_some_and(|k| k != key);
             prev_key = Some(key);
-            let day = chartview::local_day(tb, zone);
+            let day = chartview::local_day(tb, zone.at(tb));
             let new_day = c.range != Range::D1 && prev_day.is_some_and(|d| d != day);
             if !crossed {
                 continue;
@@ -1302,7 +1351,7 @@ fn candles(dc: HDC, sc: &Scene, r: RECT, c: &Chart) {
             prev_day = Some(day);
             // The bar's own start, which is the boundary itself except after a break in the session
             // (a market reopening at 23:15 is labelled 23:15, not a 23:00 it did not trade at).
-            let label = if new_day { chartview::date_label(tb, zone, chartview::DateStyle::DayMonth) } else { clock(tb, zone) };
+            let label = if new_day { chartview::date_label(tb, zone.at(tb), chartview::DateStyle::DayMonth) } else { clock(tb, zone.at(tb)) };
             ticks.push((lay.x_of(i), label, new_day));
         }
     }
@@ -1450,6 +1499,12 @@ fn candles(dc: HDC, sc: &Scene, r: RECT, c: &Chart) {
         }
         if !show_tabs || text_width(dc, sc.fonts.small, &line) <= avail {
             text(dc, sc.fonts.small, r.left + s(12), r.top + s(30), &line, t.price);
+        }
+    } else if !c.note.is_empty() {
+        // The line is otherwise empty until the pointer arrives: say what is suspect about the data.
+        let avail = if show_tabs { tabs[0].left - (r.left + s(12)) - s(10) } else { r.right - r.left - s(24) };
+        if text_width(dc, sc.fonts.small, c.note) <= avail {
+            text(dc, sc.fonts.small, r.left + s(12), r.top + s(30), c.note, t.accent);
         }
     }
     sc.layout.set(Some(lay));

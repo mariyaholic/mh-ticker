@@ -202,6 +202,9 @@ pub fn resolve(rows: &[Row], quotes: &HashMap<String, Quote>, now: f64, stale_af
 
 /// `81176.4, 0` -> "81,176"; `4154.456, 2` -> "4,154.46".
 pub fn fmt_price(v: f64, digits: u32) -> String {
+    if !v.is_finite() {
+        return "--".to_string();
+    }
     let s = format!("{:.*}", digits as usize, v.abs());
     let (int, frac) = match s.split_once('.') {
         Some((i, f)) => (i.to_string(), Some(f.to_string())),
@@ -222,6 +225,9 @@ pub fn fmt_price(v: f64, digits: u32) -> String {
 }
 
 pub fn fmt_change(pct: f64) -> String {
+    if !pct.is_finite() {
+        return "--".to_string();
+    }
     format!("{}{:.2}%", if pct >= 0.0 { "+" } else { "" }, pct)
 }
 
@@ -248,6 +254,19 @@ pub fn board_text(cells: &[Cell]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_non_finite_number_prints_as_dashes() {
+        for v in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(fmt_price(v, 2), "--", "{v}");
+            assert_eq!(fmt_change(v), "--", "{v}");
+            let q = Quote { price: v, change_pct: Some(v), ..Quote::default() };
+            let cell = Cell { label: "X".into(), digits: 2, quote: Some(q), stale: false };
+            assert_eq!(board_text(&[cell]), "X\t--\t--");
+        }
+        assert_eq!(fmt_price(-1234.5, 1), "-1,234.5");
+        assert_eq!(fmt_change(1.5), "+1.50%");
+    }
 
     #[test]
     fn board_text_is_tab_separated_with_dashes_for_gaps() {
