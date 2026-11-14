@@ -925,7 +925,7 @@ fn card(dc: HDC, sc: &Scene, r: RECT, i: usize, c: &Cell) {
             let tag = if !q.source.is_empty() {
                 format!("{src} \u{b7} age unknown")
             } else if closed {
-                let words = crate::model::closed_words(src, crate::model::closed_since(q, sc.now), sc.offset_at, sc.now);
+                let words = crate::model::closed_words(src, crate::model::closed_since_shown(q, sc.now, sc.board.last_bar_at(i)), sc.offset_at, sc.now);
                 crate::model::first_fitting(&words, &|w| text_width(dc, sc.fonts.small, w) <= room)
             } else {
                 match q.ts {
