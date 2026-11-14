@@ -10,7 +10,7 @@
 //! per symbol (`panel.rs`); the minimise button or Esc morphs it back. The morph stretches and
 //! crossfades snapshots of both states while the window glides, paced by `DwmFlush` (vsync).
 //!
-//! Placements (right-click -> Position, `config::Placement`):
+//! Placements (Settings -> Display -> Position, `config::Placement`):
 //! - **Auto** (default): a compact grid in a taskbar gap. The gap left of the Start button while
 //!   it is roomy (centred icons), else the gap between the app icons and the tray (left-aligned
 //!   icons, a crowded centre), else the bottom-right corner above the taskbar (auto-hide or
@@ -20,7 +20,12 @@
 //! - **Floating**: one row anywhere on screen, dragged by hand, position saved.
 //!
 //! On the taskbar the strip re-raises itself when the taskbar comes on top. Every placement hides
-//! while a fullscreen app (a game) is in front. With several displays, *Position* also picks one.
+//! while a fullscreen app (a game) is in front. With several displays, the Display page of the settings window also picks one.
+//!
+//! The right-click menu is short: *Settings...*, expand or collapse, refresh, copy all prices, undo, show
+//! strip and quit, and on a card the entries for that card (copy, open, pin, rename, decimals, and in
+//! Ultra move and remove). Every other option lives in the settings window (`ui/settings_win.rs`), which
+//! runs the same commands the old long menu ran.
 //!
 //! Re-entrancy: TrackPopupMenu, SetWindowPos and ShowWindow pump or send messages back into
 //! `wndproc`, so the `UI` RefCell is never borrowed across those calls.
@@ -100,7 +105,7 @@ const CMD_EXIT: usize = 1005;
 const CMD_PANEL: usize = 1007;
 const CMD_RESET: usize = 1008;
 const CMD_FALLBACK: usize = 1009;
-/// Position submenu: CMD_POS + index into `Placement::ALL`.
+/// Position choice on the Display page: CMD_POS + index into `Placement::ALL`.
 const CMD_POS: usize = 4000;
 /// Poll interval: CMD_POLL + index into `POLL_CHOICES`.
 const CMD_POLL: usize = 5000;
@@ -110,7 +115,7 @@ const CMD_THEME: usize = 5100;
 const CMD_FONT: usize = 5150;
 /// The Ultra symbol picker open/closed toggle.
 const CMD_PICK: usize = 5800;
-/// Alerts submenu, fixed entries (Ultra only): 5200..=5299 is this range's whole allotment.
+/// Alerts page, fixed options (Ultra only): 5200..=5299 is this range's whole allotment.
 /// The per-symbol presets are dynamic (`Action::Alert`), indexing `alerts::PRESETS`.
 const CMD_ALERT_ONCE: usize = 5200;
 const CMD_MUTE_1H: usize = 5201;
@@ -133,7 +138,7 @@ const CMD_GAP_NOTICE: usize = 5217;
 const CMD_LOG_COPY: usize = 5218;
 /// Clear every alert, after asking.
 const CMD_ALERTS_CLEAR_ALL: usize = 5219;
-/// The last fixed entry of the Alerts submenu (the dispatch range ends here).
+/// The last fixed option of the Alerts page (the dispatch range ends here).
 const CMD_ALERT_LAST: usize = CMD_ALERTS_CLEAR_ALL;
 /// A second "Send a test alert" inside this many seconds is refused (one request in flight).
 const TEST_ALERT_GAP_S: u64 = 15;
@@ -185,15 +190,15 @@ const CMD_REPORT: usize = 5408;
 const WM_REPORT: u32 = WM_APP + 16;
 /// The window's name should be re-read (the lock moved): `sync_title` compares and sets it. `WM_APP + 17`.
 const WM_TITLE: u32 = WM_APP + 17;
-/// Hotkey submenu: Off, `hotkey::PRESETS` at `CMD_HOTKEY + 1 + i`, and `CMD_HOTKEY_CUSTOM` for a
+/// Hotkey choice on the Startup & system page: Off, `hotkey::PRESETS` at `CMD_HOTKEY + 1 + i`, and `CMD_HOTKEY_CUSTOM` for a
 /// configured combo that is none of them.
 const CMD_HOTKEY: usize = 5410;
 const CMD_HOTKEY_CUSTOM: usize = 5415;
-/// Strip submenu: rows, text size and opacity, index into `STRIP_ROWS` / `TEXT_STEPS` / `OPACITY_STEPS`.
+/// Strip choices on the Display page: rows, text size and opacity, index into `STRIP_ROWS` / `TEXT_STEPS` / `OPACITY_STEPS`.
 const CMD_STRIP_ROWS: usize = 5420;
 const CMD_STRIP_TEXT: usize = 5430;
 const CMD_STRIP_OPACITY: usize = 5440;
-/// The poll governor's two ticks (W2), in the Poll every submenu.
+/// The poll governor's two ticks (W2), in the Poll every choice.
 const CMD_SLOW_QUIET: usize = 5450;
 const CMD_REST_LOCKED: usize = 5451;
 /// Symbols > Order the cards (W3 D5): once, by day move, by name, or back to the default order.
@@ -204,7 +209,7 @@ const CMD_ORDER_DEFAULT: usize = 5462;
 const CMD_PIN_ALL: usize = 5463;
 /// Edit > Undo the last removal, move, sort, pin change or alert clear (W3 J2).
 const CMD_UNDO: usize = 5464;
-/// Accessibility submenu (W4): up and down colours (3), hollow up candles, follow the Windows contrast
+/// Accessibility options (W4), on the Display and Chart pages: up and down colours (3), hollow up candles, follow the Windows contrast
 /// theme, follow the Windows animation setting, and panel zoom (`zoom::STEPS`).
 const CMD_UPDOWN: usize = 5470;
 const CMD_HOLLOW: usize = 5473;
@@ -221,7 +226,7 @@ const WM_WTSSESSION_CHANGE: u32 = 0x02B1;
 const WTS_SESSION_LOCK: usize = 7;
 const WTS_SESSION_UNLOCK: usize = 8;
 
-/// Rows in the taskbar grid offered by the Strip submenu (`cfg.dock_rows`).
+/// Rows in the taskbar grid offered by the Rows in the taskbar choice (`cfg.dock_rows`).
 const STRIP_ROWS: [u32; 3] = [1, 2, 3];
 /// Text sizes: `(dock_font_pt, font_pt, label)`. The second step is today's default (9, 10).
 const TEXT_STEPS: [(i32, i32, &str); 4] = [(8, 9, "Small"), (9, 10, "Default"), (10, 11, "Large"), (11, 12, "Larger")];
@@ -2369,9 +2374,10 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
             if let Some((symbol, pos, count)) = place {
                 AppendMenuW(m, MF_SEPARATOR, 0, null());
                 let grey = |off: bool| MF_STRING | if off { MF_GRAYED } else { 0 };
-                dynamic(m, grey(pos == 0), &mut commands, Action::Move(symbol.clone(), -1), "Move left");
-                dynamic(m, grey(pos + 1 >= count), &mut commands, Action::Move(symbol.clone(), 1), "Move right");
-                dynamic(m, grey(pos == 0), &mut commands, Action::MoveFirst(symbol.clone()), "Move first");
+                let [left, right, first] = move_enabled(pos, count);
+                dynamic(m, grey(!left), &mut commands, Action::Move(symbol.clone(), -1), "Move left");
+                dynamic(m, grey(!right), &mut commands, Action::Move(symbol.clone(), 1), "Move right");
+                dynamic(m, grey(!first), &mut commands, Action::MoveFirst(symbol.clone()), "Move first");
                 dynamic(m, grey(count <= 1), &mut commands, Action::Remove(symbol), "Remove from strip");
             }
             AppendMenuW(m, MF_SEPARATOR, 0, null());
@@ -2727,9 +2733,9 @@ fn run_command(hwnd: HWND, cmd: usize, listed: Listed) {
     }
 }
 
-/// The labels with an alert set, among the symbols the Alerts submenu lists (the shown ones). The
-/// submenu's title counts these: an alert on a hidden symbol is kept (it fires again once the symbol
-/// is shown) but is not listed, so counting it promised an entry the menu did not have.
+/// The labels with an alert set, among the symbols the Alerts page lists (the shown ones). The
+/// page's title counts these: an alert on a hidden symbol is kept (it fires again once the symbol
+/// is shown) but is not listed, so counting it promised a control the page did not have.
 fn armed_labels(alerts: &[config::Alert], shown_labels: &[&str]) -> Vec<String> {
     alerts
         .iter()
@@ -2768,6 +2774,12 @@ fn panel_step(listed_open: bool, now: Mode) -> Option<PanelStep> {
     }
 }
 
+/// Which of Move left, Move right and Move first a card at `pos` of `count` cards may use. The card menu
+/// and the Position control of the settings window both ask this, so they enable the same entries.
+fn move_enabled(pos: usize, count: usize) -> [bool; 3] {
+    [pos > 0, pos + 1 < count, pos > 0]
+}
+
 /// Whether a Position entry (listed only for a strip) may still be applied: the strip must still be the
 /// window's mode, or the placement would be applied to an open panel.
 fn position_applies(listed_open: bool, now: Mode) -> bool {
@@ -2801,7 +2813,7 @@ fn fallback_settings(current: &Config, enabling: bool) -> Config {
     next
 }
 
-/// What the Alerts submenu needs, read in one `with_ui` call so the menu build never nests.
+/// What the Alerts page needs, read in one `with_ui` call so the menu build never nests.
 #[derive(Default)]
 struct AlertsView {
     /// UTC seconds now.
@@ -2823,6 +2835,8 @@ struct AlertsView {
 }
 
 struct AlertsRow {
+    /// The symbol of the card. Two cards can carry the same label after a rename; the symbol cannot repeat.
+    symbol: String,
     label: String,
     digits: u32,
     /// Per `alerts::PRESETS` entry: can it be set now?
@@ -2850,6 +2864,7 @@ fn alerts_view(list: &[config::Row], shown: &[bool]) -> Option<AlertsView> {
                     })
                     .collect();
                 AlertsRow {
+                    symbol: r.symbol.clone(),
                     label: r.label.clone(),
                     digits: r.digits,
                     enabled,
@@ -2874,7 +2889,7 @@ fn alerts_view(list: &[config::Row], shown: &[bool]) -> Option<AlertsView> {
 }
 
 /// Write the config as it now stands. Kept out of `with_ui` closures: no I/O inside them.
-/// What the Accessibility submenu shows, read in one borrow.
+/// What the Accessibility options show, read in one borrow.
 #[derive(Clone, Copy)]
 struct ReachView {
     updown: crate::updown::UpDown,
@@ -2912,7 +2927,7 @@ fn alert_box(hwnd: HWND, title: &str, text: &str, flags: u32) -> i32 {
     unsafe { MessageBoxW(hwnd, x.as_ptr(), t.as_ptr(), flags) }
 }
 
-/// The fixed entries of the Alerts submenu (`CMD_ALERT_ONCE..=CMD_LOG_CLEAR`). No text here may
+/// The fixed options of the Alerts page (`CMD_ALERT_ONCE..=CMD_LOG_CLEAR`). No text here may
 /// contain the webhook URL: messages name the host (`redact`) or nothing.
 fn alert_command(hwnd: HWND, cmd: usize) {
     let now = crate::source::now_s();
@@ -3052,7 +3067,7 @@ fn register_hotkey(hwnd: HWND) {
     with_ui(|u| u.hotkey_failed = failed);
 }
 
-/// The Hotkey submenu changed the combo: store it, save, register it.
+/// The Hotkey choice changed the combo: store it, save, register it.
 fn set_hotkey(hwnd: HWND, combo: Option<String>) {
     let cfg = with_ui(|u| {
         u.cfg.hotkey = combo;
@@ -3064,7 +3079,7 @@ fn set_hotkey(hwnd: HWND, combo: Option<String>) {
     register_hotkey(hwnd);
 }
 
-/// The Strip submenu changed `dock_rows`, the text size or the opacity (already in `cfg`): save,
+/// The Strip choices changed `dock_rows`, the text size or the opacity (already in `cfg`): save,
 /// rebuild the strip font and re-lay-out like `apply_placement` does.
 ///
 /// Opacity: `expand` fades the window from `cfg.opacity` up to 255, and `collapse` reads
@@ -3555,7 +3570,7 @@ fn pane_menu(hwnd: HWND, at: (i32, i32)) -> bool {
     true
 }
 
-/// The Position menu moved the strip: new font (the taskbar grid uses `dock_font_pt`), topmost
+/// The Position choice moved the strip: new font (the taskbar grid uses `dock_font_pt`), topmost
 /// state (forced on the taskbar), place, show.
 fn apply_placement(hwnd: HWND) {
     let top = with_ui(|u| {

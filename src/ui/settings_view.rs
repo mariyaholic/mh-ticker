@@ -106,7 +106,8 @@ fn card_picker(cfg: &Config, current: usize, label: &str, hint: &str) -> Control
     Control::choice(label, hint, opts, Some(current))
 }
 
-/// The per-symbol settings the card's right-click menu had: name, decimals and the taskbar strip pin.
+/// The per-symbol settings the card's right-click menu also offers: name, decimals, the taskbar strip pin
+/// and, in Ultra, the position among the cards.
 fn card_settings(cfg: &Config, env: &Env) -> Vec<Control> {
     let Some((i, r)) = selected_row(cfg, env) else { return Vec::new() };
     let mut v = vec![Control::header("Card settings")];
@@ -133,6 +134,21 @@ fn card_settings(cfg: &Config, env: &Env) -> Vec<Control> {
         Act::Do(Action::Pin(r.symbol.clone(), !r.strip)),
         can,
     ));
+    if env.ultra {
+        // The card menu's Move left, Move right and Move first, enabled by the same rule.
+        let [left, right, first] = move_enabled(i, cfg.rows.len());
+        let sym = &r.symbol;
+        v.push(Control::choice(
+            "Position",
+            "among the cards",
+            vec![
+                opt("Move left", Act::Do(Action::Move(sym.clone(), -1))).enabled(left),
+                opt("Move right", Act::Do(Action::Move(sym.clone(), 1))).enabled(right),
+                opt("Move first", Act::Do(Action::MoveFirst(sym.clone()))).enabled(first),
+            ],
+            None,
+        ));
+    }
     v
 }
 
@@ -336,8 +352,9 @@ fn alerts_page(cfg: &Config, env: &Env) -> Vec<Control> {
     if av.rows.is_empty() {
         v.push(Control::note("(no symbols shown)"));
     }
-    let picked_label = picked.map(|(_, r)| r.label.as_str());
-    for row in av.rows.iter().filter(|r| Some(r.label.as_str()) == picked_label || picked_label.is_none()) {
+    // Rows are matched by symbol: two cards can carry the same label after a rename.
+    let picked_symbol = picked.map(|(_, r)| r.symbol.as_str());
+    for row in av.rows.iter().filter(|r| picked_symbol.is_none() || Some(r.symbol.as_str()) == picked_symbol) {
         let line = row.alert.as_ref().map(|a| alerts::describe(a, row.digits)).filter(|d| !d.is_empty());
         // The presets are split where the menu drew a separator: one control per group, the first one
         // carrying the symbol's name and its current alert.
@@ -492,6 +509,7 @@ pub(super) fn fixture(ultra: bool, theme_name: &str, section: Section) -> Vec<Co
         .iter()
         .enumerate()
         .map(|(i, r)| AlertsRow {
+            symbol: r.symbol.clone(),
             label: r.label.clone(),
             digits: r.digits,
             enabled: (0..alerts::PRESETS.len()).map(|k| (k + i) % 4 != 0).collect(),
@@ -529,7 +547,7 @@ mod tests {
         let labels: Vec<String> = cfg.rows.iter().map(|r| r.label.clone()).collect();
         env.alerts.rows = labels
             .iter()
-            .map(|l| AlertsRow { label: l.clone(), digits: 2, enabled: vec![true; alerts::PRESETS.len()], fresh: true, alert: Some(config::Alert { label: l.clone(), ..Default::default() }) })
+            .map(|l| AlertsRow { symbol: cfg.rows.iter().find(|r| &r.label == l).map_or_else(String::new, |r| r.symbol.clone()), label: l.clone(), digits: 2, enabled: vec![true; alerts::PRESETS.len()], fresh: true, alert: Some(config::Alert { label: l.clone(), ..Default::default() }) })
             .collect();
         env.alerts.host = Some("hooks.example".into());
         env.alerts.quiet = Some([21 * 60, 6 * 60]);
@@ -902,6 +920,71 @@ mod tests {
             let acts = all_acts(&cfg, &env);
             assert!(acts.contains(&Act::Do(Action::Alert(r.label.clone(), 0))), "{}", r.label);
         }
+    }
+
+    #[test]
+    fn the_position_control_runs_the_card_menus_moves_with_the_menus_enablement() {
+        let (cfg, mut env) = rich_env(true);
+        let last = cfg.rows.len() - 1;
+        let pos = |cfg: &Config, env: &Env| {
+            let page = build(cfg, env, Section::Symbols);
+            let c = page[find_in(&page, "Position")].clone();
+            (c.opts.iter().map(|o| (o.label.clone(), o.act.clone(), o.enabled)).collect::<Vec<_>>(), page.len())
+        };
+        for (at, want) in [(0, [false, true, false]), (1, [true, true, true]), (last, [true, false, true])] {
+            env.card = Some(cfg.rows[at].symbol.clone());
+            let (opts, _) = pos(&cfg, &env);
+            let sym = cfg.rows[at].symbol.clone();
+            assert_eq!(opts[0], ("Move left".to_string(), Act::Do(Action::Move(sym.clone(), -1)), want[0]), "row {at}");
+            assert_eq!(opts[1], ("Move right".to_string(), Act::Do(Action::Move(sym.clone(), 1)), want[1]), "row {at}");
+            assert_eq!(opts[2], ("Move first".to_string(), Act::Do(Action::MoveFirst(sym)), want[2]), "row {at}");
+            assert_eq!(want, move_enabled(at, cfg.rows.len()), "the card menu uses the same rule");
+        }
+        // One card: nothing to move.
+        let mut one = cfg.clone();
+        one.rows.truncate(1);
+        env.card = None;
+        assert!(pos(&one, &env).0.iter().all(|o| !o.2));
+    }
+
+    #[test]
+    fn classic_has_no_position_control_because_it_has_no_card_ordering() {
+        let (cfg, env) = rich_env(false);
+        let page = build(&cfg, &env, Section::Symbols);
+        assert!(!page.iter().any(|c| c.label == "Position"));
+    }
+
+    #[test]
+    fn move_enablement_follows_the_place_among_the_cards() {
+        assert_eq!(move_enabled(0, 1), [false, false, false]);
+        assert_eq!(move_enabled(0, 3), [false, true, false]);
+        assert_eq!(move_enabled(1, 3), [true, true, true]);
+        assert_eq!(move_enabled(2, 3), [true, false, true]);
+    }
+
+    #[test]
+    fn two_cards_with_the_same_label_do_not_share_their_alert_rows() {
+        let (mut cfg, mut env) = rich_env(true);
+        // The second card is renamed to the first one's label.
+        let (a, b) = (cfg.rows[0].symbol.clone(), cfg.rows[1].symbol.clone());
+        cfg.rows[1].label = cfg.rows[0].label.clone();
+        env.alerts.rows[1].label = cfg.rows[0].label.clone();
+        let acts_for = |sym: &str, env: &mut Env| {
+            env.card = Some(sym.to_string());
+            let page = build(&cfg, env, Section::Alerts);
+            page.iter().filter(|c| c.label.ends_with(" fast move")).count()
+        };
+        assert_eq!(acts_for(&a, &mut env), 1, "one symbol's alert block, not both");
+        assert_eq!(acts_for(&b, &mut env), 1);
+        // The block shown is the picked symbol's own: its alert line is the one of that row.
+        env.alerts.rows[0].alert.as_mut().unwrap().cooldown_s = 111.0;
+        env.alerts.rows[1].alert.as_mut().unwrap().cooldown_s = 222.0;
+        let cooldown = |sym: &str, env: &mut Env| {
+            env.card = Some(sym.to_string());
+            let page = build(&cfg, env, Section::Alerts);
+            page.iter().flat_map(|c| &c.opts).find(|o| o.label.starts_with("cooldown ")).map(|o| o.label.clone()).unwrap()
+        };
+        assert_ne!(cooldown(&a, &mut env), cooldown(&b, &mut env));
     }
 
     #[test]

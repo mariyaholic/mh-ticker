@@ -317,7 +317,7 @@ const fn pd(label: &'static str, group: u8, preset: Preset) -> PresetDef {
     PresetDef { label, group, preset }
 }
 
-/// The Alerts submenu entries, in menu order. `Action::Alert(label, k)` indexes this table.
+/// The alert presets, in the order the Alerts page lists them. `Action::Alert(label, k)` indexes this table.
 pub const PRESETS: [PresetDef; 15] = [
     pd("above 0.5 %", 0, Preset::Pct(0.5)),
     pd("above 1 %", 0, Preset::Pct(1.0)),

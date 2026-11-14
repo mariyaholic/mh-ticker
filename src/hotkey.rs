@@ -17,7 +17,7 @@ pub const MOD_NOREPEAT: u32 = 0x4000;
 /// The window message `RegisterHotKey` posts.
 pub const WM_HOTKEY: u32 = 0x0312;
 
-/// What the Hotkey submenu offers besides Off, in menu order. Each parses.
+/// What the Hotkey choice offers besides Off, in order. Each parses.
 pub const PRESETS: [&str; 4] = ["Ctrl+Alt+M", "Ctrl+Alt+T", "Ctrl+Shift+F12", "Ctrl+Alt+Space"];
 
 /// A parsed hotkey: `mods` is an OR of `MOD_ALT | MOD_CONTROL | MOD_SHIFT | MOD_WIN` (never

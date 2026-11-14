@@ -12,12 +12,13 @@
 
 use super::settings_view::{self, Env, MonitorFact};
 use super::*;
-use crate::settings::{self, Act, Control, Focus, Hit, Key, Paint, Section};
+use crate::settings::{self, Act, BarHit, BarState, Control, Focus, Hit, Key, PageKey, Paint, Section};
 use windows_sys::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
 use windows_sys::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
 use windows_sys::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForSystem};
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowLongPtrW, SetWindowLongPtrW, GWLP_HWNDPARENT};
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, EnableWindow, SetFocus, TME_LEAVE, TRACKMOUSEEVENT};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, TrackMouseEvent, EnableWindow, SetFocus, TME_LEAVE, TRACKMOUSEEVENT};
+use std::cell::Cell;
 
 /// The refresh timer: picks up changes made through the menu, the tray, the hotkey or the feed.
 const TIMER_REFRESH: usize = 77;
@@ -41,10 +42,18 @@ struct Sw {
     card: Option<String>,
     /// Wheel movement not yet shown as whole pixels (`settings::wheel_step`).
     wheel_rem: i64,
+    /// While the scrollbar thumb is dragged: how far below the thumb's top the pointer took hold.
+    drag: Option<i32>,
+    /// The pointer is over the scrollbar.
+    bar_hot: bool,
 }
 
 thread_local! {
     static SW: RefCell<Option<Sw>> = const { RefCell::new(None) };
+    /// The open window, kept outside `SW` so that finding it never depends on a borrow of the state.
+    static OPEN: Cell<isize> = const { Cell::new(0) };
+    /// How many times `slow_facts` read the registry and the display list for a fresh refresh.
+    static FRESH_READS: Cell<u32> = const { Cell::new(0) };
     /// The autostart flag and the monitor list. Reading them costs a registry call and a display
     /// enumeration, so the 1 s refresh reuses them; they are read again when the window opens, is
     /// activated, a command ran or the displays changed.
@@ -56,6 +65,9 @@ fn slow_facts(fresh: bool) -> (bool, Vec<MonitorFact>) {
         if let Some(c) = SLOW.with(|c| c.try_borrow().ok().and_then(|g| g.clone())) {
             return c;
         }
+    }
+    if fresh {
+        FRESH_READS.with(|c| c.set(c.get().wrapping_add(1)));
     }
     let monitors: Vec<MonitorFact> = dock::monitors()
         .into_iter()
@@ -169,14 +181,66 @@ fn invalidate(hwnd: HWND) {
     unsafe { InvalidateRect(hwnd, null(), 0) };
 }
 
-/// Own the window by the strip while the panel is open, so it stays above the panel, and leave it
-/// unowned otherwise: an owned window follows its owner's topmost state, and a docked strip is
-/// topmost, which would keep the window above every other app.
+/// Who owns the settings window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Owner {
+    /// The strip window, which is the panel while it is open.
+    Panel,
+    Nobody,
+}
+
+/// What to do to the window's place in the z-order once the owner is set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Restack {
+    Keep,
+    /// Put it on top of its new owner.
+    Raise,
+    /// Take it out of the topmost band it shared with its owner.
+    NotTopmost,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OwnerPlan {
+    owner: Owner,
+    restack: Restack,
+}
+
+/// The owner the window should have and whether to restack it. While the panel is open the strip owns
+/// the window, so it stays above the panel. Otherwise nobody owns it: an owned window follows its
+/// owner's topmost state, and a docked strip is topmost, which would keep the window above every other
+/// app. Changing the owner does not move the window in the z-order, so a window that has just lost its
+/// owner is taken out of the topmost band explicitly (a floating strip may be topmost too), and one
+/// that has just gained the panel as its owner is raised above it. `owned_now` is whether it has an
+/// owner at the moment.
+fn owner_plan(panel_open: bool, owned_now: bool) -> OwnerPlan {
+    match (panel_open, owned_now) {
+        (true, false) => OwnerPlan { owner: Owner::Panel, restack: Restack::Raise },
+        (true, true) => OwnerPlan { owner: Owner::Panel, restack: Restack::Keep },
+        (false, true) => OwnerPlan { owner: Owner::Nobody, restack: Restack::NotTopmost },
+        (false, false) => OwnerPlan { owner: Owner::Nobody, restack: Restack::Keep },
+    }
+}
+
 fn sync_owner(hwnd: HWND, open: bool) {
-    let want = if open { main_hwnd() as isize } else { 0 };
     unsafe {
-        if GetWindowLongPtrW(hwnd, GWLP_HWNDPARENT) != want {
+        let now = GetWindowLongPtrW(hwnd, GWLP_HWNDPARENT);
+        let plan = owner_plan(open, now != 0);
+        let want = match plan.owner {
+            Owner::Panel => main_hwnd() as isize,
+            Owner::Nobody => 0,
+        };
+        if now != want {
             SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, want);
+        }
+        let place = |after: HWND| SetWindowPos(hwnd, after, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        match plan.restack {
+            Restack::Keep => {}
+            Restack::Raise => {
+                place(HWND_TOP);
+            }
+            Restack::NotTopmost => {
+                place(HWND_NOTOPMOST);
+            }
         }
     }
 }
@@ -210,16 +274,43 @@ fn window_dpi(hwnd: HWND) -> u32 {
     unsafe { GetDpiForWindow(hwnd) }.max(96)
 }
 
-/// Open the window, or bring the open one to the front.
+/// What opening the window does when it may already be open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reopen {
+    Create,
+    /// Bring the open window to the front, on the section it shows.
+    Front,
+    /// The same, after restoring it from the taskbar.
+    RestoreAndFront,
+}
+
+fn reopen(alive: bool, minimized: bool) -> Reopen {
+    match (alive, minimized) {
+        (false, _) => Reopen::Create,
+        (true, false) => Reopen::Front,
+        (true, true) => Reopen::RestoreAndFront,
+    }
+}
+
+/// Open the window, or bring the open one to the front. There is one window: a second request shows
+/// the first, on the section it is on and with its scroll position, and never opens another.
 pub(super) fn open_settings(main: HWND) {
-    if let Some(h) = with_sw(|s| s.hwnd) {
-        unsafe {
-            if IsWindow(h) != 0 {
-                ShowWindow(h, SW_RESTORE);
-                SetForegroundWindow(h);
-                return;
+    let open = OPEN.with(|c| c.get()) as HWND;
+    let alive = !open.is_null() && unsafe { IsWindow(open) } != 0;
+    let minimized = alive && unsafe { IsIconic(open) } != 0;
+    match reopen(alive, minimized) {
+        Reopen::Create => {}
+        plan => unsafe {
+            if plan == Reopen::RestoreAndFront {
+                ShowWindow(open, SW_RESTORE);
             }
-        }
+            // The panel may have opened or closed since the window last refreshed: settle its owner
+            // before raising it, so it lands above the panel.
+            refresh_fresh(open);
+            BringWindowToTop(open);
+            SetForegroundWindow(open);
+            return;
+        },
     }
     let Some(snap) = snapshot(true) else { return };
     unsafe {
@@ -285,10 +376,13 @@ pub(super) fn open_settings(main: HWND) {
             tracking: false,
             card: None,
             wheel_rem: 0,
+            drag: None,
+            bar_hot: false,
         };
         apply(&mut sw, &snap);
         set_dark_caption(hwnd, sw.theme);
         SW.with(|c| *c.borrow_mut() = Some(sw));
+        OPEN.with(|c| c.set(hwnd as isize));
         SetTimer(hwnd, TIMER_REFRESH, REFRESH_MS, None);
         ShowWindow(hwnd, SW_SHOWNORMAL);
         SetForegroundWindow(hwnd);
@@ -324,9 +418,20 @@ fn activate(hwnd: HWND, act: Act) {
             return;
         }
         EnableWindow(hwnd, 1);
-        SetFocus(hwnd);
     }
-    refresh_fresh(hwnd);
+    // SetFocus activates the window when it was not active, and `WM_ACTIVATE` then reads the registry
+    // and the display list. Reading them again here would be a second read for the same command.
+    let before = FRESH_READS.with(|c| c.get());
+    unsafe { SetFocus(hwnd) };
+    if needs_fresh_read(before, FRESH_READS.with(|c| c.get())) {
+        refresh_fresh(hwnd);
+    }
+}
+
+/// Whether the fresh refresh a command needs still has to run: it does when nothing read the registry
+/// and the display list since the count was `before`.
+fn needs_fresh_read(before: u32, now: u32) -> bool {
+    before == now
 }
 
 /// What activating the focused option or a clicked one means: a section change for the sidebar, a
@@ -349,13 +454,22 @@ fn choose(s: &mut Sw, at: Hit) -> Option<Do> {
     }
 }
 
+/// A new section starts at the top with nothing hovered, no thumb held and no wheel remainder: a
+/// fraction of a pixel carried over from the other page would move this one.
+fn reset_view(s: &mut Sw) {
+    s.scroll = 0;
+    s.controls = Vec::new();
+    s.hover = None;
+    s.wheel_rem = 0;
+    s.drag = None;
+    s.bar_hot = false;
+}
+
 fn go_section(hwnd: HWND, i: usize) {
     let Some(snap) = snapshot(true) else { return };
     with_sw(|s| {
         s.cur = i.min(s.sections.len() - 1);
-        s.scroll = 0;
-        s.controls = Vec::new();
-        s.hover = None;
+        reset_view(s);
         apply(s, &snap);
         s.focus = Hit::Nav(s.cur);
     });
@@ -375,6 +489,45 @@ fn eff_dpi(s: &Sw, hwnd: HWND) -> u32 {
 fn current_layout(s: &Sw, hwnd: HWND) -> settings::Layout {
     let (w, h) = client_size(hwnd);
     settings::layout(eff_dpi(s, hwnd), w, h, s.sections.len(), &s.controls, s.scroll)
+}
+
+fn bar_state(s: &Sw) -> BarState {
+    if s.drag.is_some() {
+        BarState::Dragging
+    } else if s.bar_hot {
+        BarState::Hot
+    } else {
+        BarState::Idle
+    }
+}
+
+/// A press at (`x`, `y`) on the scrollbar. `None` when the point is not on it; `Some(true)` when the
+/// thumb was taken (the window captures the mouse), `Some(false)` when a click in the track paged.
+fn press_bar(s: &mut Sw, l: &settings::Layout, x: i32, y: i32) -> Option<bool> {
+    let bar = settings::scrollbar(l)?;
+    let hit = settings::bar_hit(&bar, x, y)?;
+    match hit {
+        BarHit::Thumb => {
+            s.drag = Some(y - bar.thumb.top);
+            Some(true)
+        }
+        BarHit::PageUp | BarHit::PageDown => {
+            s.scroll = settings::page_click(l, hit);
+            Some(false)
+        }
+    }
+}
+
+/// The pointer moved to (`x`, `y`). Follows the thumb while it is held, else tracks whether the pointer
+/// is over the bar. Returns whether something drawn changed.
+fn move_over_bar(s: &mut Sw, l: &settings::Layout, x: i32, y: i32) -> bool {
+    let bar = settings::scrollbar(l);
+    if let (Some(grab), Some(b)) = (s.drag, bar) {
+        let to = settings::drag_scroll(&b, grab, y);
+        return std::mem::replace(&mut s.scroll, to) != to;
+    }
+    let hot = bar.and_then(|b| settings::bar_hit(&b, x, y)).is_some();
+    std::mem::replace(&mut s.bar_hot, hot) != hot
 }
 
 fn paint(hwnd: HWND) {
@@ -405,6 +558,7 @@ fn paint(hwnd: HWND) {
                         layout: &l,
                         focus: Some(s.focus),
                         hover: s.hover,
+                        bar: bar_state(s),
                     };
                     settings::draw(mem, w, h, &p);
                 }
@@ -432,6 +586,20 @@ fn key_of(vk: u32, shift: bool) -> Option<Key> {
     })
 }
 
+/// The scroll offset a key sets, when it scrolls the page. Page Up and Page Down always do; Home and End
+/// do when the focus is on a control (they move the focus to the first or last one, and the page goes
+/// with it), while in the sidebar they pick the first or last section.
+fn key_scroll(vk: u32, l: &settings::Layout, focus_in_page: bool) -> Option<i32> {
+    let key = match vk {
+        0x21 => PageKey::PageUp,
+        0x22 => PageKey::PageDown,
+        0x24 if focus_in_page => PageKey::Home,
+        0x23 if focus_in_page => PageKey::End,
+        _ => return None,
+    };
+    Some(settings::scroll_for(l, key))
+}
+
 /// A key press. Returns the command to run (outside the borrow), or a section to go to.
 fn on_key(hwnd: HWND, vk: u32) -> Option<Do> {
     let shift = unsafe { GetKeyState(VK_SHIFT as i32) } < 0;
@@ -446,8 +614,7 @@ fn on_key(hwnd: HWND, vk: u32) -> Option<Do> {
         }
         if vk == 0x21 || vk == 0x22 {
             let l = current_layout(s, hwnd);
-            let page = l.viewport.height() * 9 / 10;
-            s.scroll = l.scroll + if vk == 0x22 { page } else { -page };
+            s.scroll = key_scroll(vk, &l, true).unwrap_or(l.scroll);
             invalidate(hwnd);
             return None;
         }
@@ -456,7 +623,7 @@ fn on_key(hwnd: HWND, vk: u32) -> Option<Do> {
         s.focus = settings::step(s.focus, key, s.cur, s.sections.len(), &s.controls);
         if let Hit::Opt(ci, _) = s.focus {
             let l = current_layout(s, hwnd);
-            s.scroll = settings::reveal(&l, ci);
+            s.scroll = key_scroll(vk, &l, true).unwrap_or_else(|| settings::reveal(&l, ci));
         }
         invalidate(hwnd);
         // The sidebar entry under the focus is the section shown.
@@ -537,7 +704,10 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
             let (x, y) = ((lp & 0xffff) as i16 as i32, ((lp >> 16) & 0xffff) as i16 as i32);
             let track = with_sw(|s| {
                 let l = current_layout(s, hwnd);
-                let now = settings::hit(&l, &s.controls, x, y);
+                if move_over_bar(s, &l, x, y) {
+                    invalidate(hwnd);
+                }
+                let now = if s.drag.is_some() { None } else { settings::hit(&l, &s.controls, x, y) };
                 if now != s.hover {
                     s.hover = now;
                     invalidate(hwnd);
@@ -555,12 +725,35 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
             with_sw(|s| {
                 s.tracking = false;
                 s.hover = None;
+                s.bar_hot = false;
             });
             invalidate(hwnd);
             0
         }
+        WM_LBUTTONUP | WM_CAPTURECHANGED => {
+            let held = with_sw(|s| s.drag.take().is_some()).unwrap_or(false);
+            if held {
+                if msg == WM_LBUTTONUP {
+                    ReleaseCapture();
+                }
+                invalidate(hwnd);
+            }
+            0
+        }
         WM_LBUTTONDOWN => {
             let (x, y) = ((lp & 0xffff) as i16 as i32, ((lp >> 16) & 0xffff) as i16 as i32);
+            let bar = with_sw(|s| {
+                let l = current_layout(s, hwnd);
+                press_bar(s, &l, x, y)
+            })
+            .flatten();
+            if let Some(grabbed) = bar {
+                if grabbed {
+                    SetCapture(hwnd);
+                }
+                invalidate(hwnd);
+                return 0;
+            }
             let what = with_sw(|s| {
                 let l = current_layout(s, hwnd);
                 let at = settings::hit(&l, &s.controls, x, y)?;
@@ -588,6 +781,7 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
         }
         WM_DESTROY => {
             KillTimer(hwnd, TIMER_REFRESH);
+            OPEN.with(|c| c.set(0));
             SLOW.with(|c| {
                 if let Ok(mut g) = c.try_borrow_mut() {
                     *g = None;
@@ -636,6 +830,8 @@ mod tests {
             tracking: false,
             card: None,
             wheel_rem: 0,
+            drag: None,
+            bar_hot: false,
         }
     }
 
@@ -664,6 +860,114 @@ mod tests {
     fn choosing_a_card_chip_picks_the_symbol_and_runs_no_command() {
         let mut s = state(vec![Control::choice("Symbol", "", vec![settings::opt("Gold", Act::Card("XAU=".into()))], Some(0))]);
         assert!(matches!(choose(&mut s, Hit::Opt(0, 0)), Some(Do::Card(ref sym)) if sym == "XAU="));
+    }
+
+    fn tall_layout(scroll: i32) -> settings::Layout {
+        let page: Vec<Control> = (0..40).map(|i| Control::button(&format!("Row {i}"), "", "Go", Act::Cmd(i), true)).collect();
+        settings::layout(96, 780, 400, 6, &page, scroll)
+    }
+
+    #[test]
+    fn the_owner_is_the_panel_while_it_is_open_and_the_window_is_raised_when_it_gains_it() {
+        assert_eq!(owner_plan(true, false), OwnerPlan { owner: Owner::Panel, restack: Restack::Raise });
+        assert_eq!(owner_plan(true, true), OwnerPlan { owner: Owner::Panel, restack: Restack::Keep }, "already owned: left where it is");
+    }
+
+    #[test]
+    fn a_docked_strip_with_the_panel_closed_owns_nothing_and_leaves_the_topmost_band() {
+        // A docked strip is topmost, and an owned window follows its owner there.
+        let plan = owner_plan(false, true);
+        assert_eq!(plan.owner, Owner::Nobody);
+        assert_eq!(plan.restack, Restack::NotTopmost, "it must not stay above other apps");
+    }
+
+    #[test]
+    fn a_floating_strip_with_the_panel_closed_owns_nothing_either() {
+        assert_eq!(owner_plan(false, true), OwnerPlan { owner: Owner::Nobody, restack: Restack::NotTopmost });
+        // Already unowned: nothing to undo, and no restack on every refresh.
+        assert_eq!(owner_plan(false, false), OwnerPlan { owner: Owner::Nobody, restack: Restack::Keep });
+    }
+
+    #[test]
+    fn opening_again_shows_the_open_window_and_restores_it_when_minimised() {
+        assert_eq!(reopen(false, false), Reopen::Create);
+        assert_eq!(reopen(false, true), Reopen::Create, "a destroyed window is not shown");
+        assert_eq!(reopen(true, false), Reopen::Front);
+        assert_eq!(reopen(true, true), Reopen::RestoreAndFront);
+    }
+
+    #[test]
+    fn a_command_does_one_fresh_read_not_two() {
+        // Nothing read since the count was taken: the command reads once itself.
+        assert!(needs_fresh_read(7, 7));
+        // SetFocus activated the window and `WM_ACTIVATE` read: no second read.
+        assert!(!needs_fresh_read(7, 8));
+        assert!(!needs_fresh_read(u32::MAX, 0), "the count wraps");
+    }
+
+    #[test]
+    fn a_new_section_clears_the_wheel_remainder_the_thumb_and_the_scroll() {
+        let mut s = state(Vec::new());
+        s.scroll = 300;
+        s.wheel_rem = 4_608;
+        s.drag = Some(5);
+        s.bar_hot = true;
+        reset_view(&mut s);
+        assert_eq!((s.scroll, s.wheel_rem, s.drag, s.bar_hot), (0, 0, None, false));
+    }
+
+    #[test]
+    fn a_press_on_the_thumb_takes_it_and_a_press_in_the_track_pages() {
+        let mut s = state(Vec::new());
+        let l = tall_layout(0);
+        let b = settings::scrollbar(&l).unwrap();
+        let x = b.track.left + 3;
+        assert_eq!(press_bar(&mut s, &l, x, b.thumb.top + 6), Some(true));
+        assert_eq!(s.drag, Some(6));
+        s.drag = None;
+        let y = b.thumb.bottom + 10;
+        assert_eq!(press_bar(&mut s, &l, x, y), Some(false));
+        assert_eq!(s.scroll, settings::page_px(&l), "one page down");
+        assert_eq!(press_bar(&mut s, &l, b.track.left - 40, 100), None, "off the bar");
+    }
+
+    #[test]
+    fn dragging_the_thumb_scrolls_to_the_end_and_back() {
+        let mut s = state(Vec::new());
+        let l = tall_layout(0);
+        let b = settings::scrollbar(&l).unwrap();
+        let x = b.track.left + 3;
+        press_bar(&mut s, &l, x, b.thumb.top + 4);
+        assert!(move_over_bar(&mut s, &l, x, 100_000));
+        assert_eq!(s.scroll, l.max_scroll());
+        assert!(move_over_bar(&mut s, &l, x, -100_000));
+        assert_eq!(s.scroll, 0);
+        assert!(!move_over_bar(&mut s, &l, x, -100_000), "no change, nothing to repaint");
+    }
+
+    #[test]
+    fn the_bar_lights_when_the_pointer_is_over_it_and_not_while_it_is_away() {
+        let mut s = state(Vec::new());
+        let l = tall_layout(0);
+        let b = settings::scrollbar(&l).unwrap();
+        assert!(move_over_bar(&mut s, &l, b.track.left + 2, 50));
+        assert_eq!(bar_state(&s), BarState::Hot);
+        assert!(move_over_bar(&mut s, &l, 300, 50));
+        assert_eq!(bar_state(&s), BarState::Idle);
+        s.drag = Some(0);
+        assert_eq!(bar_state(&s), BarState::Dragging);
+    }
+
+    #[test]
+    fn page_and_end_keys_scroll_and_home_and_end_in_the_sidebar_do_not() {
+        let l = tall_layout(100);
+        assert_eq!(key_scroll(0x22, &l, true), Some(settings::scroll_for(&l, PageKey::PageDown)));
+        assert_eq!(key_scroll(0x21, &l, false), Some(settings::scroll_for(&l, PageKey::PageUp)));
+        assert_eq!(key_scroll(0x24, &l, true), Some(0));
+        assert_eq!(key_scroll(0x23, &l, true), Some(l.max_scroll()));
+        assert_eq!(key_scroll(0x24, &l, false), None, "in the sidebar Home picks the first section");
+        assert_eq!(key_scroll(0x23, &l, false), None);
+        assert_eq!(key_scroll(0x41, &l, true), None);
     }
 
     #[test]

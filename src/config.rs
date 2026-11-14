@@ -2,8 +2,8 @@
 //! Every market source is public, so nothing here is a credential — except `webhook`, which is a
 //! bearer secret (see `Alert`).
 //!
-//! `rows` are the symbols on the strip; `catalog` is the pick list behind the menu's *Symbols*
-//! submenu and the Ultra symbol picker. Ticking a catalog entry shows it, unticking hides it; the
+//! `rows` are the symbols on the strip; `catalog` is the pick list behind the settings window's *Symbols*
+//! page and the Ultra symbol picker. Ticking a catalog entry shows it, unticking hides it; the
 //! strip keeps catalog order. Any other CNBC symbol can be added to `catalog` (or `rows`) by hand.
 
 use serde::{Deserialize, Serialize};
@@ -23,7 +23,7 @@ pub struct Profile {
     pub id: &'static str,
     /// Config file inside the data folder (`classic.json`, `ultra.json`).
     pub config_file: &'static str,
-    /// The Ultra build: theme menu, symbol picker, alerts and webhooks.
+    /// The Ultra build: theme choices, symbol picker, alerts and webhooks.
     pub ultra: bool,
 }
 
@@ -60,7 +60,7 @@ pub fn profile() -> Profile {
     *PROFILE.get_or_init(Profile::classic)
 }
 
-/// Where the strip sits (the menu's Position submenu).
+/// Where the strip sits (the Position choice on the settings window's Display page).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Placement {
@@ -115,7 +115,7 @@ pub struct Row {
     /// CNBC quote symbol (`XAU=` gold spot, `@DJ.1` front Dow future, `BTC.CB=` Coinbase bitcoin).
     pub symbol: String,
     pub digits: u32,
-    /// What it is, shown beside the label in the Symbols menu.
+    /// What it is, shown beside the label on the Symbols page.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub name: String,
     /// Shown on the taskbar strip. Absent means shown, so a 1.8 file and every Classic config are
@@ -146,7 +146,7 @@ pub struct Config {
     pub stale_after_s: f64,
     pub delayed_grace_s: f64,
     pub rows: Vec<Row>,
-    /// The Symbols menu's pick list (rows not in it are listed too).
+    /// The Symbols page's pick list (rows not in it are listed too).
     pub catalog: Vec<Row>,
     pub font: String,
     pub font_pt: i32,
@@ -156,7 +156,7 @@ pub struct Config {
     /// Global hotkey that opens and closes the panel, in `hotkey::parse` grammar
     /// (`Ctrl+Alt+M`). None = no hotkey.
     pub hotkey: Option<String>,
-    /// Where the strip sits. Unset in configs from before the Position menu: then `dock`
+    /// Where the strip sits. Unset in configs from before the Position choice: then `dock`
     /// decides (true = Auto, false = Floating).
     pub placement: Option<Placement>,
     /// Display for the strip (`\\.\DISPLAY2`); unset or unplugged = the primary one.
@@ -192,7 +192,7 @@ pub struct Config {
     /// This is a bearer secret: anyone with the URL can post to that channel. It is never printed
     /// in a note, tooltip or `--probe` line.
     pub webhook: Option<String>,
-    /// New alerts clear the level that fired (*Fire once, then clear*). The menu toggle also
+    /// New alerts clear the level that fired (*Fire once, then clear*). The settings toggle also
     /// rewrites `once` on every existing alert.
     pub alert_once: bool,
     /// Alerts are evaluated and logged but not shown or posted, until switched off.
@@ -203,7 +203,7 @@ pub struct Config {
     /// `from == to` is off.
     pub quiet_hours: Option<[u16; 2]>,
     /// New alerts fire on each crossing of their level instead of every cooldown (*Each crossing*).
-    /// The menu choice also rewrites `crossing` on every existing alert. Off is 1.8's behaviour.
+    /// The settings choice also rewrites `crossing` on every existing alert. Off is 1.8's behaviour.
     #[serde(skip_serializing_if = "is_false")]
     pub alert_crossing: bool,
     /// Poll less often while no shown price has changed (`governor`). Unset = the build's default:
@@ -426,7 +426,7 @@ impl Config {
     }
 }
 
-/// The Symbols menu: the catalog, then any row that is not in it (hand-added to `rows`).
+/// The Symbols page's list: the catalog, then any row that is not in it (hand-added to `rows`).
 pub fn menu_list(cfg: &Config) -> Vec<Row> {
     let mut list = cfg.catalog.clone();
     for r in &cfg.rows {
@@ -617,7 +617,7 @@ pub fn clean_name(raw: &str) -> String {
 pub enum Added {
     /// The symbol is on the strip now (newly listed, or listed already and now ticked).
     Shown,
-    /// Listed in the Symbols menu, but the strip already shows [`MAX_ROWS`]: not ticked.
+    /// Listed on the Symbols page, but the strip already shows [`MAX_ROWS`]: not ticked.
     Listed,
     /// It was on the strip already; nothing changed.
     AlreadyShown,
@@ -625,7 +625,7 @@ pub enum Added {
 
 /// Add a symbol CNBC knows to the catalogue and tick it when there is room. `symbol` is already
 /// cleaned ([`clean_symbol`]), `name` is CNBC's and `price` its first price. A symbol already in the
-/// Symbols menu (`menu_list`) is not added twice: it is ticked if it is not shown. A new entry is
+/// Symbols page (`menu_list`) is not added twice: it is ticked if it is not shown. A new entry is
 /// appended to `catalog` with [`label_for`], [`digits_for`] and [`clean_name`], so it shows last.
 pub fn add_custom(cfg: &mut Config, symbol: &str, name: &str, price: f64) -> Added {
     if is_shown(cfg, symbol) {
