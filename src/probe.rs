@@ -17,9 +17,9 @@ use std::path::{Path, PathBuf};
 pub const UNKNOWN_SYMBOL: &str = "MHTICKER.NOSUCH";
 
 /// The quote fields the app reads (`source::parse_quotes`).
-pub const QUOTE_READ: [&str; 15] = [
+pub const QUOTE_READ: [&str; 16] = [
     "symbol", "last", "name", "change_pct", "previous_day_closing", "last_time", "realTime", "open", "high", "low",
-    "volume", "yrhiprice", "yrloprice", "yrhidate", "currencyCode",
+    "volume", "yrhiprice", "yrloprice", "yrhidate", "currencyCode", "settleDate",
 ];
 /// The bar fields the app reads (`source::parse_chart` and `parse_series`).
 pub const BAR_READ: [&str; 7] = ["tradeTimeinMills", "tradeTimeInMills", "close", "open", "high", "low", "volume"];

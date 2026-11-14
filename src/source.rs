@@ -119,8 +119,8 @@ pub use crate::probe::parse_time;
 /// [`crate::model::FUTURE_SKEW_S`] ahead of `now`, and then it is read with the `settleDate` as
 /// well. When the `settleDate` reading is not in the past, the time is unknown.
 ///
-/// Limit: a weekday holiday (Friday 2026-12-25, Good Friday) has no weekend break to recognise, so
-/// its re-stamp is read as sent once the written clock has passed. For the delayed grace (about 16
+/// A weekday holiday (Friday 2026-12-25, Good Friday) has no weekend break to recognise, so its
+/// re-stamp is read as sent once the written clock has passed. For the delayed grace (about 16
 /// minutes) after that, the stamp reads as fresh, until `Quote::moved_at` holds 15 minutes of an
 /// unchanged price and `model::restamped` takes over.
 pub fn quote_time(last_time: &str, settle_date: Option<&str>, now: f64) -> Option<f64> {
@@ -852,8 +852,9 @@ impl Feed {
                     let now = now_s();
                     let cells = resolve(&self.rows, &self.quotes, now, stale_after, self.cfg.delayed_grace_s);
                     let stale = cells.iter().filter(|c| c.stale);
-                    let (shut, lagging): (Vec<_>, Vec<_>) = stale.partition(|c| crate::model::market_closed(c, Link::Partial, now));
-                    closed = !cells.is_empty() && shut.len() == cells.len();
+                    let (shut, lagging): (Vec<_>, Vec<_>) = stale.partition(|c| crate::model::calm_stale(c, Link::Partial, now));
+                    // The governor's closed board needs every row closed for the full age, not only calm.
+                    closed = !cells.is_empty() && cells.iter().all(|c| crate::model::market_closed(c, Link::Partial, now));
                     let names = |cs: &[&crate::model::Cell]| cs.iter().map(|c| c.label.as_str()).collect::<Vec<_>>().join(", ");
                     match (shut.is_empty(), lagging.is_empty()) {
                         (true, true) => (Link::Live, String::new()),

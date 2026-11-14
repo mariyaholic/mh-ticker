@@ -78,9 +78,12 @@ pub fn armed(alerts: &[Alert]) -> bool {
 /// What the gap tracker (`watch`) needs from one feed tick: `(armed, fresh)`. Armed means some alert
 /// with a level is set on a shown symbol (a level on a hidden symbol is not checked and is the
 /// overview's warning, not a gap). Fresh means at least one of those symbols has a fresh CNBC quote,
-/// i.e. an alert could be checked this tick. A symbol whose market is closed (`model::market_closed`
-/// at `now`, UTC seconds) counts as checked: nothing can cross while it does not print, so a weekend
-/// is not a span of unchecked alerts. A dead feed (the link down) still is.
+/// i.e. an alert could be checked this tick. A stale CNBC cell with a known time that is not ahead of
+/// the clock (`model::calm_stale` at `now`, UTC seconds) counts as checked from the moment it goes
+/// stale: nothing can cross while it does not print, and a realtime quote goes stale 90 s after a
+/// close, 810 s before `model::market_closed` holds, so a close or a weekend is not a span of
+/// unchecked alerts. A dead feed (the link down), a missing quote, a fallback quote and an unknown
+/// or future time still are.
 pub fn checkable(cfg: &Config, board: &Board, now: f64) -> (bool, bool) {
     let mut armed = false;
     for a in cfg.alerts.iter().filter(|a| has_level(a) && cfg.rows.iter().any(|r| r.label == a.label)) {
@@ -88,7 +91,7 @@ pub fn checkable(cfg: &Config, board: &Board, now: f64) -> (bool, bool) {
         let fresh = board
             .cells
             .iter()
-            .any(|c| c.label == a.label && (!c.stale || crate::model::market_closed(c, board.link, now)) && c.quote.as_ref().is_some_and(|q| q.source.is_empty() && q.price.is_finite()));
+            .any(|c| c.label == a.label && (!c.stale || crate::model::calm_stale(c, board.link, now)) && c.quote.as_ref().is_some_and(|q| q.source.is_empty() && q.price.is_finite()));
         if fresh {
             return (true, true);
         }
@@ -217,9 +220,14 @@ pub fn check_with(cfg: &mut Config, board: &Board, now: f64, series: &dyn Fn(&st
     // The poll interval in force: the governor's, else the user's.
     let poll = if board.governed_s > 0.0 { board.governed_s } else { board.poll_s };
     let stale_after = crate::governor::stale_after(cfg.stale_after_s, board.governed_s);
-    for cell in &board.cells {
+    for (ci, cell) in board.cells.iter().enumerate() {
         let Some(q) = cell.quote.as_ref() else { continue };
         if cell.stale || !q.source.is_empty() || crate::model::is_stale(q, now, stale_after, cfg.delayed_grace_s) {
+            continue;
+        }
+        // A fresh-looking time on the price the 1D chart ended at is a re-stamp, also in the first
+        // minutes after a start when `moved_at` has no history.
+        if board.restamped_over_bars(ci, now) {
             continue;
         }
         for (i, a) in cfg.alerts.iter_mut().enumerate().filter(|(_, a)| a.label == cell.label) {
@@ -1902,7 +1910,10 @@ mod tests {
     fn checkable_is_armed_on_a_shown_symbol_and_fresh_when_one_could_be_checked() {
         let cfg = overview_cfg(vec![Alert { label: "XAU".into(), above: Some(1.0), ..Alert::default() }]);
         assert_eq!(checkable(&cfg, &board(4150.0, false), 100.0), (true, true));
-        assert_eq!(checkable(&cfg, &board(4150.0, true), 100.0), (true, false), "stale: armed but blind");
+        assert_eq!(checkable(&cfg, &board(4150.0, true), 100.0), (true, true), "stale with a known time and an answering feed: calm, checked");
+        let mut unknown = board(4150.0, true);
+        unknown.cells[0].quote.as_mut().unwrap().ts = None;
+        assert_eq!(checkable(&cfg, &unknown, 100.0), (true, false), "stale with no known time: armed but blind");
         let mut fb = board(4150.0, false);
         fb.cells[0].quote.as_mut().unwrap().source = "Gold API";
         assert_eq!(checkable(&cfg, &fb, 100.0), (true, false), "a fallback price checks nothing");
@@ -1940,6 +1951,61 @@ mod tests {
             assert_eq!(w.step(172_800.0 + k as f64 * 60.0, fresh, armed, crate::watch::threshold(60.0)), None);
         }
         assert_eq!(w.blind_since(), None);
+    }
+
+    #[test]
+    fn a_realtime_close_is_never_a_span_of_unchecked_alerts() {
+        // XAU is armed. Its last print is at T; the quote is stale from T + 90 s and reads closed from
+        // T + 900 s. The tracker, fed every 15 s through the whole window, sees no gap at any point.
+        let cfg = overview_cfg(vec![Alert { label: "XAU".into(), above: Some(1.0), ..Alert::default() }]);
+        let t0 = 1_000_000.0;
+        let mut w = crate::watch::Watch::default();
+        for k in 0..=80 {
+            let now = t0 + k as f64 * 15.0;
+            let mut b = board(4150.0, now - t0 > 90.0);
+            b.link = if now - t0 > 90.0 { Link::Partial } else { Link::Live };
+            b.cells[0].quote.as_mut().unwrap().ts = Some(t0);
+            b.cells[0].quote.as_mut().unwrap().realtime = true;
+            let (armed, fresh) = checkable(&cfg, &b, now);
+            assert_eq!((armed, fresh), (true, true), "at +{} s", k * 15);
+            assert_eq!(w.step(now, fresh, armed, crate::watch::threshold(15.0)), None, "at +{} s", k * 15);
+        }
+        assert_eq!(w.blind_since(), None);
+    }
+
+    #[test]
+    fn a_stale_quote_that_is_a_fault_is_still_unchecked() {
+        let cfg = overview_cfg(vec![Alert { label: "XAU".into(), above: Some(1.0), ..Alert::default() }]);
+        let now = 1_000_000.0;
+        let stale = |f: &dyn Fn(&mut Board)| {
+            let mut b = board(4150.0, true);
+            b.link = Link::Partial;
+            b.cells[0].quote.as_mut().unwrap().ts = Some(now - 300.0);
+            f(&mut b);
+            checkable(&cfg, &b, now)
+        };
+        assert_eq!(stale(&|_| {}), (true, true), "300 s old, link answering");
+        assert_eq!(stale(&|b| b.link = Link::Down), (true, false), "link down");
+        assert_eq!(stale(&|b| b.cells[0].quote.as_mut().unwrap().source = "Gold API"), (true, false), "fallback quote");
+        assert_eq!(stale(&|b| b.cells[0].quote.as_mut().unwrap().ts = None), (true, false), "unknown time");
+        assert_eq!(stale(&|b| b.cells[0].quote.as_mut().unwrap().ts = Some(now + 20_000.0)), (true, false), "future time");
+        assert_eq!(stale(&|b| b.cells[0].quote = None), (true, false), "no quote");
+    }
+
+    #[test]
+    fn no_alert_fires_in_the_first_minutes_after_a_start_on_a_restamp_the_chart_shows() {
+        // The app started during the Friday re-stamp window: moved_at is the start, the time is fresh.
+        let now = 1_000_000.0;
+        let mut cfg = Config { alerts: vec![alert(Some(4100.0), None)], stale_after_s: 90.0, ..Config::default() };
+        let mut b = sure_board(4200.0, now - 3.0);
+        assert_eq!(check(&mut cfg.clone(), &b, now).len(), 1, "without chart history the price counts");
+        let bar = crate::model::Bar { dt: 0.0, o: 4200.0, h: 4200.0, l: 4200.0, c: 4200.0, v: 0.0 };
+        b.bars = vec![vec![bar].into()];
+        b.bars_t0 = vec![now - 3_000.0];
+        assert!(check(&mut cfg, &b, now).is_empty(), "the stamp is 50 minutes past the last bar, on its close");
+        assert_eq!(cfg.alerts[0].last, 0.0);
+        b.cells[0].quote.as_mut().unwrap().price = 4201.0;
+        assert_eq!(check(&mut cfg, &b, now).len(), 1, "a price that moved off the close is a trade");
     }
 
     #[test]

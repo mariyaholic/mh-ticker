@@ -814,24 +814,24 @@ fn make_icon(color: COLORREF, pending: bool) -> HICON {
     }
 }
 
-/// (label, price, price colour, change + colour) for one row of the board.
-///
-/// Open question for the owner: a closed cell and a stale fault cell dim to the same grey here. The
-/// strip's dot separates the cases (`theme::calm_color` stays amber while any cell is a fault), but
-/// it does not say which cell is at fault. The Ultra card shows closed with a tag and keeps the
-/// day-change colours.
-fn cell_texts(c: &Cell, t: &Theme) -> (String, String, COLORREF, Option<(String, COLORREF)>) {
+/// (label, price, price colour, change + colour) for one row of the board. A stale cell that is calm
+/// (`model::calm_stale`: a closed market) dims to the grey of the theme's secondary text. A stale
+/// cell that is a fault (no known age, a fallback quote, a dead link) takes the amber of the theme
+/// and loses its change colours, so the two read differently on the strip.
+fn cell_texts(c: &Cell, t: &Theme, link: Link, now: f64) -> (String, String, COLORREF, Option<(String, COLORREF)>) {
     let label = match &c.quote {
         Some(q) if !q.source.is_empty() => format!("{} ({} ?)", c.label, q.source),
         _ => c.label.clone(),
     };
+    let fault = c.stale && !crate::model::calm_stale(c, link, now);
     match &c.quote {
         Some(q) => {
             let change = q.change_pct.map(|p| {
                 let col = if c.stale { t.dim } else if p >= 0.0 { t.up } else { t.down };
                 (fmt_change(p), col)
             });
-            (label, fmt_price(q.price, c.digits), if c.stale { t.dim } else { t.price }, change)
+            let price = if fault { t.amber } else if c.stale { t.dim } else { t.price };
+            (label, fmt_price(q.price, c.digits), price, change)
         }
         None => (label, "--".into(), t.dim, None),
     }
@@ -849,7 +849,7 @@ fn text_run(x: i32, y: i32, s: &str, color: COLORREF) -> Run {
 }
 
 /// Free mode: everything on one row.
-fn layout_row(dc: HDC, cells: &[Cell], dpi: u32, t: &Theme) -> Frame {
+fn layout_row(dc: HDC, cells: &[Cell], dpi: u32, t: &Theme, link: Link, now: f64) -> Frame {
     let s = |v: i32| v * dpi as i32 / 96;
     let (px, py) = (s(10), s(5));
     let (_, line_h) = text_size(dc, "Xg");
@@ -857,7 +857,7 @@ fn layout_row(dc: HDC, cells: &[Cell], dpi: u32, t: &Theme) -> Frame {
     let mut slots = Vec::new();
     let mut x = px;
     for (i, c) in cells.iter().enumerate() {
-        let (label, price, pc, change) = cell_texts(c, t);
+        let (label, price, pc, change) = cell_texts(c, t, link, now);
         // The symbol's own extent starts after the gap that separates it from the one before.
         let left = x + if i > 0 { text_size(dc, "    ").0 } else { 0 };
         let mut push = |t: String, col: COLORREF| {
@@ -885,7 +885,7 @@ fn layout_row(dc: HDC, cells: &[Cell], dpi: u32, t: &Theme) -> Frame {
 
 /// Dock mode: the first `k` rows of the board as a column-major grid with `rows` lines,
 /// label | right-aligned price | right-aligned change.
-fn layout_grid(dc: HDC, cells: &[Cell], dpi: u32, rows: usize, show_change: bool, t: &Theme) -> Frame {
+fn layout_grid(dc: HDC, cells: &[Cell], dpi: u32, rows: usize, show_change: bool, t: &Theme, link: Link, now: f64) -> Frame {
     let s = |v: i32| v * dpi as i32 / 96;
     let (px, py, gap_s, gap_l) = (s(7), s(3), s(5), s(12));
     let (_, line_h) = text_size(dc, "Xg");
@@ -896,7 +896,7 @@ fn layout_grid(dc: HDC, cells: &[Cell], dpi: u32, rows: usize, show_change: bool
         if ci > 0 {
             x += gap_l;
         }
-        let texts: Vec<_> = col.iter().map(|c| cell_texts(c, t)).collect();
+        let texts: Vec<_> = col.iter().map(|c| cell_texts(c, t, link, now)).collect();
         let lw = texts.iter().map(|t| text_size(dc, &t.0).0).max().unwrap_or(0);
         let pw = texts.iter().map(|t| text_size(dc, &t.1).0).max().unwrap_or(0);
         let cw = if show_change {
@@ -946,20 +946,20 @@ fn layout(u: &Ui, avail: Option<i32>) -> Frame {
         let cells = &shown;
         let t = u.theme;
         let mut frame = match avail {
-            None => layout_row(dc, cells, u.dpi, t),
+            None => layout_row(dc, cells, u.dpi, t, u.view.link, crate::source::now_s()),
             Some(avail) => {
                 let rows = u.cfg.dock_rows.max(1) as usize;
                 let mut pick = None;
                 'fit: for k in (1..=cells.len()).rev() {
                     for show_change in [true, false] {
-                        let f = layout_grid(dc, &cells[..k], u.dpi, rows, show_change, t);
+                        let f = layout_grid(dc, &cells[..k], u.dpi, rows, show_change, t, u.view.link, crate::source::now_s());
                         if f.w <= avail {
                             pick = Some(f);
                             break 'fit;
                         }
                     }
                 }
-                pick.unwrap_or_else(|| layout_grid(dc, &cells[..cells.len().min(1)], u.dpi, rows, false, t))
+                pick.unwrap_or_else(|| layout_grid(dc, &cells[..cells.len().min(1)], u.dpi, rows, false, t, u.view.link, crate::source::now_s()))
             }
         };
         SelectObject(dc, old);
@@ -997,7 +997,7 @@ fn draw_strip(u: &Ui, dc: HDC) {
 /// symbol without the change column, else the leading symbols), painted as `draw_strip` paints it, in
 /// the theme's background and the default strip font. Off-screen; only the `shots` feature has it.
 #[cfg(feature = "shots")]
-pub(crate) fn strip_still(cells: &[Cell], t: &Theme, dpi: u32, rows: usize, avail: i32) -> (u32, u32, Vec<u8>) {
+pub(crate) fn strip_still(cells: &[Cell], link: Link, now: f64, t: &Theme, dpi: u32, rows: usize, avail: i32) -> (u32, u32, Vec<u8>) {
     let cfg = Config::default();
     let font = make_font(&Config { placement: Some(Placement::TaskbarRight), ..cfg }, dpi);
     let frame = unsafe {
@@ -1007,14 +1007,14 @@ pub(crate) fn strip_still(cells: &[Cell], t: &Theme, dpi: u32, rows: usize, avai
         let mut pick = None;
         'fit: for k in (1..=cells.len()).rev() {
             for show_change in [true, false] {
-                let f = layout_grid(dc, &cells[..k], dpi, rows, show_change, t);
+                let f = layout_grid(dc, &cells[..k], dpi, rows, show_change, t, link, now);
                 if f.w <= avail {
                     pick = Some(f);
                     break 'fit;
                 }
             }
         }
-        let frame = pick.unwrap_or_else(|| layout_grid(dc, &cells[..cells.len().min(1)], dpi, rows, false, t));
+        let frame = pick.unwrap_or_else(|| layout_grid(dc, &cells[..cells.len().min(1)], dpi, rows, false, t, link, now));
         SelectObject(dc, old);
         DeleteDC(dc);
         ReleaseDC(null_mut(), screen);
@@ -1032,7 +1032,7 @@ pub(crate) fn strip_still(cells: &[Cell], t: &Theme, dpi: u32, rows: usize, avai
             TextOutW(dc, r.x, r.y, r.text.as_ptr(), r.text.len() as i32);
         }
         let (dx, dy, d) = frame.dot;
-        let brush = CreateSolidBrush(theme::link_color(t, Link::Live));
+        let brush = CreateSolidBrush(theme::calm_color(t, link, crate::model::calm_of(cells, link, now)));
         let old_brush = SelectObject(dc, brush);
         let old_pen = SelectObject(dc, GetStockObject(NULL_PEN));
         Ellipse(dc, dx, dy, dx + d, dy + d);

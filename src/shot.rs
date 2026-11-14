@@ -296,7 +296,7 @@ pub fn write_w3(dir: &Path) -> Result<usize, String> {
         r.strip = [0, 2, 4, 8, 13, 20].contains(&i);
     }
     let pinned: Vec<crate::model::Cell> = crate::config::strip_rows(&cfg).into_iter().map(|i| b24.cells[i].clone()).collect();
-    let (w, h, px) = crate::ui::strip_still(&pinned, t, 96, 2, 1_800);
+    let (w, h, px) = crate::ui::strip_still(&pinned, b24.link, now, t, 96, 2, 1_800);
     write_png(&dir.join("w3-strip-24-pinned-6.png"), w, h, &px)?;
     Ok(2)
 }
@@ -738,6 +738,27 @@ fn board_weekend(now: f64) -> Board {
     b
 }
 
+/// Every card closed, bitcoin included: the grey dot and the header "CNBC, markets closed".
+fn board_all_closed(now: f64) -> Board {
+    let mut b = board_weekend(now);
+    b.cells[2].stale = true;
+    if let Some(q) = b.cells[2].quote.as_mut() {
+        q.ts = Some(FRIDAY_1700);
+    }
+    b
+}
+
+/// A weekend board in which one card is a fault and not a closed market: its quote time is unknown,
+/// so the header keeps the link's amber and the strip prices that card in amber.
+fn board_fault(now: f64) -> Board {
+    let mut b = board_weekend(now);
+    b.cells[2].stale = true;
+    if let Some(q) = b.cells[2].quote.as_mut() {
+        q.ts = None;
+    }
+    b
+}
+
 /// A chart still written under `file` in `dir`: the chart fixture renders to `chart-<theme>.png` in a
 /// scratch folder, which is then moved to its own name.
 #[allow(clippy::too_many_arguments)]
@@ -769,18 +790,28 @@ pub fn write_wide(dir: &Path) -> Result<usize, String> {
     hist.record(&b24, now);
     put(&mut n, "wide-cards-24.png", render(t, 0.0, now, &b24, &hist, 96))?;
     for rows in 1..=3usize {
-        put(&mut n, &format!("wide-strip-24-rows{rows}.png"), crate::ui::strip_still(&b24.cells, t, 96, rows, 1_800))?;
+        put(&mut n, &format!("wide-strip-24-rows{rows}.png"), crate::ui::strip_still(&b24.cells, b24.link, now, t, 96, rows, 1_800))?;
     }
     let b6 = board(now);
     let mut hist6 = History::new();
     hist6.record(&b6, now);
     put(&mut n, "wide-192dpi-cards.png", render(t, 0.0, now, &b6, &hist6, 192))?;
-    put(&mut n, "wide-192dpi-strip-24-rows2.png", crate::ui::strip_still(&b24.cells, t, 192, 2, 3_600))?;
+    put(&mut n, "wide-192dpi-strip-24-rows2.png", crate::ui::strip_still(&b24.cells, b24.link, now, t, 192, 2, 3_600))?;
     let bw = board_weekend(WEEKEND_NOW);
     let mut histw = History::new();
     histw.record(&bw, WEEKEND_NOW);
     put(&mut n, "closed-weekend-cards.png", render(t, 0.0, WEEKEND_NOW, &bw, &histw, 96))?;
-    put(&mut n, "closed-weekend-strip.png", crate::ui::strip_still(&bw.cells, t, 96, 1, 900))?;
+    put(&mut n, "closed-weekend-strip.png", crate::ui::strip_still(&bw.cells, bw.link, WEEKEND_NOW, t, 96, 1, 900))?;
+    let ba = board_all_closed(WEEKEND_NOW);
+    let mut hista = History::new();
+    hista.record(&ba, WEEKEND_NOW);
+    put(&mut n, "closed-all-cards.png", render(t, 0.0, WEEKEND_NOW, &ba, &hista, 96))?;
+    put(&mut n, "closed-all-strip.png", crate::ui::strip_still(&ba.cells, ba.link, WEEKEND_NOW, t, 96, 1, 900))?;
+    let bf = board_fault(WEEKEND_NOW);
+    let mut histf = History::new();
+    histf.record(&bf, WEEKEND_NOW);
+    put(&mut n, "closed-fault-cards.png", render(t, 0.0, WEEKEND_NOW, &bf, &histf, 96))?;
+    put(&mut n, "closed-fault-strip.png", crate::ui::strip_still(&bf.cells, bf.link, WEEKEND_NOW, t, 96, 1, 900))?;
     chart_still(dir, "wide-pane-narrow.png", 96, panel::minimum(6, 0, 96, false, true).0, Some(40), "5D")?;
     chart_still(dir, "wide-192dpi-pane.png", 192, 1488 * 2, Some(40), "1D")?;
     n += 2;
@@ -1194,6 +1225,19 @@ mod tests {
         let q = b.cells[4].quote.as_ref().unwrap();
         let words = crate::model::closed_words("CNBC delayed", crate::model::closed_since(q, WEEKEND_NOW), &tz_offset, WEEKEND_NOW);
         assert_eq!(words, ["CNBC delayed \u{b7} closed since Fri 17:00", "closed since Fri 17:00", "closed"]);
+    }
+
+    /// All six closed reads grey and "markets closed"; one fault among them keeps the link's own look.
+    #[test]
+    fn the_all_closed_and_fault_boards_read_differently() {
+        let all = board_all_closed(WEEKEND_NOW);
+        assert_eq!(all.calm(WEEKEND_NOW), crate::model::Calm::All(6));
+        let fault = board_fault(WEEKEND_NOW);
+        assert_eq!(fault.calm(WEEKEND_NOW), crate::model::Calm::No);
+        let t = &theme::ALL[0];
+        let grey = crate::ui::strip_still(&all.cells, all.link, WEEKEND_NOW, t, 96, 1, 900);
+        let amber = crate::ui::strip_still(&fault.cells, fault.link, WEEKEND_NOW, t, 96, 1, 900);
+        assert_ne!(grey.2, amber.2, "the strips differ");
     }
 
     /// The 24-card board carries one closed market, so its picture shows the closed card tag.
