@@ -1,5 +1,98 @@
 # Changelog — MH Ticker
 
+## 2026-11-14 — 1.8.0: alerts you can set and silence, a chart that reads, typed symbols   [claude.impl]
+
+**Files:** most of `src/` (`alerts.rs`, `chartview.rs`, `ranges.rs`, `keys.rs`, `hotkey.rs`, `update.rs`,
+`autostart.rs`, `prompt.rs`, `source.rs`, `config.rs`, `menu_commands.rs`, `panel.rs`, `ui.rs`, `model.rs`,
+`shot.rs`), `examples/chart.rs`, `scripts/check-state-linux.sh`, `README.md`, `SOURCES.md`,
+`docs/STATE-AUDIT-1.8.md`, `docs/1.8/`, `Cargo.toml` (version 1.8.0).
+
+**What.** The 1.8 cycle, grouped by what you see. Each group says which build gets it: Classic is
+`MH_Ticker.exe`, Ultra is `MH_Ticker_Ultra.exe`.
+
+- **Alerts (Ultra).**
+  - New presets: above and below at 0.5, 1, 2 and 5 % of the current price; past today's high or low (one
+    tick beyond the extreme, so a price already there does not fire at once); the previous close; and a day
+    move of plus or minus 1, 2, 3 or 5 %.
+  - *Alerts > at a price...* takes a typed level such as `4,200.50`. A level above the price is an above
+    alert, a level below is a below alert.
+  - *Fire once* clears an alert's level after it fires. The checkbox changes every alert at once.
+  - *Mute* for 1 hour, 8 hours or until turned back on. *Quiet hours* (off, 22:00 to 07:00, 23:00 to 08:00,
+    or 00:00 to 09:00, local time). A silenced alert is still checked and listed in *Recent*, but it shows no
+    balloon and sends nothing to the webhook.
+  - The webhook is set from the menu: *Paste URL from clipboard* checks the text and asks before saving, and
+    shows only the host. *Send a test alert* and *Remove* are there too. The URL is never shown, logged or put
+    in an error message.
+  - *Recent* lists the last 10 alerts with their outcome (shown, muted, quiet hours, sent, send failed). It is
+    kept in memory only.
+  - When an alert fires, the tray icon gets a marker and the tooltip's first line reads `Alert: <title>`. Both
+    clear when the panel opens or a menu is used.
+  - Alerts still fire only on a fresh CNBC price, as before.
+- **The chart (Ultra).**
+  - A hover readout on the candle pane: time, open, high, low, close and the candle's change, with a crosshair
+    and a price line. The readout line is always reserved, so the plot does not jump.
+  - Local time on the candles and the time axis. The `local` / `UTC` word in the header switches it, and the
+    choice is saved.
+  - Reference lines: the previous close (dashed, labelled `prev`), and the day's high and low as ticks on the
+    right edge. A faint dotted line marks each session break, where the market was shut.
+  - The day's change sits beside the last price, in the colour of its direction.
+  - Ranges `1D`, `5D`, `1M`, `6M`, `1Y` and `5Y`. Ranges other than `1D` are read from CNBC range files for the
+    locked symbol, when the tab is first clicked. A file is refreshed when it is old (10 minutes for `5D`, an
+    hour for the daily files, six hours for `5Y`). A failed range retries after 30 seconds.
+  - Volume bars under the candles where the feed sends volume. FX, yields and spot metals have none, so no
+    strip is drawn.
+  - Alert levels on the chart: a dashed line inside the price window, and a marker on the nearest edge outside
+    it. Right-click the chart for *Alert at* and *More...*.
+- **Everyday (both builds).**
+  - *Start with Windows* adds or removes a `Run` key for the profile. The tick is read each time the menu opens.
+  - *Hotkey* opens and closes the panel from anywhere. Four presets, or a custom combination from the config.
+  - *Refresh now* fetches every price at once and asks again for a chart range that failed.
+  - *Strip* submenu: rows in the taskbar (1, 2 or 3, only when docked to the taskbar), text size, and opacity.
+    Changes apply at once.
+  - A version line, and *Check for updates*. The check makes one request to `api.github.com`, and only when you
+    click it. The download link is a fixed address, never a link taken from the answer.
+  - *Copy all prices* copies the board as tab-separated text. A stale price gets a `stale` field.
+  - A greyed line under the status says when settings could not be saved, and clears after a later save works.
+- **Keyboard, card menu and order (Ctrl+C both builds; the rest Ultra).**
+  - In the open panel: arrows move the lock, Enter opens the locked card on CNBC, `C` opens the chart, `S` opens
+    the symbol picker, Delete removes the locked card from the strip, and Ctrl+Left and Ctrl+Right move it one
+    place. Ctrl+C copies the locked card's line, or every price when nothing is locked.
+  - The card menu gets *Move left*, *Move right*, *Move first* and *Remove from strip* (Ultra).
+  - A click on a symbol on a docked or cornered Ultra strip locks that card and opens the panel on it.
+  - Moving a card changes the Symbols catalogue, so the order survives ticking and unticking symbols.
+- **Add a symbol, up to 24 (both builds).**
+  - *Symbols > Add symbol...* checks the typed symbol against CNBC with one quote request, then adds it to the
+    menu and the strip. *Remove a symbol I added* removes it again, and its alerts with it.
+  - The strip shows up to 24 symbols, up from 12. Each shown symbol adds quote requests on every refresh, so
+    traffic grows with the number shown. The cost at 24 was not measured.
+- **Fixes from the state audit (both builds unless noted).**
+  - *Refresh now* asks again at once for a failed longer range. It used to wait out a 30 second back-off.
+  - The fallback toggle writes the settings as they are after its confirmation box. The old copy could bring a
+    spent once alert back on the next start.
+  - A test alert's result reads correctly after the log list is cleared.
+  - `Alerts (n)` in the menu counts only the symbols the submenu lists.
+  - A second *Add symbol* prompt from the tray now says a lookup is already running, instead of dropping its
+    symbol silently.
+  - Left open, and recorded in the audit: the card menu's *Copy* and *Open* act on the position the card had when
+    the menu opened (rare, Ultra); the tray marker stays lit while the panel is open; a menu opened before a hotkey
+    or tray click changes the mode can show stale entries; and a move across monitors of different DPI lays out
+    the strip at the old DPI until the next refresh.
+
+**Checked.** Under Wine: 240 tests pass. The one failure is the known
+`ui::tests::a_theme_switch_takes_the_new_themes_face` (Wine has no Consolas). The Linux harness
+(`scripts/check-state-linux.sh`) passes 107. Clippy is clean apart from the expected `windres not found`
+line. The 36 theme stills are identical to the baseline, so Classic has not drifted. The native Windows CI
+run is green.
+
+**Not verified.** Nothing was clicked on a Windows desktop. Tests ran under Wine and on the native Windows
+CI runner, and the window was reviewed from rendered pictures and from the code. The pictures were drawn under
+Wine with substitute fonts, so text widths differ from a real Windows machine. Not checked by hand: the menus,
+the dialogs, hotkey registration, balloons with Focus Assist on, the chart hover with a real mouse, and
+keyboard focus after a click or the hotkey. CNBC range shapes are not verified live: the time spelling, whether
+a bar's stamp is its start or its end, the time of day of daily bars, and whether each file carries volume come
+from a single measurement. What CNBC returns for an unknown symbol is assumed. `--probe` is the check: run it on
+a machine with network access before trusting the ranges or *Add symbol*.
+
 ## 2026-11-04 — 1.7.1: closing the chart glides back to the middle   [claude.impl]
 
 **Files:** `src/ui.rs` (`grown_rect`, `rect_after_chart`, `grow_target`, `shrink_target`, `set_chart`),

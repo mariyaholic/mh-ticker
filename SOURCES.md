@@ -152,8 +152,37 @@ app 6× its traffic for months.
 
 ---
 
+## Part 3 — Requests made by 1.8
+
+*Every request 1.8 adds, and when it is made. The price quotes and the 1D chart are the same requests as 1.7
+and are not repeated here. The table lists everything else 1.8 sends, so the traffic can be checked against it.*
+
+| Host | Request | When | What is sent | What is read back |
+|---|---|---|---|---|
+| `ts-api.cnbc.com` | `GET /harmony/app/charts/{5D,1M,1Y,5Y}.json?symbol=…` (`1M.json` also serves 6M) | Ultra only: when a chart range tab is first clicked for the locked symbol, then again when the file is older than its time to live (10 minutes for 5D, an hour for 1M and 1Y, six hours for 5Y). A failed request is retried after 30 seconds | the symbol and the request line | a range file, parsed for bars and volume; `--probe` reads the same files |
+| `quote.cnbc.com` | `GET /quote-html-webservice/restQuote/…?symbols={typed symbol}&…&output=json` | once per *Symbols > Add symbol...* click, for the typed symbol only | the typed symbol (cleaned to `A-Z 0-9 . @ = - ^ / : _`, at most 20 characters) | one quote. The symbol is found only when it matches the typed one and its price is positive |
+| `api.github.com` | `GET /repos/mariyaholic/mh-ticker/releases/latest` | both builds, only when *Check for updates* is clicked. Never at startup or in the background | the request line and headers only: `Accept: application/vnd.github+json` and the same browser-style `User-Agent` as the price requests. No body, no cookies, no config, no symbols | at most 256 KiB, 10 second timeout, no redirects. Only `tag_name` is read, and only its digits and dots are shown. Nothing else from the answer is opened or followed; the download page is a fixed address (`github.com/mariyaholic/mh-ticker/releases/latest`) |
+
+Notes on the table:
+
+- The range files and the symbol lookup use the same CNBC host and the same browser-style `User-Agent` as the
+  quotes. No new host is added to the app's list of places it talks to, apart from `api.github.com`.
+- Each shown symbol adds one quote to every refresh. Traffic therefore grows with the number of symbols on the
+  strip (up to 24 in 1.8). The size of that cost at 24 has not been measured.
+- Each range fetch is about 6 to 40 KB gzipped (the figure measured for the feature list), per symbol and range.
+  The cache keeps at most 12 series.
+- The fallback hosts (`api.gold-api.com`, `api.kraken.com`) are unchanged from 1.3 and are used only when the
+  user has turned fallback sources on.
+
+---
+
 ## What I could not verify
 
+- The range files (`5D.json`, `1M.json`, `1Y.json`, `5Y.json`) have only been measured for one symbol on one day.
+  Their time spelling, bar stamps, daily bar times and volume presence are unverified live. Run `--probe` on a
+  machine with network access to check them.
+- What `quote.cnbc.com` returns for a symbol it does not know is assumed to be no quote, or a quote without a
+  positive price. Both are read as not found.
 - Stooq's own documentation did not extract in the original research pass; its limits are from
   secondary reporting and should be re-checked before use.
 - No source's response `Content-Encoding` was confirmed from inside this app — the byte figures in
