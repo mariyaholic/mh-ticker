@@ -51,6 +51,12 @@ name = "w4"
 path = "examples/w4.rs"
 required-features = ["shots"]
 
+# The settings window, offscreen: Classic, two Ultra themes, the contrast palettes, other scales.
+[[example]]
+name = "settings"
+path = "examples/settings.rs"
+required-features = ["shots"]
+
 [features]
 shots = ["dep:png"]
 
