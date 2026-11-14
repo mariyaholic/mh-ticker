@@ -187,6 +187,12 @@ The table above is the 1.8 record. These are the changes in 1.9:
   other headers are unchanged, and it still reads only `tag_name`.
 - CNBC requests are unchanged, including the browser-style `User-Agent`.
 - The data meter counts these bytes, after decompression. It makes no request of its own.
+- The poll governor changes how often the quotes are polled: less often when no shown quote has moved, and less
+  often while the PC is locked with no alert armed. It is never more often than the *Poll every* setting. The
+  requests and hosts are the same. It is on for Ultra and off for Classic unless the user ticks it, so Classic polls
+  as before by default.
+- A webhook POST that fails with a network error or a 5xx is sent once more after 3 seconds, to the same URL with the
+  same body. A 4xx is never retried, and nothing is queued on disk.
 
 ---
 

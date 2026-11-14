@@ -183,6 +183,25 @@ pub struct Config {
     /// Quiet hours as `[from, to)` minutes of the local day; wraps midnight when `from > to`;
     /// `from == to` is off.
     pub quiet_hours: Option<[u16; 2]>,
+    /// New alerts fire on each crossing of their level instead of every cooldown (*Each crossing*).
+    /// The menu choice also rewrites `crossing` on every existing alert. Off is 1.8's behaviour.
+    #[serde(skip_serializing_if = "is_false")]
+    pub alert_crossing: bool,
+    /// Poll less often while no shown price has changed (`governor`). Unset = the build's default:
+    /// on for Ultra, off for Classic, whose polling stays exactly as it was until the user ticks it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slow_when_quiet: Option<bool>,
+    /// Poll once in five minutes while the session is locked and no alert is armed. Unset as above.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rest_when_locked: Option<bool>,
+    /// Post a line to the webhook when alerts could not be checked for a while (`watch`). It names
+    /// times and never a price. Off by default.
+    #[serde(skip_serializing_if = "is_false")]
+    pub gap_notice: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// One price threshold. Fires when the last price crosses `above` upward or `below` downward, at
@@ -202,11 +221,38 @@ pub struct Alert {
     pub day_move: Option<f64>,
     /// Clear the level that fired; an alert left with no level is removed.
     pub once: bool,
+    /// Fire on each crossing of a level, and re-arm only after the price goes back past it by a small
+    /// band (`alerts::crossing_band`). Ignored when `once` is set. Off is 1.8's every-cooldown rule.
+    #[serde(skip_serializing_if = "is_false")]
+    pub crossing: bool,
+    /// A fast-move alert: an index into `alerts::FAST_MOVES` plus one, so 0 is none (`1 % in 5 min`,
+    /// `2 % in 15 min`, `3 % in 60 min`). Anything out of range is read as none.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub fast: u8,
+    /// Which levels have fired and not yet re-armed (crossing mode): bit 0 above, 1 below, 2 day
+    /// move, 3 fast move. Runtime only, so a restart fires once if the price is already beyond.
+    #[serde(skip)]
+    pub latched: u8,
+}
+
+fn is_zero(n: &u8) -> bool {
+    *n == 0
 }
 
 impl Default for Alert {
     fn default() -> Self {
-        Self { label: String::new(), above: None, below: None, cooldown_s: 900.0, last: 0.0, day_move: None, once: false }
+        Self {
+            label: String::new(),
+            above: None,
+            below: None,
+            cooldown_s: 900.0,
+            last: 0.0,
+            day_move: None,
+            once: false,
+            crossing: false,
+            fast: 0,
+            latched: 0,
+        }
     }
 }
 
@@ -280,11 +326,24 @@ impl Default for Config {
             alerts_muted: false,
             alerts_mute_until: 0.0,
             quiet_hours: None,
+            alert_crossing: false,
+            slow_when_quiet: None,
+            rest_when_locked: None,
+            gap_notice: false,
         }
     }
 }
 
 impl Config {
+    /// The governor's two ticks as this build sees them: what the user chose, else on for Ultra and
+    /// off for Classic.
+    pub fn governor(&self, ultra: bool) -> crate::governor::Settings {
+        crate::governor::Settings {
+            slow_when_quiet: self.slow_when_quiet.unwrap_or(ultra),
+            rest_when_locked: self.rest_when_locked.unwrap_or(ultra),
+        }
+    }
+
     pub fn placement(&self) -> Placement {
         self.placement.unwrap_or(if self.dock { Placement::Auto } else { Placement::Floating })
     }
@@ -1053,5 +1112,31 @@ mod tests {
         let c: Config = serde_json::from_str(r#"{"rows":[{"label":"XAU","symbol":"XAU=","digits":2}]}"#).unwrap();
         assert_eq!(c.rows.len(), 1);
         assert_eq!(c.catalog, default_catalog());
+    }
+
+    #[test]
+    fn the_w2_settings_default_to_1_8_and_a_1_8_file_means_the_same() {
+        let c: Config = serde_json::from_str("{}").unwrap();
+        assert!(!c.alert_crossing && !c.gap_notice);
+        assert_eq!((c.slow_when_quiet, c.rest_when_locked), (None, None));
+        // Classic polls exactly as 1.8 unless the user ticks it; Ultra's default is on.
+        assert!(!c.governor(false).any());
+        assert!(c.governor(true).slow_when_quiet && c.governor(true).rest_when_locked);
+        let chosen = Config { slow_when_quiet: Some(true), ..Config::default() };
+        assert!(chosen.governor(false).slow_when_quiet && !chosen.governor(false).rest_when_locked);
+        let off = Config { slow_when_quiet: Some(false), rest_when_locked: Some(false), ..Config::default() };
+        assert!(!off.governor(true).any());
+        // A 1.8 alert has no new fields and reads as every cooldown, no fast move, nothing latched.
+        let a: Alert = serde_json::from_str(r#"{"label":"XAU","above":4200.0,"below":null,"cooldown_s":900.0,"last":0.0,"day_move":null,"once":false}"#).unwrap();
+        assert_eq!((a.crossing, a.fast, a.latched), (false, 0, 0));
+        // Nothing new is written for an alert that uses none of it, so a 1.8 reader sees the same file.
+        let json = serde_json::to_string(&Alert { label: "XAU".into(), above: Some(1.0), ..Alert::default() }).unwrap();
+        assert!(!json.contains("crossing") && !json.contains("fast") && !json.contains("latched"), "{json}");
+        let cfg_json = serde_json::to_string(&Config::default()).unwrap();
+        for key in ["alert_crossing", "slow_when_quiet", "rest_when_locked", "gap_notice"] {
+            assert!(!cfg_json.contains(key), "{key} is written only when chosen");
+        }
+        let set = serde_json::to_string(&Alert { crossing: true, fast: 2, latched: 7, ..Alert::default() }).unwrap();
+        assert!(set.contains("\"crossing\":true") && set.contains("\"fast\":2") && !set.contains("latched"));
     }
 }

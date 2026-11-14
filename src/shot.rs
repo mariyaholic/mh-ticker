@@ -150,6 +150,7 @@ fn render(t: &Theme, phase: f64, now: f64, b: &Board, h: &History, dpi: u32) -> 
         chart_btn: false,
         settings_btn: false,
         alert: None,
+        alert_dots: &[],
         phase,
     };
     capture(w, hh, &sc)
@@ -423,6 +424,7 @@ fn write_chart_fixture(
         chart_btn: true,
         settings_btn: true,
         alert: None,
+        alert_dots: &[],
         phase: 0.0,
     };
     if let Some(bar) = bar {
@@ -796,6 +798,7 @@ impl Fixture {
             chart_btn: true,
             settings_btn: true,
             alert: None,
+            alert_dots: &[],
             phase: 0.0,
         }
     }
@@ -972,6 +975,32 @@ mod tests {
                 // the pane, so that pair is only a coverage check.)
                 assert!(name.contains(" and ") || area * 2 < (fx.w as i64) * (fx.h as i64), "{name}: the rectangle should be under half the window");
             }
+        }
+    }
+
+    /// J5: a card with a level set carries a dot, inside that card and nowhere else; with no alerts
+    /// (an empty slice, which is what every still passes) not one pixel differs.
+    #[test]
+    fn a_card_with_a_level_carries_a_dot_inside_that_card_only() {
+        let fx = Fixture::new(None).unwrap();
+        let none = Hot::default();
+        let plain = capture(fx.w, fx.h, &fx.scene(&none)).2;
+        let mut sc = fx.scene(&none);
+        sc.alert_dots = &[];
+        assert!(diff(&plain, &capture(fx.w, fx.h, &sc).2, fx.w).is_empty(), "no alerts: the picture is unchanged");
+        for card in [0usize, 1] {
+            let mut dots = vec![false; fx.board.cells.len()];
+            dots[card] = true;
+            let mut sc = fx.scene(&none);
+            sc.alert_dots = &dots;
+            let marked = capture(fx.w, fx.h, &sc).2;
+            let moved = diff(&plain, &marked, fx.w);
+            assert!(!moved.is_empty(), "card {card}: the dot is drawn");
+            let r = panel::card_rect(&fx.geo(), card);
+            for (x, y) in &moved {
+                assert!(panel::in_rect(&r, *x, *y), "card {card}: pixel ({x},{y}) changed outside the card");
+            }
+            assert!(moved.len() < 120, "card {card}: a dot, not a repaint ({} px)", moved.len());
         }
     }
 

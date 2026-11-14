@@ -69,7 +69,17 @@ Double click it. If prompted, simply select Run anyway.
 - **Traffic:** every symbol on the strip is one more quote in each refresh, so the data grows with the number u
   show. the cost at 24 hasn't been measured yet. all of it goes to CNBC, except the optional fallback providers
   and one request to `api.github.com` for the update check below, which only happens when u click it. the
-  diagnostics report (below) makes the same requests as `--probe` once, to the same hosts, only when u click it
+  diagnostics report (below) makes the same requests as `--probe` once, to the same hosts, only when u click it.
+  the poll governor (below) can make fewer quote requests when nothing moves, never more than the *Poll every* setting
+  asks for. a webhook POST that fails with a network error or a 5xx is tried once more, and never after a 4xx
+- **Quiet markets and locks (both builds, on for Ultra):** right click → *Poll every* has two ticks, *Slow down when
+  nothing moves* and *Rest while the PC is locked*. with them on, a quote is polled every 15 s once no shown price has
+  changed for 10 minutes, every 60 s after 30 minutes, and once every 5 minutes while the PC is locked with no alert
+  armed. while an alert is armed it's never slower than 15 s. any change, expanding the panel, the hotkey, an unlock or
+  *Refresh now* goes back to the normal poll at once. Classic has both ticks off, so it polls as it did before unless u
+  tick them. in a scripted two-hour run, a market that moved for 5 minutes and then sat still made 2,400 polls at a 3 s
+  setting, and 465 with the governor (720 with an alert armed). the bytes weren't measured on the live feed. a source
+  that keeps failing still backs off as before, so it can wait longer than 15 s while an alert is armed
 - **Move it:** right click → *Position*, since not everyone has free space on the left of their taskbar:
   - **Auto** (default) - Stays in the taskbar and finds the space itself. it uses the left of start while theres
     room there, otherwise next to the tray, and if ur taskbar has no room at all (auto-hide or a vertical one) it
@@ -142,16 +152,36 @@ Double click it. If prompted, simply select Run anyway.
   *at a price...* takes an exact level, like `4,200.50`. u get a tray balloon and, if u set a webhook, a message in
   Discord/Slack/ntfy. it fires once per cooldown and **never on a stale price** (a market closed at a level would
   otherwise ping u forever). *Fire once* clears a level after it fires. Focus Assist eats balloons, so the tray icon
-  gets a marker and its tooltip names the alert, and the *Recent* list keeps the last 10 with what happened to each
+  gets a marker and its tooltip names the alert, and the *Recent* list keeps the last 50 with what happened to each,
+  and *Copy list* copies them
+- **Repeat (Ultra):** *Alerts* → *Repeat* is one choice: *Every cooldown* (the default, as before), *Fire once, then
+  clear*, or *Each crossing*. a crossing alert fires when the price crosses its level, and only fires again after the
+  price has gone back past the level by 0.1 %. if the first fresh price is already past the level, it fires once.
+  a stale or fallback price fires nothing in any of them
+- **Fast move (Ultra):** an alert can watch for a move of 1 % in 5 minutes, 2 % in 15 minutes or 3 % in 60 minutes. it's
+  worked out from the prices the app already holds, and needs fresh prices covering the whole window with no gap longer
+  than three polls. a window it can't cover fires nothing
+- **Alerts at a glance (Ultra):** *Alerts* → *At a glance* lists everything set, with its distance, like
+  `XAU above 4,200.00, 1.2 % away`, or `reached, 2.3 % past`. a level whose symbol isn't on the strip says it cannot
+  fire. *Clear all alerts...* asks first. a card with a level has a small amber dot
+- **Not checked (Ultra):** when no alert on a shown symbol has a fresh price for longer than 5 minutes (or ten polls,
+  if that's longer), the tray tooltip says so, and *Recent* gets a line like `02:10 to 02:31 not checked (no fresh price)`.
+  after a sleep it says `no checks ran, the PC slept`. *Alerts* → *Say when alerts could not be checked* sends one
+  message to the webhook when checking is back, off by default. that message never has a price in it, and it isn't sent
+  while alerts are muted or in quiet hours
 - **Typed levels (Ultra):** in *at a price...* a comma only groups thousands, so `4,200.50` works. `4200,5`, `4,20`
   and `,500` are refused and the menu says why. a level more than 20 % away from the price asks first, and the question
   repeats the level and the price, so a slip like `42,005` for 4200.5 gets caught. a level within 20 % is set at once
 - **Mute and quiet hours (Ultra):** *Alerts* → *Mute* for 1 hour, 8 hours or until u turn it back on. *Quiet hours*
   is off or a window of 22:00 to 07:00, 23:00 to 08:00 or 00:00 to 09:00, by ur PC's clock. a muted or quiet alert is still
-  checked and shows up in *Recent*, but it makes no balloon and sends nothing to the webhook
+  checked and shows up in *Recent*, but it makes no balloon and sends nothing to the webhook. when the mute or the quiet
+  hours end, one balloon says how many alerts came in meanwhile, like `3 alerts while muted. See Alerts > Recent.`
+  (nothing if there were none)
 - **Webhook (Ultra):** *Alerts* → *Paste URL from clipboard* reads the URL u copied, checks it and asks before saving.
   the menu shows only its host. *Send a test alert* checks it works, and *Remove* deletes it. the URL is the password
-  for that channel, so the app never shows or logs all of it
+  for that channel, so the app never shows or logs all of it. a POST that fails with a network error or a 5xx is tried
+  once more after 3 seconds, and the log says `sent on retry` if that works. a 4xx is never retried. quitting waits up
+  to 2 seconds for a POST still on its way
 - **Start with Windows:** right click → tick *Start with Windows* and it starts when u sign in. untick it to stop.
   it's a `Run` entry for ur own account (no admin needed), and the menu reads the tick each time it opens
 - **Hotkey:** right click → *Hotkey* → *Off*, one of four presets (`Ctrl+Alt+M`, `Ctrl+Alt+T`, `Ctrl+Shift+F12`,
@@ -206,7 +236,9 @@ whats in there:
   `AUD=` for aud/usd or `@SI.1` for silver futures. *Symbols* → *Add symbol...* adds one from the menu, after a
   check against CNBC, and an entry can be taken out again with *Remove a symbol I added*
 - `fallback_enabled`: optional fallback consent, `false` by default; use the menu to change it
-- `poll_s`: seconds between price requests
+- `poll_s`: seconds between price requests. the poll governor only ever waits longer than this, never shorter
+- `slow_when_quiet` and `rest_when_locked` (Ultra): the two *Poll every* ticks for the poll governor. leave both out
+  and Ultra has them on and Classic has them off, so Classic polls as before. a `true` or `false` written here wins
 - `stale_after_s` and `delayed_grace_s`: when a price gets dimmed
 - `placement` (`auto`, `taskbar_left`, `taskbar_right`, `floating`, `top_right`, `bottom_right`, `top_left`,
   `bottom_left`) and `monitor` (like `\\.\DISPLAY2`, empty = main screen)
@@ -217,10 +249,13 @@ whats in there:
   and centres - which is what every config written before the panel could be resized does
 - `theme` (Ultra): any name from [THEMES.md](THEMES.md) - `midnight`, `aurora`, `vaporwave`, `pc98`, …
 - `theme_font` (Ultra): a panel face from `theme::FACES`, e.g. `Georgia` or `Terminal`. empty = the theme's own
-- `alerts` (Ultra): `{ label, above, below, day_move, once, cooldown_s, last }` each. `label` is the row label,
+- `alerts` (Ultra): `{ label, above, below, day_move, once, cooldown_s, last, crossing, fast }` each. `label` is the row label,
   `above`/`below` are absolute prices (not %), `day_move` is a percent day change that fires it (or missing),
   `once` clears a level after it fires, `cooldown_s` is floored at 30 s and `last` is the last fire time so a
-  restart doesn't re-ping u
+  restart doesn't re-ping u. `crossing` (missing means off) is the *Each crossing* repeat, and `fast` (missing means 0) is 1, 2 or 3 for
+  the 1 % in 5 min, 2 % in 15 min and 3 % in 60 min fast moves
+- `alert_crossing` and `gap_notice` (Ultra): `alert_crossing` true sets *Each crossing* for every alert (*Fire once*
+  wins if both are set). `gap_notice` true sends the "could not be checked" webhook notice. both are off when missing, which is the default
 - `alert_once`, `alerts_muted`, `alerts_mute_until` (seconds since 1970, UTC) and `quiet_hours` (`[from, to]` in
   minutes of the local day, or missing) (Ultra): what the *Alerts* menu sets for *Fire once*, *Mute* and *Quiet hours*
 - `webhook` (Ultra): a URL to also POST alerts to. **this is a secret** - the URL is the password for that
