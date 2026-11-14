@@ -254,6 +254,66 @@ pub(crate) fn median_spacing(bars: &[Bar]) -> f64 {
     }
 }
 
+/// A bar with no price range: open, high, low and close are one number.
+fn flat(b: &Bar) -> bool {
+    b.o == b.h && b.h == b.l && b.l == b.c
+}
+
+/// The fewest bars `drop_idle` will judge.
+const MIN_FOR_SPACING: usize = 5;
+
+/// Drops the bars of a closed market from `(start time, bar)` pairs in time order.
+///
+/// Spot metals keep a feed running through weekends and holidays, and CNBC fills those hours with
+/// bars that carry no trading (measured on XAU and XAG, 2026-11: volume is 0 on every bar of every
+/// range for these symbols, so volume cannot tell). Two shapes are detected from the data alone, with
+/// no exchange calendar:
+///
+/// * Daily or longer bars (median spacing of 0.95 day or more): a bar with no price range. A day
+///   that traded has a high above its low; the Saturday, Sunday and holiday bars have
+///   `o == h == l == c` and repeat the last close to within a few basis points. They are dropped
+///   while fewer than half of the bars are flat, so a series that carries closes alone (every bar
+///   flat by construction) is kept whole.
+/// * Shorter bars: a run of flat bars that all repeat the close before the run, when the run starts
+///   after a break longer than 1.5 bars or holds three bars or more. One repeated minute inside a
+///   busy session is a real quote that did not move and stays.
+///
+/// Fewer than five bars come back as they are. A symbol that trades around the
+/// clock (BTC) has no such runs and comes back unchanged.
+pub(crate) fn drop_idle(pts: Vec<(f64, Bar)>) -> Vec<(f64, Bar)> {
+    // A handful of bars has no spacing worth the name: one overnight gap would be its median.
+    if pts.len() < MIN_FOR_SPACING {
+        return pts;
+    }
+    let mut steps: Vec<f64> = pts.windows(2).map(|w| w[1].0 - w[0].0).filter(|g| *g > 0.0).collect();
+    if steps.is_empty() {
+        return pts;
+    }
+    steps.sort_by(|a, b| a.total_cmp(b));
+    let spacing = steps[steps.len() / 2];
+    if spacing >= DAY_S * 0.95 {
+        let flats = pts.iter().filter(|p| flat(&p.1)).count();
+        if flats * 2 >= pts.len() {
+            return pts;
+        }
+        return pts.into_iter().filter(|p| !flat(&p.1)).collect();
+    }
+    let mut keep = vec![true; pts.len()];
+    let mut i = 1;
+    while i < pts.len() {
+        let before = pts[i - 1].1.c;
+        let mut j = i;
+        while j < pts.len() && flat(&pts[j].1) && pts[j].1.c == before {
+            j += 1;
+        }
+        if j > i && (j - i >= 3 || pts[i].0 - pts[i - 1].0 > 1.5 * spacing) {
+            keep[i..j].iter_mut().for_each(|k| *k = false);
+        }
+        i = j.max(i + 1);
+    }
+    pts.into_iter().zip(keep).filter_map(|(p, k)| k.then_some(p)).collect()
+}
+
 /// What the pane should say about one key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
@@ -898,5 +958,98 @@ mod tests {
         let both = s.note(s.fetched + 9_000.0, 3_600.0, 0);
         assert!(both.starts_with("as of ") && both.ends_with(" \u{b7} check dates"), "{both}");
         assert_eq!(daily_at(0.0, 30).note(1_000_001.0, 3_600.0, 0), "");
+    }
+    /// `(time, o, h, l, c)` rows as `(time, Bar)` pairs; `dt` is not used by `drop_idle`.
+    fn pairs(rows: &[(f64, f32, f32, f32, f32)]) -> Vec<(f64, Bar)> {
+        rows.iter().map(|&(t, o, h, l, c)| (t, Bar { dt: 0.0, o, h, l, c, v: 0.0 })).collect()
+    }
+
+    fn times(p: &[(f64, Bar)]) -> Vec<f64> {
+        p.iter().map(|x| x.0).collect()
+    }
+
+    #[test]
+    fn daily_bars_without_a_range_are_dropped() {
+        // Fri 2026-11-06 .. Tue 2026-11-10 of XAU 1M: Saturday and Sunday repeat Friday's close.
+        let d = 86_400.0;
+        let fri = 1_793_941_200.0;
+        let rows = [
+            (fri - d, 4062.06, 4144.89, 4058.79, 4088.4177),
+            (fri, 4088.9, 4104.61, 4031.0557, 4066.28),
+            (fri + d, 4066.28, 4066.28, 4066.28, 4066.28),
+            (fri + 2.0 * d, 4066.28, 4066.28, 4066.28, 4066.28),
+            (fri + 3.0 * d, 4066.09, 4147.29, 4054.4886, 4140.91),
+            (fri + 4.0 * d, 4140.5075, 4145.45, 4013.89, 4032.2749),
+        ];
+        let kept = drop_idle(pairs(&rows));
+        assert_eq!(times(&kept), [fri - d, fri, fri + 3.0 * d, fri + 4.0 * d]);
+        // A flat first bar goes too, and so does a midweek holiday.
+        let rows = [
+            (0.0, 50.5486, 50.5486, 50.5486, 50.5486),
+            (d, 50.5, 51.0, 50.1, 50.9),
+            (2.0 * d, 50.9, 51.2, 50.4, 50.6),
+            (3.0 * d, 50.6, 50.6, 50.6, 50.6),
+            (4.0 * d, 50.6, 51.2, 50.2, 50.8),
+        ];
+        assert_eq!(times(&drop_idle(pairs(&rows))), [d, 2.0 * d, 4.0 * d]);
+    }
+
+    #[test]
+    fn a_series_of_closes_alone_is_kept_whole() {
+        let d = 86_400.0;
+        let rows: Vec<_> = (0..6).map(|i| (i as f64 * d, 10.0 + i as f32, 10.0 + i as f32, 10.0 + i as f32, 10.0 + i as f32)).collect();
+        assert_eq!(drop_idle(pairs(&rows)).len(), 6, "every bar is flat by construction");
+        let half: Vec<_> = rows.iter().enumerate().map(|(i, r)| if i % 2 == 0 { (r.0, 9.0, 12.0, 8.0, r.4) } else { *r }).collect();
+        assert_eq!(drop_idle(pairs(&half)).len(), 6, "half flat is still a feed of closes");
+    }
+
+    #[test]
+    fn repeats_after_a_break_are_dropped_and_repeats_in_a_session_stay() {
+        // XAU 5D around the 2026-11-06 close: real bars every 5 minutes, then Saturday 00:03 and
+        // Sunday 03:48 repeating Friday's last close, then the reopening.
+        let fri = 1_793_998_200.0; // Fri 21:48 UTC
+        let mut rows: Vec<(f64, f32, f32, f32, f32)> =
+            (0..6).map(|i| (fri - 300.0 * (5 - i) as f64, 4065.0, 4066.0 + i as f32, 4064.0, 4065.5 + i as f32)).collect();
+        let last = rows[5].4;
+        rows.push((fri + 8_100.0, last, last, last, last));
+        rows.push((fri + 8_100.0 + 99_900.0, last, last, last, last));
+        rows.push((fri + 180_600.0, 4066.09, 4066.09, 4060.09, 4062.78));
+        let kept = drop_idle(pairs(&rows));
+        assert_eq!(kept.len(), 7);
+        assert_eq!(kept[5].0, fri);
+        assert_eq!(kept[6].0, fri + 180_600.0, "the reopening follows the last real bar");
+
+        // One unchanged minute inside a busy session is a quote that did not move.
+        let busy = [
+            (0.0, 1.0, 2.0, 0.5, 1.5),
+            (60.0, 1.5, 2.5, 1.0, 2.0),
+            (120.0, 2.0, 2.0, 2.0, 2.0),
+            (180.0, 2.0, 3.0, 1.5, 2.5),
+            (240.0, 2.5, 3.0, 2.0, 2.2),
+        ];
+        assert_eq!(drop_idle(pairs(&busy)).len(), 5);
+        // Three of them in a row with no break is a feed repeating itself.
+        let stuck = [
+            (0.0, 1.0, 2.0, 0.5, 1.5),
+            (60.0, 1.5, 2.5, 1.0, 2.0),
+            (120.0, 2.0, 2.0, 2.0, 2.0),
+            (180.0, 2.0, 2.0, 2.0, 2.0),
+            (240.0, 2.0, 2.0, 2.0, 2.0),
+            (300.0, 2.0, 3.0, 1.5, 2.5),
+        ];
+        assert_eq!(times(&drop_idle(pairs(&stuck))), [0.0, 60.0, 300.0]);
+        // A flat bar at a different price than the close before it is a quote, even after a break.
+        let moved = [(0.0, 1.0, 2.0, 0.5, 1.5), (60.0, 1.5, 2.5, 1.0, 2.0), (120.0, 1.0, 2.0, 0.5, 1.5), (3_000.0, 3.0, 3.0, 3.0, 3.0)];
+        assert_eq!(drop_idle(pairs(&moved)).len(), 4);
+    }
+
+    #[test]
+    fn drop_idle_leaves_short_and_continuous_series_alone() {
+        assert!(drop_idle(Vec::new()).is_empty());
+        let one = pairs(&[(5.0, 1.0, 1.0, 1.0, 1.0)]);
+        assert_eq!(drop_idle(one).len(), 1);
+        // Around the clock, as BTC does: every five minutes, none of it flat.
+        let btc: Vec<_> = (0..300).map(|i| (i as f64 * 300.0, 100.0 + i as f32, 102.0 + i as f32, 99.0 + i as f32, 101.0 + i as f32)).collect();
+        assert_eq!(drop_idle(pairs(&btc)).len(), 300);
     }
 }
