@@ -2,6 +2,10 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Action {
     Symbol(String),
+    /// Card menu: copy this card's label and price (found by label when chosen).
+    Copy(String),
+    /// Card menu: open this symbol on CNBC.
+    Open(String),
     /// Card menu: hide this symbol (the config refuses the last one).
     Remove(String),
     /// Card menu: move this symbol by this many places (-1 left, 1 right).

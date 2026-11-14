@@ -90,10 +90,6 @@ const CMD_POLL: usize = 5000;
 const CMD_THEME: usize = 5100;
 /// Font: CMD_FONT + index into `theme::FACES` (Ultra only).
 const CMD_FONT: usize = 5150;
-/// The card under the right-click: copy its price, or open it on CNBC. The index is the card's, so
-/// the two ranges must not overlap (`MAX_ROWS` apart).
-const CMD_COPY: usize = 5600;
-const CMD_OPEN: usize = 5700;
 /// The Ultra symbol picker open/closed toggle.
 const CMD_PICK: usize = 5800;
 /// Alerts submenu, fixed entries (Ultra only): 5200..=5299 is this range's whole allotment.
@@ -383,8 +379,8 @@ struct Ui {
     /// Last alert outcome, shown in the footer so a swallowed balloon is not silent.
     alert_note: Option<String>,
     /// The title of the latest alert nobody has looked at yet: the tray icon carries a marker and
-    /// the tooltip leads with it. Set by every fired alert (silenced or not); cleared by `expand`
-    /// and by opening any menu (`clear_pending`).
+    /// the tooltip leads with it. Set by every fired alert (silenced or not) unless the panel is open
+    /// and in front (`marks_tray`); cleared by `expand` and by opening any menu (`clear_pending`).
     alert_pending: Option<String>,
     /// The last 10 alerts and what became of them (memory only). Cleared by its menu entry.
     alert_log: alerts::Log,
@@ -852,7 +848,10 @@ fn draw_strip(u: &Ui, dc: HDC) {
 
 fn draw_panel(u: &mut Ui, dc: HDC, w: i32, h: i32) {
     let Some(f) = &u.fonts else { return };
-    let list = config::menu_list(&u.cfg);
+    // The catalogue is only drawn while the picker is open; building it is a clone of every row, so
+    // it is not built for the frames (every hover repaint) that do not show it.
+    let open = picker_open(u);
+    let list = if open { config::menu_list(&u.cfg) } else { Vec::new() };
     let shown: Vec<bool> = list.iter().map(|r| config::is_shown(&u.cfg, &r.symbol)).collect();
     // The background's loop position. Each palette carries its own cycle length, and the clock only
     // runs in Ultra: the classic build keeps the one look it shipped with, so it holds phase 0. It is
@@ -894,7 +893,7 @@ fn draw_panel(u: &mut Ui, dc: HDC, w: i32, h: i32) {
         hover: u.hover_at,
         chart_at: u.chart_at,
         layout: &u.chart_layout,
-        picker: picker_open(u).then(|| panel::Picker { list: &list, shown: &shown }),
+        picker: open.then(|| panel::Picker { list: &list, shown: &shown }),
         picker_scroll: u.picker_scroll,
         picker_btn: u.profile.ultra,
         chart_btn: u.profile.ultra,
@@ -1048,6 +1047,22 @@ fn draw_morph(m: &Morph, dc: HDC, w: i32, h: i32) {
     }
 }
 
+/// The hover state a mouse move can change, as the painter reads it.
+fn hot_of(u: &Ui) -> panel::Hot {
+    panel::Hot { btn: u.hover, pick: u.pick_hover, chart_btn: u.chart_hover, gear: u.gear_hover, open: u.open_hover, aim: u.chart_at, card: u.hover_at }
+}
+
+/// The rectangle a hover change from `was` to the state now in `u` has to repaint, or `None` for the
+/// whole window. A moving background is drawn from the clock at paint time, so two partial paints of
+/// it would not match along their edge: it always repaints whole (it repaints every 100 ms anyway).
+fn hover_dirty(u: &Ui, g: &panel::Geo, was: &panel::Hot) -> Option<RECT> {
+    if clock_runs(u.profile.ultra, u.motion, u.theme) {
+        return None;
+    }
+    let pane = u.chart_layout.get().map(|l| RECT { left: l.pane.left, top: l.pane.top, right: l.pane.right, bottom: l.pane.bottom });
+    panel::hot_dirty(g, u.dpi, selected_row(u), pane, was, &hot_of(u))
+}
+
 fn paint(u: &mut Ui) {
     unsafe {
         let mut ps: PAINTSTRUCT = std::mem::zeroed();
@@ -1055,17 +1070,25 @@ fn paint(u: &mut Ui) {
         let mut rc: RECT = std::mem::zeroed();
         GetClientRect(u.hwnd, &mut rc);
         let (w, h) = (rc.right.max(1), rc.bottom.max(1));
-        if !matches!(&u.back, Some(b) if b.size == (w, h)) {
+        let fresh = !matches!(&u.back, Some(b) if b.size == (w, h));
+        if fresh {
             u.back = Some(Back::new(w, h));
         }
+        // Only the invalid part is drawn and copied: a hover invalidates the rectangle it changed
+        // (`panel::hot_dirty`), and Windows hands a partly uncovered window the uncovered part. A new
+        // buffer holds nothing yet, so it is drawn whole; so is an empty or odd rectangle.
+        let r = ps.rcPaint;
+        let part = if fresh || r.right <= r.left || r.bottom <= r.top { RECT { left: 0, top: 0, right: w, bottom: h } } else { r };
         // Take the buffer out of `u` so the painter can borrow `u` immutably while drawing into it.
         if let Some(back) = u.back.take() {
+            IntersectClipRect(back.dc, part.left, part.top, part.right, part.bottom);
             match (u.mode, &u.morph) {
                 (Mode::Morph, Some(m)) => draw_morph(m, back.dc, w, h),
                 (Mode::Panel, _) => draw_panel(u, back.dc, w, h),
                 _ => draw_strip(u, back.dc),
             }
-            BitBlt(hdc, 0, 0, w, h, back.dc, 0, 0, SRCCOPY);
+            BitBlt(hdc, part.left, part.top, part.right - part.left, part.bottom - part.top, back.dc, part.left, part.top, SRCCOPY);
+            SelectClipRgn(back.dc, null_mut());
             u.back = Some(back);
         }
         EndPaint(u.hwnd, &ps);
@@ -1338,7 +1361,7 @@ fn want_range(u: &mut Ui) {
 /// Explorer round trip) refreshes at most every 5 s unless the link colour changed, and a hidden
 /// strip is not re-measured.
 fn on_feed(hwnd: HWND) {
-    let Some((tray_update, fired, hook)) = with_ui(|u| {
+    let Some((tray_update, fired, hook, save)) = with_ui(|u| {
         if let Ok(b) = u.board.lock() {
             let sources = |board: &Board| board.cells.iter()
                 .map(|c| c.quote.as_ref().map(|q| q.source).unwrap_or(""))
@@ -1361,10 +1384,12 @@ fn on_feed(hwnd: HWND) {
         // balloon, no POST) or handed back with its log sequence number for delivery. A silenced
         // alert has already burnt its cooldown inside `check`.
         let mut deliver: Vec<(alerts::Fired, u64)> = Vec::new();
+        let mut save = false;
         if u.profile.ultra && !u.cfg.alerts.is_empty() {
             let fired = alerts::check(&mut u.cfg, &u.view, now);
             if !fired.is_empty() {
-                config::save(&u.cfg);
+                // Written after the closure: `with_ui` does no I/O.
+                save = true;
                 let minute = local_minute();
                 for f in fired {
                     let silence = alerts::silence(&u.cfg, now, minute);
@@ -1374,7 +1399,9 @@ fn on_feed(hwnd: HWND) {
                         Some(_) => alerts::Outcome::Muted,
                     };
                     let seq = u.alert_log.push(f.at, f.title.clone(), outcome);
-                    u.alert_pending = Some(f.title.clone());
+                    if marks_tray(u.mode, unsafe { GetForegroundWindow() } == u.hwnd) {
+                        u.alert_pending = Some(f.title.clone());
+                    }
                     if silence.is_none() {
                         u.alert_note = Some(format!("alert: {}", f.title));
                         deliver.push((f, seq));
@@ -1391,10 +1418,13 @@ fn on_feed(hwnd: HWND) {
             (u.icon, tooltip(&u.view, u.alert_pending.as_deref()))
         });
         let fired = deliver;
-        (tray_update, fired, u.cfg.webhook.clone())
+        (tray_update, fired, u.cfg.webhook.clone(), save)
     }) else {
         return;
     };
+    if save {
+        save_cfg();
+    }
     if let Some((icon, tip)) = tray_update {
         tray(hwnd, NIM_MODIFY, icon, &tip);
     }
@@ -1725,7 +1755,7 @@ fn fit_panel(r: RECT) -> RECT {
 /// Strip -> panel.
 fn expand(hwnd: HWND) {
     clear_pending(hwnd);
-    let Some((a, b, from, to, op)) = with_ui(|u| {
+    let Some((a, b, from, to, op, dpi0)) = with_ui(|u| {
         if u.mode != Mode::Strip {
             return None;
         }
@@ -1759,7 +1789,7 @@ fn expand(hwnd: HWND) {
         let fsz = (u.frame.w.max(1), u.frame.h.max(1));
         let from = snapshot(hwnd, fsz.0, fsz.1, |dc| draw_strip(u, dc));
         let to = snapshot(hwnd, pw, ph, |dc| draw_panel(u, dc, pw, ph));
-        Some((a, b, (from, fsz), (to, (pw, ph)), u.cfg.opacity))
+        Some((a, b, (from, fsz), (to, (pw, ph)), u.cfg.opacity, u.dpi))
     })
     .flatten() else {
         return;
@@ -1772,11 +1802,20 @@ fn expand(hwnd: HWND) {
         SetForegroundWindow(hwnd);
     }
     run_morph(hwnd, a, b, from, to, (op, 255), EXPAND_MS, ease_out);
-    with_ui(|u| {
+    // A saved frame can sit on a monitor of another scale: `WM_DPICHANGED` arrived mid-morph and could
+    // not lay anything out, so the panel is fitted again at the new scale (audit 1.8, finding 9).
+    let b = with_ui(|u| {
         u.mode = Mode::Panel;
         // The cache may have expired while the panel was collapsed, and the pane is about to show.
         want_range(u);
-    });
+        settled_frame(dpi0, u.dpi, b, || {
+            let g = panel_geo(u);
+            let mut r: RECT = unsafe { std::mem::zeroed() };
+            unsafe { GetWindowRect(hwnd, &mut r) };
+            panel_rect(&r, g.w, g.h)
+        })
+    })
+    .unwrap_or(b);
     sync_anim(hwnd);
     unsafe {
         SetWindowPos(hwnd, null_mut(), b.left, b.top, b.right - b.left, b.bottom - b.top, SWP_NOZORDER | SWP_NOACTIVATE);
@@ -1787,7 +1826,7 @@ fn expand(hwnd: HWND) {
 
 /// Panel -> strip (back into the taskbar gap when docked, re-measured in case Start moved).
 fn collapse(hwnd: HWND) {
-    let Some((a, b, from, to, prev, op)) = with_ui(|u| {
+    let Some((a, b, from, to, prev, op, dpi0)) = with_ui(|u| {
         if u.mode != Mode::Panel {
             return None;
         }
@@ -1801,18 +1840,25 @@ fn collapse(hwnd: HWND) {
         u.strip_rect = strip_place(u);
         let fsz = (u.frame.w.max(1), u.frame.h.max(1));
         let to = snapshot(hwnd, fsz.0, fsz.1, |dc| draw_strip(u, dc));
-        Some((a, u.strip_rect, (from, psz), (to, fsz), std::mem::replace(&mut u.prev_fg, null_mut()), u.cfg.opacity))
+        Some((a, u.strip_rect, (from, psz), (to, fsz), std::mem::replace(&mut u.prev_fg, null_mut()), u.cfg.opacity, u.dpi))
     })
     .flatten() else {
         return;
     };
     run_morph(hwnd, a, b, from, to, (255, op), COLLAPSE_MS, ease_in_out);
-    with_ui(|u| {
+    // The strip is the window's mode again, so it can be laid out: if the morph crossed to a monitor
+    // of another scale, the frame planned above is for the old one (audit 1.8, finding 9).
+    let b = with_ui(|u| {
         u.mode = Mode::Strip;
         // The snapshots above painted the pane at the morph's sizes; none of them is the frame the
         // pointer would be answered from.
         u.chart_layout.set(None);
-    });
+        settled_frame(dpi0, u.dpi, b, || {
+            u.strip_rect = strip_place(u);
+            u.strip_rect
+        })
+    })
+    .unwrap_or(b);
     sync_anim(hwnd);
     unsafe {
         SetWindowPos(hwnd, null_mut(), b.left, b.top, b.right - b.left, b.bottom - b.top, SWP_NOZORDER | SWP_NOACTIVATE);
@@ -1905,9 +1951,13 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
             })
             .flatten()
         });
-        if let Some((i, label, price)) = &card {
-            add(m, MF_STRING, CMD_COPY + i, &format!("Copy {label} {price}"));
-            add(m, MF_STRING, CMD_OPEN + i, &format!("Open {label} on CNBC"));
+        if let Some((_, label, price)) = &card {
+            use crate::menu_commands::Action;
+            // Both entries carry the label (Copy) and the symbol (Open), like the order entries below:
+            // the rows can change while the menu is open, and a position would then name another card.
+            dynamic(m, MF_STRING, &mut commands, Action::Copy(label.clone()), &format!("Copy {label} {price}"));
+            let symbol = with_ui(|u| u.cfg.rows.iter().find(|r| &r.label == label).map(|r| r.symbol.clone())).flatten();
+            dynamic(m, MF_STRING | if symbol.is_some() { 0 } else { MF_GRAYED }, &mut commands, Action::Open(symbol.unwrap_or_default()), &format!("Open {label} on CNBC"));
             // Order and removal (Ultra). The actions carry the symbol, so they act on this card even
             // if the rows change while the menu is open. Read in a call of its own (the big tuple
             // above is not extended).
@@ -2256,6 +2306,12 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
                 save_cfg();
             }
             Action::AlertAt(label) => alert_at_price(hwnd, label),
+            Action::Copy(label) => {
+                if let Some((text, _)) = with_ui(|u| card_target(&u.view.cells, &u.cfg.rows, label)).flatten() {
+                    copy_text(&text);
+                }
+            }
+            Action::Open(symbol) => open_cnbc(hwnd, symbol),
             Action::Forget(symbol) => {
                 if with_ui(|u| config::forget_custom(&mut u.cfg, symbol)).unwrap_or(false) {
                     apply_rows(hwnd);
@@ -2271,14 +2327,15 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
         }
         return;
     }
+    // The menu's own message loop ran the hotkey and the tray: what is chosen acts on the mode now,
+    // not the one the menu was opened in (audit 1.8, finding 8).
+    let now = with_ui(|u| u.mode).unwrap_or(if open { Mode::Panel } else { Mode::Strip });
     match cmd {
-        CMD_PANEL => {
-            if open {
-                collapse(hwnd)
-            } else {
-                expand(hwnd)
-            }
-        }
+        CMD_PANEL => match panel_step(open, now) {
+            Some(PanelStep::Collapse) => collapse(hwnd),
+            Some(PanelStep::Expand) => expand(hwnd),
+            None => {}
+        },
         CMD_FALLBACK => {
             let Some(enabling) = with_ui(|u| !u.cfg.fallback_enabled) else { return; };
             if enabling {
@@ -2321,21 +2378,17 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
             }
         }
         CMD_STRIP => {
-            with_ui(|u| {
-                u.cfg.strip_visible = !visible;
-                config::save(&u.cfg);
-            });
+            with_ui(|u| u.cfg.strip_visible = !visible);
+            save_cfg();
             apply_visibility(hwnd);
         }
-        c if !open && (CMD_POS..CMD_POS + Placement::ALL.len()).contains(&c) => {
+        c if position_applies(open, now) && (CMD_POS..CMD_POS + Placement::ALL.len()).contains(&c) => {
             with_ui(|u| u.cfg.set_placement(Placement::ALL[c - CMD_POS]));
             apply_placement(hwnd);
         }
         CMD_TOP => {
-            with_ui(|u| {
-                u.cfg.topmost = !top;
-                config::save(&u.cfg);
-            });
+            with_ui(|u| u.cfg.topmost = !top);
+            save_cfg();
             set_topmost(hwnd, !top);
         }
         CMD_FOLDER => {
@@ -2357,12 +2410,12 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
             let secs = POLL_CHOICES[c - CMD_POLL];
             with_ui(|u| {
                 u.cfg.poll_s = secs;
-                config::save(&u.cfg);
                 // The feed reads the cadence from the board, so this applies on the next tick.
                 if let Ok(mut b) = u.board.lock() {
                     b.poll_s = secs;
                 }
             });
+            save_cfg();
         }
         c if ultra && (CMD_THEME..CMD_THEME + theme::ALL.len()).contains(&c) => {
             with_ui(|u| u.cfg.theme = theme::ALL[c - CMD_THEME].name.to_string());
@@ -2371,26 +2424,6 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
         c if ultra && (CMD_FONT..CMD_FONT + theme::FACES.len()).contains(&c) => {
             with_ui(|u| u.cfg.theme_font = Some(theme::FACES[c - CMD_FONT].name.to_string()));
             apply_theme(hwnd);
-        }
-        c if (CMD_COPY..CMD_COPY + config::MAX_ROWS).contains(&c) => {
-            let text = with_ui(|u| {
-                let c = u.view.cells.get(c - CMD_COPY)?;
-                Some(format!("{} {}", c.label, fmt_price(c.quote.as_ref()?.price, c.digits)))
-            })
-            .flatten();
-            if let Some(text) = text {
-                copy_text(&text);
-            }
-        }
-        c if (CMD_OPEN..CMD_OPEN + config::MAX_ROWS).contains(&c) => {
-            let sym = with_ui(|u| {
-                let cell = u.view.cells.get(c - CMD_OPEN)?;
-                u.cfg.rows.iter().find(|r| r.label == cell.label).map(|r| r.symbol.clone())
-            })
-            .flatten();
-            if let Some(sym) = sym {
-                open_cnbc(hwnd, &sym);
-            }
         }
         CMD_REFRESH => {
             // Wakes the quote loop and makes chart rows with no bars due now. The backoff counter
@@ -2461,6 +2494,60 @@ fn armed_labels(alerts: &[config::Alert], shown_labels: &[&str]) -> Vec<String> 
         .filter(|a| shown_labels.contains(&a.label.as_str()))
         .map(|a| a.label.clone())
         .collect()
+}
+
+/// Where a morph's last frame goes. The morph runs on this thread and a monitor of another scale sends
+/// `WM_DPICHANGED` in the middle of it, while the mode is `Morph` and the handler can lay nothing out
+/// (audit 1.8, finding 9). `planned` was worked out before the morph at the old scale; if the scale
+/// changed, `replan` works it out again at the new one.
+fn settled_frame(dpi_before: u32, dpi_now: u32, planned: RECT, replan: impl FnOnce() -> RECT) -> RECT {
+    if dpi_now == dpi_before {
+        planned
+    } else {
+        replan()
+    }
+}
+
+/// What the menu's *Expand view* / *Back to taskbar* entry does once chosen. `listed_open` is the mode
+/// the entry was labelled for when the menu opened; `now` is the mode when it was chosen. The menu's
+/// modal loop runs the hotkey and the tray, so the two can differ (audit 1.8, finding 8).
+#[derive(Debug, PartialEq)]
+enum PanelStep {
+    Expand,
+    Collapse,
+}
+
+fn panel_step(listed_open: bool, now: Mode) -> Option<PanelStep> {
+    match (listed_open, now) {
+        (false, Mode::Strip) => Some(PanelStep::Expand),
+        (true, Mode::Panel) => Some(PanelStep::Collapse),
+        _ => None,
+    }
+}
+
+/// Whether a Position entry (listed only for a strip) may still be applied: the strip must still be the
+/// window's mode, or the placement would be applied to an open panel.
+fn position_applies(listed_open: bool, now: Mode) -> bool {
+    !listed_open && now == Mode::Strip
+}
+
+/// Whether a fired alert lights the tray marker. The marker is the fallback for a balloon that Windows
+/// held back (Focus Assist), so it exists for a user who is not looking. With the panel open and in
+/// front the user is looking at the footer note that names the alert, and no later "expand" would
+/// ever clear a marker lit now (audit 1.8, finding 6). A panel that is open behind another window, or
+/// a strip, still lights it.
+fn marks_tray(mode: Mode, panel_in_front: bool) -> bool {
+    !(mode == Mode::Panel && panel_in_front)
+}
+
+/// What a card's *Copy* entry puts on the clipboard, and the symbol its *Open* entry opens, for the
+/// card that was right-clicked, found by its label as the menu's other card entries find it by symbol:
+/// the rows can change while the menu is open, so a position taken then would name another card.
+fn card_target(cells: &[crate::model::Cell], rows: &[config::Row], label: &str) -> Option<(String, String)> {
+    let cell = cells.iter().find(|c| c.label == label)?;
+    let text = format!("{} {}", cell.label, fmt_price(cell.quote.as_ref()?.price, cell.digits));
+    let symbol = rows.iter().find(|r| r.label == cell.label)?.symbol.clone();
+    Some((text, symbol))
 }
 
 /// The settings *Allow fallback sources* writes: the configuration as it stands when the choice is
@@ -3003,10 +3090,10 @@ fn apply_placement(hwnd: HWND) {
         u.font = make_font(&u.cfg, u.dpi);
         u.placed = false;
         u.suppressed = false;
-        config::save(&u.cfg);
         u.cfg.topmost || u.cfg.placement().on_taskbar()
     })
     .unwrap_or(true);
+    save_cfg();
     set_topmost(hwnd, top);
     relayout_and_place(hwnd);
     apply_visibility(hwnd);
@@ -3016,8 +3103,8 @@ fn apply_placement(hwnd: HWND) {
 /// The Symbols menu changed `cfg.rows`: save it, hand the list to the feed through the board, and
 /// re-fit the strip, or resize the open panel in place (it stays centred).
 fn apply_rows(hwnd: HWND) {
+    save_cfg();
     let Some(panel) = with_ui(|u| {
-        config::save(&u.cfg);
         if let Ok(mut b) = u.board.lock() {
             b.set_rows(&u.cfg.rows);
             u.view = b.clone();
@@ -3235,13 +3322,13 @@ fn apply_theme(hwnd: HWND) {
         }
         u.icon = fresh;
         u.icon_link = Some((u.view.link, u.alert_pending.is_some()));
-        config::save(&u.cfg);
         Some((u.icon, tooltip(&u.view, u.alert_pending.as_deref())))
     })
     .flatten()
     else {
         return;
     };
+    save_cfg();
     tray(hwnd, NIM_MODIFY, icon, &tip);
     sync_anim(hwnd);
     unsafe { InvalidateRect(hwnd, null(), 0) };
@@ -3720,7 +3807,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let away = panel::Hover { row: usize::MAX, t: 0.0 };
             let state = with_ui(|u| {
                 if u.mode != Mode::Panel {
-                    return (false, false);
+                    return (false, false, None);
                 }
                 let g = panel_geo(u);
                 let at = panel::hit(&g, u.view.cells.len(), u.dpi, x, y, now).map(snap).unwrap_or(away);
@@ -3734,6 +3821,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 let aim = if u.profile.ultra && u.chart { u.chart_layout.get().and_then(|l| l.pointer_at(x, y, band)) } else { None };
                 let track = !u.tracking;
                 u.tracking = true;
+                let was = hot_of(u);
                 // Hover moves the crosshair and lights buttons, and nothing else. In particular it no
                 // longer re-targets the chart: that is the lock's job.
                 let changed = btn != u.hover
@@ -3750,15 +3838,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 u.open_hover = open;
                 u.chart_at = aim;
                 u.hover_at = (at.row != usize::MAX).then_some(at);
-                (changed, track)
+                (changed, track, changed.then(|| hover_dirty(u, &g, &was)).flatten())
             });
-            if let Some((changed, track)) = state {
+            if let Some((changed, track, dirty)) = state {
                 if track {
                     let mut tme = TRACKMOUSEEVENT { cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: hwnd, dwHoverTime: 0 };
                     TrackMouseEvent(&mut tme);
                 }
                 if changed {
-                    InvalidateRect(hwnd, null(), 0);
+                    // Only what the move changed, when that can be named; everything otherwise.
+                    InvalidateRect(hwnd, dirty.as_ref().map_or(null(), |r| r as *const RECT), 0);
                 }
             }
             0
@@ -3766,6 +3855,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_MOUSELEAVE => {
             let was = with_ui(|u| {
                 u.tracking = false;
+                let (before, g) = (hot_of(u), panel_geo(u));
                 let was = u.hover || u.pick_hover || u.chart_hover || u.gear_hover || u.open_hover || u.hover_at.is_some() || u.chart_at.is_some();
                 u.hover = false;
                 u.pick_hover = false;
@@ -3774,10 +3864,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 u.open_hover = false;
                 u.hover_at = None;
                 u.chart_at = None;
-                was
+                (was, was.then(|| hover_dirty(u, &g, &before)).flatten())
             });
-            if was == Some(true) {
-                InvalidateRect(hwnd, null(), 0);
+            if let Some((true, dirty)) = was {
+                InvalidateRect(hwnd, dirty.as_ref().map_or(null(), |r| r as *const RECT), 0);
             }
             0
         }
@@ -3825,7 +3915,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_EXITSIZEMOVE => {
             let mut r: RECT = std::mem::zeroed();
             GetWindowRect(hwnd, &mut r);
-            with_ui(|u| match u.mode {
+            let moved = with_ui(|u| match u.mode {
                 Mode::Panel => {
                     // A dragged edge makes the width the user's, so closing the chart must not undo it.
                     if u.chart_grew.is_some_and(|(_, grown)| grown.right - grown.left != r.right - r.left) {
@@ -3838,17 +3928,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     let frame = [c.left, c.top, c.right - c.left, c.bottom - c.top];
                     if u.cfg.panel != Some(frame) {
                         u.cfg.panel = Some(frame);
-                        config::save(&u.cfg);
+                        return true;
                     }
+                    false
                 }
                 Mode::Strip if u.cfg.placement() == Placement::Floating => {
                     u.strip_rect = r;
                     u.cfg.x = Some(r.left);
                     u.cfg.y = Some(r.top);
-                    config::save(&u.cfg);
+                    true
                 }
-                _ => {}
+                _ => false,
             });
+            if moved == Some(true) {
+                save_cfg();
+            }
             0
         }
         WM_DPICHANGED => {
@@ -3899,7 +3993,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             STRIP.store(0, Ordering::Relaxed);
             UnregisterHotKey(hwnd, HOTKEY_ID);
             tray_delete(hwnd);
-            with_ui(|u| config::save(&u.cfg));
+            save_cfg();
             PostQuitMessage(0);
             0
         }
@@ -4216,5 +4310,68 @@ mod tests {
         assert_eq!(armed_labels(&alerts, &["XAU", "EUR"]), vec!["XAU".to_string()]);
         assert_eq!(armed_labels(&alerts, &["XAU", "BTC"]).len(), 2);
         assert!(armed_labels(&alerts, &[]).is_empty());
+    }
+
+    /// Audit 1.8, finding 5: the card menu's Copy and Open act on the card that was right-clicked even
+    /// when a row lands before it while the menu is open (a finished lookup adds a hand-added row).
+    #[test]
+    fn the_card_menu_copy_and_open_follow_the_card_not_its_old_index() {
+        let cell = |label: &str, price: f64| crate::model::Cell {
+            label: label.into(),
+            digits: 2,
+            quote: Some(crate::model::Quote { price, ..Default::default() }),
+            stale: false,
+        };
+        let row = |label: &str| config::Row { label: label.into(), symbol: format!("{label}="), digits: 2, name: String::new() };
+        // B was right-clicked at index 1; then a new row N lands in front of it.
+        let cells = [cell("N", 9.0), cell("A", 1.0), cell("B", 2.0)];
+        let rows = [row("N"), row("A"), row("B")];
+        let (text, symbol) = card_target(&cells, &rows, "B").unwrap();
+        assert_eq!(text, "B 2.00");
+        assert_eq!(symbol, "B=");
+        // And the card is gone: nothing to copy or open, not the neighbour that took its place.
+        assert!(card_target(&cells[..2], &rows[..2], "B").is_none());
+        assert!(card_target(&cells, &rows[..1], "Z").is_none());
+    }
+
+    /// Audit 1.8, finding 6: an alert that fires while the panel is open and in front does not light the
+    /// tray marker (nothing would clear it); every other situation still does.
+    #[test]
+    fn an_alert_does_not_light_the_marker_while_the_panel_is_in_front() {
+        assert!(!marks_tray(Mode::Panel, true));
+        assert!(marks_tray(Mode::Panel, false), "an open panel behind another window is not being looked at");
+        assert!(marks_tray(Mode::Strip, false));
+        assert!(marks_tray(Mode::Strip, true), "only the panel is a place to read the footer note");
+        assert!(marks_tray(Mode::Morph, true));
+    }
+
+    /// Audit 1.8, finding 8: the menu's entries act on the mode when they are chosen, not the mode the
+    /// menu was opened in, because the hotkey and the tray run during the menu's own message loop.
+    #[test]
+    fn the_menu_acts_on_the_mode_it_is_chosen_in_not_the_one_it_opened_in() {
+        // Listed "Expand view" (strip), then the hotkey opened the panel: choosing it does nothing more.
+        assert_eq!(panel_step(false, Mode::Panel), None);
+        assert_eq!(panel_step(false, Mode::Strip), Some(PanelStep::Expand));
+        // Listed "Back to taskbar" (panel), then the hotkey collapsed it: nothing more to collapse.
+        assert_eq!(panel_step(true, Mode::Strip), None);
+        assert_eq!(panel_step(true, Mode::Panel), Some(PanelStep::Collapse));
+        // A Position entry listed for the strip is dropped if the panel is open when it is chosen.
+        assert!(!position_applies(false, Mode::Panel));
+        assert!(position_applies(false, Mode::Strip));
+        assert!(!position_applies(true, Mode::Strip));
+    }
+
+    /// Audit 1.8, finding 9: a morph that crosses to a monitor of another scale lays its end frame out
+    /// again at the new scale instead of landing at the old one's size.
+    #[test]
+    fn a_morph_across_a_scale_change_replans_its_end_frame() {
+        let rect = |w: i32| RECT { left: 0, top: 0, right: w, bottom: 40 };
+        let planned = rect(400);
+        // Same scale: the plan stands and the replan is never asked for.
+        let kept = settled_frame(96, 96, planned, || panic!("no replan without a scale change"));
+        assert_eq!(kept.right, 400);
+        // 96 -> 144 dpi in the middle of the morph: the end frame is the one worked out at 144.
+        let moved = settled_frame(96, 144, planned, || rect(600));
+        assert_eq!(moved.right, 600);
     }
 }
