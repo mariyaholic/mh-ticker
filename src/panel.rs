@@ -119,7 +119,8 @@ impl History {
         Self { labels: Vec::new(), symbols: Vec::new(), rows: Vec::new(), gen: 0, backfilled: false }
     }
 
-    /// Re-key by label and symbol; a renamed/replaced instrument starts with no old prices.
+    /// Re-key by symbol (and provider): a renamed row keeps its line under the new label, a replaced
+    /// instrument starts with no old prices.
     fn align(&mut self, board: &Board) {
         let keys: Vec<_> = board.cells.iter().enumerate().map(|(i, c)| {
             let symbol = board.rows.get(i).map(|r| r.symbol.as_str()).unwrap_or("");
@@ -138,7 +139,7 @@ impl History {
             (l, symbols.get(i).cloned().unwrap_or_default(), row)
         }).collect();
         for (label, symbol) in keys {
-            let row = match old.iter().position(|(l, s, _)| *l == label && *s == symbol) {
+            let row = match old.iter().position(|(_, s, _)| *s == symbol) {
                 Some(i) => old.swap_remove(i).2,
                 None => VecDeque::new(),
             };
@@ -322,15 +323,9 @@ pub fn minimum(n: usize, catalog: usize, dpi: u32, picker: bool, chart: bool) ->
 /// the current offset when it already is. A card taller than the body is aligned to its top.
 pub fn reveal(g: &Geo, i: usize) -> i32 {
     let r = card_rect(g, i);
-    let bottom = g.h - g.footer;
-    let want = if r.top < g.header {
-        g.scroll - (g.header - r.top)
-    } else if r.bottom > bottom {
-        g.scroll + (r.bottom - bottom).min(r.top - g.header)
-    } else {
-        g.scroll
-    };
-    want.clamp(0, g.scroll_max)
+    // Content coordinates: the card's place with the scroll taken out, measured from the body's top.
+    let (top, bottom) = (r.top - g.header + g.scroll, r.bottom - g.header + g.scroll);
+    crate::find::scroll_to_show(g.scroll, g.h - g.footer - g.header, top, bottom, g.scroll_max)
 }
 
 pub fn in_rect(r: &RECT, x: i32, y: i32) -> bool {
@@ -1273,23 +1268,32 @@ fn candles(dc: HDC, sc: &Scene, r: RECT, c: &Chart) {
     let (hx, hy) = (r.left + s(12), r.top + s(8));
     // Daily and longer candles are trading days, not instants: they have no zone to name or to switch,
     // so the header ends at the candle size and there is no button (an empty rectangle is never hit).
-    let zone_btn = if chartview::daily(c.bar_s) {
-        text(dc, sc.fonts.small, hx, hy, &format!("{} \u{b7} {span}", c.label), t.label);
-        chartview::Rect::default()
+    let (zone_btn, title_end) = if chartview::daily(c.bar_s) {
+        let tw = text(dc, sc.fonts.small, hx, hy, &format!("{} \u{b7} {span}", c.label), t.label);
+        (chartview::Rect::default(), hx + tw)
     } else {
         let hw = text(dc, sc.fonts.small, hx, hy, &format!("{} \u{b7} {span} \u{b7} ", c.label), t.label);
         let zw = text(dc, sc.fonts.small, hx + hw, hy, c.tz_label, t.accent);
         fill_rect(dc, RECT { left: hx + hw, top: hy + lh, right: hx + hw + zw, bottom: hy + lh + 1 }, t.accent);
-        chartview::Rect::new(hx + hw - s(4), r.top + s(4), hx + hw + zw + s(4), hy + lh + s(4))
+        (chartview::Rect::new(hx + hw - s(4), r.top + s(4), hx + hw + zw + s(4), hy + lh + s(4)), hx + hw + zw)
     };
     let price_text = fmt_price(last, c.digits);
     let pw = text_width(dc, sc.fonts.mid, &price_text);
     text_right(dc, sc.fonts.mid, r.right - s(12), r.top + s(6), &price_text, t.price);
-    if let Some(p) = c.change_pct.filter(|p| p.is_finite()) {
-        let txt = fmt_change(p);
+    // On 1D the day's change, as ever. On a longer range the day's change is the wrong number to lead
+    // with, so the header says what the bars on screen did: `5Y +182 %` (`chartview::range_change`,
+    // nothing when the first open is zero or not a number).
+    let head = if c.range == Range::D1 {
+        c.change_pct.filter(|p| p.is_finite()).map(|p| (fmt_change(p), p))
+    } else {
+        chartview::range_change(&bars).map(|p| (chartview::range_change_text(c.range.label(), p), p))
+    };
+    if let Some((txt, p)) = head {
         let (right, w) = (r.right - s(12) - pw - s(10), text_width(dc, sc.fonts.small, &txt));
-        // Only when it clears the zone button: a narrow pane drops the change, not the zone.
-        if right - w > zone_btn.right + s(10) {
+        // Only when it clears the zone button (1D) or the title (a longer range, which has no zone
+        // button): a narrow pane drops the change, not the title.
+        let bound = if c.range == Range::D1 { zone_btn.right } else { title_end.max(zone_btn.right) };
+        if right - w > bound + s(10) {
             text_right(dc, sc.fonts.small, right, hy + s(1), &txt, if p >= 0.0 { t.up } else { t.down });
         }
     }
@@ -1475,6 +1479,43 @@ fn candles(dc: HDC, sc: &Scene, r: RECT, c: &Chart) {
         let more = if n > 1 { format!(" +{}", n - 1) } else { String::new() };
         let ly = if up { plot.top + s(1) } else { plot.bottom - lh - s(1) };
         text_right(dc, sc.fonts.small, cx - half - s(4), ly, &format!("{}{more}", fmt_price(p, c.digits)), t.amber);
+    }
+
+    // The range's high and low (longer ranges only; 1D keeps its day ticks above): a small square on the
+    // extreme candle and its price, set where it touches nothing: not an alert level, its line or its
+    // price, and not the last-price line. A label with no room is left out and the square stays.
+    if c.range != Range::D1 {
+        if let Some(((hi_i, hi_p), (lo_i, lo_p))) = chartview::extremes(&bars) {
+            let pl = chartview::Rect::new(plot.left, plot.top, plot.right, plot.bottom);
+            let mut avoid: Vec<chartview::Rect> = vec![chartview::Rect::new(plot.left, ylast - 1, plot.right, ylast + 2)];
+            for &(p, y) in &marks.lines {
+                avoid.push(chartview::Rect::new(plot.left, y - 1, plot.right, y + 2));
+                let w = text_width(dc, sc.fonts.small, &fmt_price(p, c.digits));
+                let ly = if y - lh > plot.top { y - lh - 1 } else { y + 2 };
+                avoid.push(chartview::Rect::new(plot.right - s(4) - w, ly, plot.right - s(4), ly + lh));
+            }
+            let half = s(4).max(3);
+            for (mark, up) in [(marks.above, true), (marks.below, false)] {
+                let Some((p, n)) = mark else { continue };
+                let more = if n > 1 { format!(" +{}", n - 1) } else { String::new() };
+                let w = text_width(dc, sc.fonts.small, &format!("{}{more}", fmt_price(p, c.digits)));
+                let ly = if up { plot.top + s(1) } else { plot.bottom - lh - s(1) };
+                let right = plot.right - s(4) - half - half - s(4);
+                avoid.push(chartview::Rect::new(right - w, ly, right + half * 2 + s(4), ly + lh));
+            }
+            let sq = s(3).max(2);
+            for (i, p, up, tag) in [(hi_i, hi_p, true, "H"), (lo_i, lo_p, false, "L")] {
+                let (x, y) = (lay.x_of(i), lay.y_of(p).clamp(plot.top, plot.bottom - 1));
+                fill_rect(dc, RECT { left: x - sq / 2, top: y - sq / 2, right: x - sq / 2 + sq, bottom: y - sq / 2 + sq }, t.price);
+                let label = format!("{tag} {}", fmt_price(p, c.digits));
+                let size = (text_width(dc, sc.fonts.small, &label), lh);
+                if let Some(at) = chartview::place_label((x, y), size, up, pl, &avoid, s(4)) {
+                    text(dc, sc.fonts.small, at.left, at.top, &label, t.label);
+                    // Where it went is taken: the other mark must not land on it.
+                    avoid.push(at);
+                }
+            }
+        }
     }
 
     // The crosshair, when the pointer is on a candle: a vertical line through it and a horizontal at
@@ -1802,7 +1843,7 @@ mod tests {
 
     #[test]
     fn history_resets_when_symbol_changes_under_same_label() {
-        let old = crate::config::Row { label: "X".into(), symbol: "OLD".into(), digits: 2, name: String::new() };
+        let old = crate::config::Row { label: "X".into(), symbol: "OLD".into(), digits: 2, name: String::new(), strip: true };
         let new = crate::config::Row { symbol: "NEW".into(), ..old.clone() };
         let mut board = Board::new(&[old]);
         board.cells[0].quote = Some(crate::model::Quote { symbol: "OLD".into(), price: 42.0, ..Default::default() });
@@ -1812,6 +1853,22 @@ mod tests {
         board.set_rows(&[new]);
         history.record(&board, 101.0);
         assert!(history.row(0).unwrap().is_empty(), "old symbol's line must not survive");
+    }
+
+    #[test]
+    fn a_renamed_symbol_keeps_its_line() {
+        let rows = crate::config::default_rows();
+        let mut b = Board::new(&rows[..1]);
+        b.cells[0].quote = Some(crate::model::Quote { symbol: "XAU=".into(), price: 4000.0, ts: Some(100.0), realtime: true, ..Default::default() });
+        b.cells[0].stale = false;
+        let mut h = History::new();
+        h.record(&b, 100.0);
+        let renamed = crate::config::Row { label: "Gold".into(), ..rows[0].clone() };
+        b.set_rows(&[renamed]);
+        h.record(&b, 101.0);
+        assert_eq!(h.labels, ["Gold"]);
+        assert!(!h.row(0).unwrap().is_empty() && h.row(0).unwrap()[0].0 == 100.0, "the line before the rename is still there");
+        assert_eq!(h.series_of("Gold").first().map(|p| p.1), Some(4000.0), "the fast-move alert reads it by the new label");
     }
 
     #[test]

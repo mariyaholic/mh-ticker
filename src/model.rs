@@ -181,16 +181,17 @@ impl Board {
         true
     }
 
-    /// Swap in a new symbol list, keeping data only for the same label and symbol.
+    /// Swap in a new symbol list, keeping data only for the same symbol (a row is its symbol: a rename
+    /// or a new decimal count keeps its quote, bars and line, and takes the new label and digits).
     /// Candle and backfill vectors are indexed like `rows`; remap them atomically with the cells
     /// so an in-flight fetch cannot briefly put one instrument's history under another label.
     pub fn set_rows(&mut self, rows: &[Row]) {
         let indices: Vec<_> = rows.iter().map(|r| {
-            self.rows.iter().position(|old| old.label == r.label && old.symbol == r.symbol)
+            self.rows.iter().position(|old| old.symbol == r.symbol)
         }).collect();
         self.cells = rows.iter().zip(&indices).map(|(r, i)| {
             i.and_then(|i| self.cells.get(i))
-                .map(|c| Cell { digits: r.digits, ..c.clone() })
+                .map(|c| Cell { label: r.label.clone(), digits: r.digits, ..c.clone() })
                 .unwrap_or_else(|| empty_cell(r))
         }).collect();
         self.bars = indices.iter().map(|i| i.and_then(|i| self.bars.get(i)).cloned().unwrap_or_default()).collect();
@@ -369,8 +370,8 @@ mod tests {
     #[test]
     fn resolve_keeps_row_order_and_marks_missing() {
         let rows = vec![
-            Row { label: "XAU".into(), symbol: "XAU=".into(), digits: 2, name: String::new() },
-            Row { label: "DOW".into(), symbol: "@DJ.1".into(), digits: 0, name: String::new() },
+            Row { label: "XAU".into(), symbol: "XAU=".into(), digits: 2, name: String::new(), strip: true },
+            Row { label: "DOW".into(), symbol: "@DJ.1".into(), digits: 0, name: String::new(), strip: true },
         ];
         let quotes: HashMap<_, _> = [("XAU=".to_string(), q("XAU=", Some(100.0), true))].into_iter().collect();
         let cells = resolve(&rows, &quotes, 110.0, 90.0, 900.0);
@@ -381,9 +382,9 @@ mod tests {
 
     #[test]
     fn row_changes_keep_chart_data_attached_to_their_symbols() {
-        let a = Row { label: "A".into(), symbol: "AAA".into(), digits: 2, name: String::new() };
-        let b = Row { label: "B".into(), symbol: "BBB".into(), digits: 2, name: String::new() };
-        let c = Row { label: "C".into(), symbol: "CCC".into(), digits: 2, name: String::new() };
+        let a = Row { label: "A".into(), symbol: "AAA".into(), digits: 2, name: String::new(), strip: true };
+        let b = Row { label: "B".into(), symbol: "BBB".into(), digits: 2, name: String::new(), strip: true };
+        let c = Row { label: "C".into(), symbol: "CCC".into(), digits: 2, name: String::new(), strip: true };
         let mut board = Board::new(&[a, b.clone()]);
         let bar = |v| Bar { dt: 0.0, o: v, h: v, l: v, c: v, v: 0.0 };
         board.bars = vec![vec![bar(1.0)].into(), vec![bar(2.0)].into()];
@@ -399,7 +400,7 @@ mod tests {
 
     #[test]
     fn row_with_same_label_but_new_symbol_does_not_keep_old_quote_or_chart() {
-        let old = Row { label: "A".into(), symbol: "OLD".into(), digits: 2, name: String::new() };
+        let old = Row { label: "A".into(), symbol: "OLD".into(), digits: 2, name: String::new(), strip: true };
         let new = Row { symbol: "NEW".into(), ..old.clone() };
         let mut board = Board::new(&[old]);
         board.cells[0].quote = Some(q("OLD", Some(100.0), true));
@@ -417,5 +418,21 @@ mod tests {
         assert_eq!(fmt_price(56.0312, 3), "56.031");
         assert_eq!(fmt_change(0.3214), "+0.32%");
         assert_eq!(fmt_change(-1.2), "-1.20%");
+    }
+
+    #[test]
+    fn a_renamed_row_keeps_its_quote_bars_and_cell() {
+        let old = Row { label: "XAU".into(), symbol: "XAU=".into(), digits: 2, name: String::new(), strip: true };
+        let new = Row { label: "Gold".into(), digits: 3, ..old.clone() };
+        let mut board = Board::new(&[old]);
+        board.cells[0].quote = Some(q("XAU=", Some(100.0), true));
+        board.cells[0].stale = false;
+        board.bars = vec![vec![Bar { dt: 0.0, o: 1.0, h: 1.0, l: 1.0, c: 1.0, v: 0.0 }].into()];
+        board.backfill = vec![vec![(1.0, 1.0)]];
+        board.set_rows(&[new]);
+        assert_eq!((board.cells[0].label.as_str(), board.cells[0].digits), ("Gold", 3));
+        assert!(board.cells[0].quote.is_some() && !board.cells[0].stale, "the price is still there");
+        assert_eq!(board.bars[0].len(), 1);
+        assert_eq!(board.backfill[0].len(), 1);
     }
 }

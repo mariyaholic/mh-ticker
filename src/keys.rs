@@ -27,6 +27,7 @@ pub const VK_DOWN: u32 = 0x28;
 pub const VK_DELETE: u32 = 0x2E;
 pub const VK_C: u32 = 0x43;
 pub const VK_S: u32 = 0x53;
+pub const VK_Z: u32 = 0x5A;
 
 /// A direction on the card grid.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,6 +59,8 @@ pub enum Action {
     Remove,
     /// Move the locked card one place in the order: -1 left, +1 right.
     Shift(i32),
+    /// Put the held undo snapshot back (Ultra; Classic's undo is the menu line).
+    Undo,
 }
 
 /// What `map` needs to know. Plain data, so the table is testable without a window.
@@ -74,7 +77,7 @@ pub struct State {
 /// Every key `map` can answer for. `ui.rs` routes exactly these to `map` and leaves the rest
 /// (Esc, PgUp, PgDn, Home, End, anything else) to the arms that already own them.
 pub fn is_bound(vk: u32) -> bool {
-    matches!(vk, VK_LEFT | VK_RIGHT | VK_UP | VK_DOWN | VK_RETURN | VK_DELETE | VK_C | VK_S)
+    matches!(vk, VK_LEFT | VK_RIGHT | VK_UP | VK_DOWN | VK_RETURN | VK_DELETE | VK_C | VK_S | VK_Z)
 }
 
 /// The meaning of a key press in the open panel, or `None` when the key does nothing here.
@@ -88,6 +91,7 @@ pub fn is_bound(vk: u32) -> bool {
 /// | Ctrl+C | `CopyLocked` with a lock on Ultra, else `CopyAll` | both |
 /// | Delete | `Remove` (only with a lock) | Ultra |
 /// | Ctrl+Left, Ctrl+Right | `Shift(-1)`, `Shift(1)` (only with a lock) | Ultra |
+/// | Ctrl+Z | `Undo` (with or without a lock) | Ultra |
 ///
 /// A plain arrow with Ctrl held and a vertical arrow with Ctrl are `None` (Ctrl+Up and Ctrl+Down
 /// mean nothing). Plain C, S, Enter and Delete with Ctrl held are `None`, except Ctrl+C. Every
@@ -99,6 +103,9 @@ pub fn map(vk: u32, ctrl: bool, state: State) -> Option<Action> {
     }
     if !state.ultra {
         return None;
+    }
+    if vk == VK_Z && ctrl {
+        return Some(Action::Undo);
     }
     let dir = match vk {
         VK_LEFT => Some(Dir::Left),
@@ -128,6 +135,26 @@ pub fn map(vk: u32, ctrl: bool, state: State) -> Option<Action> {
         VK_S => Some(Action::SetPicker(!state.picker_open)),
         _ => None,
     }
+}
+
+/// What Home and End mean (W3 J6). On Ultra with cards on the panel they lock the first (`false`) or the
+/// last (`true`) card, and the body scrolls to show it; on Classic, or with no cards, they are `None`
+/// and keep paging the body as in 1.8.
+pub fn edge(vk: u32, ultra: bool, cards: usize) -> Option<bool> {
+    if !ultra || cards == 0 {
+        return None;
+    }
+    match vk {
+        VK_HOME => Some(false),
+        VK_END => Some(true),
+        _ => None,
+    }
+}
+
+/// Does the typed character open the find prompt? `/` on Ultra, with or without a card locked (the
+/// character, not a key code, so a layout that types `/` on another key still works). Classic: no.
+pub fn opens_find(ch: u32, ultra: bool, ctrl: bool) -> bool {
+    ultra && !ctrl && ch == u32::from(b'/')
 }
 
 /// Where the lock goes from `index` on a grid of `n` cards laid out `cols` per row, row by row.
@@ -182,9 +209,36 @@ pub fn slot_at(slots: &[Slot], x: i32, y: i32) -> Option<usize> {
     slots.iter().find(|s| x >= s.left && x < s.right && y >= s.top && y < s.bottom).map(|s| s.index)
 }
 
+/// The strip shows only the pinned cards, so the layout numbers its slots by position on the strip.
+/// Turn each slot's `index` into the card's own index (`cards[slot.index]`, as `pins::strip_indices`
+/// gave them), so a click answers with the card on the panel. A slot with no card (cannot happen with
+/// the layout's own list) is dropped.
+pub fn remap_slots(slots: Vec<Slot>, cards: &[usize]) -> Vec<Slot> {
+    slots.into_iter().filter_map(|s| cards.get(s.index).map(|&index| Slot { index, ..s })).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remap_slots_points_each_rectangle_at_its_own_card() {
+        let slots = vec![
+            Slot { index: 0, left: 0, top: 0, right: 10, bottom: 10 },
+            Slot { index: 1, left: 12, top: 0, right: 22, bottom: 10 },
+            Slot { index: 2, left: 24, top: 0, right: 34, bottom: 10 },
+        ];
+        let cards = [2, 5, 9];
+        let mapped = remap_slots(slots.clone(), &cards);
+        assert_eq!(slot_at(&mapped, 13, 5), Some(5));
+        assert_eq!(slot_at(&mapped, 30, 5), Some(9));
+        assert_eq!(slot_at(&mapped, 1, 1), Some(2));
+        assert_eq!(mapped[1].left, 12, "the rectangle itself is untouched");
+        // Nothing unpinned: the identity.
+        assert_eq!(remap_slots(slots.clone(), &[0, 1, 2]), slots);
+        // A slot past the list is dropped, not mapped to a wrong card.
+        assert_eq!(remap_slots(slots, &[4]).len(), 1);
+    }
 
     fn ultra(has_lock: bool) -> State {
         State { ultra: true, has_lock, picker_open: false, chart_open: false }
@@ -192,7 +246,7 @@ mod tests {
 
     #[test]
     fn is_bound_names_exactly_the_keys_map_answers() {
-        for vk in [VK_LEFT, VK_RIGHT, VK_UP, VK_DOWN, VK_RETURN, VK_DELETE, VK_C, VK_S] {
+        for vk in [VK_LEFT, VK_RIGHT, VK_UP, VK_DOWN, VK_RETURN, VK_DELETE, VK_C, VK_S, VK_Z] {
             assert!(is_bound(vk));
         }
         for vk in [VK_ESCAPE, VK_PRIOR, VK_NEXT, VK_HOME, VK_END, 0x41, 0] {
@@ -282,6 +336,35 @@ mod tests {
         for has_lock in [false, true] {
             assert_eq!(map(VK_UP, true, ultra(has_lock)), None, "Ctrl+Up");
             assert_eq!(map(VK_DOWN, true, ultra(has_lock)), None, "Ctrl+Down");
+        }
+    }
+
+    #[test]
+    fn home_and_end_lock_the_first_and_last_card_on_ultra_and_keep_paging_on_classic() {
+        assert_eq!(edge(VK_HOME, true, 6), Some(false));
+        assert_eq!(edge(VK_END, true, 6), Some(true));
+        assert_eq!(edge(VK_HOME, false, 6), None, "Classic pages");
+        assert_eq!(edge(VK_END, false, 6), None);
+        assert_eq!(edge(VK_HOME, true, 0), None, "no cards: page");
+        assert_eq!(edge(VK_PRIOR, true, 6), None);
+        assert_eq!(edge(VK_NEXT, true, 6), None);
+    }
+
+    #[test]
+    fn the_slash_character_opens_find_on_ultra_only() {
+        assert!(opens_find(u32::from(b'/'), true, false));
+        assert!(!opens_find(u32::from(b'/'), false, false));
+        assert!(!opens_find(u32::from(b'/'), true, true), "Ctrl+/ is not it");
+        assert!(!opens_find(u32::from(b'?'), true, false));
+    }
+
+    #[test]
+    fn map_ctrl_z_undoes_on_ultra_only_and_plain_z_is_nothing() {
+        for has_lock in [false, true] {
+            assert_eq!(map(VK_Z, true, ultra(has_lock)), Some(Action::Undo));
+            assert_eq!(map(VK_Z, false, ultra(has_lock)), None, "plain Z");
+            assert_eq!(map(VK_Z, true, classic(has_lock)), None, "Classic keeps 1.8's keys");
+            assert_eq!(map(VK_Z, false, classic(has_lock)), None);
         }
     }
 

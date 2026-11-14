@@ -118,6 +118,20 @@ pub struct Row {
     /// What it is, shown beside the label in the Symbols menu.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub name: String,
+    /// Shown on the taskbar strip. Absent means shown, so a 1.8 file and every Classic config are
+    /// unchanged; only a pinned-out row writes `"strip": false`. The panel always shows every row. It
+    /// lives on the rows (the shown list), not on the catalogue: `in_menu_order` carries it across a
+    /// rebuild, and hiding a symbol forgets it.
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub strip: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+fn is_true(b: &bool) -> bool {
+    *b
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -160,6 +174,11 @@ pub struct Config {
     /// The candle pane's clock: false (default) cuts candles and labels times on the machine's local
     /// time, true keeps them in UTC. Flipped by clicking the zone name in the pane's header.
     pub chart_utc: bool,
+    /// The range the candle pane opens on (`1D`, `5D`, `1M`, `6M`, `1Y`, `5Y`): the last tab clicked.
+    /// Unset reads as `1D`, and so does any text that names no range (`ranges::Range::from_saved`).
+    /// Ultra only; Classic has no pane.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chart_range: Option<String>,
 
     // --- Ultra only. `serde(default)` keeps a classic config parsing unchanged. ---
     /// Theme name (`theme::ALL`). Ignored by the classic build, which has exactly one.
@@ -257,7 +276,7 @@ impl Default for Alert {
 }
 
 fn row(label: &str, symbol: &str, digits: u32, name: &str) -> Row {
-    Row { label: label.into(), symbol: symbol.into(), digits, name: name.into() }
+    Row { label: label.into(), symbol: symbol.into(), digits, name: name.into(), strip: true }
 }
 
 /// The symbols shown on a fresh install (and by *Reset to default*).
@@ -318,6 +337,7 @@ impl Default for Config {
             y: None,
             panel: None,
             chart_utc: false,
+            chart_range: None,
             theme: "midnight".into(),
             theme_font: None,
             alerts: Vec::new(),
@@ -394,9 +414,14 @@ pub fn label_for(cfg: &Config, symbol: &str) -> String {
     let base = base.strip_suffix(".1").unwrap_or(base);
     let base: String = base.chars().take(MAX_LABEL).collect();
     let base = if base.is_empty() { "SYM".to_string() } else { base };
-    let taken = |label: &str| cfg.catalog.iter().chain(cfg.rows.iter()).any(|r| r.label.eq_ignore_ascii_case(label));
-    if !taken(&base) {
-        return base;
+    unique_label(&base, |label| cfg.catalog.iter().chain(cfg.rows.iter()).any(|r| r.label.eq_ignore_ascii_case(label)))
+}
+
+/// `base` if `taken` does not know it, else `base` with `2`, `3`, ... appended, the base cut so the
+/// whole stays within [`MAX_LABEL`]. The rule `label_for` and `rename` share.
+fn unique_label(base: &str, taken: impl Fn(&str) -> bool) -> String {
+    if !taken(base) {
+        return base.to_string();
     }
     let mut n = 2;
     loop {
@@ -408,6 +433,89 @@ pub fn label_for(cfg: &Config, symbol: &str) -> String {
         }
         n += 1;
     }
+}
+
+/// A typed label made fit for a card: control characters dropped, whitespace runs made one space,
+/// trimmed, cut to [`MAX_LABEL`] characters. Empty stays empty. The case is the user's.
+pub fn clean_label(raw: &str) -> String {
+    let kept: String = raw.chars().map(|c| if c.is_whitespace() { ' ' } else { c }).filter(|c| !c.is_control()).collect();
+    kept.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(MAX_LABEL).collect::<String>().trim_end().to_string()
+}
+
+/// The label `symbol` would have had when added: a default symbol's own, else `label_for`'s reading of
+/// the symbol, either made unique against every other label (the symbol's own entries do not count).
+pub fn derived_label(cfg: &Config, symbol: &str) -> String {
+    let base = default_catalog().into_iter().find(|d| d.symbol == symbol).map(|d| d.label).unwrap_or_else(|| {
+        let b = symbol.trim_start_matches(['@', '.', '^']);
+        let b = b.strip_suffix('=').unwrap_or(b);
+        let b = b.strip_suffix(".1").unwrap_or(b);
+        let b: String = b.chars().take(MAX_LABEL).collect();
+        if b.is_empty() { "SYM".to_string() } else { b }
+    });
+    unique_label(&base, |l| label_taken_by_another(cfg, symbol, l))
+}
+
+/// Is `label` the label of another symbol's row or catalogue entry, or of an alert that no card of
+/// `symbol` owns? Compared ignoring ASCII case.
+fn label_taken_by_another(cfg: &Config, symbol: &str, label: &str) -> bool {
+    let mine: Vec<&str> = cfg.catalog.iter().chain(cfg.rows.iter()).filter(|r| r.symbol == symbol).map(|r| r.label.as_str()).collect();
+    cfg.catalog.iter().chain(cfg.rows.iter()).any(|r| r.symbol != symbol && r.label.eq_ignore_ascii_case(label))
+        || cfg.alerts.iter().any(|a| a.label.eq_ignore_ascii_case(label) && !mine.contains(&a.label.as_str()))
+}
+
+/// Give `symbol` the label typed in `raw`: cleaned (`clean_label`), made unique like an added symbol's
+/// (a taken label gets a number), and moved everywhere the old one was the key: the shown row, the
+/// catalogue entry and the alerts. Returns the label now in force, or `None` when nothing changed
+/// (nothing typed, the symbol is in neither list, or the result is the label it has).
+pub fn rename(cfg: &mut Config, symbol: &str, raw: &str) -> Option<String> {
+    let typed = clean_label(raw);
+    if typed.is_empty() {
+        return None;
+    }
+    let new = unique_label(&typed, |l| label_taken_by_another(cfg, symbol, l));
+    set_label(cfg, symbol, new)
+}
+
+/// *Reset name*: the derived label (`derived_label`) back on `symbol`. Same return as `rename`.
+pub fn reset_name(cfg: &mut Config, symbol: &str) -> Option<String> {
+    let new = derived_label(cfg, symbol);
+    set_label(cfg, symbol, new)
+}
+
+fn set_label(cfg: &mut Config, symbol: &str, new: String) -> Option<String> {
+    let old = cfg.rows.iter().chain(cfg.catalog.iter()).find(|r| r.symbol == symbol).map(|r| r.label.clone())?;
+    if old == new {
+        return None;
+    }
+    for r in cfg.rows.iter_mut().chain(cfg.catalog.iter_mut()).filter(|r| r.symbol == symbol) {
+        r.label = new.clone();
+    }
+    for a in cfg.alerts.iter_mut().filter(|a| a.label == old) {
+        a.label = new.clone();
+    }
+    Some(new)
+}
+
+/// The most decimals a card can be set to.
+pub const MAX_DIGITS: u32 = 8;
+
+/// What *Decimals: auto* means for `symbol`: a default symbol's own count, else the count its price
+/// gives (`digits_for`), else 2 while there is no price.
+pub fn auto_digits(symbol: &str, price: Option<f64>) -> u32 {
+    default_catalog().into_iter().find(|d| d.symbol == symbol).map(|d| d.digits).unwrap_or_else(|| digits_for(price.unwrap_or(f64::NAN)))
+}
+
+/// Set the decimals of `symbol`: `Some(n)` (cut to [`MAX_DIGITS`]) or `None` for auto (`auto_digits`).
+/// Row and catalogue entry both change; alerts keep their levels, which are prices, not text. Returns
+/// whether anything changed.
+pub fn set_digits(cfg: &mut Config, symbol: &str, digits: Option<u32>, price: Option<f64>) -> bool {
+    let want = digits.map_or_else(|| auto_digits(symbol, price), |d| d.min(MAX_DIGITS));
+    let mut changed = false;
+    for r in cfg.rows.iter_mut().chain(cfg.catalog.iter_mut()).filter(|r| r.symbol == symbol) {
+        changed |= r.digits != want;
+        r.digits = want;
+    }
+    changed
 }
 
 /// Decimal places for an added symbol, from the size of its first price: 0 at 10,000 and above, 2
@@ -473,7 +581,7 @@ pub fn add_custom(cfg: &mut Config, symbol: &str, name: &str, price: f64) -> Add
     }
     if !menu_list(cfg).iter().any(|r| r.symbol == symbol) {
         let label = label_for(cfg, symbol);
-        cfg.catalog.push(Row { label, symbol: symbol.to_string(), digits: digits_for(price), name: clean_name(name) });
+        cfg.catalog.push(Row { label, symbol: symbol.to_string(), digits: digits_for(price), name: clean_name(name), strip: true });
     }
     if toggle(cfg, symbol) {
         Added::Shown
@@ -501,7 +609,93 @@ pub fn forget_custom(cfg: &mut Config, symbol: &str) -> bool {
     }
     cfg.catalog.retain(|r| r.symbol != symbol);
     cfg.rows.retain(|r| r.symbol != symbol);
+    normalize_pins(cfg);
     cfg.alerts.retain(|a| a.label != row.label);
+    true
+}
+
+/// What one undo puts back (`undo::Undo`). It holds the cards or the alerts, never the webhook (or
+/// anything else), so restoring cannot bring back a webhook that was removed: it has no way to.
+#[derive(Clone, Debug)]
+pub enum Snapshot {
+    /// The shown rows, their order and pins, and the catalogue (labels, decimals and order live there too).
+    Rows { rows: Vec<Row>, catalog: Vec<Row> },
+    /// The alerts as they were.
+    Alerts(Vec<Alert>),
+}
+
+impl Config {
+    /// The cards as they are now.
+    pub fn snapshot_rows(&self) -> Snapshot {
+        Snapshot::Rows { rows: self.rows.clone(), catalog: self.catalog.clone() }
+    }
+
+    /// The alerts as they are now.
+    pub fn snapshot_alerts(&self) -> Snapshot {
+        Snapshot::Alerts(self.alerts.clone())
+    }
+
+    /// Put a snapshot back. Cards replace the cards. Alerts are merged: every alert in the snapshot
+    /// whose label has none now comes back, in its old place; one set since (same label) stays as it is
+    /// now, and alerts made since stay, after the others. Nothing else in the
+    /// config is touched; the webhook least of all.
+    pub fn restore(&mut self, snap: Snapshot) {
+        match snap {
+            Snapshot::Rows { rows, catalog } => {
+                self.rows = rows;
+                self.catalog = catalog;
+                normalize_pins(self);
+            }
+            Snapshot::Alerts(old) => {
+                let now = std::mem::take(&mut self.alerts);
+                let mut merged: Vec<Alert> = old
+                    .into_iter()
+                    .map(|a| match now.iter().find(|n| n.label == a.label) {
+                        Some(n) => n.clone(),
+                        None => a,
+                    })
+                    .collect();
+                let extra: Vec<Alert> = now.into_iter().filter(|n| !merged.iter().any(|m| m.label == n.label)).collect();
+                merged.extend(extra);
+                self.alerts = merged;
+            }
+        }
+    }
+}
+
+/// The rows on the taskbar strip, as indexes into `cfg.rows`, in order (`pins::strip_indices`): the
+/// pinned ones, or every row when none is pinned. A config with no `strip` field shows every row.
+pub fn strip_rows(cfg: &Config) -> Vec<usize> {
+    let pinned: Vec<bool> = cfg.rows.iter().map(|r| r.strip).collect();
+    crate::pins::strip_indices(&pinned)
+}
+
+/// Pin `symbol` to the strip (`on`) or take it off. The last pinned symbol cannot be taken off, and a
+/// symbol that is not shown has no pin. Returns whether anything changed.
+pub fn set_pin(cfg: &mut Config, symbol: &str, on: bool) -> bool {
+    let pinned: Vec<bool> = cfg.rows.iter().map(|r| r.strip).collect();
+    let Some(i) = cfg.rows.iter().position(|r| r.symbol == symbol) else { return false };
+    if pinned[i] == on || (!on && !crate::pins::can_unpin(&pinned, i)) {
+        return false;
+    }
+    cfg.rows[i].strip = on;
+    true
+}
+
+/// *Show all on strip*: pin every shown row. Returns whether anything changed.
+pub fn pin_all(cfg: &mut Config) -> bool {
+    let any = cfg.rows.iter().any(|r| !r.strip);
+    cfg.rows.iter_mut().for_each(|r| r.strip = true);
+    any
+}
+
+/// One row is always on the strip: when no shown row is pinned (the last pinned one was hidden, or a
+/// hand-edited file pins none) every shown row is pinned again. Returns whether anything changed.
+pub fn normalize_pins(cfg: &mut Config) -> bool {
+    if cfg.rows.is_empty() || cfg.rows.iter().any(|r| r.strip) {
+        return false;
+    }
+    cfg.rows.iter_mut().for_each(|r| r.strip = true);
     true
 }
 
@@ -517,6 +711,7 @@ pub fn toggle(cfg: &mut Config, symbol: &str) -> bool {
             return false;
         }
         cfg.rows.retain(|r| r.symbol != symbol);
+        normalize_pins(cfg);
         return true;
     }
     if cfg.rows.len() >= MAX_ROWS {
@@ -529,7 +724,15 @@ pub fn toggle(cfg: &mut Config, symbol: &str) -> bool {
 
 /// The Symbols menu's entries whose symbol `keep` accepts, in menu order.
 fn in_menu_order(cfg: &Config, keep: impl Fn(&str) -> bool) -> Vec<Row> {
-    menu_list(cfg).into_iter().filter(|r| keep(&r.symbol)).collect()
+    menu_list(cfg)
+        .into_iter()
+        .filter(|r| keep(&r.symbol))
+        .map(|mut r| {
+            // A row that is shown already keeps its pin; one being shown now starts on the strip.
+            r.strip = cfg.rows.iter().find(|o| o.symbol == r.symbol).is_none_or(|o| o.strip);
+            r
+        })
+        .collect()
 }
 
 /// Hide a shown symbol. Unlike `toggle`, a symbol that is not shown is never added: the card menu and
@@ -575,7 +778,13 @@ fn move_shown(cfg: &mut Config, from: usize, to: usize) -> bool {
     let mut order: Vec<String> = cfg.rows.iter().map(|r| r.symbol.clone()).collect();
     let moved = order.remove(from);
     order.insert(to, moved);
+    apply_order(cfg, &order)
+}
 
+/// Make the shown symbols appear in `order` (a permutation of the shown symbols), by the rule
+/// `move_shown` states. Pins travel with their rows (`in_menu_order`). False, with `cfg` untouched, when
+/// `order` is not a permutation of the shown symbols.
+fn apply_order(cfg: &mut Config, order: &[String]) -> bool {
     let mut next = cfg.clone();
     for r in &cfg.rows {
         if !next.catalog.iter().any(|c| c.symbol == r.symbol) {
@@ -584,7 +793,7 @@ fn move_shown(cfg: &mut Config, from: usize, to: usize) -> bool {
     }
     let slots: Vec<usize> = next.catalog.iter().enumerate().filter(|(_, c)| order.contains(&c.symbol)).map(|(i, _)| i).collect();
     let picked: Vec<Row> = order.iter().filter_map(|s| next.catalog.iter().find(|c| &c.symbol == s).cloned()).collect();
-    if slots.len() != order.len() || picked.len() != order.len() {
+    if slots.len() != order.len() || picked.len() != order.len() || order.len() != cfg.rows.len() {
         return false;
     }
     for (pos, row) in slots.into_iter().zip(picked) {
@@ -593,6 +802,50 @@ fn move_shown(cfg: &mut Config, from: usize, to: usize) -> bool {
     next.rows = in_menu_order(&next, |s| order.iter().any(|x| x == s));
     *cfg = next;
     true
+}
+
+/// How *Order the cards* sorts, once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OrderKey {
+    /// The biggest move of the day first, up or down (the absolute change).
+    DayMove,
+    /// By label, A to Z, ignoring case.
+    Name,
+    /// The order of a fresh install: `default_catalog()`'s, then anything added, in its present order.
+    Default,
+}
+
+/// Rewrite the order of the shown symbols once by `key` (a one-shot, nothing live follows). `moves`
+/// maps a symbol to its fresh day change in percent; a symbol with no entry has no fresh quote. The
+/// sort is stable. For `DayMove`, rows with no fresh quote keep their relative place after the others.
+/// The order is a permutation of the catalogue like every move (`move_row`), so hidden entries stay
+/// where they are and a later toggle keeps the order. Returns whether the order changed.
+pub fn order_by(cfg: &mut Config, moves: &std::collections::HashMap<String, f64>, key: OrderKey) -> bool {
+    let mut shown: Vec<&Row> = cfg.rows.iter().collect();
+    match key {
+        OrderKey::DayMove => {
+            let fresh = |r: &&Row| moves.get(&r.symbol).copied().filter(|m| m.is_finite());
+            // `sort_by` is stable; fresh rows first by the size of the move, the rest keep their place.
+            shown.sort_by(|a, b| match (fresh(a), fresh(b)) {
+                (Some(x), Some(y)) => y.abs().total_cmp(&x.abs()),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            });
+        }
+        OrderKey::Name => shown.sort_by_key(|r| r.label.to_lowercase()),
+        OrderKey::Default => {
+            let defaults = default_catalog();
+            let rank = |r: &&Row| defaults.iter().position(|d| d.symbol == r.symbol).unwrap_or(usize::MAX);
+            shown.sort_by_key(rank);
+        }
+    }
+    let order: Vec<String> = shown.iter().map(|r| r.symbol.clone()).collect();
+    let before: Vec<&str> = cfg.rows.iter().map(|r| r.symbol.as_str()).collect();
+    if order.iter().map(String::as_str).eq(before.iter().copied()) {
+        return false;
+    }
+    apply_order(cfg, &order)
 }
 
 pub fn path() -> PathBuf {
@@ -1138,5 +1391,303 @@ mod tests {
         }
         let set = serde_json::to_string(&Alert { crossing: true, fast: 2, latched: 7, ..Alert::default() }).unwrap();
         assert!(set.contains("\"crossing\":true") && set.contains("\"fast\":2") && !set.contains("latched"));
+    }
+
+    #[test]
+    fn chart_range_is_absent_by_default_round_trips_and_an_unknown_value_reads_as_one_day() {
+        let old: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(old.chart_range, None);
+        assert!(!serde_json::to_string(&old).unwrap().contains("chart_range"), "absent stays absent");
+        let c = Config { chart_range: crate::ranges::Range::Y5.to_saved(), ..Config::default() };
+        let back: Config = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        assert_eq!(crate::ranges::Range::from_saved(back.chart_range.as_deref()), crate::ranges::Range::Y5);
+        let odd: Config = serde_json::from_str(r#"{"chart_range":"7Q"}"#).unwrap();
+        assert_eq!(crate::ranges::Range::from_saved(odd.chart_range.as_deref()), crate::ranges::Range::D1);
+    }
+
+    fn moves(list: &[(&str, f64)]) -> std::collections::HashMap<String, f64> {
+        list.iter().map(|(s, m)| (s.to_string(), *m)).collect()
+    }
+
+    #[test]
+    fn order_by_day_move_is_stable_and_puts_rows_with_no_fresh_quote_last() {
+        let mut c = Config::default();
+        // XAU= XAG= BTC.CB= @DJ.1 @SP.1 @ND.1; XAG and DOW have no fresh quote; BTC and NAS tie.
+        let m = moves(&[("XAU=", 0.5), ("BTC.CB=", -2.0), ("@SP.1", 1.0), ("@ND.1", 2.0)]);
+        assert!(order_by(&mut c, &m, OrderKey::DayMove));
+        assert_eq!(order(&c), ["BTC.CB=", "@ND.1", "@SP.1", "XAU=", "XAG=", "@DJ.1"], "tie keeps place, unquoted last in their old order");
+        assert!(!order_by(&mut c, &m, OrderKey::DayMove), "a second sort changes nothing");
+    }
+
+    #[test]
+    fn order_by_leaves_hidden_symbols_where_they_are_and_later_toggles_keep_the_order() {
+        let mut c = Config::default();
+        let hidden_before: Vec<(usize, String)> =
+            catalog_order(&c).into_iter().enumerate().filter(|(_, s)| !is_shown(&c, s)).collect();
+        assert!(order_by(&mut c, &Default::default(), OrderKey::Name));
+        assert_eq!(c.rows.iter().map(|r| r.label.as_str()).collect::<Vec<_>>(), ["BTC", "DOW", "NAS", "S&P", "XAG", "XAU"]);
+        let hidden_after: Vec<(usize, String)> =
+            catalog_order(&c).into_iter().enumerate().filter(|(_, s)| !is_shown(&c, s)).collect();
+        assert_eq!(hidden_before, hidden_after, "hidden entries keep their catalogue slots");
+        let sorted = order(&c);
+        assert!(toggle(&mut c, "XPT="));
+        assert!(toggle(&mut c, "XPT="));
+        assert_eq!(order(&c), sorted, "the sorted order survives toggles");
+    }
+
+    #[test]
+    fn order_by_default_restores_the_fresh_install_order_and_keeps_added_symbols_after_it() {
+        let mut c = Config::default();
+        add_custom(&mut c, "AAPL", "Apple", 200.0);
+        assert!(move_first(&mut c, "@ND.1"));
+        assert!(move_first(&mut c, "AAPL"));
+        assert!(order_by(&mut c, &Default::default(), OrderKey::Default));
+        assert_eq!(order(&c), ["XAU=", "XAG=", "BTC.CB=", "@DJ.1", "@SP.1", "@ND.1", "AAPL"]);
+        assert!(!order_by(&mut c, &Default::default(), OrderKey::Default));
+    }
+
+    #[test]
+    fn order_by_name_is_stable_for_equal_labels_and_ignores_case() {
+        let mut c = Config::default();
+        for (i, l) in [(0, "zed"), (1, "ALPHA")] {
+            c.rows[i].label = l.into();
+            c.catalog[i].label = l.into();
+        }
+        assert!(order_by(&mut c, &Default::default(), OrderKey::Name));
+        assert_eq!(c.rows[0].label, "ALPHA");
+        assert_eq!(c.rows.last().unwrap().label, "zed");
+    }
+
+    #[test]
+    fn order_by_keeps_pins_with_their_rows() {
+        let mut c = Config::default();
+        c.rows.iter_mut().find(|r| r.label == "XAU").unwrap().strip = false;
+        assert!(order_by(&mut c, &Default::default(), OrderKey::Name));
+        assert!(!c.rows.iter().find(|r| r.label == "XAU").unwrap().strip);
+        assert_eq!(c.rows.iter().filter(|r| !r.strip).count(), 1);
+    }
+
+    #[test]
+    fn hiding_the_last_pinned_row_pins_the_rest_again() {
+        let mut c = Config::default();
+        for r in &mut c.rows[1..] {
+            r.strip = false;
+        }
+        assert!(remove(&mut c, "XAU="));
+        assert!(c.rows.iter().all(|r| r.strip), "one row is always on the strip");
+    }
+
+    #[test]
+    fn strip_is_absent_in_the_file_unless_a_row_is_pinned_out() {
+        let c = Config::default();
+        assert!(!serde_json::to_string(&c).unwrap().contains("\"strip\":"));
+        let mut d = Config::default();
+        d.rows[2].strip = false;
+        let back: Config = serde_json::from_str(&serde_json::to_string(&d).unwrap()).unwrap();
+        assert!(!back.rows[2].strip && back.rows[0].strip);
+    }
+
+    fn alert_on(label: &str) -> Alert {
+        Alert { label: label.into(), above: Some(4100.5), ..Default::default() }
+    }
+
+    #[test]
+    fn rename_moves_the_label_everywhere_it_is_the_key() {
+        let mut c = Config::default();
+        c.alerts.push(alert_on("XAU"));
+        assert_eq!(rename(&mut c, "XAU=", "  Gold \t spot "), Some("Gold spo".to_string()), "cleaned and cut to the label length");
+        assert_eq!(c.rows[0].label, "Gold spo");
+        assert_eq!(c.catalog[0].label, "Gold spo");
+        assert_eq!(c.alerts[0].label, "Gold spo", "alerts follow the rename");
+        assert_eq!(c.alerts[0].above, Some(4100.5), "and keep their level");
+        assert_eq!(rename(&mut c, "XAU=", "Gold spo"), None, "the same label changes nothing");
+        assert_eq!(rename(&mut c, "XAU=", "   "), None, "nothing typed changes nothing");
+        assert_eq!(rename(&mut c, "NOPE", "X"), None, "an unknown symbol changes nothing");
+    }
+
+    #[test]
+    fn a_taken_label_gets_a_number_and_the_cut_keeps_it_within_the_limit() {
+        let mut c = Config::default();
+        assert_eq!(rename(&mut c, "XAU=", "xag"), Some("xag2".to_string()), "XAG is taken, case ignored");
+        assert_eq!(rename(&mut c, "XPT=", "XAG"), Some("XAG3".to_string()), "XAG and xag2 are taken: next number");
+        assert_eq!(rename(&mut c, "BTC.CB=", "LONGLABEL"), Some("LONGLABE".to_string()));
+        assert_eq!(rename(&mut c, "ETH.CB=", "LONGLABEL"), Some("LONGLA2".to_string().replace("LONGLA2", "LONGLAB2")), "the base is cut to fit the number");
+        assert!(c.catalog.iter().chain(&c.rows).all(|r| r.label.chars().count() <= MAX_LABEL));
+        // A hidden catalogue entry's label counts as taken, and so does an alert's.
+        let mut d = Config::default();
+        d.alerts.push(alert_on("GHOST"));
+        assert_eq!(rename(&mut d, "XAU=", "GHOST"), Some("GHOST2".to_string()));
+        assert_eq!(d.alerts[0].label, "GHOST", "someone else's alert is not adopted");
+        assert_eq!(rename(&mut d, "XAU=", "xpt"), Some("xpt2".to_string()), "XPT is hidden but listed");
+        // Its own old label in another case is no collision.
+        let mut e = Config::default();
+        assert_eq!(rename(&mut e, "XAU=", "xau"), Some("xau".to_string()));
+    }
+
+    #[test]
+    fn reset_name_returns_the_derived_label_and_the_alerts_follow() {
+        let mut c = Config::default();
+        c.alerts.push(alert_on("XAU"));
+        rename(&mut c, "XAU=", "Gold");
+        assert_eq!(reset_name(&mut c, "XAU="), Some("XAU".to_string()));
+        assert_eq!(c.alerts[0].label, "XAU");
+        assert_eq!(reset_name(&mut c, "XAU="), None, "already derived");
+        add_custom(&mut c, "@GC.1", "Gold futures", 4000.0);
+        rename(&mut c, "@GC.1", "Fut");
+        assert_eq!(reset_name(&mut c, "@GC.1"), Some("GC".to_string()), "an added symbol's label comes from its symbol");
+        // The derived label is made unique too.
+        rename(&mut c, "@GC.1", "Zed");
+        assert_eq!(rename(&mut c, "XAG=", "GC"), Some("GC".to_string()));
+        assert_eq!(reset_name(&mut c, "@GC.1"), Some("GC2".to_string()));
+    }
+
+    #[test]
+    fn decimals_are_clamped_and_auto_goes_back_without_touching_alert_levels() {
+        let mut c = Config::default();
+        c.alerts.push(alert_on("XAU"));
+        assert!(set_digits(&mut c, "XAU=", Some(40), None));
+        assert_eq!((c.rows[0].digits, c.catalog[0].digits), (MAX_DIGITS, MAX_DIGITS));
+        assert!(!set_digits(&mut c, "XAU=", Some(8), None), "no change reported twice");
+        assert!(set_digits(&mut c, "XAU=", None, None));
+        assert_eq!(c.rows[0].digits, 2, "a default symbol returns to its own count");
+        assert_eq!(c.alerts[0].above, Some(4100.5), "levels keep their value");
+        add_custom(&mut c, "AAPL", "Apple", 200.0);
+        set_digits(&mut c, "AAPL", Some(0), None);
+        assert!(set_digits(&mut c, "AAPL", None, Some(200.0)));
+        assert_eq!(c.rows.iter().find(|r| r.symbol == "AAPL").unwrap().digits, 2, "an added symbol from its price");
+        assert_eq!(auto_digits("AAPL", None), 2, "no price yet: two");
+    }
+
+    #[test]
+    fn a_rename_survives_a_toggle_and_a_move() {
+        let mut c = Config::default();
+        rename(&mut c, "XAG=", "Silv");
+        assert!(toggle(&mut c, "XPT="));
+        assert!(move_first(&mut c, "XAG="));
+        assert_eq!(c.rows[0].label, "Silv");
+        assert!(remove(&mut c, "XAG="));
+        assert!(toggle(&mut c, "XAG="));
+        assert_eq!(c.rows.iter().find(|r| r.symbol == "XAG=").unwrap().label, "Silv", "the catalogue entry holds it too");
+    }
+
+    #[test]
+    fn with_no_strip_field_every_row_is_on_the_strip() {
+        let c: Config = serde_json::from_str(r#"{"rows":[{"label":"A","symbol":"A","digits":2},{"label":"B","symbol":"B","digits":2}]}"#).unwrap();
+        assert!(c.rows.iter().all(|r| r.strip));
+        assert_eq!(strip_rows(&c), [0, 1]);
+        assert_eq!(strip_rows(&Config::default()), [0, 1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn pins_leave_the_panel_whole_and_the_last_pinned_row_stays() {
+        let mut c = Config::default();
+        assert!(set_pin(&mut c, "XAG=", false));
+        assert!(set_pin(&mut c, "@DJ.1", false));
+        assert_eq!(strip_rows(&c), [0, 2, 4, 5]);
+        assert_eq!(c.rows.len(), 6, "the panel still has every card");
+        assert!(!set_pin(&mut c, "XAG=", false), "already off");
+        for s in ["XAU=", "BTC.CB=", "@SP.1"] {
+            assert!(set_pin(&mut c, s, false));
+        }
+        assert_eq!(strip_rows(&c), [5], "one is left");
+        assert!(!set_pin(&mut c, "@ND.1", false), "the last pinned row cannot be unpinned");
+        assert!(!set_pin(&mut c, "XPT=", true), "a hidden symbol has no pin");
+        assert!(pin_all(&mut c));
+        assert_eq!(strip_rows(&c), [0, 1, 2, 3, 4, 5]);
+        assert!(!pin_all(&mut c), "nothing left to do");
+    }
+
+    #[test]
+    fn a_pin_survives_toggling_other_symbols_and_a_hand_edited_file_with_none_pinned_shows_all() {
+        let mut c = Config::default();
+        set_pin(&mut c, "XAG=", false);
+        assert!(toggle(&mut c, "XPT="));
+        assert!(!c.rows.iter().find(|r| r.symbol == "XAG=").unwrap().strip);
+        assert!(c.rows.iter().find(|r| r.symbol == "XPT=").unwrap().strip, "a newly shown symbol starts on the strip");
+        let mut d = Config::default();
+        d.rows.iter_mut().for_each(|r| r.strip = false);
+        assert_eq!(strip_rows(&d).len(), 6);
+    }
+
+    fn json(c: &Config) -> serde_json::Value {
+        serde_json::to_value(c).unwrap()
+    }
+
+    #[test]
+    fn restoring_the_cards_gives_back_the_exact_config_after_each_kind_of_change() {
+        type Change = fn(&mut Config);
+        let changes: [(&str, Change); 5] = [
+            ("remove", |c| assert!(remove(c, "XAG="))),
+            ("move", |c| assert!(move_row(c, "XAU=", 2))),
+            ("sort", |c| assert!(order_by(c, &Default::default(), OrderKey::Name))),
+            ("pin", |c| assert!(set_pin(c, "@DJ.1", false))),
+            ("rename", |c| assert!(rename(c, "XAU=", "Gold").is_some())),
+        ];
+        for (name, change) in changes {
+            let mut c = Config::default();
+            c.alerts.push(alert_on("XAU"));
+            c.webhook = Some("https://example.invalid/hook/secret".into());
+            let before = json(&c);
+            let snap = c.snapshot_rows();
+            change(&mut c);
+            assert_ne!(json(&c), before, "{name} changed something");
+            c.restore(snap);
+            if name == "rename" {
+                // A rename moves the alert's label as well; the cards alone do not carry that back.
+                continue;
+            }
+            assert_eq!(json(&c), before, "{name}: the exact config is back");
+        }
+    }
+
+    #[test]
+    fn restoring_alerts_brings_back_the_cleared_ones_and_keeps_what_was_set_since() {
+        let mut c = Config::default();
+        c.alerts.push(alert_on("XAU"));
+        c.alerts.push(Alert { label: "XAG".into(), below: Some(30.0), last: 100.0, ..Default::default() });
+        let before = json(&c);
+        let snap = c.snapshot_alerts();
+        c.alerts.clear();
+        c.restore(snap.clone());
+        assert_eq!(json(&c), before, "the exact config is back");
+        // Cleared again, then a new level set on XAU and an unrelated one on BTC before undoing.
+        c.alerts.clear();
+        c.alerts.push(Alert { label: "XAU".into(), above: Some(5000.0), last: 200.0, ..Default::default() });
+        c.alerts.push(alert_on("BTC"));
+        c.restore(snap);
+        let labels: Vec<&str> = c.alerts.iter().map(|a| a.label.as_str()).collect();
+        assert_eq!(labels, ["XAU", "XAG", "BTC"]);
+        assert_eq!(c.alerts[0].above, Some(5000.0), "what was set since stays");
+        assert_eq!(c.alerts[1].below, Some(30.0));
+    }
+
+    #[test]
+    fn undo_never_brings_back_a_removed_webhook() {
+        let mut c = Config { webhook: Some("https://example.invalid/hook/secret".into()), ..Config::default() };
+        c.alerts.push(alert_on("XAU"));
+        let rows = c.snapshot_rows();
+        let alerts = c.snapshot_alerts();
+        assert!(!format!("{rows:?}{alerts:?}").contains("secret"), "the snapshot cannot hold it");
+        c.webhook = None;
+        c.alerts.clear();
+        c.restore(alerts);
+        c.restore(rows);
+        assert_eq!(c.webhook, None);
+        // And one set after the snapshot is left alone.
+        let snap = c.snapshot_rows();
+        c.webhook = Some("https://example.invalid/new".into());
+        c.restore(snap);
+        assert_eq!(c.webhook.as_deref(), Some("https://example.invalid/new"));
+    }
+
+    #[test]
+    fn restoring_cards_with_no_pinned_row_pins_them_again() {
+        let mut c = Config::default();
+        let mut snap = c.snapshot_rows();
+        if let Snapshot::Rows { rows, .. } = &mut snap {
+            rows.iter_mut().for_each(|r| r.strip = false);
+        }
+        c.restore(snap);
+        assert!(c.rows.iter().all(|r| r.strip));
     }
 }

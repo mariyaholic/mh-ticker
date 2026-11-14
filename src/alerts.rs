@@ -1793,7 +1793,7 @@ mod tests {
     }
 
     fn overview_cfg(alerts: Vec<Alert>) -> Config {
-        let rows = vec![crate::config::Row { label: "XAU".into(), symbol: "XAU=".into(), digits: 2, name: String::new() }];
+        let rows = vec![crate::config::Row { label: "XAU".into(), symbol: "XAU=".into(), digits: 2, name: String::new(), strip: true }];
         Config { alerts, rows, stale_after_s: 1_000_000.0, ..Config::default() }
     }
 
@@ -1895,7 +1895,7 @@ mod tests {
             Alert { label: "XAU".into(), above: Some(1.0), ..Alert::default() },
             Alert { label: "XAG".into(), above: Some(1.0), ..Alert::default() },
         ]);
-        two.rows.push(crate::config::Row { label: "XAG".into(), symbol: "XAG=".into(), digits: 3, name: String::new() });
+        two.rows.push(crate::config::Row { label: "XAG".into(), symbol: "XAG=".into(), digits: 3, name: String::new(), strip: true });
         assert_eq!(checkable(&two, &board(4150.0, false)), (true, true));
     }
 

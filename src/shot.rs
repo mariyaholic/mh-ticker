@@ -25,7 +25,7 @@ use windows_sys::Win32::Graphics::Gdi::*;
 const ROWS: usize = 6;
 
 fn row(label: &str, symbol: &str, digits: u32) -> Row {
-    Row { label: label.into(), symbol: symbol.into(), digits, name: String::new() }
+    Row { label: label.into(), symbol: symbol.into(), digits, name: String::new(), strip: true }
 }
 
 /// Plausible values rather than the same number six times: a card with no 52-week range, one with a
@@ -268,7 +268,33 @@ pub fn write_chart_named_levels(
         Some(r) => Some(Range::parse(r).ok_or_else(|| format!("no range named {r} (1D 5D 1M 6M 1Y 5Y)"))?),
         None => None,
     };
-    write_chart_fixture(dir, t, dpi, w, hover, bar, refs, range, volume, levels)
+    write_chart_fixture(dir, t, dpi, w, hover, bar, refs, range, volume, levels, "")
+}
+
+/// W3's pictures, written into `dir` beside the others and never over them: the pane on 5Y with alert
+/// levels, W1's two header notes (`as of`, `check dates`) and L1's header change and high/low marks
+/// (`w3-5y.png`, 1,488 px, 96 dpi, the second card locked); and the strip of the
+/// same 24 symbols with 6 pinned (`w3-strip-24-pinned-6.png`, two rows in a 1,800 px gap), where only
+/// the six pinned cards are laid out. Returns how many files were written.
+pub fn write_w3(dir: &Path) -> Result<usize, String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let now = 1_792_052_981.0;
+    let t = theme::ALL.iter().find(|t| t.name == "midnight").unwrap_or(&theme::ALL[0]);
+    let scratch = dir.join(".scratch");
+    let rg = Some(Range::Y5);
+    let made = write_chart_fixture(&scratch, t, 96, 1488, Some(1), None, false, rg, true, true, "as of 14:05 \u{b7} check dates")?;
+    std::fs::rename(&made, dir.join("w3-5y.png")).map_err(|e| format!("w3-5y.png: {e}"))?;
+    let _ = std::fs::remove_dir(&scratch);
+    let b24 = board_n(now, 24);
+    // Six pinned of the 24, taken through the same function the strip uses (`config::strip_rows`).
+    let mut cfg = crate::config::Config { rows: b24.rows.clone(), ..Default::default() };
+    for (i, r) in cfg.rows.iter_mut().enumerate() {
+        r.strip = [0, 2, 4, 8, 13, 20].contains(&i);
+    }
+    let pinned: Vec<crate::model::Cell> = crate::config::strip_rows(&cfg).into_iter().map(|i| b24.cells[i].clone()).collect();
+    let (w, h, px) = crate::ui::strip_still(&pinned, t, 96, 2, 1_800);
+    write_png(&dir.join("w3-strip-24-pinned-6.png"), w, h, &px)?;
+    Ok(2)
 }
 
 /// The fixture's clock: UTC-4, a US equity day in summer.
@@ -293,7 +319,7 @@ pub fn write_chart_at(
     hover: Option<usize>,
     bar: Option<usize>,
 ) -> Result<PathBuf, String> {
-    write_chart_fixture(dir, t, dpi, w, hover, bar, false, None, false, false)
+    write_chart_fixture(dir, t, dpi, w, hover, bar, false, None, false, false, "")
 }
 
 /// The fixture behind `write_chart_at` and `write_chart_named_at`. With `refs`, the pane alone gets
@@ -312,6 +338,7 @@ fn write_chart_fixture(
     range: Option<Range>,
     volume: bool,
     levels: bool,
+    note: &str,
 ) -> Result<PathBuf, String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let now = 1_792_052_981.0;
@@ -414,7 +441,7 @@ fn write_chart_fixture(
             tabs: range.is_some(),
             zone: crate::chartview::Zone::fixed(TZ_S),
             tz_label: "local",
-            note: "",
+            note,
             prev,
             day_hi,
             day_lo,
