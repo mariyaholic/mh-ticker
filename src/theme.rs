@@ -57,21 +57,34 @@ pub fn link_name(link: Link) -> &'static str {
 pub fn calm_color(t: &Theme, link: Link, calm: Calm) -> COLORREF {
     match calm {
         Calm::No => link_color(t, link),
-        Calm::Some(_) | Calm::QuietSome(_) => t.up,
-        Calm::All(_) | Calm::QuietAll(_) => t.dim,
+        Calm::Some(_) | Calm::QuietSome { .. } => t.up,
+        Calm::All(_) | Calm::QuietAll { .. } => t.dim,
     }
 }
 
 /// [`link_name`], saying "closed" when that is the only reason a price is not fresh and every such
-/// row reads closed, and "quiet" while some of them are still inside the calm window before that.
+/// row reads closed. While some of them are still inside the calm window before that, the name gives
+/// the closed count and the quiet count, the same numbers as [`crate::spoken::summary_line`].
 pub fn calm_name(link: Link, calm: Calm) -> String {
     match calm {
         Calm::No => link_name(link).to_string(),
         Calm::Some(n) => format!("CNBC live, {n} closed"),
         Calm::All(1) => "CNBC, market closed".to_string(),
         Calm::All(_) => "CNBC, markets closed".to_string(),
-        Calm::QuietSome(n) => format!("CNBC live, {n} quiet"),
-        Calm::QuietAll(_) => "CNBC, quiet".to_string(),
+        Calm::QuietSome { closed: 0, quiet } => format!("CNBC live, {quiet} quiet"),
+        Calm::QuietSome { closed, quiet } => format!("CNBC live, {closed} closed, {quiet} quiet"),
+        Calm::QuietAll { closed: 0, .. } => "CNBC, quiet".to_string(),
+        Calm::QuietAll { closed, quiet } => format!("CNBC, {closed} closed, {quiet} quiet"),
+    }
+}
+
+/// [`calm_name`] for a header with little room: a board with both closed and quiet cells gives one
+/// combined count instead of two.
+pub fn calm_name_short(link: Link, calm: Calm) -> String {
+    match calm {
+        Calm::QuietSome { closed, quiet } if closed > 0 => format!("CNBC live, {} not live", closed + quiet),
+        Calm::QuietAll { closed, quiet } if closed > 0 => format!("CNBC, {} not live", closed + quiet),
+        _ => calm_name(link, calm),
     }
 }
 
@@ -766,10 +779,15 @@ mod tests {
         assert_eq!(calm_name(Link::Partial, Calm::Some(2)), "CNBC live, 2 closed");
         assert_eq!(calm_name(Link::Partial, Calm::All(1)), "CNBC, market closed");
         assert_eq!(calm_name(Link::Partial, Calm::All(6)), "CNBC, markets closed");
-        assert_eq!(calm_name(Link::Partial, Calm::QuietSome(2)), "CNBC live, 2 quiet");
-        assert_eq!(calm_name(Link::Partial, Calm::QuietAll(2)), "CNBC, quiet");
-        assert_eq!(calm_color(t, Link::Partial, Calm::QuietAll(2)), t.dim);
-        assert_eq!(calm_color(t, Link::Partial, Calm::QuietSome(2)), t.up);
+        assert_eq!(calm_name(Link::Partial, Calm::QuietSome { closed: 0, quiet: 2 }), "CNBC live, 2 quiet");
+        assert_eq!(calm_name(Link::Partial, Calm::QuietAll { closed: 0, quiet: 2 }), "CNBC, quiet");
+        assert_eq!(calm_name(Link::Partial, Calm::QuietSome { closed: 1, quiet: 1 }), "CNBC live, 1 closed, 1 quiet");
+        assert_eq!(calm_name(Link::Partial, Calm::QuietAll { closed: 2, quiet: 1 }), "CNBC, 2 closed, 1 quiet");
+        assert_eq!(calm_name_short(Link::Partial, Calm::QuietSome { closed: 1, quiet: 1 }), "CNBC live, 2 not live");
+        assert_eq!(calm_name_short(Link::Partial, Calm::QuietAll { closed: 2, quiet: 1 }), "CNBC, 3 not live");
+        assert_eq!(calm_name_short(Link::Partial, Calm::QuietSome { closed: 0, quiet: 2 }), "CNBC live, 2 quiet");
+        assert_eq!(calm_color(t, Link::Partial, Calm::QuietAll { closed: 0, quiet: 2 }), t.dim);
+        assert_eq!(calm_color(t, Link::Partial, Calm::QuietSome { closed: 1, quiet: 1 }), t.up);
     }
 
     #[test]

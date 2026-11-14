@@ -1377,7 +1377,9 @@ fn tooltip_at(view: &Board, pending: Option<&str>, blind: Option<&str>, now: f64
 
 /// [`tooltip_at`] with the zone given (`offset_at(t)` is seconds east of UTC at `t`). A row of a closed
 /// market says `closed since Fri 17:00` when the whole tooltip still fits the tray's limit with it,
-/// else `closed`; a calm row that is not yet closed shows its source and age (`CNBC 3m`).
+/// else `closed`; a calm row that is not yet closed shows its source and age (`CNBC 3m`). The tray
+/// holds [`TIP_UNITS`] units: when the short form is already over that, the closed rows drop their
+/// suffix (the title counts them) so the shell cuts fewer rows.
 fn tooltip_in(view: &Board, pending: Option<&str>, blind: Option<&str>, now: f64, offset_at: &dyn Fn(f64) -> i32) -> String {
     let mut s = String::new();
     if let Some(title) = pending {
@@ -1409,6 +1411,16 @@ fn tooltip_in(view: &Board, pending: Option<&str>, blind: Option<&str>, now: f64
         }
     }
     let units = |t: &str| t.encode_utf16().count();
+    // A board whose short form is already over the limit drops the ` (closed)` suffix of its closed rows:
+    // the title counts them, and the shell would otherwise cut the last rows.
+    if units(&s) + rows.iter().map(|(r, _)| units(r)).sum::<usize>() > TIP_UNITS {
+        for (row, long) in rows.iter_mut() {
+            if long.is_some() {
+                *row = row.replace(" (closed)", "");
+                *long = None;
+            }
+        }
+    }
     let mut total = units(&s) + rows.iter().map(|(r, _)| units(r)).sum::<usize>();
     for (row, long) in rows {
         match long {
@@ -1485,6 +1497,32 @@ mod tooltip_tests {
                 assert_eq!(probe, " QUIET", "{ctx}");
             }
         }
+    }
+
+    #[test]
+    fn a_board_with_closed_and_quiet_rows_gives_the_same_counts_everywhere() {
+        let now = 1_000_000.0;
+        let mut b = Board::new(&[]);
+        b.link = Link::Partial;
+        b.cells = vec![cell("S&P", Some(now - 5.0 * 3600.0), true), cell("XAU", Some(now - 300.0), true), cell("BTC", Some(now - 2.0), false)];
+        let header = theme::calm_name(b.link, b.calm(now));
+        let tip = tooltip_at(&b, None, None, now);
+        let summary = crate::spoken::summary_line(&b.cells, b.link, now);
+        assert_eq!(header, "CNBC live, 1 closed, 1 quiet");
+        assert!(tip.contains(&header), "{tip}");
+        assert!(summary.contains("1 closed, 1 quiet"), "{summary}");
+    }
+
+    #[test]
+    fn a_long_closed_board_drops_the_closed_suffix_to_fit_the_tray() {
+        let now = 1_000_000.0;
+        let mut b = Board::new(&[]);
+        b.link = Link::Partial;
+        b.cells = (0..6).map(|i| cell(&format!("MARKET{i}"), Some(now - 5.0 * 3600.0), true)).collect();
+        let tip = tooltip_in(&b, None, None, now, &|_| 0);
+        assert!(tip.encode_utf16().count() <= TIP_UNITS, "{tip}");
+        assert!(tip.contains("MARKET5 10"), "the last row is kept: {tip}");
+        assert!(tip.contains("markets closed"), "the title says it: {tip}");
     }
 
     #[test]

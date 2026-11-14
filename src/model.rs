@@ -275,8 +275,8 @@ pub fn closed_since(q: &Quote, now: f64) -> Option<f64> {
 /// service answered and this instrument has not printed lately, which is what every market does when
 /// it closes, so the card, the header and the alert gap tracker treat it as calm from the moment the
 /// quote goes stale. The word `closed` waits for [`market_closed`]; a quiet open market and a
-/// single-symbol stall are calm too, from the stale limit on. A down link, a missing quote, a fallback-provider quote and an unknown or
-/// future time are faults.
+/// single-symbol stall are calm too, from the stale limit on. A down link, a missing quote, a
+/// fallback-provider quote and an unknown or future time are faults.
 pub fn calm_stale(cell: &Cell, link: Link, now: f64) -> bool {
     link != Link::Down && cell.stale && cell.quote.as_ref().is_some_and(|q| q.source.is_empty() && time_is_plausible(q, now))
 }
@@ -360,23 +360,24 @@ pub fn market_closed(cell: &Cell, link: Link, now: f64) -> bool {
     link != Link::Down && cell.stale && cell.quote.as_ref().is_some_and(|q| closed_since(q, now).is_some())
 }
 
-/// How much of the board is closed, when closed is the only reason a price is not fresh. Every
-/// surface that names the link (the panel header, the strip's dot, the tray icon and tooltip) asks
-/// [`Board::calm`], so a closed market looks the same everywhere and a fault never does.
+/// How much of the board is calm, when a closed or quiet market is the only reason a price is not
+/// fresh. Every surface that names the link (the panel header, the strip's dot, the tray icon and
+/// tooltip) asks [`Board::calm`], so a closed market looks the same everywhere and a fault never does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Calm {
-    /// Nothing is closed, or some stale cell is a fault (no quote, a fallback quote, a quote of
+    /// No stale cell is calm, or some stale cell is a fault (no quote, a fallback quote, a quote of
     /// unknown age, the link down): the link's own look applies.
     No,
-    /// Every stale cell is a closed market and the other `n` rows are live.
+    /// Every stale cell reads closed and the other rows are live. `n` is the number of closed cells.
     Some(usize),
-    /// Every row is a closed market (`n` of them).
+    /// Every row reads closed (`n` of them).
     All(usize),
-    /// Like `Some`, but some stale cell is calm and not yet closed ([`market_closed`]): the header
-    /// says `quiet` and not `closed`.
-    QuietSome(usize),
-    /// Like `All`, but some cell is calm and not yet closed.
-    QuietAll(usize),
+    /// Every stale cell is calm, the rest of the rows are live, and some calm cell is not yet closed
+    /// ([`market_closed`]). `closed` cells read closed and `quiet` cells are in the calm window, so
+    /// the header gives both counts and the numbers match [`crate::spoken::summary_line`].
+    QuietSome { closed: usize, quiet: usize },
+    /// Like `QuietSome`, with every row calm.
+    QuietAll { closed: usize, quiet: usize },
 }
 
 impl Calm {
@@ -385,8 +386,8 @@ impl Calm {
     pub fn look(self) -> Calm {
         match self {
             Calm::No => Calm::No,
-            Calm::Some(_) | Calm::QuietSome(_) => Calm::Some(0),
-            Calm::All(_) | Calm::QuietAll(_) => Calm::All(0),
+            Calm::Some(_) | Calm::QuietSome { .. } => Calm::Some(0),
+            Calm::All(_) | Calm::QuietAll { .. } => Calm::All(0),
         }
     }
 }
@@ -421,7 +422,11 @@ impl Board {
     /// as a stale card whose price last moved at the end of the last kept bar. The feed's own
     /// `moved_at` has no history in the first [`CLOSED_AFTER_S`] after a start, so a weekend launch
     /// would otherwise show a re-stamped price as a fresh one. Called whenever cells or bars are
-    /// published; the next quote publish builds its cells again from the feed's own history.
+    /// published; the next quote publish builds its cells again from the feed's own history, so the
+    /// mark returns only while the condition still holds. On a weekday, when the 1D chart refresh fails
+    /// for more than 20 minutes and the live price then lands exactly on the last kept bar's close, the
+    /// card is marked stale and closed with `moved_at` at that old bar's end. The case is rare and errs
+    /// toward not firing alerts, as [`restamped`] does for a quiet market.
     pub fn apply_bar_restamps(&mut self, now: f64) {
         for i in 0..self.cells.len() {
             let Some(end) = self.last_bar_at(i).map(|b| b + BAR_END_S).filter(|_| self.restamped_over_bars(i, now)) else {
@@ -450,13 +455,14 @@ pub fn calm_of(cells: &[Cell], link: Link, now: f64) -> Calm {
     }
     // A cell with no quote is a fault whatever its `stale` flag says.
     let stale = cells.iter().filter(|c| c.stale || c.quote.is_none()).count();
-    let closed = cells.iter().filter(|c| calm_stale(c, link, now)).count();
-    let said = cells.iter().filter(|c| reads_closed(c, link, now)).count();
-    match (stale, closed) {
+    let calm = cells.iter().filter(|c| calm_stale(c, link, now)).count();
+    let closed = cells.iter().filter(|c| reads_closed(c, link, now)).count();
+    let quiet = calm - closed;
+    match (stale, calm) {
         (0, _) | (_, 0) => Calm::No,
         (s, c) if s != c => Calm::No,
-        (_, c) if c == cells.len() => if said == c { Calm::All(c) } else { Calm::QuietAll(c) },
-        (_, c) => if said == c { Calm::Some(c) } else { Calm::QuietSome(c) },
+        (_, c) if c == cells.len() => if quiet == 0 { Calm::All(c) } else { Calm::QuietAll { closed, quiet } },
+        (_, c) => if quiet == 0 { Calm::Some(c) } else { Calm::QuietSome { closed, quiet } },
     }
 }
 
@@ -788,7 +794,7 @@ mod tests {
             let mut b = Board::new(&[]);
             b.link = Link::Partial;
             b.cells = vec![cell(age)];
-            assert_eq!(b.calm(now), Calm::QuietAll(1), "the header is calm at age {age}, without the word closed");
+            assert_eq!(b.calm(now), Calm::QuietAll { closed: 0, quiet: 1 }, "the header is calm at age {age}, without the word closed");
         }
         assert!(market_closed(&cell(901.0), Link::Partial, now));
         // Faults keep the fault look.
@@ -827,20 +833,34 @@ mod tests {
             b.cells = vec![c];
             let want = match (calm, closed) {
                 (false, _) => Calm::No,
-                (true, false) => Calm::QuietAll(1),
+                (true, false) => Calm::QuietAll { closed: 0, quiet: 1 },
                 (true, true) => Calm::All(1),
             };
             assert_eq!(b.calm(now), want, "header at {age}");
         }
-        // One closed cell and one quiet cell: the header does not say closed for both.
+        // One closed cell and one quiet cell: the header counts each, as the summary line does.
         let mut b = Board::new(&[]);
         b.link = Link::Partial;
         b.cells = vec![cell(300.0), cell(5.0 * 3600.0), Cell { stale: false, ..cell(2.0) }];
-        assert_eq!(b.calm(now), Calm::QuietSome(2));
+        assert_eq!(b.calm(now), Calm::QuietSome { closed: 1, quiet: 1 });
         b.cells = vec![cell(3600.0), cell(5.0 * 3600.0), Cell { stale: false, ..cell(2.0) }];
         assert_eq!(b.calm(now), Calm::Some(2));
-        assert_eq!(Calm::QuietSome(2).look(), Calm::Some(7).look());
-        assert_eq!(Calm::QuietAll(2).look(), Calm::All(7).look());
+        b.cells = vec![cell(300.0), cell(5.0 * 3600.0)];
+        assert_eq!(b.calm(now), Calm::QuietAll { closed: 1, quiet: 1 });
+        assert_eq!(Calm::QuietSome { closed: 1, quiet: 1 }.look(), Calm::Some(7).look());
+        assert_eq!(Calm::QuietAll { closed: 1, quiet: 1 }.look(), Calm::All(7).look());
+    }
+
+    /// The header counts and the spoken summary count the same cells on a mixed board.
+    #[test]
+    fn the_header_numbers_match_the_summary_line_on_a_mixed_board() {
+        let now = 1_000_000.0;
+        let cell = |age: f64| Cell { label: "XAU".into(), digits: 2, quote: Some(q("XAU=", Some(now - age), true)), stale: age > 90.0 };
+        let cells = vec![cell(300.0), cell(5.0 * 3600.0), Cell { stale: false, ..cell(2.0) }];
+        let calm = calm_of(&cells, Link::Partial, now);
+        assert_eq!(crate::theme::calm_name(Link::Partial, calm), "CNBC live, 1 closed, 1 quiet");
+        let line = crate::spoken::summary_line(&cells, Link::Partial, now);
+        assert!(line.contains("1 closed, 1 quiet"), "{line}");
     }
 
     #[test]
