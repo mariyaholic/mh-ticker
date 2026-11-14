@@ -10,6 +10,7 @@ use crate::menu_commands::Action;
 use crate::settings::{opt, Act, Control, Opt, Section};
 
 /// A display, as the Position choice lists it.
+#[derive(Clone)]
 pub(super) struct MonitorFact {
     pub device: String,
     pub primary: bool,
@@ -38,6 +39,11 @@ pub(super) struct Env {
     pub update_running: bool,
     pub report_running: bool,
     pub version: String,
+    /// The symbol whose card settings and alerts the pages show; the first shown symbol when `None` or
+    /// when it is no longer shown.
+    pub card: Option<String>,
+    /// The decimals *Auto* gives each shown symbol (symbol, digits), from the live price.
+    pub autos: Vec<(String, u32)>,
 }
 
 impl Default for Env {
@@ -60,6 +66,8 @@ impl Default for Env {
             update_running: false,
             report_running: false,
             version: String::new(),
+            card: None,
+            autos: Vec::new(),
         }
     }
 }
@@ -85,13 +93,57 @@ pub(super) fn build(cfg: &Config, env: &Env, section: Section) -> Vec<Control> {
     }
 }
 
+/// The shown row the card settings and the alerts are about: the one `env.card` names, else the first.
+fn selected_row<'a>(cfg: &'a Config, env: &Env) -> Option<(usize, &'a config::Row)> {
+    let named = env.card.as_ref().and_then(|c| cfg.rows.iter().position(|r| &r.symbol == c));
+    let i = named.or(if cfg.rows.is_empty() { None } else { Some(0) })?;
+    Some((i, &cfg.rows[i]))
+}
+
+/// The choice that picks the symbol the rest of the page is about.
+fn card_picker(cfg: &Config, current: usize, label: &str, hint: &str) -> Control {
+    let opts = cfg.rows.iter().map(|r| opt(r.label.clone(), Act::Card(r.symbol.clone()))).collect();
+    Control::choice(label, hint, opts, Some(current))
+}
+
+/// The per-symbol settings the card's right-click menu had: name, decimals and the taskbar strip pin.
+fn card_settings(cfg: &Config, env: &Env) -> Vec<Control> {
+    let Some((i, r)) = selected_row(cfg, env) else { return Vec::new() };
+    let mut v = vec![Control::header("Card settings")];
+    v.push(card_picker(cfg, i, "Symbol", "the card these settings are for"));
+    let renamed = config::derived_label(cfg, &r.symbol) != r.label;
+    v.push(Control::choice(
+        "Name",
+        &format!("shown as {}", r.label),
+        vec![opt("Rename...", Act::Do(Action::Rename(r.symbol.clone()))), opt("Reset name", Act::Do(Action::ResetName(r.symbol.clone()))).enabled(renamed)],
+        None,
+    ));
+    let auto = env.autos.iter().find(|(s, _)| s == &r.symbol).map_or_else(|| config::auto_digits(&r.symbol, None), |(_, d)| *d);
+    let mut digits = vec![opt(format!("Auto ({auto})"), Act::Do(Action::Digits(r.symbol.clone(), None))).checked(r.digits == auto)];
+    for d in 0..=6u32 {
+        digits.push(opt(d.to_string(), Act::Do(Action::Digits(r.symbol.clone(), Some(d)))).checked(r.digits == d && r.digits != auto));
+    }
+    v.push(Control::choice("Decimals", "digits after the point", digits, None));
+    let pinned: Vec<bool> = cfg.rows.iter().map(|r| r.strip).collect();
+    let can = if r.strip { crate::pins::can_unpin(&pinned, i) } else { pinned.len() > 1 };
+    v.push(Control::toggle(
+        "On the taskbar strip",
+        if can { "the panel always shows every card" } else { "at least one symbol stays on the strip" },
+        r.strip,
+        Act::Do(Action::Pin(r.symbol.clone(), !r.strip)),
+        can,
+    ));
+    v
+}
+
 fn symbols(cfg: &Config, env: &Env) -> Vec<Control> {
     let list = config::menu_list(cfg);
     let shown: Vec<bool> = list.iter().map(|r| config::is_shown(cfg, &r.symbol)).collect();
     let n_shown = shown.iter().filter(|s| **s).count();
     let full = n_shown >= config::MAX_ROWS;
-    let mut v = vec![Control::header(&format!("Shown symbols ({n_shown} of {})", config::MAX_ROWS))];
-    // One chip per catalogue entry: on means shown. The last one cannot go and at most MAX_ROWS show.
+    let mut v = vec![Control::header(&format!("Shown symbols ({n_shown}, at most {})", config::MAX_ROWS))];
+    // One chip per catalogue entry: on means the symbol has a card. The last one cannot go and at most
+    // MAX_ROWS have one. Whether a card is also on the taskbar strip is the Card settings toggle.
     let chips = list
         .iter()
         .zip(&shown)
@@ -100,7 +152,7 @@ fn symbols(cfg: &Config, env: &Env) -> Vec<Control> {
             opt(r.label.clone(), Act::Do(Action::Symbol(r.symbol.clone()))).checked(*on).enabled(!locked)
         })
         .collect();
-    v.push(Control::choice("Show on the strip", "tick to show, untick to hide", chips, None));
+    v.push(Control::choice("Symbols you follow", "tick to add a card, untick to remove it", chips, None));
     let adding = env.adding.as_deref();
     v.push(Control::button(
         "Add a symbol",
@@ -120,6 +172,7 @@ fn symbols(cfg: &Config, env: &Env) -> Vec<Control> {
             .collect();
         v.push(Control::choice("Remove a symbol I added", "drops it from the catalogue", opts, None));
     }
+    v.extend(card_settings(cfg, env));
     v.push(Control::header("Order and reset"));
     let order = |l: &str, id: usize| opt(l, cmd(id)).enabled(n_shown > 1);
     v.push(Control::choice(
@@ -275,11 +328,16 @@ fn alerts_page(cfg: &Config, env: &Env) -> Vec<Control> {
     ));
     v.push(Control::toggle("Alert gaps", "say when alerts could not be checked", av.gap_notice, cmd(CMD_GAP_NOTICE), has_hook));
 
-    v.push(Control::header("Alerts for each symbol"));
+    v.push(Control::header("Alerts for a symbol"));
+    let picked = selected_row(cfg, env);
+    if let Some((i, _)) = picked {
+        v.push(card_picker(cfg, i, "Symbol", "the alerts below are for this one"));
+    }
     if av.rows.is_empty() {
         v.push(Control::note("(no symbols shown)"));
     }
-    for row in &av.rows {
+    let picked_label = picked.map(|(_, r)| r.label.as_str());
+    for row in av.rows.iter().filter(|r| Some(r.label.as_str()) == picked_label || picked_label.is_none()) {
         let line = row.alert.as_ref().map(|a| alerts::describe(a, row.digits)).filter(|d| !d.is_empty());
         // The presets are split where the menu drew a separator: one control per group, the first one
         // carrying the symbol's name and its current alert.
@@ -550,6 +608,12 @@ mod tests {
         assert!(any(&|a| matches!(a, Action::Monitor(None))));
         assert!(any(&|a| matches!(a, Action::Monitor(Some(d)) if d == "B")));
         assert_eq!(any(&|a| matches!(a, Action::Forget(_))), !custom.is_empty());
+        // The card menu's per-symbol entries.
+        assert!(any(&|a| matches!(a, Action::Rename(_))));
+        assert!(any(&|a| matches!(a, Action::ResetName(_))));
+        assert!(any(&|a| matches!(a, Action::Digits(_, None))));
+        assert!((0..=6).all(|d| any(&|a| matches!(a, Action::Digits(_, Some(x)) if *x == d))));
+        assert!(any(&|a| matches!(a, Action::Pin(_, false))), "a pinned symbol offers to unpin");
         // One monitor: no Display choice.
         env.monitors.truncate(1);
         let one = all_acts(&cfg, &env);
@@ -560,7 +624,7 @@ mod tests {
     fn every_symbol_in_the_catalogue_has_a_chip_and_the_shown_ones_are_on() {
         let (cfg, env) = rich_env(true);
         let page = build(&cfg, &env, Section::Symbols);
-        let chips = &page.iter().find(|c| c.label == "Show on the strip").unwrap().opts;
+        let chips = &page.iter().find(|c| c.label == "Symbols you follow").unwrap().opts;
         let list = config::menu_list(&cfg);
         assert_eq!(chips.len(), list.len());
         for (chip, row) in chips.iter().zip(&list) {
@@ -574,7 +638,7 @@ mod tests {
         let (mut cfg, env) = rich_env(true);
         cfg.rows.truncate(1);
         let page = build(&cfg, &env, Section::Symbols);
-        let chips = &page.iter().find(|c| c.label == "Show on the strip").unwrap().opts;
+        let chips = &page.iter().find(|c| c.label == "Symbols you follow").unwrap().opts;
         assert!(chips.iter().filter(|c| c.on).all(|c| !c.enabled), "the only shown symbol is locked on");
         assert!(chips.iter().filter(|c| !c.on).all(|c| c.enabled));
     }
@@ -732,5 +796,139 @@ mod tests {
         env.update_running = true;
         let upd = build(&cfg, &env, Section::About).into_iter().find(|c| c.label == "Updates").unwrap();
         assert!(!upd.opts[0].enabled, "one update check at a time");
+    }
+
+    fn find_in(page: &[Control], label: &str) -> usize {
+        page.iter().position(|c| c.label == label).unwrap_or_else(|| panic!("no control {label:?}"))
+    }
+
+    #[test]
+    fn an_unpinned_symbol_offers_pin_and_the_last_pinned_one_cannot_be_unpinned() {
+        let (mut cfg, mut env) = rich_env(true);
+        env.card = Some(cfg.rows[1].symbol.clone());
+        cfg.rows[1].strip = false;
+        let page = build(&cfg, &env, Section::Symbols);
+        let pin = &page[find_in(&page, "On the taskbar strip")];
+        assert!(!pin.on);
+        assert_eq!(pin.opts[0].act, Act::Do(Action::Pin(cfg.rows[1].symbol.clone(), true)));
+        assert!(pin.opts[0].enabled, "several rows: pinning is allowed");
+        // Only one row stays pinned: it cannot be unpinned.
+        for (k, r) in cfg.rows.iter_mut().enumerate() {
+            r.strip = k == 0;
+        }
+        env.card = Some(cfg.rows[0].symbol.clone());
+        let page = build(&cfg, &env, Section::Symbols);
+        let pin = &page[find_in(&page, "On the taskbar strip")];
+        assert!(pin.on);
+        assert_eq!(pin.opts[0].act, Act::Do(Action::Pin(cfg.rows[0].symbol.clone(), false)));
+        assert!(!pin.opts[0].enabled);
+    }
+
+    #[test]
+    fn rename_is_always_offered_and_reset_name_only_when_the_label_was_changed() {
+        let (mut cfg, mut env) = rich_env(true);
+        env.card = Some(cfg.rows[0].symbol.clone());
+        let name = |cfg: &Config, env: &Env| {
+            let page = build(cfg, env, Section::Symbols);
+            page[find_in(&page, "Name")].clone()
+        };
+        let c = name(&cfg, &env);
+        assert_eq!(c.opts[0].act, Act::Do(Action::Rename(cfg.rows[0].symbol.clone())));
+        assert!(c.opts[0].enabled);
+        assert_eq!(c.opts[1].act, Act::Do(Action::ResetName(cfg.rows[0].symbol.clone())));
+        assert!(!c.opts[1].enabled, "the label is the derived one");
+        cfg.rows[0].label = "My name".into();
+        let c = name(&cfg, &env);
+        assert!(c.opts[1].enabled);
+        assert!(c.hint.contains("My name"));
+    }
+
+    #[test]
+    fn decimals_mark_auto_or_the_chosen_count_like_the_menu_did() {
+        let (mut cfg, mut env) = rich_env(true);
+        let sym = cfg.rows[0].symbol.clone();
+        env.card = Some(sym.clone());
+        env.autos = vec![(sym.clone(), 2)];
+        let marked = |cfg: &Config, env: &Env| {
+            let page = build(cfg, env, Section::Symbols);
+            let c = &page[find_in(&page, "Decimals")];
+            assert_eq!(c.opts.len(), 8, "Auto and 0 to 6");
+            c.opts.iter().position(|o| o.on)
+        };
+        cfg.rows[0].digits = 2;
+        assert_eq!(marked(&cfg, &env), Some(0), "the count equals what Auto gives");
+        cfg.rows[0].digits = 4;
+        assert_eq!(marked(&cfg, &env), Some(1 + 4));
+        let page = build(&cfg, &env, Section::Symbols);
+        assert_eq!(page[find_in(&page, "Decimals")].opts[0].label, "Auto (2)");
+        assert_eq!(page[find_in(&page, "Decimals")].opts[3].act, Act::Do(Action::Digits(sym, Some(2))));
+    }
+
+    #[test]
+    fn the_card_picker_defaults_to_the_first_shown_symbol_and_follows_the_choice() {
+        let (cfg, mut env) = rich_env(true);
+        let picker = |cfg: &Config, env: &Env| {
+            let page = build(cfg, env, Section::Symbols);
+            let c = page[find_in(&page, "Symbol")].clone();
+            (c.sel, c.opts.len(), c.opts.iter().map(|o| o.act.clone()).collect::<Vec<_>>())
+        };
+        let (sel, n, acts) = picker(&cfg, &env);
+        assert_eq!(sel, Some(0));
+        assert_eq!(n, cfg.rows.len());
+        assert_eq!(acts[2], Act::Card(cfg.rows[2].symbol.clone()));
+        env.card = Some(cfg.rows[2].symbol.clone());
+        assert_eq!(picker(&cfg, &env).0, Some(2));
+        env.card = Some("NOT.SHOWN".into());
+        assert_eq!(picker(&cfg, &env).0, Some(0), "a symbol that is no longer shown falls back to the first");
+    }
+
+    #[test]
+    fn the_alerts_page_shows_the_alert_rows_of_the_picked_symbol_only() {
+        let (cfg, mut env) = rich_env(true);
+        let rows = |cfg: &Config, env: &Env| {
+            let page = build(cfg, env, Section::Alerts);
+            let named = |l: &str| page.iter().any(|c| c.label == l);
+            (named(&format!("{} fast move", cfg.rows[0].label)), named(&format!("{} fast move", cfg.rows[1].label)), page.len())
+        };
+        let (first, second, len_first) = rows(&cfg, &env);
+        assert!(first && !second);
+        env.card = Some(cfg.rows[1].symbol.clone());
+        let (first, second, len_second) = rows(&cfg, &env);
+        assert!(!first && second);
+        assert_eq!(len_first, len_second, "the page is as long for any symbol");
+        // Every preset of every symbol is still reachable by choosing the symbol.
+        for r in &cfg.rows {
+            env.card = Some(r.symbol.clone());
+            let acts = all_acts(&cfg, &env);
+            assert!(acts.contains(&Act::Do(Action::Alert(r.label.clone(), 0))), "{}", r.label);
+        }
+    }
+
+    #[test]
+    fn the_symbols_header_does_not_read_as_a_share_of_the_catalogue() {
+        let (cfg, env) = rich_env(true);
+        let page = build(&cfg, &env, Section::Symbols);
+        let h = &page[0].label;
+        assert!(h.starts_with("Shown symbols (") && h.contains(", at most 24)") && !h.contains(" of "), "{h}");
+        assert_eq!(page[find_in(&page, "Symbols you follow")].hint, "tick to add a card, untick to remove it");
+    }
+
+    #[test]
+    fn focus_on_undo_stays_on_undo_when_a_custom_symbol_adds_a_control_above_it() {
+        let (mut cfg, mut env) = rich_env(true);
+        cfg.rows.pop();
+        env.undo = Some("removal");
+        let old = build(&cfg, &env, Section::Symbols);
+        let at = find_in(&old, "Undo");
+        let focus = settings::Hit::Opt(at, 0);
+        // A symbol is added to the catalogue: "Remove a symbol I added" appears above Undo.
+        cfg.catalog.push(config::Row { label: "NEW".into(), symbol: "NEW.TEST".into(), digits: 2, name: String::new(), strip: true });
+        let new = build(&cfg, &env, Section::Symbols);
+        assert!(new.len() > old.len(), "the page gained a control");
+        let f = settings::settle(focus, &old, 0, 6, &new);
+        let settings::Hit::Opt(ci, oi) = f else { panic!("the focus left the controls: {f:?}") };
+        assert_eq!(new[ci].opts[oi].act, Act::Cmd(CMD_UNDO), "the focus stays on Undo");
+        assert_ne!(new[ci].opts[oi].act, Act::Cmd(CMD_RESET), "and never lands on Reset to default");
+        assert_eq!(new[ci].label, "Undo");
     }
 }

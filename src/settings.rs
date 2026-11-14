@@ -89,6 +89,8 @@ impl Section {
 pub enum Act {
     Cmd(usize),
     Do(Action),
+    /// Chooses the symbol whose card settings and alerts the page shows. The window handles it itself.
+    Card(String),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -357,10 +359,30 @@ pub fn layout(dpi: u32, w: i32, h: i32, nav_n: usize, controls: &[Control], scro
     l
 }
 
-/// The pixels a wheel `delta` scrolls at `dpi`: 48 px per notch (a delta of 120) at 96 DPI, scaled
-/// continuously so the small deltas of a precision touchpad or a smooth-scroll mouse count.
+/// One wheel notch (a delta of 120) scrolls 48 px at 96 DPI.
+const WHEEL_DEN: i64 = 96 * 120;
+
+/// The pixels a wheel `delta` scrolls at `dpi`, scaled continuously so the small deltas of a precision
+/// touchpad or a smooth-scroll mouse count. `rem` carries what a step could not show as whole pixels
+/// into the next one, so a run of very fine deltas adds up to the same distance as one large delta.
+pub fn wheel_step(delta: i32, dpi: u32, rem: &mut i64) -> i32 {
+    let total = delta as i64 * 48 * dpi as i64 + *rem;
+    *rem = total % WHEEL_DEN;
+    (total / WHEEL_DEN) as i32
+}
+
+/// `wheel_step` for a single delta with nothing carried over.
+#[cfg(test)]
 pub fn wheel_px(delta: i32, dpi: u32) -> i32 {
-    (delta as i64 * 48 * dpi as i64 / 96 / 120) as i32
+    wheel_step(delta, dpi, &mut 0)
+}
+
+/// Where a window of `w` x `h` opens so it is centred in the work area `work` of the monitor the strip
+/// is on, kept inside that area when it is larger than it.
+pub fn place(work: Rc, w: i32, h: i32) -> (i32, i32) {
+    let x = work.left + (work.width() - w) / 2;
+    let y = work.top + (work.height() - h) / 2;
+    (x.max(work.left), y.max(work.top))
 }
 
 /// Whether the theme's page is dark, which decides the caption bar colour.
@@ -422,9 +444,13 @@ pub enum Key {
     End,
 }
 
-/// The option a control takes the focus on: the current one, else the first enabled one.
+/// The option a control takes the focus on: the current one (`sel`), else the first enabled option
+/// drawn as chosen, else the first enabled one.
 pub fn entry_opt(c: &Control) -> Option<usize> {
-    c.sel.filter(|i| c.opts.get(*i).is_some_and(|o| o.enabled)).or_else(|| c.opts.iter().position(|o| o.enabled))
+    c.sel
+        .filter(|i| c.opts.get(*i).is_some_and(|o| o.enabled))
+        .or_else(|| c.opts.iter().position(|o| o.on && o.enabled))
+        .or_else(|| c.opts.iter().position(|o| o.enabled))
 }
 
 fn focus_stops(controls: &[Control]) -> Vec<usize> {
@@ -482,20 +508,40 @@ pub fn step(f: Focus, key: Key, nav_cur: usize, nav_n: usize, controls: &[Contro
     }
 }
 
-/// Keep a focus valid after the controls were rebuilt (a symbol was hidden, an alert cleared).
-pub fn settle(f: Focus, nav_n: usize, controls: &[Control]) -> Focus {
-    match f {
-        Hit::Nav(i) => Hit::Nav(i.min(nav_n.saturating_sub(1))),
-        Hit::Opt(ci, oi) => match controls.get(ci) {
-            Some(c) if c.opts.get(oi).is_some_and(|o| o.enabled) => f,
-            Some(c) => entry_opt(c).map_or(Hit::Nav(0), |j| Hit::Opt(ci, j)),
-            None => stops_last(controls).unwrap_or(Hit::Nav(0)),
-        },
-    }
+/// What a focus on an option stands for: the control's label and the option's command. It survives a
+/// rebuild that inserts or removes controls, which an index does not.
+fn identity(f: Focus, controls: &[Control]) -> Option<(&str, &Act)> {
+    let Hit::Opt(ci, oi) = f else { return None };
+    let c = controls.get(ci)?;
+    Some((c.label.as_str(), &c.opts.get(oi)?.act))
 }
 
-fn stops_last(controls: &[Control]) -> Option<Focus> {
-    focus_stops(controls).last().and_then(|&ci| entry_opt(&controls[ci]).map(|oi| Hit::Opt(ci, oi)))
+/// Keep a focus valid after the controls were rebuilt (a symbol was hidden, an alert cleared). `old` is
+/// the control list the focus was on. The focus follows the option with the same control label and the
+/// same command; when that is gone it goes to the entry option of the control with the same (non-empty)
+/// label, and then to the sidebar entry `nav_cur`. It never lands on an unrelated control because the
+/// controls above it changed in number.
+pub fn settle(f: Focus, old: &[Control], nav_cur: usize, nav_n: usize, controls: &[Control]) -> Focus {
+    let side = Hit::Nav(nav_cur.min(nav_n.saturating_sub(1)));
+    match f {
+        Hit::Nav(i) => Hit::Nav(i.min(nav_n.saturating_sub(1))),
+        Hit::Opt(..) => {
+            let Some((label, act)) = identity(f, old) else { return side };
+            let same = controls.iter().enumerate().find_map(|(ci, c)| {
+                if c.label != label {
+                    return None;
+                }
+                c.opts.iter().position(|o| &o.act == act && o.enabled).map(|oi| Hit::Opt(ci, oi))
+            });
+            same.or_else(|| {
+                if label.is_empty() {
+                    return None;
+                }
+                controls.iter().enumerate().find(|(_, c)| c.label == label && c.focusable()).and_then(|(ci, c)| entry_opt(c).map(|oi| Hit::Opt(ci, oi)))
+            })
+            .unwrap_or(side)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1006,16 +1052,71 @@ mod tests {
         let controls = vec![Control::header("Only a header"), Control::note("and a note")];
         assert_eq!(step(Hit::Nav(1), Key::Tab, 1, 4, &controls), Hit::Nav(1));
         assert_eq!(step(Hit::Nav(1), Key::Right, 1, 4, &controls), Hit::Nav(1));
-        assert_eq!(settle(Hit::Opt(0, 0), 4, &controls), Hit::Nav(0));
-        assert_eq!(settle(Hit::Nav(9), 4, &controls), Hit::Nav(3));
+        assert_eq!(settle(Hit::Opt(0, 0), &controls, 2, 4, &controls), Hit::Nav(2));
+        assert_eq!(settle(Hit::Nav(9), &controls, 2, 4, &controls), Hit::Nav(3));
     }
 
     #[test]
-    fn settle_repairs_a_focus_the_rebuilt_controls_no_longer_have() {
+    fn settle_follows_the_option_by_label_and_command() {
         let controls = sample();
-        assert_eq!(settle(Hit::Opt(2, 1), 6, &controls), Hit::Opt(2, 1));
-        assert_eq!(settle(Hit::Opt(7, 0), 6, &controls), Hit::Opt(7, 1), "option 0 is disabled now");
-        assert_eq!(settle(Hit::Opt(40, 0), 6, &controls), Hit::Opt(7, 1), "the control is gone");
+        assert_eq!(settle(Hit::Opt(2, 1), &controls, 1, 6, &controls), Hit::Opt(2, 1));
+        assert_eq!(settle(Hit::Opt(7, 1), &controls, 1, 6, &controls), Hit::Opt(7, 1));
+        assert_eq!(settle(Hit::Opt(40, 0), &controls, 1, 6, &controls), Hit::Nav(1), "the control is gone");
+    }
+
+    #[test]
+    fn settle_keeps_the_focus_on_the_same_control_when_controls_are_inserted_above_it() {
+        let old = sample();
+        let mut new = sample();
+        new.insert(2, Control::choice("Inserted", "", vec![opt("x", Act::Cmd(900))], None));
+        new.insert(2, Control::choice("Inserted too", "", vec![opt("y", Act::Cmd(901)), opt("z", Act::Cmd(902))], None));
+        // "Update" was control 5, option 0; it is control 7 now.
+        assert_eq!(settle(Hit::Opt(5, 0), &old, 1, 6, &new), Hit::Opt(7, 0));
+        // "Themes" option 9 moves with its control.
+        assert_eq!(settle(Hit::Opt(3, 9), &old, 1, 6, &new), Hit::Opt(5, 9));
+        // Controls removed above: the same.
+        let fewer: Vec<Control> = old.iter().skip(2).cloned().collect();
+        assert_eq!(settle(Hit::Opt(5, 0), &old, 1, 6, &fewer), Hit::Opt(3, 0));
+    }
+
+    #[test]
+    fn settle_goes_to_the_sidebar_rather_than_a_stranger_when_the_control_is_gone() {
+        let old = sample();
+        // Without the "Update" control, the control now at its old index (5) is "Disabled" and the one
+        // after is "Half"; neither takes the focus.
+        let new: Vec<Control> = old.iter().filter(|c| c.label != "Update").cloned().collect();
+        assert_eq!(settle(Hit::Opt(5, 0), &old, 3, 6, &new), Hit::Nav(3));
+        // The option's command changed but its control stays: the control's entry option takes it.
+        let mut changed = sample();
+        changed[5] = Control::button("Update", "", "Check again", Act::Cmd(77), true);
+        assert_eq!(settle(Hit::Opt(5, 0), &old, 1, 6, &changed), Hit::Opt(5, 0));
+    }
+
+    #[test]
+    fn entry_prefers_the_selected_option_then_the_one_drawn_as_chosen() {
+        let on_third = Control::choice("c", "", vec![opt("a", Act::Cmd(1)), opt("b", Act::Cmd(2)), opt("c", Act::Cmd(3)).checked(true)], None);
+        assert_eq!(entry_opt(&on_third), Some(2), "no sel, so the checked option");
+        let with_sel = Control::choice("c", "", vec![opt("a", Act::Cmd(1)), opt("b", Act::Cmd(2)), opt("c", Act::Cmd(3))], Some(1));
+        assert_eq!(entry_opt(&with_sel), Some(1));
+        let locked = Control::choice("c", "", vec![opt("a", Act::Cmd(1)), opt("b", Act::Cmd(2)).checked(true).enabled(false)], None);
+        assert_eq!(entry_opt(&locked), Some(0), "a disabled chosen option is skipped");
+    }
+
+    #[test]
+    fn a_window_is_centred_in_the_work_area_and_kept_inside_it() {
+        let work = Rc::new(1920, 0, 1920 + 1600, 860);
+        assert_eq!(place(work, 800, 600), (1920 + 400, 130));
+        assert_eq!(place(work, 2000, 1000), (1920, 0), "larger than the area: top left corner");
+    }
+
+    #[test]
+    fn fine_wheel_deltas_carry_their_remainder() {
+        let mut rem = 0;
+        let sum: i32 = (0..80).map(|_| wheel_step(1, 96, &mut rem)).sum();
+        assert_eq!(sum, 80 * 48 / 120, "80 deltas of 1 add up to 32 px, none lost to rounding");
+        let mut rem = 0;
+        let sum: i32 = (0..300).map(|_| wheel_step(-1, 96, &mut rem)).sum();
+        assert_eq!(sum, -(300 * 48 / 120), "the downward remainder adds up the same way");
     }
 
     fn every_palette() -> Vec<Theme> {
