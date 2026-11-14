@@ -25,8 +25,9 @@ effort went:
 |---|---|---|
 | Look | one theme, exactly as it always was | **26 palettes in 4 tiers**, every one of them moving, plus 22 fonts — see [THEMES.md](THEMES.md) |
 | Symbols | the *Symbols* menu | that **plus a picker strip inside the panel** |
-| Alerts | — | price alerts, tray balloon, optional **Discord/Slack/ntfy webhook** |
-| Memory after a minute | ~5.7 MB | ~5.8 MB |
+| Alerts | — | price alerts, mute and quiet hours, tray balloon, optional **Discord/Slack/ntfy webhook** |
+| Chart | — | a candle pane with ranges from 1D to 5Y, volume and alert levels |
+| Memory after a minute | ~5.7 MB (measured on 1.7.1, not yet on 1.8) | ~5.8 MB (measured on 1.7.1, not yet on 1.8) |
 
 They run side by side (separate settings files, separate tray icons). The classic exe keeps its name
 and its look on purpose: if you just want the little ticker, nothing about it changed except the bugs.
@@ -60,7 +61,14 @@ Double click it. If prompted, simply select Run anyway.
 - **Put it back:** The minimize button top right, **Esc**, or the tray icon again
 - **Pick ur symbols:** right click → *Symbols* and tick whatever u want from 23 of them (metals, crypto, us
   futures, oil, gas, copper, fx, the dollar index, us yields, vix, nikkei, dax, ftse, hang seng). the strip and
-  the panel change right away, no restart. max 12 at once, and *Reset to default* gets u back the original six
+  the panel change right away, no restart. up to 24 at once, and *Reset to default* gets u back the original six
+- **Add any symbol:** *Symbols* → *Add symbol...* and type a CNBC symbol like `AAPL`, `EUR=` or `@GC.1`. the app
+  checks it with one request to CNBC before it adds it, and the name and first price come from CNBC. if the symbol
+  isn't one CNBC knows, nothing is added. u can take it back off with *Symbols* → *Remove a symbol I added*, which
+  also removes its alerts
+- **Traffic:** every symbol on the strip is one more quote in each refresh, so the data grows with the number u
+  show. the cost at 24 hasn't been measured yet. all of it goes to CNBC, except the optional fallback providers
+  and one request to `api.github.com` for the update check below, which only happens when u click it
 - **Move it:** right click → *Position*, since not everyone has free space on the left of their taskbar:
   - **Auto** (default) - Stays in the taskbar and finds the space itself. it uses the left of start while theres
     room there, otherwise next to the tray, and if ur taskbar has no room at all (auto-hide or a vertical one) it
@@ -105,17 +113,57 @@ Double click it. If prompted, simply select Run anyway.
 - **Candles (Ultra):** the candle button in the panel header opens a candle pane down the right side, charting the
   locked card (it locks the first card if nothing is). one-minute bars from the same CNBC request the sparklines
   already use, folded to 5/15/30/60 minutes on a narrow pane so a candle is never a one-pixel scratch. candles are
-  whole-pixel and uniform, gridlines sit on round prices, the time axis ticks on round UTC hours, and a tag on the
-  price axis marks where it last traded. opening it on a narrow window widens the frame to fit both, **closing it
+  whole-pixel and uniform, gridlines sit on round prices, and a tag on the price axis marks where it last traded.
+  the time axis is on ur local clock, and the `local` / `UTC` word in the header switches it (it's saved). opening it on a narrow window widens the frame to fit both, **closing it
   glides the window back to the size and spot it came from**, centred again (unless u dragged the edge yourself), and the picker and the chart take turns (they
   want the same space)
+- **Chart reading (Ultra):** move the pointer over a candle and a line in the header shows its time, open, high,
+  low, close and change, with a crosshair and the price on the axis. the previous close is a dashed line marked
+  `prev`, the day's high and low are small ticks on the right edge, and a faint dotted line marks where the
+  market was shut. the day's change sits beside the last price
+- **Ranges (Ultra):** the tabs on the chart's second header line are `1D 5D 1M 6M 1Y 5Y`. `1D` is today. the others
+  load the first time u click them, for the locked card, and refresh themselves when they get old. a range that
+  fails says so and tries again after 30 seconds. `1M` and `6M` are daily bars trimmed to a month or half a year.
+  daily and longer bars keep the exchange's own dates for everyone, so they have no local/UTC switch
+- **Volume (Ultra):** where CNBC sends volume, a strip of volume bars sits under the candles. FX, yields and spot
+  metals don't have it, so there's no strip for them
+- **Alert levels on the chart (Ultra):** an alert level inside the chart's price range is a dashed line with its
+  price at the right end. a level outside it is a marker on the nearest edge. right click the chart for *Alert
+  at...* or *More...* (which opens the main menu)
 - **Settings button (Ultra):** the cog at the left end of the panel header opens the same menu as the tray icon
   (Symbols, Poll, Theme, Font, Alerts, Position...) right under it, so u don't have to go hunting for the tray
-- **Alerts (Ultra):** right click → *Alerts* → pick a symbol → *above 1 %* / *above 2 %* / *below 1 %* / *below 2 %*
-  (of whatever it is right now). u get a tray balloon and, if u set a `webhook`, a message in Discord/Slack/ntfy.
-  it fires once per cooldown and **never on a stale price** (a market closed at a level would otherwise ping u
-  forever). Focus Assist eats balloons, so the panel footer also shows the last alert - and arbitrary levels are a
-  one-line config edit for now
+- **Alerts (Ultra):** right click → *Alerts* → pick a symbol. the presets are above or below 0.5, 1, 2 or 5 % (of
+  whatever it is right now), past today's high or low, the previous close, and a day move of ±1, 2, 3 or 5 %.
+  *at a price...* takes an exact level, like `4,200.50`. u get a tray balloon and, if u set a webhook, a message in
+  Discord/Slack/ntfy. it fires once per cooldown and **never on a stale price** (a market closed at a level would
+  otherwise ping u forever). *Fire once* clears a level after it fires. Focus Assist eats balloons, so the tray icon
+  gets a marker and its tooltip names the alert, and the *Recent* list keeps the last 10 with what happened to each
+- **Mute and quiet hours (Ultra):** *Alerts* → *Mute* for 1 hour, 8 hours or until u turn it back on. *Quiet hours*
+  is off or a window of 22:00 to 07:00, 23:00 to 08:00 or 00:00 to 09:00, by ur PC's clock. a muted or quiet alert is still
+  checked and shows up in *Recent*, but it makes no balloon and sends nothing to the webhook
+- **Webhook (Ultra):** *Alerts* → *Paste URL from clipboard* reads the URL u copied, checks it and asks before saving.
+  the menu shows only its host. *Send a test alert* checks it works, and *Remove* deletes it. the URL is the password
+  for that channel, so the app never shows or logs all of it
+- **Start with Windows:** right click → tick *Start with Windows* and it starts when u sign in. untick it to stop.
+  it's a `Run` entry for ur own account (no admin needed), and the menu reads the tick each time it opens
+- **Hotkey:** right click → *Hotkey* → *Off*, one of four presets (`Ctrl+Alt+M`, `Ctrl+Alt+T`, `Ctrl+Shift+F12`,
+  `Ctrl+Alt+Space`), or a custom one from the config. the key opens and closes the panel from anywhere. if another
+  app already has the combination, the entry says so
+- **Refresh now:** right click → *Refresh now* fetches every price and chart range at once, instead of waiting for
+  the next poll. the backoff after a source that keeps failing still applies
+- **Strip:** right click → *Strip* for the rows in the taskbar (1, 2 or 3; only when it's docked to the taskbar),
+  the text size (small, default, large, larger) and the opacity (100 down to 60 %). changes apply at once
+- **Check for updates:** right click → *Check for updates*. the app asks GitHub once for the latest release and
+  tells u whether it's newer. if it is, it offers to open the download page. nothing else from GitHub's answer is
+  used. it never checks by itself, only when u click
+- **Copy all prices:** right click → *Copy all prices* puts the whole board on the clipboard, one symbol per line,
+  tab-separated. in the open Ultra panel, Ctrl+C copies the locked card's line, or every price if nothing is locked
+- **Keys in the open Ultra panel:** arrows move the lock between cards, Enter opens the locked card on CNBC, `C`
+  opens the chart, `S` opens the symbol picker, Delete takes the locked card off the strip, and Ctrl+Left and
+  Ctrl+Right move it one place. the card menu has *Move left*, *Move right*, *Move first* and *Remove from strip*
+  too, and a click on a symbol on a docked Ultra strip locks that card and opens the panel on it
+- **Save failures:** if the settings can't be written (a read-only folder, say), the menu shows a greyed line saying
+  so. it clears when a later save works
 - **Quit or whatever else:** Right click the strip or the tray icon (or use the cog in the Ultra panel). u get *Expand view*, *Symbols*,
   *Poll every*, *Theme* and *Alerts* (Ultra), *Position*, *Show strip*, *Always on top*, what its currently doing,
   *Open config folder* and *Quit* - so no more going to Task Manager every time u need it killed
@@ -129,11 +177,13 @@ Double click it. If prompted, simply select Run anyway.
 
 `%LOCALAPPDATA%\MH_Ticker\config.json` gets made with the defaults the first time u run it (*Open config folder*
 in the menu takes u there). **Ultra keeps its own `config_ultra.json`** in the same folder, so the two builds
-never overwrite each other. if u edit it by hand restart the app after (the menus dont need a restart tho).
+never overwrite each other. if u edit it by hand, restart the app after. anything the menus change (symbols, poll, theme, font, alerts, strip,
+hotkey, position, chart time zone) takes effect at once, with no restart.
 whats in there:
 - `rows`: the symbols that show, each with a `label`, the cnbc `symbol`, `digits` and an optional `name`
 - `catalog`: the list the Symbols menu shows, same fields. any symbol cnbc's quote pages have works, like
-  `AUD=` for aud/usd or `@SI.1` for silver futures - add it here and then tick it in the menu
+  `AUD=` for aud/usd or `@SI.1` for silver futures. *Symbols* → *Add symbol...* adds one from the menu, after a
+  check against CNBC, and an entry can be taken out again with *Remove a symbol I added*
 - `fallback_enabled`: optional fallback consent, `false` by default; use the menu to change it
 - `poll_s`: seconds between price requests
 - `stale_after_s` and `delayed_grace_s`: when a price gets dimmed
@@ -146,14 +196,23 @@ whats in there:
   and centres - which is what every config written before the panel could be resized does
 - `theme` (Ultra): any name from [THEMES.md](THEMES.md) - `midnight`, `aurora`, `vaporwave`, `pc98`, …
 - `theme_font` (Ultra): a panel face from `theme::FACES`, e.g. `Georgia` or `Terminal`. empty = the theme's own
-- `alerts` (Ultra): `{ label, above, below, cooldown_s, last }` each. `label` is the row label, `above`/`below`
-  are absolute prices (not %), `cooldown_s` is floored at 30 s and `last` is the last fire time so a restart
-  doesn't re-ping u
+- `alerts` (Ultra): `{ label, above, below, day_move, once, cooldown_s, last }` each. `label` is the row label,
+  `above`/`below` are absolute prices (not %), `day_move` is a percent day change that fires it (or missing),
+  `once` clears a level after it fires, `cooldown_s` is floored at 30 s and `last` is the last fire time so a
+  restart doesn't re-ping u
+- `alert_once`, `alerts_muted`, `alerts_mute_until` (seconds since 1970, UTC) and `quiet_hours` (`[from, to]` in
+  minutes of the local day, or missing) (Ultra): what the *Alerts* menu sets for *Fire once*, *Mute* and *Quiet hours*
 - `webhook` (Ultra): a URL to also POST alerts to. **this is a secret** - the URL is the password for that
-  channel, so dont paste it anywhere public. the app never prints it (menus and `--probe` show the host at most)
+  channel, so dont paste it anywhere public. set it from *Alerts* → *Paste URL from clipboard* or here. the app
+  never prints it (menus and `--probe` show the host at most)
+- `chart_utc` (Ultra): `true` puts the chart's time axis on UTC. the `local` / `UTC` word in the chart header sets it
+- `hotkey`: the global key to open and close the panel, as text like `Ctrl+Alt+M`, or `null` for none. the keys are
+  letters, digits, `F1` to `F24`, `Space`, `Home`, `End`, `Insert`, `Delete`, `PageUp` and `PageDown`, with at
+  least one of `Ctrl`, `Alt` or `Win`. the menu's presets are the usual choice
 
-`MH_Ticker --probe` does one pass over the prices and the day's bars, prints it and exits - handy for
-checking a new symbol actually works before u add it
+`MH_Ticker --probe` does one pass over the prices, the day's bars and (for the first row) each chart range file,
+prints it and exits - handy for checking a new symbol actually works before u add it, and for checking the ranges
+on a machine with a connection
 
 ## Building it Yourself
 

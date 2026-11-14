@@ -8,10 +8,11 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
 /// The strip, dock grid and panel stay readable up to this many symbols.
-pub const MAX_ROWS: usize = 12;
+pub const MAX_ROWS: usize = 24;
 
 /// Which product this process is. One engine, two builds: the profile picks the config file,
 /// the single-instance mutex and the window title, so the two can run side by side and never
@@ -138,6 +139,9 @@ pub struct Config {
     pub opacity: u8,
     pub strip_visible: bool,
     pub topmost: bool,
+    /// Global hotkey that opens and closes the panel, in `hotkey::parse` grammar
+    /// (`Ctrl+Alt+M`). None = no hotkey.
+    pub hotkey: Option<String>,
     /// Where the strip sits. Unset in configs from before the Position menu: then `dock`
     /// decides (true = Auto, false = Floating).
     pub placement: Option<Placement>,
@@ -153,6 +157,9 @@ pub struct Config {
     /// The panel's last frame, `[x, y, w, h]`. None = size it to its content and centre it, which
     /// is what every config written before a panel became resizable gets.
     pub panel: Option<[i32; 4]>,
+    /// The candle pane's clock: false (default) cuts candles and labels times on the machine's local
+    /// time, true keeps them in UTC. Flipped by clicking the zone name in the pane's header.
+    pub chart_utc: bool,
 
     // --- Ultra only. `serde(default)` keeps a classic config parsing unchanged. ---
     /// Theme name (`theme::ALL`). Ignored by the classic build, which has exactly one.
@@ -166,6 +173,16 @@ pub struct Config {
     /// This is a bearer secret: anyone with the URL can post to that channel. It is never printed
     /// in a note, tooltip or `--probe` line.
     pub webhook: Option<String>,
+    /// New alerts clear the level that fired (*Fire once, then clear*). The menu toggle also
+    /// rewrites `once` on every existing alert.
+    pub alert_once: bool,
+    /// Alerts are evaluated and logged but not shown or posted, until switched off.
+    pub alerts_muted: bool,
+    /// UTC seconds a timed mute lasts until; past it the mute is over by the clock, no timer.
+    pub alerts_mute_until: f64,
+    /// Quiet hours as `[from, to)` minutes of the local day; wraps midnight when `from > to`;
+    /// `from == to` is off.
+    pub quiet_hours: Option<[u16; 2]>,
 }
 
 /// One price threshold. Fires when the last price crosses `above` upward or `below` downward, at
@@ -181,11 +198,15 @@ pub struct Alert {
     pub cooldown_s: f64,
     /// UTC seconds the alert last fired. Persisted so a restart does not re-fire immediately.
     pub last: f64,
+    /// Fires when the day's change reaches this many percent, up or down (absolute value).
+    pub day_move: Option<f64>,
+    /// Clear the level that fired; an alert left with no level is removed.
+    pub once: bool,
 }
 
 impl Default for Alert {
     fn default() -> Self {
-        Self { label: String::new(), above: None, below: None, cooldown_s: 900.0, last: 0.0 }
+        Self { label: String::new(), above: None, below: None, cooldown_s: 900.0, last: 0.0, day_move: None, once: false }
     }
 }
 
@@ -241,6 +262,7 @@ impl Default for Config {
             opacity: 235,
             strip_visible: true,
             topmost: true,
+            hotkey: None,
             placement: None,
             monitor: None,
             dock: true,
@@ -249,10 +271,15 @@ impl Default for Config {
             x: None,
             y: None,
             panel: None,
+            chart_utc: false,
             theme: "midnight".into(),
             theme_font: None,
             alerts: Vec::new(),
             webhook: None,
+            alert_once: false,
+            alerts_muted: false,
+            alerts_mute_until: 0.0,
+            quiet_hours: None,
         }
     }
 }
@@ -279,6 +306,146 @@ pub fn menu_list(cfg: &Config) -> Vec<Row> {
     list
 }
 
+/// The longest symbol *Add symbol...* accepts, in characters.
+pub const MAX_SYMBOL: usize = 20;
+/// The longest label made for an added symbol, in characters (the strip is narrow).
+pub const MAX_LABEL: usize = 8;
+/// The longest name kept for an added symbol, in characters, the ellipsis included.
+pub const MAX_NAME: usize = 40;
+
+/// A typed CNBC symbol, made safe to store and to send: trimmed, upper-cased (ASCII), and only when
+/// every character is one of `A-Z 0-9 . @ = - ^ / : _` and there are 1 to [`MAX_SYMBOL`] of them.
+/// `None` otherwise (empty, a space inside, a letter outside ASCII, too long). `" aapl "` gives
+/// `"AAPL"`, `"@gc.1"` gives `"@GC.1"`, `"eur="` gives `"EUR="`.
+pub fn clean_symbol(raw: &str) -> Option<String> {
+    let s = raw.trim().to_ascii_uppercase();
+    let count = s.chars().count();
+    let ok = (1..=MAX_SYMBOL).contains(&count) && s.chars().all(|c| c.is_ascii_alphanumeric() || ".@=-^/:_".contains(c));
+    ok.then_some(s)
+}
+
+/// The strip label for a newly added `symbol` (already cleaned): the symbol without a leading `@`,
+/// `.` or `^`, without a trailing `=`, and without a trailing `.1` (a front-month future: `@GC.1` is
+/// `GC`); cut to [`MAX_LABEL`] characters; `SYM` if nothing is left. Then made unique against every
+/// label in `catalog` and `rows`, compared ignoring ASCII case, by appending `2`, `3`, ... and cutting
+/// the base so the whole stays within [`MAX_LABEL`] (`GOLD` taken gives `GOLD2`).
+pub fn label_for(cfg: &Config, symbol: &str) -> String {
+    let base = symbol.trim_start_matches(['@', '.', '^']);
+    let base = base.strip_suffix('=').unwrap_or(base);
+    let base = base.strip_suffix(".1").unwrap_or(base);
+    let base: String = base.chars().take(MAX_LABEL).collect();
+    let base = if base.is_empty() { "SYM".to_string() } else { base };
+    let taken = |label: &str| cfg.catalog.iter().chain(cfg.rows.iter()).any(|r| r.label.eq_ignore_ascii_case(label));
+    if !taken(&base) {
+        return base;
+    }
+    let mut n = 2;
+    loop {
+        let suffix = n.to_string();
+        let head: String = base.chars().take(MAX_LABEL - suffix.len()).collect();
+        let candidate = format!("{head}{suffix}");
+        if !taken(&candidate) {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
+/// Decimal places for an added symbol, from the size of its first price: 0 at 10,000 and above, 2
+/// from 10, 4 from 0.01, and below 0.01 enough for three significant figures, at most 8. A price that
+/// is not positive and finite gives 2.
+pub fn digits_for(price: f64) -> u32 {
+    if !price.is_finite() || price <= 0.0 {
+        return 2;
+    }
+    if price >= 10_000.0 {
+        0
+    } else if price >= 10.0 {
+        2
+    } else if price >= 0.01 {
+        4
+    } else {
+        // Below 0.01: three significant figures. Here `exp` is at most -3, so `2 - exp` is positive.
+        let exp = price.log10().floor() as i32;
+        ((2 - exp) as u32).min(8)
+    }
+}
+
+/// CNBC's name for an added symbol, made fit for a menu line: control characters (a tab would split
+/// the menu's columns) dropped, runs of whitespace made one space, trimmed, and cut to [`MAX_NAME`]
+/// characters with a trailing `...` when longer. Empty stays empty.
+pub fn clean_name(raw: &str) -> String {
+    // Whitespace (a tab included) becomes a space and other control characters go; then the runs of
+    // spaces collapse and the ends are trimmed.
+    let mut kept = String::with_capacity(raw.len());
+    for c in raw.chars() {
+        if c.is_whitespace() {
+            kept.push(' ');
+        } else if !c.is_control() {
+            kept.push(c);
+        }
+    }
+    let joined = kept.split_whitespace().collect::<Vec<_>>().join(" ");
+    if joined.chars().count() <= MAX_NAME {
+        return joined;
+    }
+    let head: String = joined.chars().take(MAX_NAME - 3).collect();
+    format!("{head}...")
+}
+
+/// What [`add_custom`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Added {
+    /// The symbol is on the strip now (newly listed, or listed already and now ticked).
+    Shown,
+    /// Listed in the Symbols menu, but the strip already shows [`MAX_ROWS`]: not ticked.
+    Listed,
+    /// It was on the strip already; nothing changed.
+    AlreadyShown,
+}
+
+/// Add a symbol CNBC knows to the catalogue and tick it when there is room. `symbol` is already
+/// cleaned ([`clean_symbol`]), `name` is CNBC's and `price` its first price. A symbol already in the
+/// Symbols menu (`menu_list`) is not added twice: it is ticked if it is not shown. A new entry is
+/// appended to `catalog` with [`label_for`], [`digits_for`] and [`clean_name`], so it shows last.
+pub fn add_custom(cfg: &mut Config, symbol: &str, name: &str, price: f64) -> Added {
+    if is_shown(cfg, symbol) {
+        return Added::AlreadyShown;
+    }
+    if !menu_list(cfg).iter().any(|r| r.symbol == symbol) {
+        let label = label_for(cfg, symbol);
+        cfg.catalog.push(Row { label, symbol: symbol.to_string(), digits: digits_for(price), name: clean_name(name) });
+    }
+    if toggle(cfg, symbol) {
+        Added::Shown
+    } else {
+        Added::Listed
+    }
+}
+
+/// The catalogue entries that are not in `default_catalog()` (by symbol), in catalogue order: what
+/// *Remove a symbol I added* lists.
+pub fn custom_entries(cfg: &Config) -> Vec<Row> {
+    let defaults = default_catalog();
+    cfg.catalog.iter().filter(|r| !defaults.iter().any(|d| d.symbol == r.symbol)).cloned().collect()
+}
+
+/// Remove an added symbol: from `catalog`, from `rows`, and its alerts (by its label). Refused, with
+/// nothing changed, when the symbol is in `default_catalog()`, is not in the catalogue, or is the only
+/// symbol shown. Returns whether anything changed.
+pub fn forget_custom(cfg: &mut Config, symbol: &str) -> bool {
+    let Some(row) = custom_entries(cfg).into_iter().find(|r| r.symbol == symbol) else {
+        return false;
+    };
+    if is_shown(cfg, symbol) && cfg.rows.len() <= 1 {
+        return false;
+    }
+    cfg.catalog.retain(|r| r.symbol != symbol);
+    cfg.rows.retain(|r| r.symbol != symbol);
+    cfg.alerts.retain(|a| a.label != row.label);
+    true
+}
+
 pub fn is_shown(cfg: &Config, symbol: &str) -> bool {
     cfg.rows.iter().any(|r| r.symbol == symbol)
 }
@@ -297,7 +464,75 @@ pub fn toggle(cfg: &mut Config, symbol: &str) -> bool {
         return false;
     }
     let shown: Vec<String> = cfg.rows.iter().map(|r| r.symbol.clone()).collect();
-    cfg.rows = menu_list(cfg).into_iter().filter(|r| r.symbol == symbol || shown.contains(&r.symbol)).collect();
+    cfg.rows = in_menu_order(cfg, |s| s == symbol || shown.iter().any(|x| x == s));
+    true
+}
+
+/// The Symbols menu's entries whose symbol `keep` accepts, in menu order.
+fn in_menu_order(cfg: &Config, keep: impl Fn(&str) -> bool) -> Vec<Row> {
+    menu_list(cfg).into_iter().filter(|r| keep(&r.symbol)).collect()
+}
+
+/// Hide a shown symbol. Unlike `toggle`, a symbol that is not shown is never added: the card menu and
+/// the Delete key carry a symbol that may have left the strip while a menu was open. Refuses the last
+/// row. Returns whether anything changed.
+pub fn remove(cfg: &mut Config, symbol: &str) -> bool {
+    is_shown(cfg, symbol) && toggle(cfg, symbol)
+}
+
+/// Move a shown symbol `delta` places along the strip (negative = left, positive = right), by one
+/// place per unit, stopping at the ends. Returns whether the order changed.
+///
+/// The order is a permutation of the catalogue, so it survives later `toggle`s ("rows keep menu
+/// order"): a shown row that is not in the catalogue is first appended to it (which changes nothing
+/// visible: `menu_list` already lists it last), then the symbol swaps places in the catalogue with
+/// the shown neighbour it passes, hidden catalogue entries in between keep their relative place, and
+/// `rows` is rebuilt exactly as `toggle` builds it. A symbol that is not shown, `delta == 0` or a
+/// move past an end changes nothing and returns false (the catalogue is then left as it was).
+pub fn move_row(cfg: &mut Config, symbol: &str, delta: i32) -> bool {
+    let Some(from) = cfg.rows.iter().position(|r| r.symbol == symbol) else {
+        return false;
+    };
+    let to = from as i64 + i64::from(delta);
+    if delta == 0 || to < 0 || to >= cfg.rows.len() as i64 {
+        return false;
+    }
+    move_shown(cfg, from, to as usize)
+}
+
+/// Move a shown symbol to the front of the strip. Same permutation rules as `move_row`. Returns
+/// whether the order changed (false when it is already first, not shown, or the only row).
+pub fn move_first(cfg: &mut Config, symbol: &str) -> bool {
+    match cfg.rows.iter().position(|r| r.symbol == symbol) {
+        Some(from) if from > 0 => move_shown(cfg, from, 0),
+        _ => false,
+    }
+}
+
+/// Put the shown row at `from` at `to`. The shown symbols keep the catalogue positions they hold, and
+/// take them in the new order, so hidden entries stay where they are. Works on a copy and commits
+/// only when every step holds, so a false return leaves `cfg` untouched.
+fn move_shown(cfg: &mut Config, from: usize, to: usize) -> bool {
+    let mut order: Vec<String> = cfg.rows.iter().map(|r| r.symbol.clone()).collect();
+    let moved = order.remove(from);
+    order.insert(to, moved);
+
+    let mut next = cfg.clone();
+    for r in &cfg.rows {
+        if !next.catalog.iter().any(|c| c.symbol == r.symbol) {
+            next.catalog.push(r.clone());
+        }
+    }
+    let slots: Vec<usize> = next.catalog.iter().enumerate().filter(|(_, c)| order.contains(&c.symbol)).map(|(i, _)| i).collect();
+    let picked: Vec<Row> = order.iter().filter_map(|s| next.catalog.iter().find(|c| &c.symbol == s).cloned()).collect();
+    if slots.len() != order.len() || picked.len() != order.len() {
+        return false;
+    }
+    for (pos, row) in slots.into_iter().zip(picked) {
+        next.catalog[pos] = row;
+    }
+    next.rows = in_menu_order(&next, |s| order.iter().any(|x| x == s));
+    *cfg = next;
     true
 }
 
@@ -336,12 +571,29 @@ fn load_from(p: &Path) -> Result<Config, String> {
     }
 }
 
+/// Whether the last `save` / `save_checked` failed. Starts false; a success clears it again.
+static SAVE_FAILED: AtomicBool = AtomicBool::new(false);
+
+/// True while the most recent save through `save` or `save_checked` failed (read-only folder,
+/// full disk, antivirus lock). The menu's status line says so. `save_checked_to` itself does not
+/// record, so tests of the low-level writer cannot race with a test of this flag.
+pub fn save_failed() -> bool {
+    SAVE_FAILED.load(Ordering::Relaxed)
+}
+
+/// Record a save outcome in the flag read by `save_failed`. Returns the result unchanged.
+fn record_save(result: std::io::Result<()>) -> std::io::Result<()> {
+    SAVE_FAILED.store(result.is_err(), Ordering::Relaxed);
+    result
+}
+
+/// Write the settings. Signature unchanged; the outcome is recorded for `save_failed`.
 pub fn save(cfg: &Config) {
     save_to(&path(), cfg);
 }
 
 pub fn save_checked(cfg: &Config) -> std::io::Result<()> {
-    save_checked_to(&path(), cfg)
+    record_save(save_checked_to(&path(), cfg))
 }
 
 fn save_checked_to(p: &Path, cfg: &Config) -> std::io::Result<()> {
@@ -357,7 +609,7 @@ fn save_checked_to(p: &Path, cfg: &Config) -> std::io::Result<()> {
 }
 
 fn save_to(p: &Path, cfg: &Config) {
-    let _ = save_checked_to(p, cfg);
+    let _ = record_save(save_checked_to(p, cfg));
 }
 
 #[cfg(test)]
@@ -378,6 +630,17 @@ mod tests {
     }
 
     #[test]
+    fn old_configs_parse_to_todays_alert_behaviour() {
+        let c: Config = serde_json::from_str("{}").unwrap();
+        assert!(!c.alert_once && !c.alerts_muted && c.alerts_mute_until == 0.0 && c.quiet_hours.is_none());
+        let c: Config = serde_json::from_str(r#"{"alerts":[{"label":"XAU","above":4100.0}]}"#).unwrap();
+        let a = &c.alerts[0];
+        assert_eq!((a.above, a.day_move, a.once, a.cooldown_s), (Some(4100.0), None, false, 900.0));
+        let c: Config = serde_json::from_str(r#"{"quiet_hours":[1320,420]}"#).unwrap();
+        assert_eq!(c.quiet_hours, Some([1320, 420]));
+    }
+
+    #[test]
     fn save_reports_failure_instead_of_claiming_consent_persisted() {
         let root = std::env::var_os("TICKER_TEST_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
         let dest = root.join(format!("mh-ticker-save-dir-{}", std::process::id()));
@@ -394,6 +657,15 @@ mod tests {
         assert!(parse_settings("{invalid json").is_err());
         assert!(parse_settings(r#"{"placement":"not-a-placement"}"#).is_err());
         assert!(parse_settings("{}").is_ok());
+    }
+
+    #[test]
+    fn the_chart_clock_defaults_to_local_and_persists_utc() {
+        let c: Config = serde_json::from_str("{}").unwrap();
+        assert!(!c.chart_utc, "an old config gets local time");
+        let utc: Config = serde_json::from_str(r#"{"chart_utc":true}"#).unwrap();
+        assert!(utc.chart_utc);
+        assert!(serde_json::to_string(&utc).unwrap().contains(r#""chart_utc":true"#));
     }
 
     #[test]
@@ -417,9 +689,126 @@ mod tests {
         c.rows.truncate(1);
         let last = c.rows[0].symbol.clone();
         assert!(!toggle(&mut c, &last), "the last symbol stays");
-        let mut full = Config { rows: default_catalog(), ..Config::default() };
-        full.rows.truncate(MAX_ROWS);
-        assert!(!toggle(&mut full, ".HSI"), "no more than MAX_ROWS");
+        // A catalogue of its own, one longer than the cap: the default one is shorter than MAX_ROWS.
+        let long: Vec<Row> = (0..=MAX_ROWS).map(|i| row(&format!("S{i}"), &format!("S{i}="), 2, "")).collect();
+        let mut full = Config { rows: long[..MAX_ROWS].to_vec(), catalog: long, ..Config::default() };
+        assert!(!toggle(&mut full, &format!("S{MAX_ROWS}=")), "no more than MAX_ROWS");
+        assert_eq!(full.rows.len(), MAX_ROWS);
+    }
+
+    #[test]
+    fn clean_symbol_trims_uppercases_and_refuses_the_rest() {
+        assert_eq!(clean_symbol(" aapl ").as_deref(), Some("AAPL"));
+        assert_eq!(clean_symbol("@gc.1").as_deref(), Some("@GC.1"));
+        assert_eq!(clean_symbol("eur=").as_deref(), Some("EUR="));
+        let too_long = "A".repeat(21);
+        for bad in ["", "   ", "A B", "ÄPFEL", "A;B", too_long.as_str()] {
+            assert_eq!(clean_symbol(bad), None, "{bad:?} is refused");
+        }
+        assert_eq!(clean_symbol(&"A".repeat(20)).as_deref(), Some("A".repeat(20).as_str()));
+    }
+
+    #[test]
+    fn labels_are_derived_and_made_unique() {
+        let c = Config::default();
+        assert_eq!(label_for(&c, "AAPL"), "AAPL");
+        assert_eq!(label_for(&c, "@GC.1"), "GC");
+        assert_eq!(label_for(&c, "EUR="), "EUR");
+        assert_eq!(label_for(&c, ".SPX"), "SPX");
+        assert_eq!(label_for(&c, "BRK.B"), "BRK.B");
+        assert_eq!(label_for(&c, "ABCDEFGHIJ"), "ABCDEFGH");
+        assert_eq!(label_for(&c, "@="), "SYM");
+        assert_eq!(label_for(&c, "XAU"), "XAU2", "XAU is on the default strip");
+
+        let mut taken = Config::default();
+        taken.rows.push(row("ABCDEFGH", "ABCDEFGH=", 2, ""));
+        assert_eq!(label_for(&taken, "ABCDEFGHIJ"), "ABCDEFG2");
+    }
+
+    #[test]
+    fn digits_follow_the_price_size() {
+        let cases = [
+            (98000.0, 0),
+            (10000.0, 0),
+            (9999.5, 2),
+            (4200.0, 2),
+            (10.0, 2),
+            (9.99, 4),
+            (1.08, 4),
+            (0.01, 4),
+            (0.00123, 5),
+            (0.0000001234, 8),
+            (0.0, 2),
+            (-1.0, 2),
+            (f64::NAN, 2),
+            (f64::INFINITY, 2),
+        ];
+        for (price, want) in cases {
+            assert_eq!(digits_for(price), want, "price {price}");
+        }
+    }
+
+    #[test]
+    fn names_are_cleaned_and_shortened() {
+        assert_eq!(clean_name("  Apple\tInc  "), "Apple Inc");
+        assert_eq!(clean_name("Gold\u{7}Spot"), "GoldSpot", "other control characters go");
+        assert_eq!(clean_name(""), "");
+        let long = "x".repeat(60);
+        let short = clean_name(&long);
+        assert_eq!(short.chars().count(), MAX_NAME);
+        assert!(short.ends_with("..."));
+        let exact = "y".repeat(MAX_NAME);
+        assert_eq!(clean_name(&exact), exact);
+    }
+
+    #[test]
+    fn add_custom_appends_ticks_and_respects_the_cap() {
+        let mut c = Config::default();
+        assert_eq!(add_custom(&mut c, "NVDA", "NVIDIA", 120.0), Added::Shown);
+        assert_eq!(c.catalog.last().unwrap().symbol, "NVDA");
+        assert_eq!(c.rows.last().unwrap().symbol, "NVDA");
+        assert_eq!(c.rows.last().unwrap().label, "NVDA");
+        assert_eq!(add_custom(&mut c, "NVDA", "", 120.0), Added::AlreadyShown);
+        assert_eq!(c.catalog.iter().filter(|r| r.symbol == "NVDA").count(), 1);
+
+        assert!(!is_shown(&c, "ETH.CB="));
+        assert_eq!(add_custom(&mut c, "ETH.CB=", "", 2000.0), Added::Shown);
+        assert_eq!(c.catalog.iter().filter(|r| r.symbol == "ETH.CB=").count(), 1, "not duplicated");
+
+        let long: Vec<Row> = (0..=MAX_ROWS).map(|i| row(&format!("S{i}"), &format!("S{i}="), 2, "")).collect();
+        let mut full = Config { rows: long[..MAX_ROWS].to_vec(), catalog: long, ..Config::default() };
+        assert_eq!(add_custom(&mut full, "NEWX=", "New", 5.0), Added::Listed);
+        assert!(full.catalog.iter().any(|r| r.symbol == "NEWX="));
+        assert!(!is_shown(&full, "NEWX="));
+        assert_eq!(full.rows.len(), MAX_ROWS);
+
+        let mut c = Config::default();
+        assert_eq!(add_custom(&mut c, "XAU", "", 2000.0), Added::Shown);
+        assert_eq!(c.catalog.last().unwrap().label, "XAU2");
+    }
+
+    #[test]
+    fn forget_custom_removes_only_what_was_added() {
+        let mut c = Config::default();
+        assert!(!forget_custom(&mut c, "XAU="), "a default symbol is refused");
+        add_custom(&mut c, "NVDA", "", 120.0);
+        add_custom(&mut c, "AMD", "", 100.0);
+        assert_eq!(custom_entries(&c).iter().map(|r| r.symbol.as_str()).collect::<Vec<_>>(), ["NVDA", "AMD"]);
+        c.alerts.push(Alert { label: "NVDA".into(), above: Some(130.0), ..Alert::default() });
+        c.alerts.push(Alert { label: "AMD".into(), above: Some(130.0), ..Alert::default() });
+
+        assert!(forget_custom(&mut c, "NVDA"));
+        assert!(!c.catalog.iter().any(|r| r.symbol == "NVDA"));
+        assert!(!is_shown(&c, "NVDA"));
+        assert_eq!(c.alerts.iter().map(|a| a.label.as_str()).collect::<Vec<_>>(), ["AMD"]);
+        assert_eq!(custom_entries(&c).iter().map(|r| r.symbol.as_str()).collect::<Vec<_>>(), ["AMD"]);
+
+        let mut only = Config::default();
+        add_custom(&mut only, "NVDA", "", 120.0);
+        only.rows.retain(|r| r.symbol == "NVDA");
+        let before = (only.catalog.clone(), only.rows.clone());
+        assert!(!forget_custom(&mut only, "NVDA"), "the only symbol shown is refused");
+        assert_eq!((only.catalog, only.rows), before);
     }
 
     #[test]
@@ -429,6 +818,107 @@ mod tests {
         assert_eq!(menu_list(&c).last().unwrap().symbol, "SOL=");
         assert!(toggle(&mut c, "ETH.CB="));
         assert_eq!(c.rows.last().unwrap().symbol, "SOL=");
+    }
+
+    /// The shown symbols, strip order.
+    fn order(c: &Config) -> Vec<String> {
+        c.rows.iter().map(|r| r.symbol.clone()).collect()
+    }
+
+    /// The catalogue's symbols, in catalogue order.
+    fn catalog_order(c: &Config) -> Vec<String> {
+        c.catalog.iter().map(|r| r.symbol.clone()).collect()
+    }
+
+    #[test]
+    fn remove_never_adds_and_never_takes_the_last_row() {
+        let mut c = Config::default();
+        assert!(remove(&mut c, "XAU="));
+        assert_eq!(order(&c), ["XAG=", "BTC.CB=", "@DJ.1", "@SP.1", "@ND.1"]);
+        let before = order(&c);
+        assert!(!remove(&mut c, "XAU="), "already hidden: nothing is added back");
+        assert_eq!(order(&c), before);
+        assert!(!remove(&mut c, "XPT="), "never shown");
+        assert_eq!(order(&c), before);
+        c.rows.truncate(1);
+        assert!(!remove(&mut c, "XAG="), "the last row stays");
+        assert_eq!(order(&c), ["XAG="]);
+    }
+
+    #[test]
+    fn move_row_swaps_with_the_shown_neighbour_and_stops_at_the_ends() {
+        let mut c = Config::default();
+        assert_eq!(order(&c), ["XAU=", "XAG=", "BTC.CB=", "@DJ.1", "@SP.1", "@ND.1"]);
+        assert!(move_row(&mut c, "BTC.CB=", -1));
+        assert_eq!(order(&c), ["XAU=", "BTC.CB=", "XAG=", "@DJ.1", "@SP.1", "@ND.1"]);
+
+        let (rows, catalog) = (order(&c), catalog_order(&c));
+        assert!(!move_row(&mut c, "XAU=", -1), "the first row cannot go left");
+        assert!(!move_row(&mut c, "@ND.1", 1), "the last row cannot go right");
+        assert!(!move_row(&mut c, "XAG=", 0), "delta 0 is no move");
+        assert!(!move_row(&mut c, "XPT=", -1), "a hidden symbol does not move");
+        assert!(!move_row(&mut c, "NOT.SHOWN=", 1), "an unknown symbol does not move");
+        assert_eq!((order(&c), catalog_order(&c)), (rows, catalog), "every false leaves the order alone");
+
+        assert!(move_row(&mut c, "@ND.1", -2), "two places in one call");
+        assert_eq!(order(&c), ["XAU=", "BTC.CB=", "XAG=", "@ND.1", "@DJ.1", "@SP.1"]);
+    }
+
+    #[test]
+    fn move_row_passes_over_hidden_catalogue_entries() {
+        let mut c = Config::default();
+        assert!(!is_shown(&c, "XPT="));
+        assert!(move_row(&mut c, "BTC.CB=", -1));
+        assert_eq!(catalog_order(&c)[..4], ["XAU=", "BTC.CB=", "XPT=", "XAG="], "the hidden XPT keeps its place");
+        assert!(toggle(&mut c, "XPT="));
+        assert_eq!(order(&c), ["XAU=", "BTC.CB=", "XPT=", "XAG=", "@DJ.1", "@SP.1", "@ND.1"]);
+    }
+
+    #[test]
+    fn move_row_adopts_a_hand_added_row_into_the_catalogue() {
+        let mut c = Config::default();
+        c.rows.push(row("SOL", "SOL=", 2, ""));
+        assert_eq!(menu_list(&c).last().unwrap().symbol, "SOL=");
+        let catalog = catalog_order(&c);
+        assert!(!move_row(&mut c, "SOL=", 1), "past the end");
+        assert_eq!(catalog_order(&c), catalog, "a false return does not adopt the row");
+        assert!(move_row(&mut c, "SOL=", -1));
+        assert_eq!(order(&c), ["XAU=", "XAG=", "BTC.CB=", "@DJ.1", "@SP.1", "SOL=", "@ND.1"]);
+        assert_eq!(catalog_order(&c).iter().filter(|s| *s == "SOL=").count(), 1, "adopted once");
+        assert_eq!(menu_list(&c).iter().map(|r| r.symbol.clone()).collect::<Vec<_>>(), catalog_order(&c), "no duplicate in the menu");
+    }
+
+    #[test]
+    fn the_order_survives_a_later_toggle() {
+        let mut c = Config::default();
+        assert!(move_first(&mut c, "BTC.CB="));
+        assert_eq!(order(&c)[0], "BTC.CB=");
+        assert!(toggle(&mut c, "ETH.CB="));
+        assert_eq!(order(&c), ["BTC.CB=", "XAU=", "XAG=", "ETH.CB=", "@DJ.1", "@SP.1", "@ND.1"], "BTC stays first");
+        assert!(toggle(&mut c, "XAU="), "hide XAU");
+        assert!(toggle(&mut c, "XAU="), "show XAU again");
+        assert_eq!(order(&c), ["BTC.CB=", "XAU=", "XAG=", "ETH.CB=", "@DJ.1", "@SP.1", "@ND.1"], "the moved order is kept");
+    }
+
+    #[test]
+    fn move_first_puts_the_symbol_at_the_front() {
+        let mut c = Config::default();
+        assert!(move_first(&mut c, "@ND.1"));
+        assert_eq!(order(&c), ["@ND.1", "XAU=", "XAG=", "BTC.CB=", "@DJ.1", "@SP.1"]);
+        let before = (order(&c), catalog_order(&c));
+        assert!(!move_first(&mut c, "@ND.1"), "already first");
+        assert!(!move_first(&mut c, "XPT="), "not shown");
+        assert_eq!((order(&c), catalog_order(&c)), before);
+
+        let mut solo = Config::default();
+        solo.rows.truncate(1);
+        assert!(!move_first(&mut solo, "XAU="), "the only row");
+
+        let mut a = Config::default();
+        let mut b = Config::default();
+        assert!(move_first(&mut a, "@ND.1"));
+        assert!(move_row(&mut b, "@ND.1", -5));
+        assert_eq!((order(&a), catalog_order(&a)), (order(&b), catalog_order(&b)), "agrees with move_row");
     }
 
     #[test]
@@ -441,6 +931,28 @@ mod tests {
         assert!(free.dock);
         let text = serde_json::to_string(&free).unwrap();
         assert!(text.contains(r#""placement":"taskbar_right""#), "{text}");
+    }
+
+    #[test]
+    fn save_failed_flag_sets_and_clears_with_the_last_save() {
+        // Only record_save touches the flag in this test; no test drives a successful save_to
+        // or load_from on a missing file, so the static cannot change under this test.
+        let failed = record_save(Err(std::io::Error::other("x")));
+        assert!(save_failed());
+        assert_eq!(failed.unwrap_err().to_string(), "x", "the error passes through unchanged");
+        assert!(record_save(Ok(())).is_ok());
+        assert!(!save_failed());
+    }
+
+    #[test]
+    fn hotkey_defaults_to_none_and_old_configs_parse() {
+        let old: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(old.hotkey, None);
+        let set: Config = serde_json::from_str(r#"{"hotkey":"Ctrl+Alt+M"}"#).unwrap();
+        assert_eq!(set.hotkey.as_deref(), Some("Ctrl+Alt+M"));
+        let text = serde_json::to_string(&set).unwrap();
+        let back: Config = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.hotkey.as_deref(), Some("Ctrl+Alt+M"));
     }
 
     #[test]
