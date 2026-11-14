@@ -118,6 +118,11 @@ pub use crate::probe::parse_time;
 /// no session runs. Any other stamp is read as sent unless it is more than
 /// [`crate::model::FUTURE_SKEW_S`] ahead of `now`, and then it is read with the `settleDate` as
 /// well. When the `settleDate` reading is not in the past, the time is unknown.
+///
+/// Limit: a weekday holiday (Friday 2026-12-25, Good Friday) has no weekend break to recognise, so
+/// its re-stamp is read as sent once the written clock has passed. For the delayed grace (about 16
+/// minutes) after that, the stamp reads as fresh, until `Quote::moved_at` holds 15 minutes of an
+/// unchanged price and `model::restamped` takes over.
 pub fn quote_time(last_time: &str, settle_date: Option<&str>, now: f64) -> Option<f64> {
     let ts = parse_time(last_time)?;
     let settle = settle_date.map(str::trim).filter(|s| !s.is_empty());
@@ -839,6 +844,9 @@ impl Feed {
                         .map(|r| self.quotes.get(&r.symbol).map_or(f64::NAN, |q| q.price))
                         .collect();
                     let quiet_for = quiet.observe(started.elapsed().as_secs_f64(), &prices);
+                    // `closed` is the previous answer's: this answer's cells are resolved below with
+                    // the limit this line sets. The governed interval reported to the board
+                    // therefore changes one poll after the board becomes fully closed or open.
                     governed_s = self.governed(quiet_for, closed).1;
                     let stale_after = crate::governor::stale_after(self.cfg.stale_after_s, governed_s);
                     let now = now_s();
@@ -1339,7 +1347,9 @@ mod tests {
 
     /// The raw answer CNBC gave on Saturday 14 Nov 2026 at 17:18:36 UTC (an abridged copy: the
     /// fields that carry a time, plus the price). The 1D charts of the same minute show the last
-    /// real prints on Friday 13 Nov at 16:59 and the thin re-stamps at 17:40 (`@SP.1`, `@DJ.1`).
+    /// real prints on Friday 13 Nov at 16:59 (`@SP.1`, `@DJ.1`). The stamps at 17:40 are re-stamps with
+    /// no trade behind them (the bars after 17:00 are thin and `ranges::drop_idle` removes them), so
+    /// `model::closed_since_shown` caps the time a card shows at the end of the last kept bar.
     const SATURDAY: &str = r#"{"FormattedQuoteResult":{"FormattedQuote":[
       {"symbol":"@SP.1","last":"7,561.00","last_timedate":"5:40 PM EST","last_time":"2026-11-14T17:40:14.000-0500","realTime":"false","settleDate":"2026-11-13","timeZone":"EST"},
       {"symbol":"@DJ.1","last":"52,347.00","last_timedate":"5:40 PM EST","last_time":"2026-11-14T17:40:32.000-0500","realTime":"false","settleDate":"2026-11-13","timeZone":"EST"},
