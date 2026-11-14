@@ -119,7 +119,8 @@ impl History {
         Self { labels: Vec::new(), symbols: Vec::new(), rows: Vec::new(), gen: 0, backfilled: false }
     }
 
-    /// Re-key by label and symbol; a renamed/replaced instrument starts with no old prices.
+    /// Re-key by symbol (and provider): a renamed row keeps its line under the new label, a replaced
+    /// instrument starts with no old prices.
     fn align(&mut self, board: &Board) {
         let keys: Vec<_> = board.cells.iter().enumerate().map(|(i, c)| {
             let symbol = board.rows.get(i).map(|r| r.symbol.as_str()).unwrap_or("");
@@ -138,7 +139,7 @@ impl History {
             (l, symbols.get(i).cloned().unwrap_or_default(), row)
         }).collect();
         for (label, symbol) in keys {
-            let row = match old.iter().position(|(l, s, _)| *l == label && *s == symbol) {
+            let row = match old.iter().position(|(_, s, _)| *s == symbol) {
                 Some(i) => old.swap_remove(i).2,
                 None => VecDeque::new(),
             };
@@ -170,6 +171,12 @@ impl History {
                 row.pop_front();
             }
         }
+    }
+
+    /// The held samples of the row labelled `label`, oldest first (the fast-move alert reads these).
+    pub fn series_of(&self, label: &str) -> Vec<(f64, f64)> {
+        let i = self.labels.iter().position(|l| l == label);
+        i.and_then(|i| self.rows.get(i)).map(|r| r.iter().copied().collect()).unwrap_or_default()
     }
 
     fn row(&self, i: usize) -> Option<&VecDeque<(f64, f64)>> {
@@ -316,15 +323,9 @@ pub fn minimum(n: usize, catalog: usize, dpi: u32, picker: bool, chart: bool) ->
 /// the current offset when it already is. A card taller than the body is aligned to its top.
 pub fn reveal(g: &Geo, i: usize) -> i32 {
     let r = card_rect(g, i);
-    let bottom = g.h - g.footer;
-    let want = if r.top < g.header {
-        g.scroll - (g.header - r.top)
-    } else if r.bottom > bottom {
-        g.scroll + (r.bottom - bottom).min(r.top - g.header)
-    } else {
-        g.scroll
-    };
-    want.clamp(0, g.scroll_max)
+    // Content coordinates: the card's place with the scroll taken out, measured from the body's top.
+    let (top, bottom) = (r.top - g.header + g.scroll, r.bottom - g.header + g.scroll);
+    crate::find::scroll_to_show(g.scroll, g.h - g.footer - g.header, top, bottom, g.scroll_max)
 }
 
 pub fn in_rect(r: &RECT, x: i32, y: i32) -> bool {
@@ -453,6 +454,46 @@ fn utf16(s: &str) -> Vec<u16> {
     s.encode_utf16().collect()
 }
 
+/// A record of every string the panel draws (position, width, font), for the fit tests and for
+/// nothing else: it exists only in test builds and in the `shots` feature, so neither shipped exe
+/// has it, and it costs nothing unless a test switched it on.
+#[cfg(any(test, feature = "shots"))]
+#[allow(dead_code)] // read by the tests; the `shots` feature alone only writes it
+pub(crate) mod trace {
+    use std::cell::RefCell;
+
+    #[derive(Clone, Debug)]
+    pub struct Run {
+        pub x: i32,
+        pub y: i32,
+        pub w: i32,
+        pub font: isize,
+        pub text: String,
+    }
+
+    thread_local! {
+        static LOG: RefCell<Option<Vec<Run>>> = const { RefCell::new(None) };
+    }
+
+    /// Start recording on this thread (drops anything recorded before).
+    pub fn start() {
+        LOG.with(|l| *l.borrow_mut() = Some(Vec::new()));
+    }
+
+    /// Stop recording and hand back what was drawn since `start`.
+    pub fn take() -> Vec<Run> {
+        LOG.with(|l| l.borrow_mut().take().unwrap_or_default())
+    }
+
+    pub(super) fn push(x: i32, y: i32, w: i32, font: isize, text: &str) {
+        LOG.with(|l| {
+            if let Some(v) = l.borrow_mut().as_mut() {
+                v.push(Run { x, y, w, font, text: text.to_string() });
+            }
+        });
+    }
+}
+
 /// Draw `s` with its top-left at (x, y); returns its width.
 fn text(dc: HDC, font: HFONT, x: i32, y: i32, s: &str, color: COLORREF) -> i32 {
     unsafe {
@@ -463,6 +504,8 @@ fn text(dc: HDC, font: HFONT, x: i32, y: i32, s: &str, color: COLORREF) -> i32 {
         let mut sz = SIZE { cx: 0, cy: 0 };
         GetTextExtentPoint32W(dc, t.as_ptr(), t.len() as i32, &mut sz);
         SelectObject(dc, old);
+        #[cfg(any(test, feature = "shots"))]
+        trace::push(x, y, sz.cx, font as isize, s);
         sz.cx
     }
 }
@@ -477,6 +520,8 @@ fn text_right(dc: HDC, font: HFONT, right: i32, y: i32, s: &str, color: COLORREF
         SetTextColor(dc, color);
         TextOutW(dc, right - sz.cx, y, t.as_ptr(), t.len() as i32);
         SelectObject(dc, old);
+        #[cfg(any(test, feature = "shots"))]
+        trace::push(right - sz.cx, y, sz.cx, font as isize, s);
     }
 }
 
@@ -579,10 +624,15 @@ pub struct Chart<'a> {
     /// Draw the range tabs and store them in the layout. False reproduces the pane from before
     /// ranges (the shot fixture's default).
     pub tabs: bool,
-    /// Seconds east of UTC the pane's clock runs on (0 = UTC). Candles are cut and labelled on it.
-    pub tz_offset_s: i32,
+    /// The clock the pane runs on (seconds east of UTC, 0 = UTC), which may change once inside the
+    /// series. Candles are cut and labelled on it, each bar on the clock of its own instant.
+    pub zone: chartview::Zone,
     /// The zone's name as the header shows it ("local" or "UTC"); it is the click target that flips it.
     pub tz_label: &'a str,
+    /// What the reader should know about the data on screen (`as of 14:05`, `check dates`), or "".
+    /// Drawn on the header's second line while no candle is hovered; the hover legend takes the line
+    /// over, and the whole pane repaints when the hover changes, so the note comes back with it.
+    pub note: &'a str,
     /// Previous close, for the dashed reference line. `None` when the quote has none (or sends 0).
     pub prev: Option<f64>,
     /// The day's high and low, drawn as short ticks on the axis. `None` as above.
@@ -649,6 +699,13 @@ pub struct Scene<'a> {
     /// The last alert outcome. Replaces the footer hint, because Focus Assist can swallow the
     /// tray balloon and the panel is then the only place the alert is visible.
     pub alert: Option<&'a str>,
+    /// Per card: it has an alert level set, and a small dot says so beside its label (Ultra only; an
+    /// empty slice draws nothing, which is what every still shows). Missing entries read as false.
+    pub alert_dots: &'a [bool],
+    /// Up candles are drawn as outlines (Ultra's `hollow_up`, and always in a contrast theme).
+    pub hollow_up: bool,
+    /// The crosshair was set by a key: it sits on its candle's close instead of at the pointer's row.
+    pub aim_snap: bool,
     /// Position in an animated background's cycle, 0..1. Ignored by every other theme, so the caller
     /// can always pass a clock.
     pub phase: f64,
@@ -784,6 +841,40 @@ fn short_date(s: &str) -> Option<String> {
     Some(format!("{d} {}", MON.get(m.checked_sub(1)?)?))
 }
 
+/// A button or chip fill. A solid accent fill stays solid in every theme (its text is the card
+/// colour, the same system pair reversed in the contrast theme). A `tinted` fill (the hover and "on"
+/// tint, `Theme::btn`) becomes an outline in the contrast theme: the window colour is the only background it may draw text on, so a hover or
+/// an "on" state is shown by a frame, not by a tint.
+fn plate(dc: HDC, sc: &Scene, r: RECT, radius: i32, fill: COLORREF, tinted: bool) {
+    let t = sc.theme;
+    if t.contrast && tinted {
+        let edge = (sc.dpi as i32 / 96).max(1) * 2;
+        fill_round(dc, r, radius, t.accent);
+        let inner = RECT { left: r.left + edge, top: r.top + edge, right: r.right - edge, bottom: r.bottom - edge };
+        fill_round(dc, inner, (radius - edge).max(0), t.card);
+    } else {
+        fill_round(dc, r, radius, fill);
+    }
+}
+
+/// An up candle's body as an outline: `edge` pixels thick on every side, so a rise differs from a
+/// fall by shape. A body too small to have an inside stays a solid fill (it has no room for both).
+fn hollow_body(dc: HDC, x: i32, top: i32, w: i32, bottom: i32, col: COLORREF, edge: i32) {
+    let edge = edge.max(1);
+    if w <= 2 * edge + 1 || bottom - top <= 2 * edge + 1 {
+        fill_rect(dc, RECT { left: x, top, right: x + w, bottom }, col);
+        return;
+    }
+    for r in [
+        RECT { left: x, top, right: x + w, bottom: top + edge },
+        RECT { left: x, top: bottom - edge, right: x + w, bottom },
+        RECT { left: x, top: top + edge, right: x + edge, bottom: bottom - edge },
+        RECT { left: x + w - edge, top: top + edge, right: x + w, bottom: bottom - edge },
+    ] {
+        fill_rect(dc, r, col);
+    }
+}
+
 fn card(dc: HDC, sc: &Scene, r: RECT, i: usize, c: &Cell) {
     let t = sc.theme;
     let s = |v: i32| v * sc.dpi as i32 / 96;
@@ -792,8 +883,15 @@ fn card(dc: HDC, sc: &Scene, r: RECT, i: usize, c: &Cell) {
     // The border is a second, inset fill rather than a pen, so it is the same two pixels on every
     // edge and the corners stay round at any dpi.
     let locked = sc.select && sc.selected == Some(i);
-    if locked {
-        let edge = s(2).max(2);
+    if t.contrast && !locked {
+        // The card is the window colour like the panel, so it needs a frame to be a card at all.
+        fill_round(dc, r, radius, t.guide);
+        let edge = s(1).max(1);
+        let inner = RECT { left: r.left + edge, top: r.top + edge, right: r.right - edge, bottom: r.bottom - edge };
+        fill_round(dc, inner, (radius - edge).max(0), t.card);
+    } else if locked {
+        // Heavier than the contrast theme's one-pixel frame, so "locked" is still a shape.
+        let edge = if t.contrast { s(4).max(3) } else { s(2).max(2) };
         fill_round(dc, r, radius, t.accent);
         let inner = RECT { left: r.left + edge, top: r.top + edge, right: r.right - edge, bottom: r.bottom - edge };
         fill_round(dc, inner, (radius - edge).max(0), t.card);
@@ -801,7 +899,13 @@ fn card(dc: HDC, sc: &Scene, r: RECT, i: usize, c: &Cell) {
         fill_round(dc, r, radius, t.card);
     }
     let (ix, rx) = (r.left + s(14), r.right - s(14));
-    text(dc, sc.fonts.mid, ix, r.top + s(8), &c.label, t.label);
+    let label_w = text(dc, sc.fonts.mid, ix, r.top + s(8), &c.label, t.label);
+    // A level is set on this symbol: a dot after the label, in the amber the pane's level lines use.
+    if sc.alert_dots.get(i).copied().unwrap_or(false) {
+        let d = s(6).max(4);
+        let (x, y) = (ix + label_w + s(6), r.top + s(8) + s(9) - d / 2);
+        fill_round(dc, RECT { left: x, top: y, right: x + d, bottom: y + d }, d / 2, t.amber);
+    }
     match &c.quote {
         None => {
             text(dc, sc.fonts.big, ix, r.top + s(28), "--", t.dim);
@@ -915,7 +1019,7 @@ fn open_button(dc: HDC, sc: &Scene, card: RECT) {
     let r = open_btn_rect(card, sc.dpi);
     // Idle it is a chip (the picker's "on" look); under the pointer it fills with the accent, so the
     // one clickable thing on the card announces itself.
-    fill_round(dc, r, if t.is_pixel() { 0 } else { s(8) }, if sc.open_hover { t.accent } else { t.btn });
+    plate(dc, sc, r, if t.is_pixel() { 0 } else { s(8) }, if sc.open_hover { t.accent } else { t.btn }, !sc.open_hover);
     let label = "Open on CNBC";
     let (tw, th) = (text_width(dc, sc.fonts.small, label), line_height(dc, sc.fonts.small));
     text(
@@ -971,7 +1075,7 @@ fn picker(dc: HDC, sc: &Scene, g: &Geo, p: &Picker) {
     for (i, r) in g.chips.iter().enumerate() {
         let Some(row) = p.list.get(i) else { continue };
         let on = p.shown.get(i).copied().unwrap_or(false);
-        fill_round(dc, *r, if t.is_pixel() { 0 } else { s(8) }, if on { t.btn } else { t.card });
+        plate(dc, sc, *r, if t.is_pixel() { 0 } else { s(8) }, if on { t.btn } else { t.card }, on);
         let label = &row.label;
         let (tw, th) = (text_width(dc, sc.fonts.small, label), line_height(dc, sc.fonts.small));
         text(
@@ -1014,7 +1118,7 @@ pub fn draw(dc: HDC, w: i32, h: i32, sc: &Scene) {
 
     if sc.picker_btn {
         if sc.pick_hover {
-            fill_round(dc, g.pick_btn, radius(8), t.btn);
+            plate(dc, sc, g.pick_btn, radius(8), t.btn, true);
         }
         // three stacked bars: the catalogue
         let (px, py) = ((g.pick_btn.left + g.pick_btn.right) / 2, (g.pick_btn.top + g.pick_btn.bottom) / 2);
@@ -1025,11 +1129,11 @@ pub fn draw(dc: HDC, w: i32, h: i32, sc: &Scene) {
         }
     }
     if sc.btn_hover {
-        fill_round(dc, g.btn, radius(8), t.btn);
+        plate(dc, sc, g.btn, radius(8), t.btn, true);
     }
     if sc.settings_btn {
         if sc.gear_hover {
-            fill_round(dc, g.gear_btn, radius(8), t.btn);
+            plate(dc, sc, g.gear_btn, radius(8), t.btn, true);
         }
         let c = ((g.gear_btn.left + g.gear_btn.right) / 2, (g.gear_btn.top + g.gear_btn.bottom) / 2);
         gear(dc, c, s(8), if sc.gear_hover { t.price } else { t.label });
@@ -1039,7 +1143,7 @@ pub fn draw(dc: HDC, w: i32, h: i32, sc: &Scene) {
         // panel, so it has to look pressable in both states.
         let hot = sc.chart.is_some();
         if hot || sc.chart_hover {
-            fill_round(dc, g.chart_btn, radius(8), t.btn);
+            plate(dc, sc, g.chart_btn, radius(8), t.btn, true);
         }
         // Three candles, tallest in the middle: a chart, at 12 px.
         let (px, py) = ((g.chart_btn.left + g.chart_btn.right) / 2, (g.chart_btn.top + g.chart_btn.bottom) / 2);
@@ -1139,6 +1243,7 @@ fn candles(dc: HDC, sc: &Scene, r: RECT, c: &Chart) {
             zone_btn: chartview::Rect::default(),
             tabs,
             vol: None,
+            cross: None,
         }));
     }
     if c.bars.is_empty() {
@@ -1181,11 +1286,12 @@ fn candles(dc: HDC, sc: &Scene, r: RECT, c: &Chart) {
     }
     // The clock the buckets, the axis and the legend are read on: the viewer's for intraday bars, the
     // exchange's own date for daily and longer ones (see `chartview::date_zone`).
-    let zone = chartview::date_zone(c.bar_s, c.tz_offset_s);
+    let zone = chartview::date_zone_of(c.bar_s, c.zone);
     // 1D folds minutes into at most hours, as it always has; the long ranges start at the series' own
     // spacing and climb to a month.
     let coarsest = if c.range == Range::D1 { 3_600.0 } else { chartview::MONTH_S };
     let (bars, bucket) = chartview::fitted_to(c.bars, full.right - full.left, c.t0, zone, c.bar_s, coarsest);
+    let bars = chartview::newest_that_fit(bars, full.right - full.left, sc.dpi);
     let span = chartview::bucket_name(bucket);
     // Volume: when any drawn candle has some, the bottom fifth of the plot is a strip for it and the
     // price plot is that much shorter. No volume anywhere: no strip, and `plot == full`.
@@ -1208,23 +1314,32 @@ fn candles(dc: HDC, sc: &Scene, r: RECT, c: &Chart) {
     let (hx, hy) = (r.left + s(12), r.top + s(8));
     // Daily and longer candles are trading days, not instants: they have no zone to name or to switch,
     // so the header ends at the candle size and there is no button (an empty rectangle is never hit).
-    let zone_btn = if chartview::daily(c.bar_s) {
-        text(dc, sc.fonts.small, hx, hy, &format!("{} \u{b7} {span}", c.label), t.label);
-        chartview::Rect::default()
+    let (zone_btn, title_end) = if chartview::daily(c.bar_s) {
+        let tw = text(dc, sc.fonts.small, hx, hy, &format!("{} \u{b7} {span}", c.label), t.label);
+        (chartview::Rect::default(), hx + tw)
     } else {
         let hw = text(dc, sc.fonts.small, hx, hy, &format!("{} \u{b7} {span} \u{b7} ", c.label), t.label);
         let zw = text(dc, sc.fonts.small, hx + hw, hy, c.tz_label, t.accent);
         fill_rect(dc, RECT { left: hx + hw, top: hy + lh, right: hx + hw + zw, bottom: hy + lh + 1 }, t.accent);
-        chartview::Rect::new(hx + hw - s(4), r.top + s(4), hx + hw + zw + s(4), hy + lh + s(4))
+        (chartview::Rect::new(hx + hw - s(4), r.top + s(4), hx + hw + zw + s(4), hy + lh + s(4)), hx + hw + zw)
     };
     let price_text = fmt_price(last, c.digits);
     let pw = text_width(dc, sc.fonts.mid, &price_text);
     text_right(dc, sc.fonts.mid, r.right - s(12), r.top + s(6), &price_text, t.price);
-    if let Some(p) = c.change_pct.filter(|p| p.is_finite()) {
-        let txt = fmt_change(p);
+    // On 1D the day's change, as ever. On a longer range the day's change is the wrong number to lead
+    // with, so the header says what the bars on screen did: `5Y +182 %` (`chartview::range_change`,
+    // nothing when the first open is zero or not a number).
+    let head = if c.range == Range::D1 {
+        c.change_pct.filter(|p| p.is_finite()).map(|p| (fmt_change(p), p))
+    } else {
+        chartview::range_change(&bars).map(|p| (chartview::range_change_text(c.range.label(), p), p))
+    };
+    if let Some((txt, p)) = head {
         let (right, w) = (r.right - s(12) - pw - s(10), text_width(dc, sc.fonts.small, &txt));
-        // Only when it clears the zone button: a narrow pane drops the change, not the zone.
-        if right - w > zone_btn.right + s(10) {
+        // Only when it clears the zone button (1D) or the title (a longer range, which has no zone
+        // button): a narrow pane drops the change, not the title.
+        let bound = if c.range == Range::D1 { zone_btn.right } else { title_end.max(zone_btn.right) };
+        if right - w > bound + s(10) {
             text_right(dc, sc.fonts.small, right, hy + s(1), &txt, if p >= 0.0 { t.up } else { t.down });
         }
     }
@@ -1233,7 +1348,7 @@ fn candles(dc: HDC, sc: &Scene, r: RECT, c: &Chart) {
     // at the end for the pointer.
     let n = bars.len();
     let (step, body, wick) = candle_metrics(plot.right - plot.left, n as i32, sc.dpi);
-    let lay = Layout {
+    let mut lay = Layout {
         pane: chartview::Rect::new(r.left, r.top, r.right, r.bottom),
         plot: chartview::Rect::new(plot.left, plot.top, plot.right, plot.bottom),
         step,
@@ -1246,6 +1361,7 @@ fn candles(dc: HDC, sc: &Scene, r: RECT, c: &Chart) {
         zone_btn,
         tabs,
         vol,
+        cross: None,
     };
     // Coloured by the day's direction, the same one the header and the card report. Only when the
     // day's change is unknown does it fall back to the bars: the last close against the first open.
@@ -1274,13 +1390,12 @@ fn candles(dc: HDC, sc: &Scene, r: RECT, c: &Chart) {
     // date labels (a new day on the long intraday range) are placed first, so a clock label beside a
     // day boundary gives way to the date and not the other way round.
     let base = lay.base();
-    let tz = zone as f64;
     let mut ticks: Vec<(i32, String, bool)> = Vec::new();
     if bucket >= chartview::DAY_S {
         // Candles of a day or more: month starts ("Oct"), or year starts ("2025") when the months
         // would not fit, or dates when the window is under two months.
         let measure = |label: &str| text_width(dc, sc.fonts.small, label);
-        for (i, label) in chartview::date_ticks(&bars, c.t0, zone, step, &measure, s(8)) {
+        for (i, label) in chartview::date_ticks(&bars, c.t0, zone.first(), step, &measure, s(8)) {
             ticks.push((lay.x_of(i), label, false));
         }
     } else {
@@ -1291,10 +1406,10 @@ fn candles(dc: HDC, sc: &Scene, r: RECT, c: &Chart) {
         let (mut prev_key, mut prev_day) = (None, None);
         for (i, b) in bars.iter().enumerate() {
             let tb = b.t(c.t0);
-            let key = ((tb + tz) / every).floor();
+            let key = ((tb + zone.at(tb) as f64) / every).floor();
             let crossed = prev_key.is_some_and(|k| k != key);
             prev_key = Some(key);
-            let day = chartview::local_day(tb, zone);
+            let day = chartview::local_day(tb, zone.at(tb));
             let new_day = c.range != Range::D1 && prev_day.is_some_and(|d| d != day);
             if !crossed {
                 continue;
@@ -1302,7 +1417,7 @@ fn candles(dc: HDC, sc: &Scene, r: RECT, c: &Chart) {
             prev_day = Some(day);
             // The bar's own start, which is the boundary itself except after a break in the session
             // (a market reopening at 23:15 is labelled 23:15, not a 23:00 it did not trade at).
-            let label = if new_day { chartview::date_label(tb, zone, chartview::DateStyle::DayMonth) } else { clock(tb, zone) };
+            let label = if new_day { chartview::date_label(tb, zone.at(tb), chartview::DateStyle::DayMonth) } else { clock(tb, zone.at(tb)) };
             ticks.push((lay.x_of(i), label, new_day));
         }
     }
@@ -1367,7 +1482,12 @@ fn candles(dc: HDC, sc: &Scene, r: RECT, c: &Chart) {
         fill_rect(dc, RECT { left: wx, top: y0.min(y1), right: wx + wick, bottom: y1.max(y0 + 1) }, col);
         let (b0, b1) = (lay.y_of(b.o.max(b.c) as f64), lay.y_of(b.o.min(b.c) as f64));
         let bx = x - body / 2;
-        fill_rect(dc, RECT { left: bx, top: b0.min(b1), right: bx + body, bottom: b1.max(b0 + 1) }, col);
+        let (top, bottom) = (b0.min(b1), b1.max(b0 + 1));
+        if (sc.hollow_up || t.contrast) && b.c > b.o {
+            hollow_body(dc, bx, top, body, bottom, col, wick);
+        } else {
+            fill_rect(dc, RECT { left: bx, top, right: bx + body, bottom }, col);
+        }
     }
     // The volume strip: one bar per candle, in the candle's colour, bottom-aligned.
     if let Some(v) = vol {
@@ -1413,10 +1533,57 @@ fn candles(dc: HDC, sc: &Scene, r: RECT, c: &Chart) {
         text_right(dc, sc.fonts.small, cx - half - s(4), ly, &format!("{}{more}", fmt_price(p, c.digits)), t.amber);
     }
 
+    // The range's high and low (longer ranges only; 1D keeps its day ticks above): a small square on the
+    // extreme candle and its price, set where it touches nothing: not an alert level, its line or its
+    // price, and not the last-price line. A label with no room is left out and the square stays.
+    if c.range != Range::D1 {
+        if let Some(((hi_i, hi_p), (lo_i, lo_p))) = chartview::extremes(&bars) {
+            let pl = chartview::Rect::new(plot.left, plot.top, plot.right, plot.bottom);
+            let mut avoid: Vec<chartview::Rect> = vec![chartview::Rect::new(plot.left, ylast - 1, plot.right, ylast + 2)];
+            for &(p, y) in &marks.lines {
+                avoid.push(chartview::Rect::new(plot.left, y - 1, plot.right, y + 2));
+                let w = text_width(dc, sc.fonts.small, &fmt_price(p, c.digits));
+                let ly = if y - lh > plot.top { y - lh - 1 } else { y + 2 };
+                avoid.push(chartview::Rect::new(plot.right - s(4) - w, ly, plot.right - s(4), ly + lh));
+            }
+            let half = s(4).max(3);
+            for (mark, up) in [(marks.above, true), (marks.below, false)] {
+                let Some((p, n)) = mark else { continue };
+                let more = if n > 1 { format!(" +{}", n - 1) } else { String::new() };
+                let w = text_width(dc, sc.fonts.small, &format!("{}{more}", fmt_price(p, c.digits)));
+                let ly = if up { plot.top + s(1) } else { plot.bottom - lh - s(1) };
+                let right = plot.right - s(4) - half - half - s(4);
+                avoid.push(chartview::Rect::new(right - w, ly, right + half * 2 + s(4), ly + lh));
+            }
+            let sq = s(3).max(2);
+            for (i, p, up, tag) in [(hi_i, hi_p, true, "H"), (lo_i, lo_p, false, "L")] {
+                let (x, y) = (lay.x_of(i), lay.y_of(p).clamp(plot.top, plot.bottom - 1));
+                fill_rect(dc, RECT { left: x - sq / 2, top: y - sq / 2, right: x - sq / 2 + sq, bottom: y - sq / 2 + sq }, t.price);
+                let label = format!("{tag} {}", fmt_price(p, c.digits));
+                let size = (text_width(dc, sc.fonts.small, &label), lh);
+                if let Some(at) = chartview::place_label((x, y), size, up, pl, &avoid, s(4)) {
+                    text(dc, sc.fonts.small, at.left, at.top, &label, t.label);
+                    // Where it went is taken: the other mark must not land on it.
+                    avoid.push(at);
+                }
+            }
+        }
+    }
+
     // The crosshair, when the pointer is on a candle: a vertical line through it and a horizontal at
     // the pointer's row. `bar` is clamped because the pointer was taken from the previous frame and
     // a resize can have refolded the bars since.
-    let hover = sc.chart_at.filter(|p| p.y >= plot.top && p.y < plot.bottom).map(|p| (p.bar.min(n - 1), p.y));
+    // A crosshair set by key (`aim_snap`) sits on its candle's close; one set by the pointer stays where
+    // the pointer is.
+    let hover = sc
+        .chart_at
+        .map(|p| {
+            let bar = p.bar.min(n - 1);
+            let y = if sc.aim_snap { lay.y_of(bars[bar].c as f64).clamp(plot.top, plot.bottom - 1) } else { p.y };
+            (bar, y)
+        })
+        .filter(|&(_, y)| y >= plot.top && y < plot.bottom);
+    lay.cross = hover.and_then(|(bar, y)| lay.price_at(y).map(|price| (bar, price)));
     if let Some((bar, y)) = hover {
         let x = lay.x_of(bar);
         pen_line(dc, PS_DOT, t.accent, (x, plot.top), (x, plot.bottom));
@@ -1451,6 +1618,12 @@ fn candles(dc: HDC, sc: &Scene, r: RECT, c: &Chart) {
         if !show_tabs || text_width(dc, sc.fonts.small, &line) <= avail {
             text(dc, sc.fonts.small, r.left + s(12), r.top + s(30), &line, t.price);
         }
+    } else if !c.note.is_empty() {
+        // The line is otherwise empty until the pointer arrives: say what is suspect about the data.
+        let avail = if show_tabs { tabs[0].left - (r.left + s(12)) - s(10) } else { r.right - r.left - s(24) };
+        if text_width(dc, sc.fonts.small, c.note) <= avail {
+            text(dc, sc.fonts.small, r.left + s(12), r.top + s(30), c.note, t.accent);
+        }
     }
     sc.layout.set(Some(lay));
 }
@@ -1468,7 +1641,7 @@ fn range_tabs(dc: HDC, sc: &Scene, r: RECT, c: &Chart, lh: i32) -> [chartview::R
         let rc = RECT { left: right - w, top, right, bottom };
         let lit = *rg == c.range;
         if lit {
-            fill_round(dc, rc, if t.is_pixel() { 0 } else { s(4) }, t.btn);
+            plate(dc, sc, rc, if t.is_pixel() { 0 } else { s(4) }, t.btn, true);
         }
         text(dc, sc.fonts.small, rc.left + s(5), top + (bottom - top - lh) / 2, rg.label(), if lit { t.price } else { t.label });
         out[k] = chartview::Rect::new(rc.left, rc.top, rc.right, rc.bottom);
@@ -1732,7 +1905,7 @@ mod tests {
 
     #[test]
     fn history_resets_when_symbol_changes_under_same_label() {
-        let old = crate::config::Row { label: "X".into(), symbol: "OLD".into(), digits: 2, name: String::new() };
+        let old = crate::config::Row { label: "X".into(), symbol: "OLD".into(), digits: 2, name: String::new(), strip: true };
         let new = crate::config::Row { symbol: "NEW".into(), ..old.clone() };
         let mut board = Board::new(&[old]);
         board.cells[0].quote = Some(crate::model::Quote { symbol: "OLD".into(), price: 42.0, ..Default::default() });
@@ -1742,6 +1915,22 @@ mod tests {
         board.set_rows(&[new]);
         history.record(&board, 101.0);
         assert!(history.row(0).unwrap().is_empty(), "old symbol's line must not survive");
+    }
+
+    #[test]
+    fn a_renamed_symbol_keeps_its_line() {
+        let rows = crate::config::default_rows();
+        let mut b = Board::new(&rows[..1]);
+        b.cells[0].quote = Some(crate::model::Quote { symbol: "XAU=".into(), price: 4000.0, ts: Some(100.0), realtime: true, ..Default::default() });
+        b.cells[0].stale = false;
+        let mut h = History::new();
+        h.record(&b, 100.0);
+        let renamed = crate::config::Row { label: "Gold".into(), ..rows[0].clone() };
+        b.set_rows(&[renamed]);
+        h.record(&b, 101.0);
+        assert_eq!(h.labels, ["Gold"]);
+        assert!(!h.row(0).unwrap().is_empty() && h.row(0).unwrap()[0].0 == 100.0, "the line before the rename is still there");
+        assert_eq!(h.series_of("Gold").first().map(|p| p.1), Some(4000.0), "the fast-move alert reads it by the new label");
     }
 
     #[test]

@@ -26,7 +26,9 @@
 //!   including an animated one, which slides over pre-built brushes instead of rebuilding them.
 
 use crate::model::Link;
-use std::sync::OnceLock;
+use crate::updown::UpDown;
+use crate::contrast::SystemColours;
+use std::sync::{Mutex, OnceLock};
 use windows_sys::Win32::Foundation::{COLORREF, LPARAM, RECT};
 use windows_sys::Win32::Graphics::Gdi::{
     CreateSolidBrush, DeleteObject, EnumFontFamiliesExW, FillRect, GetDC, ReleaseDC, LOGFONTW,
@@ -118,6 +120,9 @@ pub struct Theme {
     pub accent: COLORREF,
     /// The panel face. The strip keeps `cfg.font` (its size comes from `dock_font_pt`/`font_pt`).
     pub font: &'static str,
+    /// Built from the Windows contrast theme (`from_system`). The painter then draws outlines where
+    /// a catalogue theme draws a fill, and a rise differs from a fall by shape, not only by colour.
+    pub contrast: bool,
 }
 
 /// A compact literal for the catalogue below: `t(name, note, kind, [bg, bg_to, bg_mid],
@@ -149,6 +154,7 @@ macro_rules! theme {
             btn: $btn,
             accent: $accent,
             font: $font,
+            contrast: false,
         }
     };
 }
@@ -261,7 +267,7 @@ const EMBER: Theme = theme!("ember", "charcoal to rust", Kind::Gradient, Some(14
 
 const GLASS: Theme = theme!("glass", "light, cool and airy", Kind::Gradient, Some(18.0), "Segoe UI Variable", {
     bg: rgb(236, 242, 248), bg_to: rgb(214, 226, 240), bg_mid: rgb(226, 236, 246), card: rgb(252, 254, 255),
-    label: rgb(96, 110, 126), price: rgb(20, 28, 40), dim: rgb(134, 148, 164),
+    label: rgb(87, 100, 115), price: rgb(20, 28, 40), dim: rgb(134, 148, 164),
     up: rgb(18, 132, 96), down: rgb(190, 52, 72), amber: rgb(160, 112, 20),
     guide: rgb(200, 214, 230), btn: rgb(226, 236, 246), accent: rgb(44, 110, 220),
 });
@@ -307,7 +313,7 @@ const SUNSET: Theme = theme!("sunset", "amber through purple", Kind::Animated, S
 
 const EGA: Theme = theme!("ega", "EGA 16-colour, cyan", Kind::Pixel, Some(8.0), "Terminal", {
     bg: rgb(0, 0, 42), bg_to: rgb(0, 0, 20), bg_mid: rgb(0, 0, 30), card: rgb(0, 0, 84),
-    label: rgb(85, 85, 255), price: rgb(255, 255, 255), dim: rgb(85, 85, 170),
+    label: rgb(107, 107, 255), price: rgb(255, 255, 255), dim: rgb(85, 85, 170),
     up: rgb(85, 255, 85), down: rgb(255, 85, 85), amber: rgb(255, 255, 85),
     guide: rgb(0, 0, 120), btn: rgb(0, 0, 140), accent: rgb(85, 255, 255),
 });
@@ -328,14 +334,14 @@ const PHOSPHOR: Theme = theme!("phosphor", "green phosphor", Kind::Pixel, Some(7
 
 const GAMEBOY: Theme = theme!("gameboy", "four shades of green", Kind::Pixel, Some(10.0), "Fixedsys", {
     bg: rgb(15, 56, 15), bg_to: rgb(10, 38, 10), bg_mid: rgb(12, 47, 12), card: rgb(48, 98, 48),
-    label: rgb(138, 171, 15), price: rgb(214, 232, 140), dim: rgb(96, 130, 60),
-    up: rgb(190, 230, 80), down: rgb(230, 110, 80), amber: rgb(220, 190, 60),
+    label: rgb(190, 220, 70), price: rgb(214, 232, 140), dim: rgb(96, 130, 60),
+    up: rgb(190, 230, 80), down: rgb(236, 145, 122), amber: rgb(220, 190, 60),
     guide: rgb(60, 110, 60), btn: rgb(56, 112, 56), accent: rgb(155, 188, 15),
 });
 
 const C64: Theme = theme!("c64", "breadbin blue", Kind::Pixel, Some(9.0), "Fixedsys", {
     bg: rgb(53, 40, 121), bg_to: rgb(32, 24, 82), bg_mid: rgb(42, 32, 101), card: rgb(66, 50, 140),
-    label: rgb(120, 160, 255), price: rgb(164, 190, 255), dim: rgb(96, 116, 200),
+    label: rgb(138, 172, 255), price: rgb(164, 190, 255), dim: rgb(96, 116, 200),
     up: rgb(140, 230, 160), down: rgb(255, 120, 120), amber: rgb(240, 220, 100),
     guide: rgb(78, 62, 160), btn: rgb(74, 58, 150), accent: rgb(255, 255, 255),
 });
@@ -374,6 +380,84 @@ pub fn tier(kind: Kind) -> impl Iterator<Item = usize> {
 /// The classic build's look: one palette, no menu.
 pub fn classic() -> &'static Theme {
     &MIDNIGHT
+}
+
+/// `t` with the direction colours `mode` asks for, and nothing else changed. The default returns `t`
+/// itself, so the classic build and a plain settings file draw exactly what they always drew. The
+/// others come from a table built once, so the result is as `'static` as the catalogue and a theme
+/// can still be compared by address.
+pub fn with_updown(t: &'static Theme, mode: UpDown) -> &'static Theme {
+    static TABLE: OnceLock<Vec<Theme>> = OnceLock::new();
+    if mode == UpDown::GreenRed || t.contrast {
+        return t;
+    }
+    let Some(i) = ALL.iter().position(|a| std::ptr::eq(a, t) || a.name == t.name) else {
+        return t;
+    };
+    let table = TABLE.get_or_init(|| {
+        let mut v = Vec::with_capacity(ALL.len() * 2);
+        for mode in [UpDown::RedGreen, UpDown::BlueOrange] {
+            for a in ALL.iter() {
+                let (up, down) = mode.pair(a.up, a.down, is_light(a));
+                v.push(Theme { up, down, ..*a });
+            }
+        }
+        v
+    });
+    let slot = if mode == UpDown::RedGreen { 0 } else { 1 };
+    &table[slot * ALL.len() + i]
+}
+
+impl Theme {
+    /// The contrast theme: the panel drawn in the Windows contrast palette and nothing else.
+    ///
+    /// Every pair it can draw is a pair the system defines. All backgrounds (the panel, the card and
+    /// the button) are the window colour, so the foregrounds are only the three the system pairs with
+    /// it: window text for prices, labels, the fall colour and the lines; the hyperlink colour for
+    /// the rise colour, the stale tag and level lines; the disabled-text colour for dim text. The
+    /// accent is window text again, so a filled accent shape carrying window-coloured text is the same
+    /// pair reversed. Direction is then told by the sign, and by hollow up candles (`contrast`).
+    pub fn from_system(c: &SystemColours) -> Theme {
+        Theme {
+            name: "contrast",
+            note: "the Windows contrast theme",
+            kind: Kind::Flat,
+            cycle: None,
+            bg: c.window,
+            bg_to: c.window,
+            bg_mid: c.window,
+            card: c.window,
+            label: c.window_text,
+            price: c.window_text,
+            dim: c.gray_text,
+            up: c.hotlight,
+            down: c.window_text,
+            amber: c.hotlight,
+            guide: c.window_text,
+            btn: c.window,
+            accent: c.window_text,
+            font: "Segoe UI",
+            contrast: true,
+        }
+    }
+}
+
+/// The contrast theme for these colours, built once per distinct palette and kept: the Ui holds
+/// `&'static Theme`, and a person changes the Windows contrast theme a handful of times in a session.
+pub fn system(c: &SystemColours) -> &'static Theme {
+    static MADE: Mutex<Vec<(SystemColours, &'static Theme)>> = Mutex::new(Vec::new());
+    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, t)) = made.iter().find(|(k, _)| k == c) {
+        return t;
+    }
+    let t: &'static Theme = Box::leak(Box::new(Theme::from_system(c)));
+    made.push((*c, t));
+    t
+}
+
+/// A light theme: its cards are brighter than mid grey. Decides which blue and orange it gets.
+pub fn is_light(t: &Theme) -> bool {
+    crate::contrast::luminance(t.card) > 0.4
 }
 
 /// The theme in force. The classic build always gets `MIDNIGHT` whatever the config says, so a
@@ -677,6 +761,111 @@ mod tests {
             assert_ne!(t.card, t.bg, "{}: cards must stand off the background", t.name);
             assert_ne!(t.accent, t.bg, "{}: the accent must be visible", t.name);
             assert!(!t.font.is_empty(), "{}: names no font", t.name);
+        }
+    }
+
+    /// Every background a theme can show: its three stops, the mixes between them that the breath
+    /// and the ring walk through, and the card. Text and direction colours are judged on all of
+    /// them, because a cycle moves the background under fixed foreground colours.
+    fn backgrounds(t: &Theme) -> Vec<COLORREF> {
+        let mut out = vec![t.card];
+        for (a, b) in [(t.bg, t.bg_to), (t.bg_to, t.bg_mid), (t.bg_mid, t.bg)] {
+            for i in 0..=BREATH_BANDS {
+                out.push(mix(a, b, i as f64 / BREATH_BANDS as f64));
+            }
+        }
+        out
+    }
+
+    fn worst(fg: COLORREF, t: &Theme) -> f64 {
+        backgrounds(t).into_iter().map(|b| crate::contrast::ratio(fg, b)).fold(f64::MAX, f64::min)
+    }
+
+    #[test]
+    fn every_theme_reads_text_and_direction_against_its_background() {
+        use crate::contrast::{DIRECTION_MIN, TEXT_MIN};
+        let mut bad = Vec::new();
+        for t in ALL {
+            for (what, fg, min) in [
+                ("price", t.price, TEXT_MIN),
+                ("label", t.label, TEXT_MIN),
+                ("up", t.up, DIRECTION_MIN),
+                ("down", t.down, DIRECTION_MIN),
+            ] {
+                let r = worst(fg, &t);
+                if r < min {
+                    bad.push(format!("{} {what} {r:.2} (needs {min})", t.name));
+                }
+            }
+        }
+        assert!(bad.is_empty(), "below the contrast floor: {bad:?}");
+    }
+
+    #[test]
+    fn every_updown_palette_keeps_direction_readable_on_every_theme_and_changes_only_two_colours() {
+        use crate::contrast::DIRECTION_MIN;
+        let mut bad = Vec::new();
+        for (i, t) in ALL.iter().enumerate() {
+            assert!(std::ptr::eq(with_updown(&ALL[i], UpDown::GreenRed), &ALL[i]), "the default is the theme itself");
+            for mode in [UpDown::RedGreen, UpDown::BlueOrange] {
+                let v = with_updown(&ALL[i], mode);
+                assert_eq!(Theme { up: t.up, down: t.down, ..*v }, *t, "{} {mode:?} touched more than up and down", t.name);
+                assert_ne!(v.up, v.down, "{} {mode:?}", t.name);
+                for (what, fg) in [("up", v.up), ("down", v.down)] {
+                    let r = worst(fg, v);
+                    if r < DIRECTION_MIN {
+                        bad.push(format!("{} {mode:?} {what} {r:.2}", t.name));
+                    }
+                }
+            }
+        }
+        assert!(bad.is_empty(), "below 3 to 1: {bad:?}");
+    }
+
+    #[test]
+    fn red_green_swaps_the_themes_own_two_colours() {
+        let v = with_updown(&ALL[0], UpDown::RedGreen);
+        assert_eq!((v.up, v.down), (ALL[0].down, ALL[0].up));
+    }
+
+    /// The contrast theme is built from the system's colours and from nothing else: every foreground
+    /// it can draw sits on the window colour, in one of the three pairs the system defines for it
+    /// (window text, the hyperlink colour, disabled text), whichever of the two fixed palettes it is
+    /// made from; and every text colour reads on it at the contrast test's floor.
+    #[test]
+    fn the_contrast_theme_draws_only_pairs_the_system_defines() {
+        use crate::contrast::{ratio, HC_BLACK, HC_WHITE, TEXT_MIN};
+        for (which, c) in [("black", HC_BLACK), ("white", HC_WHITE)] {
+            let t = Theme::from_system(&c);
+            assert!(t.contrast && t.cycle.is_none() && t.kind == Kind::Flat, "{which}: a still, flat fill");
+            let defined = [(c.window_text, c.window), (c.hotlight, c.window), (c.gray_text, c.window)];
+            for bg in [t.bg, t.bg_to, t.bg_mid, t.card, t.btn] {
+                assert_eq!(bg, c.window, "{which}: every background is the window colour");
+            }
+            for (what, fg) in [
+                ("price", t.price), ("label", t.label), ("dim", t.dim), ("up", t.up), ("down", t.down),
+                ("amber", t.amber), ("guide", t.guide), ("accent", t.accent),
+            ] {
+                assert!(defined.contains(&(fg, t.card)), "{which}: {what} on the window is not a pair the system defines");
+                assert!(ratio(fg, t.card) >= TEXT_MIN, "{which}: {what} {:.2}", ratio(fg, t.card));
+            }
+            assert_ne!(t.up, t.down, "{which}: rise and fall differ in colour too");
+            // Built from the system and nothing else: a different palette gives a different theme.
+            assert_ne!(Theme::from_system(&HC_BLACK), Theme::from_system(&HC_WHITE));
+        }
+        // The same palette is the same theme object, so a repeat change message rebuilds nothing.
+        assert!(std::ptr::eq(system(&HC_BLACK), system(&HC_BLACK)));
+        assert!(!std::ptr::eq(system(&HC_BLACK), system(&HC_WHITE)));
+    }
+
+    /// Prints every ratio the note quotes: `cargo test print_the_contrast_table -- --nocapture`.
+    #[test]
+    fn print_the_contrast_table() {
+        for t in ALL {
+            println!(
+                "{:12} price {:5.2} label {:5.2} dim {:5.2} up {:5.2} down {:5.2}",
+                t.name, worst(t.price, &t), worst(t.label, &t), worst(t.dim, &t), worst(t.up, &t), worst(t.down, &t)
+            );
         }
     }
 
