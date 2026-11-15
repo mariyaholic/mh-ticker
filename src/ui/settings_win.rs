@@ -167,6 +167,8 @@ fn apply(s: &mut Sw, snap: &Snap) -> bool {
     s.face = snap.face;
     s.zoom = zoom;
     s.focus = settings::settle(s.focus, &old, s.cur, s.sections.len(), &s.controls);
+    // The pointer highlight is an index pair too, and the pointer has not moved to say it changed.
+    s.hover = settings::settle_hover(s.hover, &old, s.sections.len(), &s.controls);
     changed
 }
 

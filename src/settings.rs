@@ -679,6 +679,25 @@ pub fn settle(f: Focus, old: &[Control], nav_cur: usize, nav_n: usize, controls:
     }
 }
 
+/// Keep a pointer highlight on the control it was on after the controls were rebuilt. `old` is the list
+/// the hover index was taken from. An option is followed by control label and command, like the focus;
+/// one that is gone or now disabled loses the highlight (the next pointer move finds what is under the
+/// pointer), and a sidebar entry stays while it exists. It never lands on a stranger at the old index.
+pub fn settle_hover(h: Option<Hit>, old: &[Control], nav_n: usize, controls: &[Control]) -> Option<Hit> {
+    match h? {
+        Hit::Nav(i) => (i < nav_n).then_some(Hit::Nav(i)),
+        opt @ Hit::Opt(..) => {
+            let (label, act) = identity(opt, old)?;
+            controls.iter().enumerate().find_map(|(ci, c)| {
+                if c.label != label {
+                    return None;
+                }
+                c.opts.iter().position(|o| &o.act == act && o.enabled).map(|oi| Hit::Opt(ci, oi))
+            })
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Colours
 
@@ -1242,6 +1261,30 @@ mod tests {
         let mut changed = sample();
         changed[5] = Control::button("Update", "", "Check again", Act::Cmd(77), true);
         assert_eq!(settle(Hit::Opt(5, 0), &old, 1, 6, &changed), Hit::Opt(5, 0));
+    }
+
+    /// Audit 2026-11, hover-index-stale-after-rebuild: the pointer highlight moves with its control
+    /// when controls are inserted above it, and is dropped when its control or option is gone.
+    #[test]
+    fn settle_hover_follows_the_control_and_drops_what_is_gone() {
+        let old = sample();
+        let mut new = sample();
+        new.insert(2, Control::choice("Inserted", "", vec![opt("x", Act::Cmd(900))], None));
+        new.insert(2, Control::choice("Inserted too", "", vec![opt("y", Act::Cmd(901)), opt("z", Act::Cmd(902))], None));
+        // The old index would now name another control; the hover goes with "Update" to index 7.
+        assert_eq!(settle_hover(Some(Hit::Opt(5, 0)), &old, 6, &new), Some(Hit::Opt(7, 0)));
+        assert_eq!(settle_hover(Some(Hit::Opt(5, 0)), &old, 6, &old), Some(Hit::Opt(5, 0)), "an unchanged list keeps it");
+        // The control is gone: no highlight, not the control that took its index.
+        let gone: Vec<Control> = old.iter().filter(|c| c.label != "Update").cloned().collect();
+        assert_eq!(settle_hover(Some(Hit::Opt(5, 0)), &old, 6, &gone), None);
+        // The option is still there but disabled: `hit` would not answer it, so neither does this.
+        let mut off = sample();
+        off[5].opts[0].enabled = false;
+        assert_eq!(settle_hover(Some(Hit::Opt(5, 0)), &old, 6, &off), None);
+        // The sidebar and nothing.
+        assert_eq!(settle_hover(Some(Hit::Nav(2)), &old, 6, &new), Some(Hit::Nav(2)));
+        assert_eq!(settle_hover(Some(Hit::Nav(7)), &old, 6, &new), None, "the entry is gone");
+        assert_eq!(settle_hover(None, &old, 6, &new), None);
     }
 
     #[test]
