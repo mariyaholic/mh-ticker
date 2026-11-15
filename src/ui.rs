@@ -1406,14 +1406,17 @@ fn tooltip_in(view: &Board, pending: Option<&str>, blind: Option<&str>, now: f64
         s.push('\n');
         s.push_str(line);
     }
-    // Each row is its short form and, for a closed market, a longer one with the since-time.
-    let mut rows: Vec<(String, Option<String>)> = Vec::new();
+    // Each row is its short form, whether its market reads closed, and, for a closed market with a
+    // since-time, a longer form.
+    let mut rows: Vec<(String, Option<String>, bool)> = Vec::new();
     for (i, c) in view.cells.iter().enumerate() {
         if let Some(q) = &c.quote {
             let mut row = format!("\n{} {}", c.label, fmt_price(q.price, c.digits));
             let mut long = None;
+            let mut closed = false;
             if !q.source.is_empty() { row.push_str(&format!(" ({}; age unknown)", q.source)); }
             else if crate::model::reads_closed(c, view.link, now) {
+                closed = true;
                 row.push_str(" (closed)");
                 long = crate::model::closed_since_shown(q, now, view.last_bar_at(i))
                     .map(|t| format!("\n{} {} (closed since {})", c.label, fmt_price(q.price, c.digits), crate::model::fmt_since(offset_at, now, t)));
@@ -1423,22 +1426,23 @@ fn tooltip_in(view: &Board, pending: Option<&str>, blind: Option<&str>, now: f64
                 row.push_str(&format!(" ({src} {})", crate::panel::fmt_age(now - q.ts.unwrap_or(now))));
             }
             else if c.stale { row.push_str(" (stale)"); }
-            rows.push((row, long));
+            rows.push((row, long, closed));
         }
     }
     let units = |t: &str| t.encode_utf16().count();
-    // A board whose short form is already over the limit drops the ` (closed)` suffix of its closed rows:
-    // the title counts them, and the shell would otherwise cut the last rows.
-    if units(&s) + rows.iter().map(|(r, _)| units(r)).sum::<usize>() > TIP_UNITS {
-        for (row, long) in rows.iter_mut() {
-            if long.is_some() {
+    // A board whose short form is already over the limit drops the ` (closed)` suffix of every closed
+    // row, whether or not it has a since-time: the title counts them, and the shell would otherwise
+    // cut the last rows. One rule for all closed rows keeps the tooltip from mixing the two.
+    if units(&s) + rows.iter().map(|(r, _, _)| units(r)).sum::<usize>() > TIP_UNITS {
+        for (row, long, closed) in rows.iter_mut() {
+            if *closed {
                 *row = row.replace(" (closed)", "");
                 *long = None;
             }
         }
     }
-    let mut total = units(&s) + rows.iter().map(|(r, _)| units(r)).sum::<usize>();
-    for (row, long) in rows {
+    let mut total = units(&s) + rows.iter().map(|(r, _, _)| units(r)).sum::<usize>();
+    for (row, long, _) in rows {
         match long {
             Some(l) if total - units(&row) + units(&l) <= TIP_UNITS => {
                 total = total - units(&row) + units(&l);
@@ -1539,6 +1543,21 @@ mod tooltip_tests {
         assert!(tip.encode_utf16().count() <= TIP_UNITS, "{tip}");
         assert!(tip.contains("MARKET5 10"), "the last row is kept: {tip}");
         assert!(tip.contains("markets closed"), "the title says it: {tip}");
+    }
+
+    #[test]
+    fn a_long_board_drops_the_closed_suffix_from_every_closed_row_including_one_with_no_since_time() {
+        let now = 1_000_000.0;
+        let mut b = Board::new(&[]);
+        b.link = Link::Partial;
+        // Five markets stopped on a weekday (a since-time exists); one carries a Saturday stamp and no
+        // 1D bar, so it has none.
+        b.cells = (0..5).map(|i| cell(&format!("MARKET{i}"), Some(now - 5.0 * 3600.0), true)).collect();
+        b.cells.push(cell("NEWSYM", Some(800_000.0), true));
+        let tip = tooltip_in(&b, None, None, now, &|_| 0);
+        assert!(tip.contains("NEWSYM 10"), "{tip}");
+        assert!(!tip.contains("(closed"), "no row keeps the word while the others lose it: {tip}");
+        assert!(tip.encode_utf16().count() <= TIP_UNITS + 24, "the rows are the short ones: {tip}");
     }
 
     #[test]
