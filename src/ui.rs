@@ -3301,6 +3301,7 @@ fn alert_command(hwnd: HWND, cmd: usize) {
                     let ask = format!("Send alerts to {host}?\n\nOnly the host is shown here; the rest of the address stays private.");
                     if alert_box(hwnd, "Use this webhook?", &ask, MB_YESNO | MB_ICONQUESTION) == IDYES {
                         with_ui(|u| u.cfg.webhook = Some(url));
+                        alerts::webhook_changed();
                         save_cfg();
                     }
                 }
@@ -3333,6 +3334,7 @@ fn alert_command(hwnd: HWND, cmd: usize) {
         }
         CMD_HOOK_REMOVE => {
             with_ui(|u| u.cfg.webhook = None);
+            alerts::webhook_changed();
             save_cfg();
         }
         CMD_LOG_CLEAR => {
