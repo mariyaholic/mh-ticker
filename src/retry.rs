@@ -44,9 +44,17 @@ pub fn next(why: Failure, attempt: u32) -> Option<f64> {
     }
 }
 
+/// Whether a post that started under webhook generation `started` may still send its retry when the
+/// generation is `now`: the address it was for has not been removed or replaced since.
+pub fn still_wanted(started: u64, now: u64) -> bool {
+    started == now
+}
+
 /// Send, and send once more if [`next`] says so. Returns the last result and whether it took the
-/// second try (`sent on retry`). `sleep` gets the seconds to wait.
-pub fn run(mut send: impl FnMut() -> Result<(), String>, mut sleep: impl FnMut(f64)) -> (Result<(), String>, bool) {
+/// second try (`sent on retry`). `sleep` gets the seconds to wait. `wanted` is asked after each wait:
+/// when it says no, the failure that caused the wait is the result and nothing more is sent (a webhook
+/// removed during the wait must not get the request).
+pub fn run_while(mut send: impl FnMut() -> Result<(), String>, mut sleep: impl FnMut(f64), mut wanted: impl FnMut() -> bool) -> (Result<(), String>, bool) {
     let mut attempt = 0;
     loop {
         match send() {
@@ -54,6 +62,9 @@ pub fn run(mut send: impl FnMut() -> Result<(), String>, mut sleep: impl FnMut(f
             Err(e) => match next(classify(&e), attempt) {
                 Some(wait) => {
                     sleep(wait);
+                    if !wanted() {
+                        return (Err(e), attempt > 0);
+                    }
                     attempt += 1;
                 }
                 None => return (Err(e), attempt > 0),
@@ -92,13 +103,14 @@ mod tests {
     fn script(answers: &[&str]) -> (Result<(), String>, bool, usize, usize) {
         let mut i = 0;
         let mut waits = 0;
-        let (r, retried) = run(
+        let (r, retried) = run_while(
             || {
                 let a = answers[i];
                 i += 1;
                 if a == "ok" { Ok(()) } else { Err(a.to_string()) }
             },
             |_| waits += 1,
+            || true,
         );
         (r, retried, i, waits)
     }
@@ -108,6 +120,39 @@ mod tests {
         assert_eq!(script(&["ok"]), (Ok(()), false, 1, 0));
         assert_eq!(script(&["HTTP 503", "ok"]), (Ok(()), true, 2, 1), "sent on retry");
         assert_eq!(script(&["network", "ok"]), (Ok(()), true, 2, 1));
+    }
+
+    /// Audit 2026-11, webhook-retry-after-remove: a retry waiting for its pause does not go to an
+    /// address that was removed or replaced meanwhile, and the result is the first failure, never "sent".
+    #[test]
+    fn a_retry_is_skipped_when_the_webhook_changed_during_the_wait() {
+        assert!(still_wanted(4, 4));
+        assert!(!still_wanted(4, 5), "removed or replaced");
+        let mut sends = 0;
+        let generation = std::cell::Cell::new(7u64);
+        let (r, retried) = run_while(
+            || {
+                sends += 1;
+                Err("HTTP 503".to_string())
+            },
+            // The user removes the webhook while the post sleeps.
+            |_| generation.set(generation.get() + 1),
+            || still_wanted(7, generation.get()),
+        );
+        assert_eq!(sends, 1, "the removed address got nothing more");
+        assert_eq!(r, Err("HTTP 503".to_string()));
+        assert!(!retried, "not reported as sent on retry");
+        // Unchanged: the retry goes and succeeds, as before.
+        let mut sends = 0;
+        let (r, retried) = run_while(
+            || {
+                sends += 1;
+                if sends == 1 { Err("network".to_string()) } else { Ok(()) }
+            },
+            |_| {},
+            || still_wanted(7, 7),
+        );
+        assert_eq!((r, retried, sends), (Ok(()), true, 2));
     }
 
     #[test]

@@ -15,7 +15,7 @@
 
 use crate::config::{Alert, Config};
 use crate::model::{fmt_price, Board};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::HWND;
@@ -865,6 +865,15 @@ static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 /// The app is quitting: a waiting retry goes at once instead of after its pause.
 static QUITTING: AtomicBool = AtomicBool::new(false);
 
+/// Bumped each time the webhook address is removed or replaced. A post remembers the value it started
+/// under, and its retry goes out only while the value is still the same (`retry::still_wanted`).
+static WEBHOOK_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// The webhook was removed or replaced: posts waiting for their retry stop waiting.
+pub fn webhook_changed() {
+    WEBHOOK_GENERATION.fetch_add(1, Ordering::SeqCst);
+}
+
 /// How long quitting waits for a POST in flight.
 pub const QUIT_WAIT: Duration = Duration::from_secs(2);
 
@@ -915,10 +924,16 @@ pub fn wait_for_posts() {
 /// Returns false when the thread could not be started; `on_done` is then never called.
 pub fn spawn_post(url: String, title: String, body: String, on_done: Box<dyn Fn(Option<String>, bool) + Send>) -> bool {
     IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
+    // Read here, on the caller's thread: a change between this call and the thread's first line counts.
+    let generation = WEBHOOK_GENERATION.load(Ordering::SeqCst);
     let started = thread::Builder::new().name("alert-post".into()).spawn(move || {
         let _flight = Flight;
         let (json, ctype) = payload(&url, &title, &body);
-        let (result, retried) = crate::retry::run(|| crate::source::post(&url, &json, ctype, POST_TIMEOUT_S), nap);
+        let (result, retried) = crate::retry::run_while(
+            || crate::source::post(&url, &json, ctype, POST_TIMEOUT_S),
+            nap,
+            || crate::retry::still_wanted(generation, WEBHOOK_GENERATION.load(Ordering::SeqCst)),
+        );
         on_done(result.err().map(|e| format!("{}: {e}", redact(&url))), retried);
     });
     if started.is_err() {
