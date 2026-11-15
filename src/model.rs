@@ -206,7 +206,8 @@ impl Board {
 }
 
 /// A quote time this far ahead of the clock counts as clock skew. Further ahead, the time is wrong
-/// and the quote has no known age (`is_stale` is true and `market_closed` is false for it).
+/// and the quote has no known age (`is_stale` is true and `market_closed` is false for it). It keeps
+/// the fault look unless the 1D bars show the close ([`Board::apply_bar_restamps`]).
 pub const FUTURE_SKEW_S: f64 = 300.0;
 
 pub fn is_stale(q: &Quote, now: f64, stale_after: f64, delayed_grace: f64) -> bool {
@@ -404,7 +405,10 @@ impl Board {
     /// Does the 1D chart show that card `i`'s quote is a re-stamp, before `moved_at` can? True for a
     /// CNBC quote whose time is more than [`RESTAMP_AFTER_BAR_S`] after the end of the last kept bar
     /// while its price equals that bar's close: the market stopped at the bar and the quote only
-    /// carries a newer stamp. This covers the first [`CLOSED_AFTER_S`] after a start, when
+    /// carries a newer stamp. A quote whose time is unknown or ahead of the clock (the Sunday stamps of
+    /// spot silver and the futures) counts when its price equals that bar's close and the bar ended at
+    /// least [`CLOSED_AFTER_S`] ago; [`Board::apply_bar_restamps`] then gives that quote the bar's end
+    /// as its time. This covers the first [`CLOSED_AFTER_S`] after a start, when
     /// [`restamped`] has no history, and it needs the chart's answer to have arrived.
     pub fn restamped_over_bars(&self, i: usize, now: f64) -> bool {
         let (Some(q), Some(bar), Some(end)) = (
@@ -415,7 +419,15 @@ impl Board {
             return false;
         };
         let same = (q.price - bar.c as f64).abs() <= 1e-6 * q.price.abs().max(1.0);
-        same && time_is_plausible(q, now) && q.ts.is_some_and(|t| t - end > RESTAMP_AFTER_BAR_S)
+        if !same {
+            return false;
+        }
+        // A time that is unknown or ahead of the clock cannot be compared with the bar, so the bar's own
+        // age decides: the price is the last bar's close and that bar ended [`CLOSED_AFTER_S`] ago.
+        if !time_is_plausible(q, now) {
+            return now - end >= CLOSED_AFTER_S;
+        }
+        q.ts.is_some_and(|t| t - end > RESTAMP_AFTER_BAR_S)
     }
 
     /// Marks every card whose quote the 1D chart shows to be a re-stamp ([`Board::restamped_over_bars`])
@@ -435,6 +447,11 @@ impl Board {
             let cell = &mut self.cells[i];
             if let Some(q) = cell.quote.as_mut() {
                 q.moved_at = Some(q.moved_at.map_or(end, |m| m.min(end)));
+                // A time that is unknown or ahead of the clock gets the bar's end, the last time the
+                // price is known to have traded. Without it the card has no age and reads as a fault.
+                if !time_is_plausible(q, now) {
+                    q.ts = Some(end);
+                }
             }
             cell.stale = true;
         }
@@ -939,6 +956,76 @@ mod tests {
         b.cells[0].quote.as_mut().unwrap().price = 7_561.0;
         b.bars_t0 = vec![now - 60.0 - BAR_END_S];
         assert!(!b.restamped_over_bars(0, now), "a stamp right after the bar is a live market");
+    }
+
+    /// A board with one CNBC card on `price` and a 1D chart whose last bar closed at `price` and ended
+    /// `bar_age` seconds before `now`.
+    fn board_on_a_bar(ts: Option<f64>, realtime: bool, price: f64, bar_age: f64, now: f64) -> Board {
+        let mut b = Board::new(&[]);
+        b.link = Link::Live;
+        let mut quote = q("XAG=", ts, realtime);
+        quote.price = price;
+        b.cells = vec![Cell { label: "XAG".into(), digits: 3, quote: Some(quote), stale: true }];
+        let bar = Bar { dt: 0.0, o: price as f32, h: price as f32, l: price as f32, c: price as f32, v: 0.0 };
+        b.bars = vec![vec![bar].into()];
+        b.bars_t0 = vec![now - bar_age - BAR_END_S];
+        b
+    }
+
+    #[test]
+    fn a_weekend_stamp_ahead_of_the_clock_reads_closed_when_the_bar_shows_it() {
+        // Spot silver on Sunday: the feed's time is Sunday's date on Friday's clock, hours ahead of now.
+        let now = 1_000_000.0;
+        let mut b = board_on_a_bar(Some(now + 7_200.0), true, 31.25, 3_000.0, now);
+        assert!(!reads_closed(&b.cells[0], b.link, now), "no bar evidence has been applied yet");
+        assert!(!calm_stale(&b.cells[0], b.link, now));
+        assert!(b.restamped_over_bars(0, now));
+        b.cells[0].stale = false;
+        b.apply_bar_restamps(now);
+        assert!(b.cells[0].stale);
+        assert!(reads_closed(&b.cells[0], b.link, now));
+        assert!(calm_stale(&b.cells[0], b.link, now));
+        assert_eq!(closed_since(b.cells[0].quote.as_ref().unwrap(), now), Some(now - 3_000.0));
+        assert_eq!(b.calm(now), Calm::All(1));
+    }
+
+    #[test]
+    fn a_bare_date_stamp_reads_closed_when_the_bar_shows_it() {
+        // Index futures on Saturday: the feed gives a date with no time, so the quote has no time at all.
+        let now = 1_000_000.0;
+        let mut b = board_on_a_bar(None, false, 7_561.0, 3_000.0, now);
+        assert!(b.restamped_over_bars(0, now));
+        b.apply_bar_restamps(now);
+        assert!(reads_closed(&b.cells[0], b.link, now));
+        assert_eq!(b.calm(now), Calm::All(1));
+    }
+
+    #[test]
+    fn an_unknown_time_stays_a_fault_when_the_bar_does_not_show_a_close() {
+        let now = 1_000_000.0;
+        // The price moved off the bar's close: it is a trade at an unknown time.
+        let mut b = board_on_a_bar(None, false, 7_561.0, 3_000.0, now);
+        b.cells[0].quote.as_mut().unwrap().price = 7_562.0;
+        assert!(!b.restamped_over_bars(0, now));
+        b.apply_bar_restamps(now);
+        assert!(!reads_closed(&b.cells[0], b.link, now));
+        assert!(!calm_stale(&b.cells[0], b.link, now));
+        // The last bar ended five minutes ago: a live market that only lacks a time.
+        let mut live = board_on_a_bar(None, false, 7_561.0, 300.0, now);
+        assert!(!live.restamped_over_bars(0, now));
+        live.apply_bar_restamps(now);
+        assert!(!reads_closed(&live.cells[0], live.link, now));
+        // No chart answer: nothing decides, so the fault look stays.
+        let mut none = board_on_a_bar(None, false, 7_561.0, 3_000.0, now);
+        none.bars = vec![];
+        none.bars_t0 = vec![];
+        assert!(!none.restamped_over_bars(0, now));
+        // With the link down the quote is never calm or closed.
+        let mut down = board_on_a_bar(None, false, 7_561.0, 3_000.0, now);
+        down.apply_bar_restamps(now);
+        down.link = Link::Down;
+        assert!(!reads_closed(&down.cells[0], down.link, now));
+        assert!(!calm_stale(&down.cells[0], down.link, now));
     }
 
     #[test]
