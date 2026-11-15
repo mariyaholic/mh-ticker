@@ -2304,6 +2304,31 @@ fn shrink_target(cur: RECT) -> Option<RECT> {
     rect_after_chart(cur, grown, before).map(fit_panel)
 }
 
+/// The state the chart flag changes. The pane takes or gives back width, so the card columns refold
+/// and the header buttons move: every stored pointer position names the old layout and is dropped.
+fn chart_state(u: &mut Ui, on: bool) {
+    u.chart = on;
+    u.hover = false;
+    u.pick_hover = false;
+    u.chart_hover = false;
+    u.gear_hover = false;
+    u.open_hover = false;
+    u.hover_at = None;
+    u.chart_at = None;
+    u.chart_layout.set(None);
+    // The pane reopens on the range last used (`chart_range`), so the range is not reset here; the
+    // cache keeps what was fetched.
+    if on {
+        u.pick_open = false;
+        // Nothing locked yet: lock the first card, so the pane opens on a chart instead of an
+        // instruction. A second click on the locked card unlocks it again.
+        if u.profile.ultra && selected_row(u).is_none() {
+            u.selected = u.view.cells.first().map(|c| c.label.clone());
+        }
+        want_range(u);
+    }
+}
+
 /// Open or close the candle pane, with the window gliding to match: opening widens it (centred on where
 /// it was), closing brings it back to where it came from. Without the give-back the pane could be
 /// closed but the window stayed wide, with the cards stretched across the gap. The picker and the chart
@@ -2345,24 +2370,7 @@ fn set_chart(hwnd: HWND, on: bool) {
         let (w, h) = size(cur);
         with_ui(|u| (snapshot(hwnd, w, h, |dc| draw_panel(u, dc, w, h)), (w, h)))
     });
-    with_ui(|u| {
-        u.chart = on;
-        u.open_hover = false;
-        u.chart_hover = false;
-        u.chart_at = None;
-        u.chart_layout.set(None);
-        // The pane reopens on the range last used (`chart_range`), so the range is not reset here; the
-        // cache keeps what was fetched.
-        if on {
-            u.pick_open = false;
-            // Nothing locked yet: lock the first card, so the pane opens on a chart instead of an
-            // instruction. A second click on the locked card unlocks it again.
-            if u.profile.ultra && selected_row(u).is_none() {
-                u.selected = u.view.cells.first().map(|c| c.label.clone());
-            }
-            want_range(u);
-        }
-    });
+    with_ui(|u| chart_state(u, on));
     if let Some(to_rect) = target {
         let (w, h) = size(to_rect);
         let to = with_ui(|u| (snapshot(hwnd, w, h, |dc| draw_panel(u, dc, w, h)), (w, h)));
@@ -5413,6 +5421,101 @@ mod tests {
 
     fn rect(l: i32, t: i32, r: i32, b: i32) -> RECT {
         RECT { left: l, top: t, right: r, bottom: b }
+    }
+
+    /// A `Ui` with no window behind it: null handles, the classic theme, no cards. Enough for the
+    /// functions that only move state (`chart_state`, `apply_zoom_state`).
+    fn test_ui(ultra: bool) -> Ui {
+        let cfg = Config::default();
+        let theme = theme::classic();
+        Ui {
+            hwnd: null_mut(),
+            profile: if ultra { Profile::ultra() } else { Profile::classic() },
+            font: null_mut(),
+            bg: null_mut(),
+            theme,
+            face: theme.font,
+            grad: Gradient::new(theme),
+            icon: null_mut(),
+            icon_link: None,
+            dpi: 96,
+            cfg: cfg.clone(),
+            board: Arc::new(Mutex::new(Board::new(&[]))),
+            view: Board::new(&[]),
+            frame: Frame::default(),
+            placed: false,
+            suppressed: false,
+            taskbar_created: 0,
+            mode: Mode::Panel,
+            morph: None,
+            strip_rect: rect(0, 0, 0, 0),
+            last_panel: None,
+            fonts: None,
+            hist: panel::History::new(),
+            hover: false,
+            pick_hover: false,
+            chart_hover: false,
+            gear_hover: false,
+            open_hover: false,
+            chart_at: None,
+            chart_key: false,
+            title_set: String::new(),
+            chart_layout: std::cell::Cell::new(None),
+            range: Range::D1,
+            book: ranges::Book::new(),
+            undo: undo::Undo::default(),
+            range_slots: Arc::new(Mutex::new(ranges::Slots::default())),
+            pick_open: false,
+            picker_scroll: 0,
+            wheel_remainder: 0,
+            chart: false,
+            selected: None,
+            chart_grew: None,
+            hover_at: None,
+            alert_note: None,
+            alert_pending: None,
+            alert_log: alerts::Log::default(),
+            watch: watch::Watch::default(),
+            hush: watch::Hush::default(),
+            test_alert_at: None,
+            tracking: false,
+            block: InputBlock::default(),
+            prev_fg: null_mut(),
+            tip_at: None,
+            tray_click_at: None,
+            hotkey_failed: false,
+            update_running: false,
+            update_result: Arc::new(Mutex::new(None)),
+            report_running: false,
+            report_result: Arc::new(Mutex::new(None)),
+            adding: None,
+            lookup_result: Arc::new(Mutex::new(None)),
+            back: None,
+            anim: None,
+            motion: true,
+            system: None,
+        }
+    }
+
+    /// Audit 2026-11, chart-toggle-keeps-card-hover: opening or closing the pane refolds the cards, so
+    /// the card the pointer was on is no longer under it and nothing stays lit.
+    #[test]
+    fn toggling_the_chart_forgets_every_hover() {
+        for on in [true, false] {
+            let mut u = test_ui(true);
+            u.chart = !on;
+            u.hover_at = Some(panel::Hover { row: 2, t: 0.0 });
+            u.hover = true;
+            u.pick_hover = true;
+            u.chart_hover = true;
+            u.gear_hover = true;
+            u.open_hover = true;
+            chart_state(&mut u, on);
+            assert_eq!(u.chart, on);
+            assert!(u.hover_at.is_none(), "the card hover (chart {on})");
+            assert!(!(u.hover || u.pick_hover || u.chart_hover || u.gear_hover || u.open_hover), "the button hovers (chart {on})");
+            assert!(u.chart_at.is_none());
+        }
     }
 
     #[test]
