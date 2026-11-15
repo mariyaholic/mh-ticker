@@ -2552,7 +2552,7 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
         return;
     };
     let mut commands = crate::menu_commands::MenuCommands::default();
-    let cmd = unsafe {
+    let (cmd, before) = unsafe {
         let m = CreatePopupMenu();
         let add = |menu: HMENU, flags: u32, id: usize, text: &str| {
             let t = wide(text);
@@ -2668,19 +2668,35 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
                 GetCursorPos(&mut pt);
             }
         }
+        // A menu only closes on a click outside it when its owner is the foreground window, so the
+        // strip takes the foreground for the menu; the window that had it gets it back afterwards.
+        let before = GetForegroundWindow();
         SetForegroundWindow(hwnd);
         let cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, null());
         PostMessageW(hwnd, WM_NULL, 0, 0);
         DestroyMenu(m);
-        cmd as usize
+        (cmd as usize, before)
     };
     // Dynamic actions are assigned unique IDs when this particular menu is built. They retain
     // their row identity even if an event changes the catalogue during the modal menu loop.
     if let Some(action) = commands.get(cmd) {
         run_action(hwnd, action);
-        return;
+    } else {
+        run_command(hwnd, cmd, Listed { open, visible, top, picked, ultra });
     }
-    run_command(hwnd, cmd, Listed { open, visible, top, picked, ultra });
+    release_foreground(hwnd, before);
+}
+
+/// After a menu and the command it chose: if the strip is still a strip and still the foreground window,
+/// the window that was in front before the menu gets the foreground back (`foreground_after_menu`).
+/// Read now, so a command that opened a window or expanded the panel is left as it left things.
+fn release_foreground(hwnd: HWND, before: HWND) {
+    let Some(mode) = with_ui(|u| u.mode) else { return };
+    unsafe {
+        if let Some(window) = foreground_after_menu(mode, hwnd, before, IsWindow(before) != 0, GetForegroundWindow() == hwnd) {
+            SetForegroundWindow(window);
+        }
+    }
 }
 
 /// What the menu (or the settings window) knew about the window when the command was listed: the mode,
@@ -3035,6 +3051,15 @@ fn panel_step(listed_open: bool, now: Mode) -> Option<PanelStep> {
         (true, Mode::Panel) => Some(PanelStep::Collapse),
         _ => None,
     }
+}
+
+/// The window to hand the foreground back to once a menu opened on the strip has closed. The strip
+/// never keeps the keyboard from the app being typed in, so while it is still a strip and still the
+/// foreground window, the window that had the foreground before the menu gets it again. Nothing when
+/// that window is gone, was the strip itself, or the foreground already moved on (a command that opened
+/// its own window, or the user clicking elsewhere).
+fn foreground_after_menu(mode: Mode, strip: HWND, before: HWND, before_is_window: bool, strip_is_foreground: bool) -> Option<HWND> {
+    (mode == Mode::Strip && strip_is_foreground && before_is_window && !before.is_null() && before != strip).then_some(before)
 }
 
 /// Whether a header point is on a button the build draws. `buttons` is minimise, picker, chart and
@@ -5391,6 +5416,19 @@ mod tests {
             assert!(!is_resume(other), "{other:#x}");
         }
         assert_eq!(WM_POWERBROADCAST, 0x0218);
+    }
+
+    /// Audit 2026-11, strip-keeps-foreground-after-menu.
+    #[test]
+    fn the_strip_gives_the_foreground_back_after_its_menu() {
+        let (strip, notepad) = (1usize as HWND, 2usize as HWND);
+        assert_eq!(foreground_after_menu(Mode::Strip, strip, notepad, true, true), Some(notepad));
+        assert_eq!(foreground_after_menu(Mode::Panel, strip, notepad, true, true), None, "the panel keeps focus for Esc");
+        assert_eq!(foreground_after_menu(Mode::Morph, strip, notepad, true, true), None);
+        assert_eq!(foreground_after_menu(Mode::Strip, strip, notepad, false, true), None, "the window closed");
+        assert_eq!(foreground_after_menu(Mode::Strip, strip, null_mut(), true, true), None, "nothing was in front");
+        assert_eq!(foreground_after_menu(Mode::Strip, strip, strip, true, true), None, "it was already the strip");
+        assert_eq!(foreground_after_menu(Mode::Strip, strip, notepad, true, false), None, "a command took the foreground");
     }
 
     /// Audit 2026-11, classic-header-dead-zone: Classic draws only the minimise button, so the header
