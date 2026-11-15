@@ -1902,6 +1902,13 @@ fn kick_feed() {
     };
 }
 
+/// Whether a new "Poll every" choice ends the feed's current wait. A longer interval can wait for the
+/// old one to run out; a shorter one would otherwise be served only after it (up to 60 s, or 120 s
+/// while backing off).
+fn poll_choice_wakes(old_s: f64, new_s: f64) -> bool {
+    new_s < old_s
+}
+
 /// `WM_POWERBROADCAST` wParam values after which the clock and the network have moved on: the machine
 /// resumed from sleep, with or without a person present. The same resume can send both.
 const PBT_APMRESUMESUSPEND: usize = 0x0007;
@@ -2866,14 +2873,20 @@ fn run_command(hwnd: HWND, cmd: usize, listed: Listed) {
         CMD_ORDER_DEFAULT => order_cards(hwnd, config::OrderKey::Default),
         c if (CMD_POLL..CMD_POLL + POLL_CHOICES.len()).contains(&c) => {
             let secs = POLL_CHOICES[c - CMD_POLL];
-            with_ui(|u| {
+            let was = with_ui(|u| {
+                let was = u.cfg.poll_s;
                 u.cfg.poll_s = secs;
-                // The feed reads the cadence from the board, so this applies on the next tick.
+                // The feed reads the cadence from the board when it plans its next wait.
                 if let Ok(mut b) = u.board.lock() {
                     b.poll_s = secs;
                 }
+                was
             });
             save_cfg();
+            // The wait the feed is in was planned under the old interval: a shorter one ends it now.
+            if was.is_some_and(|was| poll_choice_wakes(was, secs)) {
+                kick_feed();
+            }
         }
         c if ultra && (CMD_UPDOWN..CMD_UPDOWN + crate::updown::UpDown::ALL.len()).contains(&c) => {
             with_ui(|u| u.cfg.updown = crate::updown::UpDown::ALL[c - CMD_UPDOWN].to_saved());
@@ -5363,6 +5376,15 @@ mod tests {
             assert!(!is_resume(other), "{other:#x}");
         }
         assert_eq!(WM_POWERBROADCAST, 0x0218);
+    }
+
+    /// Audit 2026-11, poll-choice-waits-out-old-interval.
+    #[test]
+    fn a_shorter_poll_interval_ends_the_current_wait() {
+        assert!(poll_choice_wakes(60.0, 1.0));
+        assert!(poll_choice_wakes(3.0, 2.0));
+        assert!(!poll_choice_wakes(3.0, 3.0), "the same choice again changes nothing");
+        assert!(!poll_choice_wakes(3.0, 60.0), "a longer one can wait out the old wait");
     }
 
     /// Audit 2026-11, maximise-state-not-handled: the panel keeps its resize edges and has no maximise box.
