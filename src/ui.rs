@@ -476,6 +476,9 @@ struct Ui {
     /// refused. Time-based on purpose: no result message can leave it stuck.
     test_alert_at: Option<Instant>,
     tracking: bool,
+    /// What keeps the hotkey and the tray from opening or closing the panel: a prompt or message box
+    /// of this window is up (`modal`), or the system's move/size loop is running.
+    block: InputBlock,
     /// Foreground window before the panel opened; it gets focus back on collapse.
     prev_fg: HWND,
     /// Last tray tooltip refresh.
@@ -2056,6 +2059,13 @@ fn apply_visibility(hwnd: HWND) {
     }
 }
 
+/// The window's style. WS_THICKFRAME is what makes the panel resizable (and what lets Windows run its
+/// own sizing loop on wm_nchittest's HTLEFT/HTRIGHT/... edges). WM_NCCALCSIZE then returns 0, so the
+/// frame costs no visible border and no client-area offset: the look is still ours. There is no
+/// WS_MAXIMIZEBOX, so Win+Up and a drag to the top edge cannot maximise the panel (nothing here saves
+/// or restores a maximised frame).
+const WINDOW_STYLE: u32 = WS_POPUP | WS_THICKFRAME;
+
 /// Whether the strip sits in the topmost band: the Always on top setting, and always on the taskbar,
 /// where it has to stay above the taskbar. The open panel is topmost whatever this says, so every
 /// return to the strip puts this back.
@@ -2763,7 +2773,7 @@ fn run_command(hwnd: HWND, cmd: usize, listed: Listed) {
             if enabling {
                 let message = wide("If CNBC is unavailable or a quote is stale, MH Ticker may request prices from Gold API or Kraken. Prices and update times can differ; Bitcoin may come from a different exchange. Some symbols have no fallback.\n\nYour device connects directly to these providers. Check the source and freshness shown before relying on a quote. Disabling stops new requests from being scheduled and clears fallback prices. Already-authorized requests may still connect or finish; their results are discarded. Kraken requires permission for non-personal commercial use of its data.\n\nAllow fallback sources?");
                 let title = wide("Allow fallback sources?");
-                let yes = unsafe { MessageBoxW(hwnd, message.as_ptr(), title.as_ptr(), MB_YESNO | MB_DEFBUTTON2 | MB_ICONWARNING) } == IDYES;
+                let yes = message_box(hwnd, &message, &title, MB_YESNO | MB_DEFBUTTON2 | MB_ICONWARNING) == IDYES;
                 if !yes { return; }
             }
             // The settings to write are read now, after the confirmation box: its modal loop runs the
@@ -2795,7 +2805,7 @@ fn run_command(hwnd: HWND, cmd: usize, listed: Listed) {
                         else { "Fallback is off for this session, but settings could not be saved. It may be enabled again after restart." };
                     let text = wide(msg);
                     let title = wide("Could not save settings");
-                    unsafe { MessageBoxW(hwnd, text.as_ptr(), title.as_ptr(), MB_OK | MB_ICONERROR); }
+                    message_box(hwnd, &text, &title, MB_OK | MB_ICONERROR);
                 }
             }
         }
@@ -2900,7 +2910,7 @@ fn run_command(hwnd: HWND, cmd: usize, listed: Listed) {
             if autostart::set(id, !autostart::enabled(id)).is_err() {
                 let text = wide("Could not change the Start with Windows setting.");
                 let title = wide("Start with Windows");
-                unsafe { MessageBoxW(hwnd, text.as_ptr(), title.as_ptr(), MB_OK | MB_ICONWARNING) };
+                message_box(hwnd, &text, &title, MB_OK | MB_ICONWARNING);
             }
         }
         CMD_UPDATE => start_update_check(hwnd),
@@ -2985,6 +2995,56 @@ fn panel_step(listed_open: bool, now: Mode) -> Option<PanelStep> {
         (true, Mode::Panel) => Some(PanelStep::Collapse),
         _ => None,
     }
+}
+
+/// What holds the hotkey and the tray click back. A prompt or message box runs its own message loop
+/// with this window disabled, and the system's move/size loop of the panel keeps applying the rectangle
+/// it tracks; a mode change inside either one leaves the dialog owned by a strip, a disabled panel, or a
+/// strip drawn panel-sized at the drag position.
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
+struct InputBlock {
+    /// Prompts and message boxes of this window that are open (they can nest).
+    modals: u32,
+    /// Between `WM_ENTERSIZEMOVE` and `WM_EXITSIZEMOVE`.
+    sizing: bool,
+}
+
+impl InputBlock {
+    fn blocked(self) -> bool {
+        self.modals > 0 || self.sizing
+    }
+}
+
+/// What the hotkey or a tray click does: open the strip, close the panel, and nothing while blocked
+/// or while a morph runs.
+fn toggle_step(block: InputBlock, mode: Mode) -> Option<PanelStep> {
+    if block.blocked() {
+        return None;
+    }
+    match mode {
+        Mode::Strip => Some(PanelStep::Expand),
+        Mode::Panel => Some(PanelStep::Collapse),
+        Mode::Morph => None,
+    }
+}
+
+/// Run a call that opens a modal loop on this window (a prompt, a message box) with the hotkey and the
+/// tray held back until it returns. Called outside `with_ui`, like the dialogs it wraps.
+fn modal<R>(f: impl FnOnce() -> R) -> R {
+    with_ui(|u| u.block.modals += 1);
+    let r = f();
+    with_ui(|u| u.block.modals = u.block.modals.saturating_sub(1));
+    r
+}
+
+/// `prompt::ask` as a modal call (see `modal`).
+fn ask_text(hwnd: HWND, title: &str, label: &str, initial: &str, max_len: usize) -> Option<String> {
+    modal(|| prompt::ask(hwnd, title, label, initial, max_len))
+}
+
+/// `MessageBoxW` as a modal call (see `modal`).
+fn message_box(hwnd: HWND, text: &[u16], title: &[u16], flags: u32) -> i32 {
+    modal(|| unsafe { MessageBoxW(hwnd, text.as_ptr(), title.as_ptr(), flags) })
 }
 
 /// Which of Move left, Move right and Move first a card at `pos` of `count` cards may use. The card menu
@@ -3137,7 +3197,7 @@ fn save_cfg() {
 
 fn alert_box(hwnd: HWND, title: &str, text: &str, flags: u32) -> i32 {
     let (t, x) = (wide(title), wide(text));
-    unsafe { MessageBoxW(hwnd, x.as_ptr(), t.as_ptr(), flags) }
+    message_box(hwnd, &x, &t, flags)
 }
 
 /// The fixed options of the Alerts page (`CMD_ALERT_ONCE..=CMD_LOG_CLEAR`). No text here may
@@ -3362,12 +3422,12 @@ fn on_update(hwnd: HWND) {
         match outcome {
             update::Outcome::UpToDate => {
                 let text = wide(&format!("MH Ticker {current} is the latest version."));
-                MessageBoxW(hwnd, text.as_ptr(), title.as_ptr(), MB_OK | MB_ICONINFORMATION);
+                message_box(hwnd, &text, &title, MB_OK | MB_ICONINFORMATION);
             }
             update::Outcome::Newer(tag) => {
                 let tag: String = tag.chars().filter(|c| !c.is_control()).take(40).collect();
                 let text = wide(&format!("Version {tag} is available. You have {current}.\n\nOpen the download page?"));
-                if MessageBoxW(hwnd, text.as_ptr(), title.as_ptr(), MB_YESNO | MB_ICONINFORMATION) == IDYES {
+                if message_box(hwnd, &text, &title, MB_YESNO | MB_ICONINFORMATION) == IDYES {
                     let url = wide(update::RELEASES_URL);
                     let op = wide("open");
                     ShellExecuteW(hwnd, op.as_ptr(), url.as_ptr(), null(), null(), SW_SHOWNORMAL);
@@ -3376,7 +3436,7 @@ fn on_update(hwnd: HWND) {
             update::Outcome::Failed(why) => {
                 let why: String = why.chars().filter(|c| !c.is_control()).take(40).collect();
                 let text = wide(&format!("Could not check for updates ({why}). Try again later."));
-                MessageBoxW(hwnd, text.as_ptr(), title.as_ptr(), MB_OK | MB_ICONWARNING);
+                message_box(hwnd, &text, &title, MB_OK | MB_ICONWARNING);
             }
         }
     }
@@ -3492,7 +3552,7 @@ fn add_symbol(hwnd: HWND) {
         return;
     }
     let title = "Add symbol";
-    let Some(text) = prompt::ask(hwnd, title, "CNBC symbol to add (for example AAPL, @GC.1 or EUR=):", "", SYMBOL_PROMPT_LEN) else {
+    let Some(text) = ask_text(hwnd, title, "CNBC symbol to add (for example AAPL, @GC.1 or EUR=):", "", SYMBOL_PROMPT_LEN) else {
         return;
     };
     let Some(symbol) = config::clean_symbol(&text) else {
@@ -3637,7 +3697,7 @@ fn refuse(hwnd: HWND, title: &str, sentence: &str) {
 fn type_quiet_hours(hwnd: HWND) {
     let initial = with_ui(|u| u.cfg.quiet_hours.filter(|w| w[0] != w[1]).map(crate::typed::span_text)).flatten().unwrap_or_else(|| "22:30-06:45".into());
     let title = "Quiet hours";
-    let Some(typed) = prompt::ask(hwnd, title, "Quiet hours, start-end in 24-hour time (same start and end is off):", &initial, 16) else { return };
+    let Some(typed) = ask_text(hwnd, title, "Quiet hours, start-end in 24-hour time (same start and end is off):", &initial, 16) else { return };
     match crate::typed::parse_span(&typed) {
         Ok(span) => {
             with_ui(|u| u.cfg.quiet_hours = span);
@@ -3649,7 +3709,7 @@ fn type_quiet_hours(hwnd: HWND) {
 
 fn type_mute_until(hwnd: HWND) {
     let title = "Mute until";
-    let Some(typed) = prompt::ask(hwnd, title, "Mute alerts until this time (24-hour, next time the clock reads it):", "", 8) else { return };
+    let Some(typed) = ask_text(hwnd, title, "Mute alerts until this time (24-hour, next time the clock reads it):", "", 8) else { return };
     match crate::typed::parse_time(&typed) {
         Ok(minute) => {
             let now = crate::source::now_s();
@@ -3670,7 +3730,7 @@ fn type_mute_until(hwnd: HWND) {
 fn type_cooldown(hwnd: HWND, label: &str) {
     let Some(current) = with_ui(|u| u.cfg.alerts.iter().find(|a| a.label == label).map(|a| a.cooldown_s)).flatten() else { return };
     let title = format!("Cooldown for {label}");
-    let Some(typed) = prompt::ask(hwnd, &title, "Wait this long before the alert can fire again (90s, 15m, 2h):", &crate::typed::cooldown_text(current), 8) else { return };
+    let Some(typed) = ask_text(hwnd, &title, "Wait this long before the alert can fire again (90s, 15m, 2h):", &crate::typed::cooldown_text(current), 8) else { return };
     match crate::typed::parse_cooldown(&typed) {
         Ok(secs) => {
             with_ui(|u| {
@@ -3687,7 +3747,7 @@ fn type_cooldown(hwnd: HWND, label: &str) {
 fn type_hotkey(hwnd: HWND) {
     let initial = with_ui(|u| u.cfg.hotkey.clone()).flatten().unwrap_or_else(|| hotkey::PRESETS[0].to_string());
     let title = "Hotkey";
-    let Some(typed) = prompt::ask(hwnd, title, "Hotkey that opens and closes the panel (such as Ctrl+Alt+M):", &initial, 32) else { return };
+    let Some(typed) = ask_text(hwnd, title, "Hotkey that opens and closes the panel (such as Ctrl+Alt+M):", &initial, 32) else { return };
     match hotkey::parse(&typed) {
         // Stored in the canonical spelling, so the menu matches it against the presets.
         Some(combo) => set_hotkey(hwnd, Some(hotkey::label(&combo))),
@@ -3703,7 +3763,7 @@ fn alert_at_price(hwnd: HWND, label: &str, suggest: Option<f64>) {
     let initial = suggest.map_or_else(|| now.clone(), |v| fmt_price(v, digits));
     let title = format!("Alert for {label}");
     let text = format!("Alert when {label} reaches this price (now {now}):");
-    let Some(typed) = prompt::ask(hwnd, &title, &text, &initial, LEVEL_PROMPT_LEN) else { return };
+    let Some(typed) = ask_text(hwnd, &title, &text, &initial, LEVEL_PROMPT_LEN) else { return };
     match alerts::parse_level_why(&typed) {
         Ok(level) => {
             // A level far from the price is read back in the symbol's digits and asked about first.
@@ -3848,7 +3908,7 @@ fn rename_card(hwnd: HWND, symbol: &str) {
         return;
     };
     let ask = format!("Name for {symbol} (up to {} characters, a taken name gets a number):", config::MAX_LABEL);
-    let Some(text) = prompt::ask(hwnd, "Rename card", &ask, &current, config::MAX_LABEL) else {
+    let Some(text) = ask_text(hwnd, "Rename card", &ask, &current, config::MAX_LABEL) else {
         return;
     };
     relabel_card(hwnd, symbol, Some(text));
@@ -3998,10 +4058,15 @@ fn lock_edge(hwnd: HWND, last: bool) {
 /// Cancel, empty text and a text nothing matches change nothing. The prompt runs outside `with_ui`.
 /// What the system does with the keyboard focus once the prompt closes is not verified.
 fn find_card(hwnd: HWND) {
-    let Some(text) = prompt::ask(hwnd, "Find a card", "Find a card by label or name:", "", config::MAX_NAME) else {
+    let Some(text) = ask_text(hwnd, "Find a card", "Find a card by label or name:", "", config::MAX_NAME) else {
         return;
     };
     let found = with_ui(|u| {
+        // A menu opened during the prompt can still close the panel; a lock set on the strip would
+        // come back off screen.
+        if u.mode != Mode::Panel {
+            return None;
+        }
         let cards: Vec<(&str, &str)> = u
             .view
             .cells
@@ -4538,10 +4603,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         m if m == hotkey::WM_HOTKEY => {
             if wp as i32 == HOTKEY_ID {
                 wake_feed();
-                match with_ui(|u| u.mode) {
-                    Some(Mode::Strip) => expand(hwnd),
-                    Some(Mode::Panel) => collapse(hwnd),
-                    _ => {}
+                match with_ui(|u| toggle_step(u.block, u.mode)).flatten() {
+                    Some(PanelStep::Expand) => expand(hwnd),
+                    Some(PanelStep::Collapse) => collapse(hwnd),
+                    None => {}
                 }
             }
             0
@@ -4951,7 +5016,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             0
         }
+        // The system's move/size loop dispatches the hotkey and the tray; see `InputBlock`.
+        WM_ENTERSIZEMOVE => {
+            with_ui(|u| u.block.sizing = true);
+            0
+        }
         WM_EXITSIZEMOVE => {
+            with_ui(|u| u.block.sizing = false);
             let mut r: RECT = std::mem::zeroed();
             GetWindowRect(hwnd, &mut r);
             let moved = with_ui(|u| match u.mode {
@@ -5010,16 +5081,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_TRAY => {
             match (lp as u32) & 0xffff {
                 WM_LBUTTONUP => {
-                    let mode = with_ui(|u| {
+                    let step = with_ui(|u| {
                         let recent = u.tray_click_at.is_some_and(|t| t.elapsed() < TRAY_DEBOUNCE);
                         u.tray_click_at = Some(Instant::now());
-                        (!recent).then_some(u.mode)
+                        if recent { None } else { toggle_step(u.block, u.mode) }
                     })
                     .flatten();
-                    match mode {
-                        Some(Mode::Panel) => collapse(hwnd),
-                        Some(Mode::Strip) => expand(hwnd),
-                        _ => {}
+                    match step {
+                        Some(PanelStep::Collapse) => collapse(hwnd),
+                        Some(PanelStep::Expand) => expand(hwnd),
+                        None => {}
                     }
                 }
                 // The tray has no cards, so there is nothing for a contextual entry to point at.
@@ -5078,11 +5149,7 @@ pub fn run(cfg: Config, board: Arc<Mutex<Board>>) {
         RegisterClassW(&wc);
         let title = wide(profile.title());
         let ex = WS_EX_TOOLWINDOW | WS_EX_LAYERED | if wants_topmost(cfg.topmost, cfg.placement()) { WS_EX_TOPMOST } else { 0 };
-        // WS_THICKFRAME is what makes the panel resizable (and what lets Windows run its own sizing
-        // loop on wm_nchittest's HTLEFT/HTRIGHT/... edges). WM_NCCALCSIZE then returns 0, so the
-        // frame costs no visible border and no client-area offset: the look is still ours.
-        let style = WS_POPUP | WS_THICKFRAME | WS_MAXIMIZEBOX;
-        let hwnd = CreateWindowExW(ex, class.as_ptr(), title.as_ptr(), style, 0, 0, 10, 10, null_mut(), null_mut(), inst, null());
+        let hwnd = CreateWindowExW(ex, class.as_ptr(), title.as_ptr(), WINDOW_STYLE, 0, 0, 10, 10, null_mut(), null_mut(), inst, null());
         if hwnd.is_null() {
             return;
         }
@@ -5154,6 +5221,7 @@ pub fn run(cfg: Config, board: Arc<Mutex<Board>>) {
             hush: watch::Hush::default(),
             test_alert_at: None,
             tracking: false,
+            block: InputBlock::default(),
             prev_fg: null_mut(),
             tip_at: None,
             tray_click_at: None,
@@ -5233,6 +5301,45 @@ mod tests {
         }
         assert!(!wants_topmost(false, Placement::Floating), "a floating strip is not forced up");
         assert!(wants_topmost(false, Placement::Auto), "the taskbar strip always is");
+    }
+
+    /// Audit 2026-11, hotkey-and-tray-under-modal, find-applies-after-collapse and
+    /// hotkey-inside-move-size-loop: the hotkey and a tray click change the mode only when no
+    /// prompt, message box or move/size loop of this window is running.
+    #[test]
+    fn the_hotkey_and_the_tray_wait_for_a_modal_box_and_for_the_size_loop() {
+        let free = InputBlock::default();
+        assert_eq!(toggle_step(free, Mode::Strip), Some(PanelStep::Expand));
+        assert_eq!(toggle_step(free, Mode::Panel), Some(PanelStep::Collapse));
+        assert_eq!(toggle_step(free, Mode::Morph), None, "nothing during a morph");
+        // The Find prompt (or any message box) is up: the panel stays as it is.
+        let prompt_up = InputBlock { modals: 1, sizing: false };
+        assert_eq!(toggle_step(prompt_up, Mode::Panel), None);
+        assert_eq!(toggle_step(prompt_up, Mode::Strip), None);
+        // A box opened from inside another box: still held until both return.
+        let nested = InputBlock { modals: 2, sizing: false };
+        assert!(nested.blocked());
+        // A dragged edge or a dragged header: the loop owns the window until it exits.
+        let dragging = InputBlock { modals: 0, sizing: true };
+        assert_eq!(toggle_step(dragging, Mode::Panel), None);
+        assert_eq!(toggle_step(dragging, Mode::Strip), None);
+        assert!(!free.blocked());
+    }
+
+    /// Audit 2026-11, maximise-state-not-handled: the panel keeps its resize edges and has no maximise box.
+    #[test]
+    fn the_window_style_cannot_be_maximised_but_can_be_resized() {
+        assert_eq!(WINDOW_STYLE & WS_MAXIMIZEBOX, 0);
+        assert_eq!(WINDOW_STYLE & WS_THICKFRAME, WS_THICKFRAME);
+        assert_eq!(WINDOW_STYLE & WS_POPUP, WS_POPUP);
+    }
+
+    #[test]
+    fn a_modal_call_counts_itself_in_and_out() {
+        // No window exists in a unit test, so `with_ui` finds no `Ui` and the counter is not reached;
+        // the wrapper still returns what the dialog returned.
+        assert_eq!(modal(|| 7), 7);
+        assert_eq!(modal(|| modal(|| "inner")), "inner");
     }
 
     #[test]
