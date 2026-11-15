@@ -1403,7 +1403,7 @@ mod tests {
         let none = Hot::default();
         let r = panel::hot_dirty(&g, 96, Some(0), None, &none, &none).unwrap();
         assert_eq!((r.right - r.left, r.bottom - r.top), (0, 0));
-        let aimed = Hot { aim: Some(crate::chartview::Pointer { bar: 3, y: 100 }), ..none };
+        let aimed = Hot { aim: Some(crate::chartview::Pointer { bar: 3, y: 100, x: 0, t: None }), ..none };
         assert!(panel::hot_dirty(&g, 96, Some(0), None, &none, &aimed).is_none());
         assert!(panel::hot_dirty(&g, 96, None, None, &none, &Hot { open: true, ..none }).is_none());
     }

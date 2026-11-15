@@ -1267,6 +1267,7 @@ fn candles(dc: HDC, sc: &Scene, r: RECT, c: &Chart) {
             tabs,
             vol: None,
             cross: None,
+            aim: None,
         }));
     }
     if c.bars.is_empty() {
@@ -1385,6 +1386,7 @@ fn candles(dc: HDC, sc: &Scene, r: RECT, c: &Chart) {
         tabs,
         vol,
         cross: None,
+        aim: None,
     };
     // Coloured by the day's direction, the same one the header and the card report. Only when the
     // day's change is unknown does it fall back to the bars: the last close against the first open.
@@ -1594,18 +1596,22 @@ fn candles(dc: HDC, sc: &Scene, r: RECT, c: &Chart) {
     }
 
     // The crosshair, when the pointer is on a candle: a vertical line through it and a horizontal at
-    // the pointer's row. `bar` is clamped because the pointer was taken from the previous frame and
-    // a resize can have refolded the bars since.
+    // the pointer's row. The stored pointer comes from the previous frame and a feed tick, a range
+    // arriving or a resize can have refolded the candles since, so the candle is answered again from
+    // the pointer's x (or, for a key, from its candle's time) with this frame's layout.
     // A crosshair set by key (`aim_snap`) sits on its candle's close; one set by the pointer stays where
     // the pointer is.
-    let hover = sc
+    let start_of = |i: usize| (c.t0 + bars[i].dt as f64).round() as i64;
+    let aimed = sc
         .chart_at
+        .and_then(|p| chartview::settle_aim(p, sc.aim_snap, &lay, start_of))
         .map(|p| {
-            let bar = p.bar.min(n - 1);
-            let y = if sc.aim_snap { lay.y_of(bars[bar].c as f64).clamp(plot.top, plot.bottom - 1) } else { p.y };
-            (bar, y)
+            let y = if sc.aim_snap { lay.y_of(bars[p.bar].c as f64).clamp(plot.top, plot.bottom - 1) } else { p.y };
+            (p, y)
         })
         .filter(|&(_, y)| y >= plot.top && y < plot.bottom);
+    lay.aim = aimed.map(|(p, _)| p);
+    let hover = aimed.map(|(p, y)| (p.bar, y));
     lay.cross = hover.and_then(|(bar, y)| lay.price_at(y).map(|price| (bar, price)));
     if let Some((bar, y)) = hover {
         let x = lay.x_of(bar);

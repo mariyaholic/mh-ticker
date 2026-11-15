@@ -1208,6 +1208,16 @@ fn draw_panel(u: &mut Ui, dc: HDC, w: i32, h: i32) {
         phase,
     };
     panel::draw(dc, w, h, &scene);
+    // The painter answered the crosshair again with this frame's candles. Taking that over keeps the
+    // stored pointer from outliving the layout it was answered from (a refold between two mouse moves).
+    if u.chart {
+        if let Some(l) = u.chart_layout.get() {
+            u.chart_at = l.aim;
+            if l.aim.is_none() {
+                u.chart_key = false;
+            }
+        }
+    }
 }
 
 /// Seconds east of UTC the machine's clock runs on right now (daylight time included): the pane's
