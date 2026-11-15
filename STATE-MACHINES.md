@@ -1,9 +1,11 @@
-# Runtime state machines, 1.8 (W1, W2 and W3 rows are at the end of the inventory)
+# Runtime state machines, 1.9.0 (W1 to W4 rows, then the Audit 2026-11 rows, are at the end of the inventory)
 
-Scope: Classic and Ultra at the 1.8 integration head. Source inventory plus targeted tests; not a proof
-of every native interleaving. Findings and fixes of this pass: `docs/STATE-AUDIT-1.8.md`. The 1.7.1
-record (fallback policy, startup, placement, geometry, feed, backfill) is `docs/STATE-AUDIT-2026-11.md`
-and the earlier version of this file; what it says still holds unless a row below changes it.
+Scope: Classic and Ultra at the 1.9.0 head of `feat/sessions-and-settings`. The inventory has 87 machine
+rows. Source inventory plus targeted tests; not a proof of every native interleaving. Findings and fixes of
+the 1.8 pass: `docs/STATE-AUDIT-1.8.md`. Findings and fixes of the 2026-11 audit of this round: the
+"Audit 2026-11" section below. The 1.7.1 record (fallback policy, startup, placement, geometry, feed,
+backfill) is `docs/STATE-AUDIT-2026-11.md` and the earlier version of this file; what it says still holds
+unless a row below changes it.
 
 ## Rules every machine follows
 
@@ -83,6 +85,32 @@ and the earlier version of this file; what it says still holds unless a row belo
 | Panel zoom (W4) | 75, 90, 100, 125, 150 | Accessibility menu (`apply_zoom`) | `Config::panel_zoom`, `pdpi` | a change drops the saved and remembered frames and repaints the whole window; 100 is the default and is never written | `zoom` tests, `zoom_150_at_96_dpi_is_the_144_dpi_picture...` |
 | Reduced motion (W4) | glide, one step | each morph asks `motion::frames(follow, system)` | `Config::animate`, `Ui::motion` | read fresh at each morph; Classic default does not follow | `motion` tests; the real setting unverified |
 | Window name (W4) | unset, set(text) | each feed tick and each lock move (`WM_TITLE` posted by `lock_card`) | `Ui::title_set` | unchanged text is not set again; Classic is never touched | `spoken` tests; the name call is reviewed by code only |
+| Settings window lifetime | closed; open; open and minimised; open and disabled while a command runs | Settings... (short menu, tray menu, Ultra panel cog: `open_settings`); Esc; caption close; quit (`close`, from the main WM_DESTROY); taskbar restore | `src/ui/settings_win.rs`: `OPEN`, `SW`, `Reopen` (Create, Front, RestoreAndFront), `open_settings`, `close`, WM_DESTROY | not recorded in the audit | not recorded in the audit |
+| Owner and z-order | owned by the strip (panel open); unowned (panel closed); restack keep, raise above the panel, or leave the topmost band | 1 s refresh timer, WM_ACTIVATE, reopen, a command finishing; panel expand or collapse | `src/ui/settings_win.rs`: `Owner`, `Restack`, `owner_plan`, `owner_step`, `sync_owner` (run from every refresh) | not recorded in the audit | `owner_plan` and `owner_step` tests |
+| Section and page view | section index; scroll offset; hovered control or none; wheel remainder; the card the pages are about (the first shown row, or the chosen symbol); font cache keyed by face, DPI and theme | sidebar click; Up, Down, Home, End with the sidebar focused; wheel; Page keys; track click; refresh timer rebuilding controls; theme or zoom change; WM_SIZE; WM_DPICHANGED; card chip click | `Sw` (`cur`, `controls`, `scroll`, `hover`, `wheel_rem`, `bar_hot`, `card`, `fonts`), `reset_view`, `go_section`, `apply` | not recorded in the audit | not recorded in the audit |
+| Keyboard focus by identity | Hit::Nav(i) or Hit::Opt(ci, oi) | Tab, BackTab, arrows, Home, End, Page keys, click, every rebuild (settled by control label and command) | `src/settings.rs`: `step`, `settle`, `identity`, `focus_in_view`; `Sw.focus` | not recorded in the audit | not recorded in the audit |
+| Scrollbar thumb drag and mouse capture | idle; hot (pointer over the bar); dragging with capture held (released on every button-up) | WM_LBUTTONDOWN on the thumb, WM_MOUSEMOVE, WM_LBUTTONUP, WM_CAPTURECHANGED, EnableWindow(0) via WM_CANCELMODE, section change (`reset_view`), Esc, DestroyWindow | `src/ui/settings_win.rs`: `Sw.drag`, SetCapture, ReleaseCapture, `press_bar`, `move_over_bar`, `bar_state` | not recorded in the audit | not recorded in the audit |
+| Command run from the window | idle; running (window disabled, possibly inside a MessageBox, prompt or menu modal loop) | Enter, Space or click on an enabled option; the command's own modal loops, which dispatch timers, hotkey, tray and feed | `src/ui/settings_win.rs` `activate`: EnableWindow, `Listed` snapshot, `run_command` / `run_action` with the strip window, IsWindow check, SetFocus | not recorded in the audit | not recorded in the audit |
+| Refresh timer (settings window) | running while the window exists | WM_TIMER (also dispatched inside command modal loops) | `TIMER_REFRESH` (77), 1000 ms; SetTimer in `open_settings`, KillTimer in WM_DESTROY | not recorded in the audit | not recorded in the audit |
+| Settings facts cache and fresh-read count | empty or cached; count of fresh reads | window create, WM_ACTIVATE, WM_DISPLAYCHANGE, go_section, command end, reopen; cleared in WM_DESTROY | `src/ui/settings_win.rs`: `SLOW`, `FRESH_READS`, `slow_facts`, `read_fresh_after`, `run_open`, `needs_fresh_read` | not recorded in the audit | `opening_reads_at_most_once_after_the_snapshot` (counts from after the first read; see the open findings) |
+| Foreground and keyboard focus | strip not active; panel active; strip active after a menu; `prev_fg` remembered or null | expand, collapse, right-click menus, tray menu, prompt and MessageBox open and close, user clicks in other apps | `Ui::prev_fg`; `expand`, `collapse`, `menu_at`, `pane_menu`, WM_MOUSEACTIVATE; `src/prompt.rs` dialog owner | not recorded in the audit | not recorded in the audit |
+| Taskbar ownership and z-order | owned by the taskbar or unowned; topmost or not | `dock_check` (TIMER_DOCK, WM_FGCHANGE, TIMER_RECHECK, collapse), `expand`, Always on top, Position, Explorer restart (TaskbarCreated) | `own_by_taskbar`, `set_topmost`, `dock_check`, `expand`, CMD_TOP; GWLP_HWNDPARENT, WS_EX_TOPMOST; `dock::TARGET` | not recorded in the audit | not recorded in the audit |
+| Strip placement and visibility | placed or unplaced; shown, hidden by the user, hidden for a fullscreen app; probe paused or running | WM_DOCK, WM_DISPLAYCHANGE, WM_SETTINGCHANGE, TIMER_DOCK, WM_FGCHANGE, TIMER_RECHECK, Show strip, Position, Display choice, collapse | `placed`, `suppressed`, `cfg.strip_visible`, `strip_rect`, `frame.slots`, IsWindowVisible; `strip_place`, `relayout_and_place`, `apply_visibility`, `heal`, `apply_placement`; `dock::PAUSED` | not recorded in the audit | not recorded in the audit |
+| Dock probe thread | paused or probing; each button cached, or absent with a retry time | 2 s loop; `set_paused` from `apply_visibility`; `set_target` from `strip_place`; Explorer restart | `src/dock.rs`: START_LEFT, WIDGETS_*, ICONS_RIGHT, TRAY_LEFT, TARGET, PAUSED, the button cache (`el`, `retry_at`), `last_tb` | not recorded in the audit | not recorded in the audit |
+| Window timers | each set or killed | start-up; expand, collapse, theme or motion change (`sync_anim`); WM_FGCHANGE; each timer's own tick | `TIMER_DOCK` (500 ms, never killed), `TIMER_ANIM`, `TIMER_RECHECK` (one shot, 150 ms) in `src/ui.rs` | not recorded in the audit | not recorded in the audit |
+| Tray icon and tooltip | icon drawn for (link, calm, marker); tooltip fresh or due; click debounce window | WM_FEED, `clear_pending`, theme change, tray click, Explorer restart (TaskbarCreated) | `src/ui.rs`: `icon`, `icon_link`, `sync_icon`, `refresh_tray`, `tooltip_in` | not recorded in the audit | not recorded in the audit |
+| DPI and fonts | window DPI; strip font and panel fonts built for it | WM_DPICHANGED (drag to another monitor, scale change, morph across monitors) | `src/ui.rs`: `dpi`, `font`, `fonts`, `pdpi()`, `settled_frame` | not recorded in the audit | not recorded in the audit |
+| Saved frames and floating position | none, remembered, saved | panel drag or resize end, floating strip drag end, collapse, zoom change | `cfg.panel`, `last_panel`, `cfg.x` and `cfg.y`, `strip_rect`; WM_EXITSIZEMOVE, `collapse`, `expand` | not recorded in the audit | not recorded in the audit |
+| Window maximise state (system owned) | normal, maximised | Win+Up, drag of the header to the top edge, Win+Down; no WM_SYSCOMMAND handler (see the open findings) | WS_MAXIMIZEBOX and WS_THICKFRAME in `run()`; WM_GETMINMAXINFO sets track sizes only | not recorded in the audit | not recorded in the audit |
+| Closed-board latch | open; closed (every shown row `market_closed` at the last Ok answer) | each Ok answer recomputes it; an Err forces it false; the governed interval is read one poll late and the wait is computed in the same poll | `closed` local in `Feed::run` (`src/source.rs`); `Board.governed_s` and `Board.slowed` via `note_governed` | not recorded in the audit | not recorded in the audit |
+| Quote move tracking and re-stamp | per symbol: moving; unchanged under 900 s; re-stamped (unchanged for 900 s or more, `restamped`) | each Ok poll; a partial batch removes the quotes of the rows it did not return; 1D bars publish (`apply_bar_restamps`); rows change (quotes of removed rows are forgotten) | `Quote::moved_at` set in `Feed::run`; `src/model.rs` `restamped`, `closed_since`; `Board::apply_bar_restamps`; `Feed::quotes` | not recorded in the audit | `a_restamped_unchanged_price_never_fires_in_any_repeat_mode` |
+| Link, calm and closed classification | Live, Partial, Down, each with Calm::{No, Some, All, QuietSome, QuietAll} | each publish; the UI recomputes stale in `on_feed` and calm on each paint | `Board::link`, `Board::note`; `src/model.rs` `calm_stale`, `market_closed`, `reads_closed`, `calm_of`; `src/theme.rs` `calm_name`, `calm_name_short` | not recorded in the audit | `calm_stale` and `market_closed` tests in `src/model.rs` |
+| Fallback policy and expiry | off, on; per cell: CNBC, fallback quote fresh (under 90 s), expired | toggle (after a MessageBox); worker results gated by `fallback_gen` and `rows_gen`; 250 ms expiry thread | `Board::fallback_enabled`, `fallback_gen`, `set_fallback`, `publish_fallback`, `expire_fallback` in `src/model.rs`; `fallback_worker` in `src/source.rs`; `CMD_FALLBACK` in `src/ui.rs` | not recorded in the audit | `expire_fallback` assertions in `src/model.rs` |
+| UI view snapshot | the view as of the last WM_FEED; tooltip due or not | WM_FEED only (feed publish, chart publish, fallback expiry, apply_rows post, CMD_FALLBACK); TIMER_DOCK repaints the same view; no WM_POWERBROADCAST handler (see the open findings) | `Ui::view` (a clone of Board); `stale` set in `on_feed` | not recorded in the audit | not recorded in the audit |
+| Sparkline and fast-move sample history | per row: samples; reseed pending when `Board.backfill_gen` moves; fast move: per symbol a deque of (utc, price) samples, last sample overwritten inside SAMPLE_S | `on_feed` and `apply_rows` call `record`; fast-move menu; feed tick; rows change (align by symbol); backfill reseed; wall-clock jumps (samples stamped in the future are dropped) | `src/panel.rs` `History {labels, symbols, rows, gen, backfilled}`, `record`, `align`, `series_of`; `Ui::hist`; `src/alerts.rs` `fast_move` | not recorded in the audit | not recorded in the audit |
+| Footer alert note | none, or one line (last writer wins) | alert fired or silenced, gap line, digest, test alert click, any late webhook result | `Ui::alert_note`, written in `on_feed`, `CMD_HOOK_TEST`, `WM_ALERT` | not recorded in the audit | not recorded in the audit |
+| At a glance overview | per level: distance, reached, no fresh price, closed, cannot fire | settings window refresh (1 s timer), menu open | `alerts::overview` (computed per menu build, nothing stored); `src/ui/settings_view.rs` `alerts_page` | not recorded in the audit | not recorded in the audit |
+| Ranges worker client | no client; client built | first request builds it; a failed build answers Err(TLS) and is retried on the next request; a failed thread spawn leaves every request presumed lost | `src/source.rs` `spawn_ranges`: local `client: Option<Client>` | not recorded in the audit | not recorded in the audit |
 
 ## Ownership
 
@@ -90,9 +118,61 @@ and the earlier version of this file; what it says still holds unless a row belo
 `menu_commands`, `config` row functions and `update`/`hotkey` parsing are pure and are what the tests pin;
 the Linux harness runs the pure modules (see `scripts/check-state-linux.sh`).
 
+## Audit 2026-11
+
+The 2026-11 state-machine audit recorded 12 defects in the 1.9.0 code. Each one is fixed on
+`feat/sessions-and-settings`, with a unit test. One line each: the machine, the defect, the fix, and the
+audit id.
+
+- **Scrollbar thumb drag and mouse capture:** the capture stayed held after a section change had cleared the drag. Fix: the capture is released on every button-up (`section-change-leaks-capture`).
+- **Undo snapshot, alert clear:** undo put the alerts back under their label, which a rename had made stale. Fix: `Snapshot::Alerts` carries each alert's symbol, and undo follows the symbol (`alert-undo-reattaches-by-stale-label`).
+- **Undo snapshot, alert clear after a rename:** undo restored the alerts under the old label. Fix: the same change; undo restores them under the symbol's current label (`alert-clear-undo-after-rename-restores-under-old-label`).
+- **Symbol lookup, add symbol:** the new label did not avoid the labels of alerts that no card owns. Fix: the label avoids those labels (`add-symbol-label-ignores-orphan-alerts`).
+- **Owner and z-order:** the one-second settings refresh restacked the window while a command had it disabled, so the window rose above its own prompt. Fix: the refresh leaves the owner alone while the window is disabled (`timer-raises-settings-over-its-own-prompt`).
+- **Autostart:** the Start with Windows tick ignored the StartupApproved entry that Task Manager and Settings write. Fix: the entry is read (a first byte of 3 or 7 means off), and switching the tick on clears it (`autostart-ignores-startupapproved`).
+- **Pointer and layout, chart crosshair:** the crosshair kept a stale candle after the candles were folded again. Fix: `chartview::settle_aim` settles it against each frame's candles (`stale-pointer-after-refold`).
+- **Sparkline and fast-move sample history:** a clock set back stamped samples in the future, which stretched a fast move and froze the history. Fix: samples stamped in the future are dropped (`fast-move-after-clock-set-back`).
+- **Quote move tracking and re-stamp:** the feed kept the quotes of rows taken off the strip. Fix: those quotes are forgotten (`feed-quotes-outlive-row-removal`).
+- **Link, calm and closed classification, panel header name:** the name could run under the leftmost button the header draws. Fix: `header_buttons_left` leaves room for every drawn button (`header-name-room-ignores-buttons`).
+- **Tray icon and tooltip:** over its limit, the tooltip dropped " (closed)" from some closed rows and not others. Fix: every closed row drops it together (`tooltip-closed-suffix-mixed`).
+- **Link, calm and closed classification, short header name:** the short name read "live" and "not live" together. Fix: it reads `CNBC live, N idle` (`calm-name-short-contradicts-live`).
+
 ## Open findings
 
 See `docs/STATE-AUDIT-1.8.md`: findings 1 to 9 are all fixed (5, 6, 8, 9 in the responsiveness pass,
-`docs/1.8/notes/responsive.md`). Still open: the 1.7.1 list (webhook
-durability on exit, worker join, DPI and monitor changes, topmost and focus restoration, history
-corrections). Nothing here was exercised on native Windows.
+`docs/1.8/notes/responsive.md`). Still open from the 1.7.1 list: webhook durability on exit, worker join,
+DPI and monitor changes, topmost and focus restoration, history corrections. The clock-set-back fix in the
+sample history (Audit 2026-11) may or may not close the "history corrections" item; that is unverified, so
+the item stays listed. Nothing here was exercised on native Windows.
+
+### Audit 2026-11 open findings
+
+These 26 findings were recorded by the 2026-11 audit and are not fixed. None of them was independently
+verified (unverified). Each line gives the id, the severity and the files.
+
+- `apply-level-rearms-other-levels`, medium, `src/alerts.rs`, `src/ui.rs` (unverified)
+- `zoom-drops-chart-width-record`, medium, `src/ui.rs`, `src/panel.rs` (unverified)
+- `strip-stays-topmost-after-panel`, medium, `src/ui.rs` (unverified)
+- `collapse-restores-stale-foreground`, medium, `src/ui.rs` (unverified)
+- `hotkey-and-tray-under-modal`, medium, `src/ui.rs`, `src/prompt.rs` (unverified)
+- `dpichanged-ignores-suggested-rect`, medium, `src/ui.rs` (unverified)
+- `maximise-state-not-handled`, medium, `src/ui.rs` (unverified)
+- `view-freshness-only-on-wm-feed`, medium, `src/ui.rs` (unverified)
+- `hover-index-stale-after-rebuild`, low, `src/ui/settings_win.rs` (unverified)
+- `new-window-and-section-change-read-twice`, low, `src/ui/settings_win.rs` (unverified)
+- `webhook-retry-after-remove`, low, `src/alerts.rs`, `src/retry.rs`, `src/ui.rs` (unverified)
+- `alert-note-late-result-wins`, low, `src/ui.rs` (unverified)
+- `digest-misses-after-clock-set-back`, low, `src/watch.rs`, `src/alerts.rs`, `src/ui.rs` (unverified)
+- `watch-never-blind-without-feed-thread`, low, `src/source.rs`, `src/watch.rs`, `src/ui.rs` (unverified)
+- `book-clock-set-back-freezes-range`, low, `src/ranges.rs`, `src/source.rs` (unverified)
+- `find-applies-after-collapse`, low, `src/ui.rs` (unverified)
+- `strip-keeps-foreground-after-menu`, low, `src/ui.rs` (unverified)
+- `zoom-change-keeps-old-frame`, low, `src/ui.rs` (unverified)
+- `hotkey-inside-move-size-loop`, low, `src/ui.rs` (unverified)
+- `classic-header-dead-zone`, low, `src/ui.rs` (unverified)
+- `display-choice-ignored-with-panel-open`, low, `src/ui.rs`, `src/ui/settings_view.rs` (unverified)
+- `chart-toggle-keeps-card-hover`, low, `src/ui.rs`, `src/panel.rs` (unverified)
+- `gap-line-misnames-sleep`, low, `src/watch.rs`, `src/ui.rs` (unverified)
+- `closed-latch-lags-governed-report`, low, `src/source.rs`, `src/ui.rs` (unverified)
+- `poll-choice-waits-out-old-interval`, low, `src/ui.rs`, `src/source.rs` (unverified)
+- `feed-never-starts-after-tls-failure`, low, `src/source.rs` (unverified)
