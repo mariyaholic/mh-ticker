@@ -228,10 +228,11 @@ fn display(cfg: &Config, env: &Env) -> Vec<Control> {
             .enumerate()
             .map(|(i, d)| {
                 let main = if d.primary { ", main" } else { "" };
-                opt(format!("Display {}{main} ({} x {})", i + 1, d.w, d.h), Act::Do(Action::Monitor((!d.primary).then(|| d.device.clone()))))
+                // The choice moves the strip and applies only to a strip, like Position.
+                opt(format!("Display {}{main} ({} x {})", i + 1, d.w, d.h), Act::Do(Action::Monitor((!d.primary).then(|| d.device.clone())))).enabled(!env.open)
             })
             .collect();
-        v.push(Control::choice("Display", "which screen the strip uses", opts, Some(active)));
+        v.push(Control::choice("Display", if env.open { "back to the taskbar to change it" } else { "which screen the strip uses" }, opts, Some(active)));
     }
     let rows = STRIP_ROWS.iter().map(|n| format!("{n} row{}", if *n == 1 { "" } else { "s" })).collect();
     v.push(radio("Rows in the taskbar", if docked { "" } else { "applies on the taskbar" }, rows, CMD_STRIP_ROWS, nearest_rows(cfg.dock_rows), docked));
@@ -659,6 +660,27 @@ mod tests {
         let chips = &page.iter().find(|c| c.label == "Symbols you follow").unwrap().opts;
         assert!(chips.iter().filter(|c| c.on).all(|c| !c.enabled), "the only shown symbol is locked on");
         assert!(chips.iter().filter(|c| !c.on).all(|c| c.enabled));
+    }
+
+    /// Audit 2026-11, display-choice-ignored-with-panel-open: the Display choice applies only to a
+    /// strip, so it is greyed with the same hint as Position while the panel is open.
+    #[test]
+    fn display_is_greyed_with_the_panel_open_as_position_is() {
+        let (cfg, mut env) = rich_env(true);
+        let pick = |env: &Env| {
+            let page = build(&cfg, env, Section::Display);
+            let find = |label: &str| page.iter().find(|c| c.label == label).cloned().unwrap();
+            (find("Position"), find("Display"))
+        };
+        let (position, display) = pick(&env);
+        assert!(position.opts.iter().all(|o| o.enabled) && display.opts.iter().all(|o| o.enabled), "a strip can move");
+        assert_eq!(display.hint, "which screen the strip uses");
+        env.open = true;
+        let (position, display) = pick(&env);
+        assert!(position.opts.iter().all(|o| !o.enabled));
+        assert!(display.opts.iter().all(|o| !o.enabled), "the pick would be dropped, so it is not offered");
+        assert_eq!(display.hint, position.hint, "the same hint as Position");
+        assert!(display.opts.iter().any(|o| o.on), "the current display stays marked");
     }
 
     #[test]
