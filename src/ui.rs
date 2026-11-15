@@ -3037,6 +3037,14 @@ fn panel_step(listed_open: bool, now: Mode) -> Option<PanelStep> {
     }
 }
 
+/// Whether a header point is on a button the build draws. `buttons` is minimise, picker, chart and
+/// settings, in `Geo`'s order; Classic draws only the first, so the other three rectangles are plain
+/// header there and drag the panel like the rest of it.
+fn on_header_button(buttons: &[RECT; 4], ultra: bool, x: i32, y: i32) -> bool {
+    let live = if ultra { &buttons[..] } else { &buttons[..1] };
+    live.iter().any(|r| panel::in_rect(r, x, y))
+}
+
 /// What holds the hotkey and the tray click back. A prompt or message box runs its own message loop
 /// with this window disabled, and the system's move/size loop of the panel keeps applying the rectangle
 /// it tracks; a mode change inside either one leaves the dialog owned by a strip, a disabled panel, or a
@@ -4751,9 +4759,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     return h as LRESULT;
                 }
             }
-            let Some((mode, dock, header, btn, pick_btn, chart_btn, gear_btn)) = with_ui(|u| {
+            let Some((mode, dock, ultra, header, btn, pick_btn, chart_btn, gear_btn)) = with_ui(|u| {
                 let g = panel_geo(u);
-                (u.mode, u.cfg.placement() != Placement::Floating, g.header, g.btn, g.pick_btn, g.chart_btn, g.gear_btn)
+                (u.mode, u.cfg.placement() != Placement::Floating, u.profile.ultra, g.header, g.btn, g.pick_btn, g.chart_btn, g.gear_btn)
             }) else {
                 return HTCLIENT as LRESULT;
             };
@@ -4762,10 +4770,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 Mode::Panel => {
                     let mut pt = POINT { x: (lp & 0xffff) as i16 as i32, y: ((lp >> 16) & 0xffff) as i16 as i32 };
                     ScreenToClient(hwnd, &mut pt);
-                    let on_button = panel::in_rect(&btn, pt.x, pt.y)
-                        || panel::in_rect(&pick_btn, pt.x, pt.y)
-                        || panel::in_rect(&chart_btn, pt.x, pt.y)
-                        || panel::in_rect(&gear_btn, pt.x, pt.y);
+                    let on_button = on_header_button(&[btn, pick_btn, chart_btn, gear_btn], ultra, pt.x, pt.y);
                     if pt.y < header && !on_button {
                         HTCAPTION as LRESULT
                     } else {
@@ -5384,6 +5389,25 @@ mod tests {
             assert!(!is_resume(other), "{other:#x}");
         }
         assert_eq!(WM_POWERBROADCAST, 0x0218);
+    }
+
+    /// Audit 2026-11, classic-header-dead-zone: Classic draws only the minimise button, so the header
+    /// left of it drags the panel; Ultra keeps its three extra buttons.
+    #[test]
+    fn classic_header_drags_where_ultra_has_buttons() {
+        let g = panel::geometry(6, 0, 96, false);
+        let buttons = [g.btn, g.pick_btn, g.chart_btn, g.gear_btn];
+        let centre = |r: &RECT| ((r.left + r.right) / 2, (r.top + r.bottom) / 2);
+        let (x, y) = centre(&g.btn);
+        assert!(on_header_button(&buttons, false, x, y), "minimise in Classic");
+        assert!(on_header_button(&buttons, true, x, y), "minimise in Ultra");
+        for (name, r) in [("picker", &g.pick_btn), ("chart", &g.chart_btn), ("settings", &g.gear_btn)] {
+            let (x, y) = centre(r);
+            assert!(!on_header_button(&buttons, false, x, y), "{name} area is header in Classic");
+            assert!(on_header_button(&buttons, true, x, y), "{name} is a button in Ultra");
+        }
+        let (x, y) = (g.gear_btn.left - 20, g.gear_btn.top + 5);
+        assert!(!on_header_button(&buttons, true, x, y), "left of every button is header in both");
     }
 
     /// Audit 2026-11, poll-choice-waits-out-old-interval.
