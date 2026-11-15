@@ -17,7 +17,7 @@ use windows_sys::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSI
 use windows_sys::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
 use windows_sys::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForSystem};
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowLongPtrW, SetWindowLongPtrW, GWLP_HWNDPARENT};
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, TrackMouseEvent, EnableWindow, SetFocus, TME_LEAVE, TRACKMOUSEEVENT};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetCapture, ReleaseCapture, SetCapture, TrackMouseEvent, EnableWindow, SetFocus, TME_LEAVE, TRACKMOUSEEVENT};
 use std::cell::Cell;
 
 /// The refresh timer: picks up changes made through the menu, the tray, the hotkey or the feed.
@@ -552,6 +552,21 @@ fn bar_state(s: &Sw) -> BarState {
     }
 }
 
+/// What the end of a mouse press does to the capture and the drawing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ButtonUp {
+    release: bool,
+    repaint: bool,
+}
+
+/// The capture is released on a button-up whenever the window still holds it, whatever the thumb state
+/// says: a section change clears the drag while the button is down, and the capture must still end with
+/// the button. A capture change has already moved the capture away, so it releases nothing. `held` is
+/// whether a thumb drag was in progress, `owns` whether this window holds the mouse capture.
+fn button_up(is_up: bool, held: bool, owns: bool) -> ButtonUp {
+    ButtonUp { release: is_up && owns, repaint: held }
+}
+
 /// A press at (`x`, `y`) on the scrollbar. `None` when the point is not on it; `Some(true)` when the
 /// thumb was taken (the window captures the mouse), `Some(false)` when a click in the track paged.
 fn press_bar(s: &mut Sw, l: &settings::Layout, x: i32, y: i32) -> Option<bool> {
@@ -788,10 +803,12 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
         }
         WM_LBUTTONUP | WM_CAPTURECHANGED => {
             let held = with_sw(|s| s.drag.take().is_some()).unwrap_or(false);
-            if held {
-                if msg == WM_LBUTTONUP {
-                    ReleaseCapture();
-                }
+            let owns = GetCapture() == hwnd;
+            let up = button_up(msg == WM_LBUTTONUP, held, owns);
+            if up.release {
+                ReleaseCapture();
+            }
+            if up.repaint {
                 invalidate(hwnd);
             }
             0
@@ -1010,6 +1027,22 @@ mod tests {
         // A reopened window is not shown as new, and a new window is not restored.
         assert_eq!(reads_after_snapshot(Reopen::Front, true, true, false), 1, "front ignores show and restore");
         assert_eq!(reads_after_snapshot(Reopen::Create, false, true, false), 1, "create ignores restore");
+    }
+
+    #[test]
+    fn a_button_up_releases_the_capture_the_window_holds_even_after_the_drag_was_cleared() {
+        // A section change during a thumb drag clears the drag while the capture stays.
+        let mut s = state(Vec::new());
+        s.drag = Some(4);
+        reset_view(&mut s);
+        let held = s.drag.take().is_some();
+        assert!(!held);
+        assert!(button_up(true, held, true).release, "the capture ends with the button");
+        assert!(button_up(true, true, true).release);
+        assert!(!button_up(true, false, false).release, "nothing to release when another window holds it");
+        assert!(!button_up(false, true, false).release, "a capture change has already moved the capture");
+        assert!(button_up(true, true, true).repaint);
+        assert!(!button_up(true, false, true).repaint, "no thumb was held, so nothing drawn changes");
     }
 
     #[test]
