@@ -1115,6 +1115,20 @@ fn picker(dc: HDC, sc: &Scene, g: &Geo, p: &Picker) {
     }
 }
 
+/// The left edge of the leftmost button the header draws: the gear, else the chart button, else the
+/// picker toggle, else the minimise button. The link name has to end before it.
+fn header_buttons_left(g: &Geo, settings_btn: bool, chart_btn: bool, picker_btn: bool) -> i32 {
+    if settings_btn {
+        g.gear_btn.left
+    } else if chart_btn {
+        g.chart_btn.left
+    } else if picker_btn {
+        g.pick_btn.left
+    } else {
+        g.btn.left
+    }
+}
+
 /// Paint the whole panel into `dc` (w × h is the panel's size from `geometry`).
 pub fn draw(dc: HDC, w: i32, h: i32, sc: &Scene) {
     let t = sc.theme;
@@ -1138,7 +1152,7 @@ pub fn draw(dc: HDC, w: i32, h: i32, sc: &Scene) {
     fill_ellipse(dc, dx, ty + (lh - d) / 2, d, crate::theme::calm_color(t, sc.board.link, calm));
     let sh = line_height(dc, sc.fonts.small);
     let nx = dx + d + s(7);
-    let room = (if sc.picker_btn { g.pick_btn.left } else { w - g.pad }) - s(6) - nx;
+    let room = header_buttons_left(&g, sc.settings_btn, sc.chart_btn, sc.picker_btn) - s(6) - nx;
     let mut name = crate::theme::calm_name(sc.board.link, calm);
     if text_width(dc, sc.fonts.small, &name) > room {
         name = crate::theme::calm_name_short(sc.board.link, calm);
@@ -1881,6 +1895,21 @@ mod tests {
         assert!(g.pick_btn.right < g.btn.left, "the picker toggle sits left of the cross");
         assert!(g.gear_btn.right < g.chart_btn.left, "settings sits at the left end of the group");
         assert_eq!(geometry(2, 0, 96, false).w, 2 * 16 + 2 * 236 + 10);
+    }
+
+    #[test]
+    fn the_header_name_ends_before_the_leftmost_button_that_is_drawn() {
+        for dpi in [96, 144] {
+            let g = geometry(6, 0, dpi, false);
+            // Ultra draws the gear, the chart button and the picker toggle left of the minimise button.
+            assert_eq!(header_buttons_left(&g, true, true, true), g.gear_btn.left);
+            assert!(g.gear_btn.left < g.pick_btn.left, "the old edge, the picker, sat right of the gear");
+            assert_eq!(header_buttons_left(&g, false, true, true), g.chart_btn.left);
+            assert_eq!(header_buttons_left(&g, false, false, true), g.pick_btn.left);
+            // Classic draws only the minimise button; the old edge, the panel's right margin, was under it.
+            assert_eq!(header_buttons_left(&g, false, false, false), g.btn.left);
+            assert!(g.btn.left < g.w - g.pad);
+        }
     }
 
     #[test]
