@@ -72,7 +72,7 @@ pub fn rect(h: HWND) -> Option<RECT> {
     (unsafe { GetWindowRect(h, &mut r) } != 0).then_some(r)
 }
 
-/// One display, as the Position menu lists it.
+/// One display, as the Position and Display choices list it.
 #[derive(Clone)]
 pub struct Monitor {
     pub handle: HMONITOR,
