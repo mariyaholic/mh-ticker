@@ -1,5 +1,41 @@
 # Changelog — MH Ticker
 
+## Unreleased — the settings window, closed markets, and the state audit
+
+**Files:** `src/ranges.rs`, `src/source.rs`, `src/model.rs`, `src/theme.rs`, `src/settings.rs`, `src/ui/settings_view.rs`, `src/ui/settings_win.rs`, `src/ui.rs`, `src/alerts.rs`, `src/autostart.rs`, `src/chartview.rs`, `src/config.rs`, `src/dock.rs`, `src/governor.rs`, `src/hotkey.rs`, `src/lib.rs`, `src/menu_commands.rs`, `src/panel.rs`, `src/probe.rs`, `src/shot.rs`, `src/spoken.rs`, `examples/settings.rs`, `README.md`, `STATE-MACHINES.md` and `CHANGELOG.md`.
+
+**What.**
+
+- **Closed-market candles (both builds).**
+  - Daily and longer charts drop the bars of closed days, where open, high, low and close are the same price. A chart keeps every bar when half or more of its bars have that shape.
+  - Intraday charts drop a run of bars that repeat the previous close, but only when the run follows a break of more than 10 bars. The bars from the first break inside the run onward are dropped.
+  - No exchange calendar is used. A 24/7 market such as BTC is unchanged. The filter runs when the data arrives (`ranges::drop_idle`, called from `source::parse_series` and `source::parse_chart`).
+- **Closed-market state (both builds).**
+  - A stale CNBC quote with a readable time shows as calm, with its age dimmed. The stale limit is 90 s by default, or twice the governed interval when that is longer.
+  - After 15 minutes, or when the 1D bars show a weekend re-stamp, the card reads `closed since Fri 17:00` in local time. The header dot and name, the Ultra card tag, the Classic strip, the tray tooltip, the spoken line, the summary and the alert overview use the same rule.
+  - A dead feed, a missing quote, a fallback-provider quote and a quote with an unknown time keep the fault look. CNBC futures quotes are read on their `settleDate`, and a time more than 300 s ahead of the clock counts as unknown.
+  - A closed market does not open an "alerts could not be checked" gap. An alert cannot fire on a weekend re-stamp of an unchanged price (`moved_at`). A fully closed board polls every 60 s when *Slow when quiet* is on.
+  - A quiet open market, or one symbol whose feed stalled while the others update, looks calm with its age, and reads `closed` after 15 minutes. The app cannot tell those cases apart from a closed market.
+- **Settings window (both builds; the Chart and Alerts sections are Ultra only).**
+  - The long right-click menu is now a themed settings window with the sections Symbols, Display, Chart, Alerts, Startup & system and About. It has a draggable scrollbar thumb and keyboard focus that follows a control by identity.
+  - The Symbols page holds Card settings for one symbol: Rename, Reset name, Decimals, the taskbar strip pin and, in Ultra, Position.
+  - One settings window is open at a time. While the panel is open, the panel owns it.
+  - The right-click menu is short: Settings..., Expand view, Refresh now, Copy all prices, Undo, Show strip, the status lines and Quit. The card menu keeps its card entries.
+  - `examples/settings.rs` renders the window.
+- **State-machine audit (twelve fixes, each with a unit test).**
+  - The scrollbar thumb releases its mouse capture on every button-up, also after a section change.
+  - Undoing an alert clear follows the symbol, also after a rename, and no longer re-attaches by a stale label.
+  - A new symbol's label avoids the labels of alerts that no card owns.
+  - The settings refresh does not restack the window while a command has it disabled.
+  - Start with Windows honours the StartupApproved entry that Task Manager and Settings write (`Store` in `src/autostart.rs`).
+  - The chart crosshair is settled against each frame's candles (`chartview::settle_aim`).
+  - A clock set back drops fast-move samples stamped in the future.
+  - The feed forgets the quotes of rows taken off the strip.
+  - The panel header name ends before the leftmost drawn button (`header_buttons_left`).
+  - The tray tooltip drops " (closed)" from every closed row together when it is over its limit.
+  - The short header name reads `CNBC live, N idle`.
+  - Twenty-six further findings are open. They are listed, unverified, in `STATE-MACHINES.md`.
+
 ## 2026-11-14 — 1.9.0: know it is true, alerts that say when they cannot see, twenty-four symbols, reach   [claude.impl]
 
 **Files:** mostly `src/`: new `probe.rs`, `report.rs`, `meter.rs`, `governor.rs`, `watch.rs`, `retry.rs`, `pins.rs`, `undo.rs`, `find.rs`, `contrast.rs`, `updown.rs`, `motion.rs`, `typed.rs`, `zoom.rs` and `spoken.rs`; changed
