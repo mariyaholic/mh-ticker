@@ -672,8 +672,19 @@ pub fn forget_custom(cfg: &mut Config, symbol: &str) -> bool {
 pub enum Snapshot {
     /// The shown rows, their order and pins, and the catalogue (labels, decimals and order live there too).
     Rows { rows: Vec<Row>, catalog: Vec<Row> },
-    /// The alerts as they were.
-    Alerts(Vec<Alert>),
+    /// The alerts as they were, each with the symbol its label named then (`None` for an alert no card
+    /// owned), so a restore can follow the symbol when the label has moved since.
+    Alerts(Vec<(Alert, Option<String>)>),
+}
+
+/// The symbol whose card or catalogue entry carries `label`, rows first.
+fn symbol_of_label(cfg: &Config, label: &str) -> Option<String> {
+    cfg.rows.iter().chain(cfg.catalog.iter()).find(|r| r.label == label).map(|r| r.symbol.clone())
+}
+
+/// The label `symbol` carries now, rows first (the order `set_label` reads the old one in).
+fn label_of_symbol(cfg: &Config, symbol: &str) -> Option<String> {
+    cfg.rows.iter().chain(cfg.catalog.iter()).find(|r| r.symbol == symbol).map(|r| r.label.clone())
 }
 
 impl Config {
@@ -684,12 +695,14 @@ impl Config {
 
     /// The alerts as they are now.
     pub fn snapshot_alerts(&self) -> Snapshot {
-        Snapshot::Alerts(self.alerts.clone())
+        Snapshot::Alerts(self.alerts.iter().map(|a| (a.clone(), symbol_of_label(self, &a.label))).collect())
     }
 
     /// Put a snapshot back. Cards replace the cards. Alerts are merged: every alert in the snapshot
     /// whose label has none now comes back, in its old place; one set since (same label) stays as it is
-    /// now, and alerts made since stay, after the others. Nothing else in the
+    /// now, and alerts made since stay, after the others. An alert comes back under the label its
+    /// symbol carries now, and is left out when that symbol has no card or entry any more, or when it
+    /// had no symbol and its label belongs to a card since. Nothing else in the
     /// config is touched; the webhook least of all.
     pub fn restore(&mut self, snap: Snapshot) {
         match snap {
@@ -699,6 +712,17 @@ impl Config {
                 normalize_pins(self);
             }
             Snapshot::Alerts(old) => {
+                let old: Vec<Alert> = old
+                    .into_iter()
+                    .filter_map(|(mut a, symbol)| {
+                        match symbol {
+                            Some(s) => a.label = label_of_symbol(self, &s)?,
+                            None if symbol_of_label(self, &a.label).is_some() => return None,
+                            None => {}
+                        }
+                        Some(a)
+                    })
+                    .collect();
                 let now = std::mem::take(&mut self.alerts);
                 let mut merged: Vec<Alert> = old
                     .into_iter()
@@ -1740,6 +1764,49 @@ mod tests {
         assert_eq!(labels, ["XAU", "XAG", "BTC"]);
         assert_eq!(c.alerts[0].above, Some(5000.0), "what was set since stays");
         assert_eq!(c.alerts[1].below, Some(30.0));
+    }
+
+    #[test]
+    fn restoring_alerts_after_the_label_moved_to_another_symbol_does_not_follow_the_label() {
+        let mut c = Config::default();
+        c.alerts.push(Alert { label: "XAU".into(), below: Some(4000.0), ..Default::default() });
+        let snap = c.snapshot_alerts();
+        c.alerts.clear();
+        assert_eq!(rename(&mut c, "XAU=", "GOLD").as_deref(), Some("GOLD"));
+        assert_eq!(rename(&mut c, "XAG=", "XAU").as_deref(), Some("XAU"), "nothing holds XAU now");
+        c.restore(snap);
+        assert!(c.alerts.iter().all(|a| a.label != "XAU"), "the silver card does not get the gold level");
+        assert_eq!(c.alerts.len(), 1);
+        assert_eq!(c.alerts[0].label, "GOLD", "the level goes back to the symbol it was set on");
+        assert_eq!(c.alerts[0].below, Some(4000.0));
+    }
+
+    #[test]
+    fn restoring_alerts_after_a_rename_puts_them_under_the_new_label() {
+        let mut c = Config::default();
+        c.alerts.push(Alert { label: "XAU".into(), above: Some(2500.0), ..Default::default() });
+        let snap = c.snapshot_alerts();
+        c.alerts.clear();
+        assert_eq!(rename(&mut c, "XAU=", "Bullion").as_deref(), Some("Bullion"));
+        c.restore(snap);
+        assert_eq!(c.alerts.len(), 1);
+        assert_eq!(c.alerts[0].label, "Bullion", "a card that carries the level, not a label nobody has");
+        // Another card taking the old label afterwards gets nothing.
+        assert_eq!(rename(&mut c, "XAG=", "XAU").as_deref(), Some("XAU"));
+        assert!(c.alerts.iter().all(|a| a.label != "XAU"));
+    }
+
+    #[test]
+    fn restoring_alerts_of_a_forgotten_symbol_brings_back_no_orphan() {
+        let mut c = Config::default();
+        assert_eq!(add_custom(&mut c, "@SI.1", "Silver", 25.0), Added::Shown);
+        c.alerts.push(Alert { label: "SI".into(), below: Some(25.0), ..Default::default() });
+        let snap = c.snapshot_alerts();
+        c.alerts.clear();
+        assert!(forget_custom(&mut c, "@SI.1"));
+        c.restore(snap);
+        assert!(c.alerts.is_empty(), "no card carries SI, so the level has nowhere to go");
+        assert_eq!(label_for(&c, "SI"), "SI", "and the label is free for a new symbol");
     }
 
     #[test]
