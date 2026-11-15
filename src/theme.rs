@@ -79,11 +79,12 @@ pub fn calm_name(link: Link, calm: Calm) -> String {
 }
 
 /// [`calm_name`] for a header with little room: a board with both closed and quiet cells gives one
-/// combined count instead of two.
+/// combined count instead of two. The word is "idle", so a name that begins "CNBC live" does not also
+/// say "not live".
 pub fn calm_name_short(link: Link, calm: Calm) -> String {
     match calm {
-        Calm::QuietSome { closed, quiet } if closed > 0 => format!("CNBC live, {} not live", closed + quiet),
-        Calm::QuietAll { closed, quiet } if closed > 0 => format!("CNBC, {} not live", closed + quiet),
+        Calm::QuietSome { closed, quiet } if closed > 0 => format!("CNBC live, {} idle", closed + quiet),
+        Calm::QuietAll { closed, quiet } if closed > 0 => format!("CNBC, {} idle", closed + quiet),
         _ => calm_name(link, calm),
     }
 }
@@ -782,8 +783,11 @@ mod tests {
         assert_eq!(calm_name(Link::Partial, Calm::QuietAll { closed: 0, quiet: 2 }), "CNBC, quiet");
         assert_eq!(calm_name(Link::Partial, Calm::QuietSome { closed: 1, quiet: 1 }), "CNBC live, 1 closed, 1 quiet");
         assert_eq!(calm_name(Link::Partial, Calm::QuietAll { closed: 2, quiet: 1 }), "CNBC, 2 closed, 1 quiet");
-        assert_eq!(calm_name_short(Link::Partial, Calm::QuietSome { closed: 1, quiet: 1 }), "CNBC live, 2 not live");
-        assert_eq!(calm_name_short(Link::Partial, Calm::QuietAll { closed: 2, quiet: 1 }), "CNBC, 3 not live");
+        assert_eq!(calm_name_short(Link::Partial, Calm::QuietSome { closed: 1, quiet: 1 }), "CNBC live, 2 idle");
+        assert_eq!(calm_name_short(Link::Partial, Calm::QuietAll { closed: 2, quiet: 1 }), "CNBC, 3 idle");
+        for calm in [Calm::QuietSome { closed: 1, quiet: 1 }, Calm::QuietAll { closed: 2, quiet: 1 }] {
+            assert!(!calm_name_short(Link::Partial, calm).contains("not live"), "the link word and its denial do not share a name");
+        }
         assert_eq!(calm_name_short(Link::Partial, Calm::QuietSome { closed: 0, quiet: 2 }), "CNBC live, 2 quiet");
         assert_eq!(calm_color(t, Link::Partial, Calm::QuietAll { closed: 0, quiet: 2 }), t.dim);
         assert_eq!(calm_color(t, Link::Partial, Calm::QuietSome { closed: 1, quiet: 1 }), t.up);
