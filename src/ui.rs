@@ -2056,6 +2056,13 @@ fn apply_visibility(hwnd: HWND) {
     }
 }
 
+/// Whether the strip sits in the topmost band: the Always on top setting, and always on the taskbar,
+/// where it has to stay above the taskbar. The open panel is topmost whatever this says, so every
+/// return to the strip puts this back.
+fn wants_topmost(topmost: bool, placement: Placement) -> bool {
+    topmost || placement.on_taskbar()
+}
+
 fn set_topmost(hwnd: HWND, on: bool) {
     unsafe {
         SetWindowPos(hwnd, if on { HWND_TOPMOST } else { HWND_NOTOPMOST }, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
@@ -2102,7 +2109,7 @@ fn own_by_taskbar(hwnd: HWND, dock: bool) {
     unsafe {
         if GetWindowLongPtrW(hwnd, GWLP_HWNDPARENT) as HWND != want {
             SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, want as isize);
-            let top = with_ui(|u| u.cfg.topmost || u.cfg.placement().on_taskbar()).unwrap_or(true);
+            let top = with_ui(|u| wants_topmost(u.cfg.topmost, u.cfg.placement())).unwrap_or(true);
             set_topmost(hwnd, top);
         }
     }
@@ -2471,6 +2478,9 @@ fn collapse(hwnd: HWND) {
     })
     .unwrap_or(b);
     sync_anim(hwnd);
+    // `expand` made the window topmost for the panel; the strip goes back to what the settings say.
+    let top = with_ui(|u| wants_topmost(u.cfg.topmost, u.cfg.placement())).unwrap_or(true);
+    set_topmost(hwnd, top);
     unsafe {
         SetWindowPos(hwnd, null_mut(), b.left, b.top, b.right - b.left, b.bottom - b.top, SWP_NOZORDER | SWP_NOACTIVATE);
         InvalidateRect(hwnd, null(), 0);
@@ -3781,7 +3791,7 @@ fn apply_placement(hwnd: HWND) {
         u.font = make_font(&u.cfg, u.dpi);
         u.placed = false;
         u.suppressed = false;
-        u.cfg.topmost || u.cfg.placement().on_taskbar()
+        wants_topmost(u.cfg.topmost, u.cfg.placement())
     })
     .unwrap_or(true);
     save_cfg();
@@ -5067,7 +5077,7 @@ pub fn run(cfg: Config, board: Arc<Mutex<Board>>) {
         };
         RegisterClassW(&wc);
         let title = wide(profile.title());
-        let ex = WS_EX_TOOLWINDOW | WS_EX_LAYERED | if cfg.topmost || cfg.placement().on_taskbar() { WS_EX_TOPMOST } else { 0 };
+        let ex = WS_EX_TOOLWINDOW | WS_EX_LAYERED | if wants_topmost(cfg.topmost, cfg.placement()) { WS_EX_TOPMOST } else { 0 };
         // WS_THICKFRAME is what makes the panel resizable (and what lets Windows run its own sizing
         // loop on wm_nchittest's HTLEFT/HTRIGHT/... edges). WM_NCCALCSIZE then returns 0, so the
         // frame costs no visible border and no client-area offset: the look is still ours.
@@ -5211,6 +5221,18 @@ mod tests {
         }
         cfg.theme_font = Some("Consolas".to_string());
         assert_eq!(selected_look(&cfg, true).1, "Consolas", "an explicit face still wins");
+    }
+
+    /// Audit 2026-11, strip-stays-topmost-after-panel: `expand` makes the window topmost, so the
+    /// strip's z-order is worked out again from the settings on the way back.
+    #[test]
+    fn the_strip_is_topmost_only_when_the_setting_or_the_taskbar_says_so() {
+        for p in Placement::ALL {
+            assert_eq!(wants_topmost(true, p), true, "{p:?} with Always on top");
+            assert_eq!(wants_topmost(false, p), p.on_taskbar(), "{p:?} without it");
+        }
+        assert!(!wants_topmost(false, Placement::Floating), "a floating strip is not forced up");
+        assert!(wants_topmost(false, Placement::Auto), "the taskbar strip always is");
     }
 
     #[test]
