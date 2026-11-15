@@ -631,6 +631,10 @@ impl Feed {
                 }).collect();
                 self.rows = b.rows.clone();
                 self.rows_gen = b.rows_gen;
+                // A quote of a symbol that left the strip would otherwise survive for the life of the
+                // process: its `moved_at` would count for the symbol when it is shown again, and a
+                // failed first poll would put its old price back on the card.
+                self.quotes.retain(|symbol, _| self.rows.iter().any(|r| &r.symbol == symbol));
                 // Board::set_rows has already remapped these vectors by identity. Reuse that
                 // cache so a failed fetch after the change cannot wipe a surviving symbol's bars.
                 self.chart = self.rows.iter().enumerate().map(|(i, _)| {
@@ -1832,6 +1836,26 @@ mod tests {
         feed.note_governed(0.0, 3.0);
         let b = shared.lock().unwrap();
         assert_eq!((b.governed_s, b.slowed), (0.0, false));
+    }
+
+    #[test]
+    fn quotes_of_a_row_taken_off_the_strip_are_forgotten_and_a_re_added_row_starts_clean() {
+        let rows = Config::default().rows[..3].to_vec();
+        let shared = Arc::new(Mutex::new(Board::new(&rows)));
+        let mut feed = test_feed(&shared, rows.clone());
+        for (i, r) in rows.iter().enumerate() {
+            let q = Quote { symbol: r.symbol.clone(), price: 4.25, ts: Some(now_s()), moved_at: Some(1_000.0 + i as f64), realtime: true, ..Quote::default() };
+            feed.quotes.insert(q.symbol.clone(), q);
+        }
+        shared.lock().unwrap().set_rows(&rows[..2]);
+        feed.sync_rows();
+        assert!(!feed.quotes.contains_key(&rows[2].symbol), "the removed row's quote must not outlive it");
+        assert!(feed.quotes.contains_key(&rows[0].symbol) && feed.quotes.contains_key(&rows[1].symbol), "the rows that stay keep theirs");
+        // Added back, with the first poll failing: nothing from before the removal comes back.
+        shared.lock().unwrap().set_rows(&rows);
+        feed.sync_rows();
+        feed.publish(Link::Down, "CNBC: down".into());
+        assert!(shared.lock().unwrap().cells[2].quote.is_none(), "the pre-removal price stays gone");
     }
 
     /// A quote one slow poll old is not stale in the cells the feed publishes; ungoverned it is.
