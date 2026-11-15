@@ -2252,32 +2252,54 @@ fn motion_now(u: &Ui) -> bool {
     u.motion || !u.cfg.follows_animation(u.profile.ultra)
 }
 
-/// The panel's rect: centred in the work area of the monitor the strip is on.
-fn panel_rect(near: &RECT, w: i32, h: i32) -> RECT {
+/// The work area of the monitor `near` is on.
+fn work_of(near: &RECT) -> RECT {
     unsafe {
         let mut mi: MONITORINFO = std::mem::zeroed();
         mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
         GetMonitorInfoW(MonitorFromRect(near, MONITOR_DEFAULTTONEAREST), &mut mi);
-        let wa = mi.rcWork;
-        let w = w.min(wa.right - wa.left).max(1);
-        let h = h.min(wa.bottom - wa.top).max(1);
-        let x = wa.left + (wa.right - wa.left - w) / 2;
-        let y = wa.top + (wa.bottom - wa.top - h) / 2;
-        RECT { left: x, top: y, right: x + w, bottom: y + h }
+        mi.rcWork
     }
+}
+
+/// A `w` by `h` rect centred in the work area `wa`, trimmed to it.
+fn centred_in(wa: RECT, w: i32, h: i32) -> RECT {
+    let w = w.min(wa.right - wa.left).max(1);
+    let h = h.min(wa.bottom - wa.top).max(1);
+    let x = wa.left + (wa.right - wa.left - w) / 2;
+    let y = wa.top + (wa.bottom - wa.top - h) / 2;
+    RECT { left: x, top: y, right: x + w, bottom: y + h }
+}
+
+/// The panel's rect: centred in the work area of the monitor the strip is on.
+fn panel_rect(near: &RECT, w: i32, h: i32) -> RECT {
+    centred_in(work_of(near), w, h)
+}
+
+/// How much wider than the cards' natural grid the window is when the chart pane is open: a full pane
+/// and the gap beside it, at `dpi`. The pane takes what is left over, so this is the one width where
+/// both panes are whole.
+fn chart_room(dpi: u32) -> i32 {
+    let s = |v: i32| v * dpi as i32 / 96;
+    s(720) + s(10)
+}
+
+/// The frame a panel opens at when nothing remembers one: the cards' natural size (`natural`, width and
+/// height) centred in the work area, and with the chart open (`room` is `chart_room`) also the wider
+/// frame the pane needs, which grows out from the compact one the way `grow_target` does it. The pair
+/// is what `Ui::chart_grew` records, so closing the pane later gives the width back.
+fn content_frame(work: RECT, natural: (i32, i32), room: Option<i32>) -> (RECT, Option<RECT>) {
+    let compact = centred_in(work, natural.0, natural.1);
+    (compact, room.map(|room| grown_rect(compact, natural.0 + room, work)))
 }
 
 /// Where the window goes when the chart opens, if it has to widen at all. Both panes need room: a frame
 /// that cannot hold them is widened to the two-pane size rather than squeezing the cards into one
 /// column. Records the move so closing the chart can undo exactly it.
 fn grow_target(hwnd: HWND, cur: RECT) -> Option<RECT> {
-    let (natural, chart_max, gap) = with_ui(|u| {
-        let s = |v: i32| v * pdpi(u) as i32 / 96;
-        (panel::geometry(u.view.cells.len(), catalog_len(u), pdpi(u), false), s(720), s(10))
-    })?;
-    // Wide enough for the cards' natural grid plus a full chart pane; the pane takes what is left
-    // over, so this is the one width where both are whole.
-    let want = natural.w + chart_max + gap;
+    let (natural, room) = with_ui(|u| (panel::geometry(u.view.cells.len(), catalog_len(u), pdpi(u), false), chart_room(pdpi(u))))?;
+    // Wide enough for the cards' natural grid plus a full chart pane.
+    let want = natural.w + room;
     if cur.right - cur.left >= want {
         with_ui(|u| u.chart_grew = None);
         return None;
@@ -2443,7 +2465,14 @@ fn expand(hwnd: HWND) {
             fit_panel(last)
         } else { match u.cfg.panel {
             Some(p) => fit_panel(RECT { left: p[0], top: p[1], right: p[0] + p[2], bottom: p[1] + p[3] }),
-            None => panel_rect(&a, natural.w, natural.h),
+            // The chart flag can be on while the strip shows (a zoom change dropped the frame): the
+            // panel then opens wide enough for the pane, or the cards would lose columns to it.
+            None => {
+                let room = u.chart.then(|| chart_room(pdpi(u)));
+                let (compact, grown) = content_frame(work_of(&a), (natural.w, natural.h), room);
+                u.chart_grew = grown.map(|g| (compact, g));
+                grown.unwrap_or(compact)
+            }
         }};
         // The content is laid out for the frame it is about to be drawn in, not for the one it would
         // have had if the window were still content-sized.
@@ -4429,7 +4458,10 @@ fn apply_theme(hwnd: HWND) {
 /// Panel zoom changed (Accessibility > Panel size). Everything the open panel is laid out from changes,
 /// so nothing is repainted in part: fonts are rebuilt at the new effective DPI, the remembered and the
 /// saved frames (in the old scale's pixels) are dropped so the panel is content-sized again, and the
-/// whole window is invalidated.
+/// whole window is invalidated. An open panel is sized from the cards' natural size at the new zoom
+/// (its current client size is in the old scale), plus the pane when the chart is open, and the chart's
+/// width record is made again for that frame so closing the chart still gives the width back. With the
+/// strip showing, `expand` does the same on its next open.
 fn apply_zoom(hwnd: HWND, pct: u32) {
     let open = with_ui(|u| {
         if u.cfg.zoom(u.profile.ultra) == pct {
@@ -4444,16 +4476,21 @@ fn apply_zoom(hwnd: HWND, pct: u32) {
         u.chart_layout.set(None);
         u.hover_at = None;
         u.picker_scroll = 0;
-        Some((u.mode == Mode::Panel).then(|| panel_geo(u)))
+        Some((u.mode == Mode::Panel).then(|| {
+            let natural = panel::geometry(u.view.cells.len(), catalog_len(u), pdpi(u), picker_open(u));
+            ((natural.w, natural.h), u.chart.then(|| chart_room(pdpi(u))))
+        }))
     })
     .flatten();
     let Some(open) = open else { return };
     save_cfg();
-    if let Some(g) = open {
+    if let Some((natural, room)) = open {
         unsafe {
             let mut r: RECT = std::mem::zeroed();
             GetWindowRect(hwnd, &mut r);
-            let b = panel_rect(&r, g.w, g.h);
+            let (compact, grown) = content_frame(work_of(&r), natural, room);
+            with_ui(|u| u.chart_grew = grown.map(|g| (compact, g)));
+            let b = grown.unwrap_or(compact);
             SetWindowPos(hwnd, null_mut(), b.left, b.top, b.right - b.left, b.bottom - b.top, SWP_NOZORDER | SWP_NOACTIVATE);
         }
     }
@@ -5416,6 +5453,63 @@ mod tests {
             assert!(!is_resume(other), "{other:#x}");
         }
         assert_eq!(WM_POWERBROADCAST, 0x0218);
+    }
+
+    /// Audit 2026-11, zoom-change-keeps-old-frame: an open panel's new frame comes from the cards'
+    /// natural size at the new zoom, so it shrinks with the zoom as well as growing.
+    #[test]
+    fn a_zoom_change_sizes_the_open_panel_from_its_content_not_its_old_frame() {
+        let work = rect(0, 0, 3_000, 1_400);
+        let (n, catalog) = (6, 20);
+        let big = panel::geometry(n, catalog, 144, false); // 150 %
+        let small = panel::geometry(n, catalog, 72, false); // 75 %
+        assert!(small.w < big.w && small.h < big.h);
+        // The old code took the current client size, so the frame stayed `big`; now it is `small`.
+        let (compact, grown) = content_frame(work, (small.w, small.h), None);
+        assert_eq!((compact.right - compact.left, compact.bottom - compact.top), (small.w, small.h));
+        assert!(grown.is_none(), "no chart, no wide frame");
+        assert_eq!((compact.left, compact.top), ((3_000 - small.w) / 2, (1_400 - small.h) / 2), "centred in the work area");
+        // A monitor smaller than the content trims it.
+        let tight = content_frame(rect(0, 0, 1_000, 500), (big.w, big.h), None).0;
+        assert_eq!((tight.right - tight.left, tight.bottom - tight.top), (1_000, 500));
+    }
+
+    /// Audit 2026-11, zoom-drops-chart-width-record: with the chart open the new frame holds both panes
+    /// and records the pair `chart_grew` keeps, so closing the chart gives the pane's width back.
+    #[test]
+    fn a_zoom_change_with_the_chart_open_keeps_the_width_record() {
+        let work = rect(0, 0, 3_000, 1_400);
+        let (n, catalog, dpi) = (6, 20, 72);
+        let natural = panel::geometry(n, catalog, dpi, false);
+        let (compact, grown) = content_frame(work, (natural.w, natural.h), Some(chart_room(dpi)));
+        let grown = grown.expect("the chart needs the wider frame");
+        assert_eq!(grown.right - grown.left, natural.w + chart_room(dpi));
+        assert_eq!((grown.left + grown.right) / 2, (compact.left + compact.right) / 2, "it opens out from the same centre");
+        // Both panes whole: the cards keep every column they had without the chart.
+        assert_eq!(panel::geometry_in(grown.right - grown.left, n, catalog, dpi, false, true).cols, natural.cols);
+        // Closing the chart: the recorded pair brings the window back to the compact frame.
+        let back = rect_after_chart(grown, grown, compact).expect("the width is still the chart's");
+        assert_eq!((back.left, back.right), (compact.left, compact.right));
+        assert_eq!(compact_frame(grown, Some((compact, grown))).right - compact_frame(grown, Some((compact, grown))).left, natural.w);
+    }
+
+    /// Audit 2026-11, zoom-drops-chart-width-record (b): the strip is showing, the chart flag is on and
+    /// no frame is remembered. The compact width gives the pane 360 px of its own, and the cards lose
+    /// columns to it; the frame `expand` now picks holds both.
+    #[test]
+    fn opening_with_the_chart_flag_on_and_no_saved_frame_does_not_cost_the_cards_a_column() {
+        let work = rect(0, 0, 3_000, 1_400);
+        let (n, catalog, dpi) = (6, 20, 120);
+        let natural = panel::geometry(n, catalog, dpi, false);
+        assert!(natural.cols > 1);
+        // What the old expand did: the compact frame with the pane squeezed into it.
+        let squeezed = panel::geometry_in(natural.w, n, catalog, dpi, false, true);
+        assert!(squeezed.cols < natural.cols, "the defect: {} columns of {}", squeezed.cols, natural.cols);
+        let (compact, grown) = content_frame(work, (natural.w, natural.h), Some(chart_room(dpi)));
+        let opened = grown.unwrap_or(compact);
+        let held = panel::geometry_in(opened.right - opened.left, n, catalog, dpi, false, true);
+        assert_eq!(held.cols, natural.cols);
+        assert!(held.chart.is_some(), "and the pane is there");
     }
 
     /// Audit 2026-11, strip-keeps-foreground-after-menu.
