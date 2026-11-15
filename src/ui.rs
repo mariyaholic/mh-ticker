@@ -5413,7 +5413,7 @@ mod tests {
     #[test]
     fn the_strip_is_topmost_only_when_the_setting_or_the_taskbar_says_so() {
         for p in Placement::ALL {
-            assert_eq!(wants_topmost(true, p), true, "{p:?} with Always on top");
+            assert!(wants_topmost(true, p), "{p:?} with Always on top");
             assert_eq!(wants_topmost(false, p), p.on_taskbar(), "{p:?} without it");
         }
         assert!(!wants_topmost(false, Placement::Floating), "a floating strip is not forced up");
