@@ -120,9 +120,10 @@ the Linux harness runs the pure modules (see `scripts/check-state-linux.sh`).
 
 ## Audit 2026-11
 
-The 2026-11 state-machine audit recorded 12 defects in the 1.9.0 code. Each one is fixed on
-`feat/sessions-and-settings`, with a unit test. One line each: the machine, the defect, the fix, and the
-audit id.
+The 2026-11 state-machine audit recorded 38 defects in the 1.9.0 code. 30 are fixed on
+`feat/sessions-and-settings`, each with a unit test: 12 in the first pass and 18 in the second. The other 8
+were read against the code and left (see Open findings). One line each: the machine, the defect, the fix,
+and the audit id.
 
 - **Scrollbar thumb drag and mouse capture:** the capture stayed held after a section change had cleared the drag. Fix: the capture is released on every button-up (`section-change-leaks-capture`).
 - **Undo snapshot, alert clear:** undo put the alerts back under their label, which a rename had made stale. Fix: `Snapshot::Alerts` carries each alert's symbol, and undo follows the symbol (`alert-undo-reattaches-by-stale-label`).
@@ -137,6 +138,27 @@ audit id.
 - **Tray icon and tooltip:** over its limit, the tooltip dropped " (closed)" from some closed rows and not others. Fix: every closed row drops it together (`tooltip-closed-suffix-mixed`).
 - **Link, calm and closed classification, short header name:** the short name read "live" and "not live" together. Fix: it reads `CNBC live, N idle` (`calm-name-short-contradicts-live`).
 
+Second pass (18 findings, each read against the code before it was fixed):
+
+- **Taskbar ownership and z-order:** `expand` made the window topmost and `collapse` never put the setting back, so a floating or corner strip with Always on top off stayed topmost. Fix: `wants_topmost` is the one rule, and `collapse` applies it (`strip-stays-topmost-after-panel`).
+- **Window mode, modal prompts and message boxes:** the hotkey and the tray click ran `expand` or `collapse` underneath an open prompt or box, so the prompt ended up owned by a strip or a disabled panel. Fix: `InputBlock` counts open modal calls (`modal`, `ask_text`, `message_box`), and `toggle_step` does nothing while it is non-zero (`hotkey-and-tray-under-modal`).
+- **Find a card:** the prompt could outlive a collapse, and its result locked a card while the strip showed. Fix: the same guard, and `find_card` drops its result when the mode is no longer Panel (`find-applies-after-collapse`).
+- **Window mode, move and size loop:** the hotkey collapsed the panel inside the system's drag loop, and `WM_EXITSIZEMOVE` then saved a panel-sized strip position. Fix: `InputBlock::sizing` is set between `WM_ENTERSIZEMOVE` and `WM_EXITSIZEMOVE` (`hotkey-inside-move-size-loop`).
+- **Window maximise state:** Win+Up or a drag to the top edge maximised the panel, and nothing handled that state. Fix: the window style has no `WS_MAXIMIZEBOX` (`maximise-state-not-handled`).
+- **UI view snapshot:** after a resume from sleep the strip kept the old link colour and fresh flags until the feed answered. Fix: `WM_POWERBROADCAST` on a resume calls `kick_feed`, so the feed publishes at once (`view-freshness-only-on-wm-feed`).
+- **Section and page view, hover:** the pointer highlight is an index pair and drifted onto another control after a rebuild. Fix: `settings::settle_hover` follows the control by label and command, and drops the highlight when it is gone or disabled (`hover-index-stale-after-rebuild`).
+- **Webhook post, retry and quit wait:** a post waiting for its retry sent to a webhook that had been removed or replaced. Fix: a generation counter (`alerts::webhook_changed`) is bumped by Remove and Paste, and `retry::run_while` skips the retry when it moved (`webhook-retry-after-remove`).
+- **Range book:** every transition was timed by wall-clock differences, so a clock set back froze a cached series, a failure back-off and a lost request until the clock caught up. Fix: `Book::want` treats a stamp later than now as expired, and `age_label` shows the note for it (`book-clock-set-back-freezes-range`).
+- **Foreground and keyboard focus, strip menu:** `menu_at` took the foreground and never gave it back, so the strip kept the keyboard from the app being typed in. Fix: `foreground_after_menu` returns it after the command has run, while the strip is still a strip and still in front (`strip-keeps-foreground-after-menu`).
+- **Hover flags and hit testing, Classic header:** `WM_NCHITTEST` counted the picker, chart and gear rectangles as buttons in Classic, which draws none of them, leaving a dead zone beside the minimise button. Fix: `on_header_button` counts only the buttons the build draws (`classic-header-dead-zone`).
+- **Strip placement, Display choice:** the choice was offered with the panel open and silently dropped. Fix: it is greyed with the same hint as Position (`display-choice-ignored-with-panel-open`).
+- **Hover flags, chart toggle:** `set_chart` kept the stored card hover while the columns refolded. Fix: `chart_state` clears every hover (`chart-toggle-keeps-card-hover`).
+- **Quote feed loop, poll interval:** a shorter *Poll every* choice waited out the old interval. Fix: `kick_feed` runs when the new interval is shorter (`poll-choice-waits-out-old-interval`).
+- **Quote feed loop, TLS client:** when `Client::new` failed at start-up no feed, chart or fallback thread was ever started, and Refresh now did nothing. Fix: a `tls-retry` thread tries again after 5, 10, 20, 40 and then 60 s, wakes on a kick, and starts the workers once through `start_workers` (`feed-never-starts-after-tls-failure`).
+- **Gap tracker (Blind and Back):** with no feed thread the watch stepped once and never announced Blind. Fix: the same retry thread starts the feed, so the watch gets its ticks (`watch-never-blind-without-feed-thread`).
+- **Panel zoom, open panel:** a zoom change sized the window from its current client size, which is in the old scale, so the frame never shrank. Fix: `content_frame` sizes it from the cards' natural size at the new zoom (`zoom-change-keeps-old-frame`).
+- **Chart pane open and closed with the width record:** a zoom change dropped the width record while the chart stayed open, so closing the chart gave no width back, and an expand with the chart flag on opened at the compact width. Fix: `content_frame` rebuilds the record for the new frame, and `expand` uses it when no frame is saved (`zoom-drops-chart-width-record`).
+
 ## Open findings
 
 See `docs/STATE-AUDIT-1.8.md`: findings 1 to 9 are all fixed (5, 6, 8, 9 in the responsiveness pass,
@@ -147,32 +169,14 @@ the item stays listed. Nothing here was exercised on native Windows.
 
 ### Audit 2026-11 open findings
 
-These 26 findings were recorded by the 2026-11 audit and are not fixed. None of them was independently
-verified (unverified). Each line gives the id, the severity and the files.
+The audit's 38 findings were all read against the code. 30 are fixed (see Audit 2026-11 above). These 8
+were left, each for the reason given. None was exercised on native Windows.
 
-- `apply-level-rearms-other-levels`, medium, `src/alerts.rs`, `src/ui.rs` (unverified)
-- `zoom-drops-chart-width-record`, medium, `src/ui.rs`, `src/panel.rs` (unverified)
-- `strip-stays-topmost-after-panel`, medium, `src/ui.rs` (unverified)
-- `collapse-restores-stale-foreground`, medium, `src/ui.rs` (unverified)
-- `hotkey-and-tray-under-modal`, medium, `src/ui.rs`, `src/prompt.rs` (unverified)
-- `dpichanged-ignores-suggested-rect`, medium, `src/ui.rs` (unverified)
-- `maximise-state-not-handled`, medium, `src/ui.rs` (unverified)
-- `view-freshness-only-on-wm-feed`, medium, `src/ui.rs` (unverified)
-- `hover-index-stale-after-rebuild`, low, `src/ui/settings_win.rs` (unverified)
-- `new-window-and-section-change-read-twice`, low, `src/ui/settings_win.rs` (unverified)
-- `webhook-retry-after-remove`, low, `src/alerts.rs`, `src/retry.rs`, `src/ui.rs` (unverified)
-- `alert-note-late-result-wins`, low, `src/ui.rs` (unverified)
-- `digest-misses-after-clock-set-back`, low, `src/watch.rs`, `src/alerts.rs`, `src/ui.rs` (unverified)
-- `watch-never-blind-without-feed-thread`, low, `src/source.rs`, `src/watch.rs`, `src/ui.rs` (unverified)
-- `book-clock-set-back-freezes-range`, low, `src/ranges.rs`, `src/source.rs` (unverified)
-- `find-applies-after-collapse`, low, `src/ui.rs` (unverified)
-- `strip-keeps-foreground-after-menu`, low, `src/ui.rs` (unverified)
-- `zoom-change-keeps-old-frame`, low, `src/ui.rs` (unverified)
-- `hotkey-inside-move-size-loop`, low, `src/ui.rs` (unverified)
-- `classic-header-dead-zone`, low, `src/ui.rs` (unverified)
-- `display-choice-ignored-with-panel-open`, low, `src/ui.rs`, `src/ui/settings_view.rs` (unverified)
-- `chart-toggle-keeps-card-hover`, low, `src/ui.rs`, `src/panel.rs` (unverified)
-- `gap-line-misnames-sleep`, low, `src/watch.rs`, `src/ui.rs` (unverified)
-- `closed-latch-lags-governed-report`, low, `src/source.rs`, `src/ui.rs` (unverified)
-- `poll-choice-waits-out-old-interval`, low, `src/ui.rs`, `src/source.rs` (unverified)
-- `feed-never-starts-after-tls-failure`, low, `src/source.rs` (unverified)
+- `apply-level-rearms-other-levels`, medium, `src/alerts.rs`, `src/ui.rs`: setting or changing one level resets the alert's single cooldown clock and latches, so another level that already fired and is still beyond can fire again. Left because an alert has one `last` and the re-arm on a new level is the documented rule; a fix needs a cooldown per level.
+- `collapse-restores-stale-foreground`, medium, `src/ui.rs`: `collapse` gives the foreground back to the window that had it when the panel opened, even if the user has clicked elsewhere since, and a tray click records the taskbar as that window. Left as the intended "return to where you were"; the tray case is minor.
+- `dpichanged-ignores-suggested-rect`, medium, `src/ui.rs`: `WM_DPICHANGED` with the panel open ignores the rectangle Windows suggests and re-fits the panel around its old position. Left because it needs a second display at another scale to check.
+- `new-window-and-section-change-read-twice`, low, `src/ui/settings_win.rs`: opening the settings window, and each sidebar step, does a fresh registry and display read, two on open. Left because the cost is small.
+- `alert-note-late-result-wins`, low, `src/ui.rs`: a late webhook result overwrites a newer footer note, and a second test alert can start before the first has finished. Left; the footer is a single line by design.
+- `digest-misses-after-clock-set-back`, low, `src/watch.rs`, `src/alerts.rs`, `src/ui.rs`: a clock set back during a mute makes the end-of-mute digest miss the alerts swallowed after the step. Left; it needs a clock change inside a mute.
+- `gap-line-misnames-sleep`, low, `src/watch.rs`, `src/ui.rs`: after a resume whose first poll fails, the gap line reads "no fresh price" instead of "the PC slept". Left; the wording differs and nothing is lost.
+- `closed-latch-lags-governed-report`, low, `src/source.rs`, `src/ui.rs`: on the poll where the board turns closed, the reported interval is the old one, so an alert armed within that minute is first checked up to 60 s late. Left; every quote is closed at that point, so nothing can fire.

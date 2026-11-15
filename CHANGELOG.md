@@ -22,7 +22,20 @@
   - One settings window is open at a time. While the panel is open, the panel owns it.
   - The right-click menu is short: Settings..., Expand view, Refresh now, Copy all prices, Undo, Show strip, the status lines and Quit. The card menu keeps its card entries.
   - `examples/settings.rs` renders the window.
-- **State-machine audit (twelve fixes, each with a unit test).**
+- **State-machine audit, second pass (eighteen fixes, each with a unit test).**
+  - The strip goes back to its configured z-order after the panel closes (`wants_topmost`).
+  - The hotkey and the tray click do nothing while a prompt or message box is open or the panel is being dragged or resized (`InputBlock`, `toggle_step`). The find prompt drops its result when the panel has collapsed.
+  - The panel window has no maximise box, so Win+Up and a drag to the top edge cannot maximise it.
+  - A resume from sleep wakes the feed at once, and a shorter *Poll every* choice ends the current wait (`kick_feed`).
+  - The settings pointer highlight follows its control through a rebuild (`settings::settle_hover`). The Display choice is greyed while the panel is open, as Position is.
+  - A webhook removed or replaced during a retry wait no longer receives the retry (`alerts::webhook_changed`, `retry::run_while`).
+  - A clock set back no longer freezes the range cache, a failure back-off or a lost request (`Book::want`).
+  - The strip gives the foreground back after its right-click menu closes (`foreground_after_menu`).
+  - Classic drags the panel from the whole header left of its minimise button (`on_header_button`). Toggling the chart clears every card hover.
+  - A failed TLS client at start-up is retried after 5, 10, 20, 40 and then 60 s, and Refresh now ends the wait. The feed, chart and fallback threads start once it succeeds (`start_workers`).
+  - A zoom change with the panel open sizes the window from the cards' natural size at the new zoom and keeps the chart-width record (`content_frame`).
+  - Eight findings were left on purpose, each with its reason in `STATE-MACHINES.md`.
+- **State-machine audit, first pass (twelve fixes, each with a unit test).**
   - The scrollbar thumb releases its mouse capture on every button-up, also after a section change.
   - Undoing an alert clear follows the symbol, also after a rename, and no longer re-attaches by a stale label.
   - A new symbol's label avoids the labels of alerts that no card owns.
@@ -34,7 +47,6 @@
   - The panel header name ends before the leftmost drawn button (`header_buttons_left`).
   - The tray tooltip drops " (closed)" from every closed row together when it is over its limit.
   - The short header name reads `CNBC live, N idle`.
-  - Twenty-six further findings are open. They are listed, unverified, in `STATE-MACHINES.md`.
 
 ## 2026-11-14 — 1.9.0: know it is true, alerts that say when they cannot see, twenty-four symbols, reach   [claude.impl]
 
