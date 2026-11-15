@@ -17,7 +17,7 @@ use windows_sys::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSI
 use windows_sys::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
 use windows_sys::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForSystem};
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowLongPtrW, SetWindowLongPtrW, GWLP_HWNDPARENT};
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetCapture, ReleaseCapture, SetCapture, TrackMouseEvent, EnableWindow, SetFocus, TME_LEAVE, TRACKMOUSEEVENT};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetCapture, IsWindowEnabled, ReleaseCapture, SetCapture, TrackMouseEvent, EnableWindow, SetFocus, TME_LEAVE, TRACKMOUSEEVENT};
 use std::cell::Cell;
 
 /// The refresh timer: picks up changes made through the menu, the tray, the hotkey or the feed.
@@ -220,10 +220,18 @@ fn owner_plan(panel_open: bool, owned_now: bool) -> OwnerPlan {
     }
 }
 
+/// The owner plan to apply on a refresh, or `None` while the window is disabled. A command started
+/// from the window disables it and runs a prompt or box owned by the strip; the refresh timer still
+/// fires inside that modal loop, and restacking then would raise the disabled window over the prompt.
+/// The refresh after the command settles the owner. `enabled` is whether the window accepts input.
+fn owner_step(panel_open: bool, owned_now: bool, enabled: bool) -> Option<OwnerPlan> {
+    enabled.then(|| owner_plan(panel_open, owned_now))
+}
+
 fn sync_owner(hwnd: HWND, open: bool) {
     unsafe {
         let now = GetWindowLongPtrW(hwnd, GWLP_HWNDPARENT);
-        let plan = owner_plan(open, now != 0);
+        let Some(plan) = owner_step(open, now != 0, IsWindowEnabled(hwnd) != 0) else { return };
         let want = match plan.owner {
             Owner::Panel => main_hwnd() as isize,
             Owner::Nobody => 0,
@@ -961,6 +969,17 @@ mod tests {
         assert_eq!(owner_plan(false, true), OwnerPlan { owner: Owner::Nobody, restack: Restack::NotTopmost });
         // Already unowned: nothing to undo, and no restack on every refresh.
         assert_eq!(owner_plan(false, false), OwnerPlan { owner: Owner::Nobody, restack: Restack::Keep });
+    }
+
+    #[test]
+    fn a_refresh_leaves_the_owner_alone_while_a_command_has_the_window_disabled() {
+        // The panel opened (hotkey, tray) while a prompt from the window was up: restacking would raise
+        // the disabled window over the prompt.
+        assert_eq!(owner_step(true, false, false), None);
+        assert_eq!(owner_step(false, true, false), None);
+        // An enabled window settles as before.
+        assert_eq!(owner_step(true, false, true), Some(OwnerPlan { owner: Owner::Panel, restack: Restack::Raise }));
+        assert_eq!(owner_step(false, true, true), Some(OwnerPlan { owner: Owner::Nobody, restack: Restack::NotTopmost }));
     }
 
     #[test]
