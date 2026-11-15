@@ -90,10 +90,52 @@ impl From<i32> for Zone {
 
 /// Where the pointer is on the pane: the candle (index into the bars as drawn, after folding) and a
 /// y in pane pixels already quantised by [`Layout::pointer_at`], so equality means "nothing to repaint".
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug)]
 pub struct Pointer {
     pub bar: usize,
     pub y: i32,
+    /// The pointer's x in pane pixels. A later frame can fold the candles differently, so the painter
+    /// answers the candle again from this point (see [`settle_aim`]) instead of trusting `bar`. It is
+    /// left out of the comparison: a move inside one candle's slot is still nothing to repaint.
+    pub x: i32,
+    /// For a crosshair set by key: the start of its candle in UTC seconds, filled in by the painter
+    /// from the frame it first drew the crosshair on. A refold then keeps the crosshair on that candle.
+    pub t: Option<i64>,
+}
+
+impl PartialEq for Pointer {
+    fn eq(&self, other: &Self) -> bool {
+        (self.bar, self.y, self.t) == (other.bar, other.y, other.t)
+    }
+}
+
+impl Eq for Pointer {}
+
+/// The crosshair `p` as it stands in the frame of `lay`, or `None` when no candle is there any more.
+/// `start_of(i)` is the start of candle `i` in UTC seconds, ascending. A crosshair set by the pointer
+/// (`key` false) names the candle under its x in this frame's layout, so a refold between two frames
+/// (more bars, a coarser bucket, a new scale) cannot leave it on another candle. A keyed one names the
+/// candle that holds its start time, and is dropped when that candle is gone; before it has a time
+/// (its first frame) it names its index.
+pub fn settle_aim(p: Pointer, key: bool, lay: &Layout, start_of: impl Fn(usize) -> i64) -> Option<Pointer> {
+    if lay.bars == 0 {
+        return None;
+    }
+    if !key {
+        return Some(Pointer { bar: lay.index_at(p.x)?, t: None, ..p });
+    }
+    let bar = match p.t {
+        Some(t) => {
+            let i = (0..lay.bars).rev().find(|&i| start_of(i) <= t)?;
+            if ((t - start_of(i)) as f64) >= lay.bucket_s {
+                return None;
+            }
+            i
+        }
+        None if p.bar < lay.bars => p.bar,
+        None => return None,
+    };
+    Some(Pointer { bar, x: lay.x_of(bar), t: Some(start_of(bar)), ..p })
 }
 
 /// Everything the painter and the pointer share about one frame of the pane.
@@ -130,6 +172,9 @@ pub struct Layout {
     /// Written by the painter after it has resolved a keyed crosshair onto its candle's close, so
     /// *Alert at the crosshair* asks for the price on screen, not for one the key handler guessed.
     pub cross: Option<(usize, f64)>,
+    /// The crosshair as the painter settled it onto this frame's candles (`settle_aim`), which the
+    /// pointer state takes over after the frame so it never outlives the layout it was answered from.
+    pub aim: Option<Pointer>,
 }
 
 impl Layout {
@@ -204,7 +249,7 @@ impl Layout {
             return None;
         }
         let q = quant.max(1);
-        Some(Pointer { bar, y: self.plot.top + (y - self.plot.top) / q * q })
+        Some(Pointer { bar, y: self.plot.top + (y - self.plot.top) / q * q, x, t: None })
     }
 }
 
@@ -916,6 +961,7 @@ mod tests {
             tabs: [Rect::default(); 6],
             vol: None,
             cross: None,
+            aim: None,
         }
     }
 
@@ -1352,7 +1398,53 @@ mod tests {
             tabs: [Rect::default(); 6],
             vol: None,
             cross: None,
+            aim: None,
         }
+    }
+
+    /// The painter used to clamp the stored index to the new bar count (`bar.min(n - 1)`); the answer
+    /// under the pointer and the one the clamp gives differ as soon as the step changes.
+    fn old_aim(p: Pointer, lay: &Layout) -> usize {
+        p.bar.min(lay.bars - 1)
+    }
+
+    #[test]
+    fn a_still_pointer_names_the_candle_under_it_after_the_candles_refold() {
+        // Early in a session: 46 one-minute candles, then a feed tick adds the 47th and the step shrinks.
+        let before = layout_for(600, 46, 96);
+        let after = layout_for(600, 47, 96);
+        assert_ne!(before.step, after.step, "the tick changes the step");
+        let x = before.x_of(30);
+        let p = before.pointer_at(x, 100, 2).unwrap();
+        assert_eq!(p.bar, 30);
+        let start = |i: usize| 60 * i as i64;
+        let now = settle_aim(p, false, &after, start).expect("the pointer is still over a candle");
+        assert_eq!(Some(now.bar), after.index_at(x), "the candle under the pointer in the new frame");
+        assert_ne!(now.bar, old_aim(p, &after), "the stored index would name another candle");
+        // The pointer now sits over empty plot (the list shrank): no crosshair, not the last candle.
+        let shrunk = layout_for(600, 10, 96);
+        assert_eq!(settle_aim(p, false, &shrunk, start), None);
+        assert_eq!(old_aim(p, &shrunk), 9, "the clamp used to pin it to the last candle");
+        assert_eq!(settle_aim(p, false, &Layout { bars: 0, ..after }, start), None);
+    }
+
+    #[test]
+    fn a_keyed_crosshair_stays_on_its_candle_in_time_when_the_candles_refold() {
+        // Candle 30 of 46 one-minute candles, then the day folds to five-minute candles.
+        let fine = layout_for(600, 46, 96);
+        let key = Pointer { bar: 30, y: 100, x: fine.x_of(30), t: None };
+        let first = settle_aim(key, true, &fine, |i| 60 * i as i64).unwrap();
+        assert_eq!((first.bar, first.t), (30, Some(1_800)), "the first frame records the candle's time");
+        let coarse = Layout { bucket_s: 300.0, ..layout_for(600, 12, 96) };
+        let at = settle_aim(first, true, &coarse, |i| 300 * i as i64).unwrap();
+        assert_eq!(at.bar, 6, "the candle that holds 1800 s, not candle 30 clamped to the last");
+        assert_eq!(at.t, Some(1_800));
+        assert_eq!(at.x, coarse.x_of(6));
+        assert_eq!(old_aim(first, &coarse), 11);
+        // Its candle has rolled out of the left edge: the crosshair goes.
+        assert_eq!(settle_aim(first, true, &coarse, |i| 300 * i as i64 + 3_600), None);
+        // A gap: the time falls after the last candle that starts before it by a whole bucket.
+        assert_eq!(settle_aim(first, true, &coarse, |i| 300 * (i as i64).min(2)), None);
     }
 
     /// A crosshair set by key and one set by the pointer give the same layout index, at every width and
@@ -1434,7 +1526,7 @@ mod tests {
         assert_eq!(l.index_at(l.plot.left - 1), None);
         assert_eq!(l.index_at(l.plot.right - 1), Some(39));
         assert_eq!(l.index_at(l.plot.right), None);
-        assert_eq!(l.pointer_at(l.plot.left, l.plot.top, 2), Some(Pointer { bar: 0, y: l.plot.top }));
+        assert_eq!(l.pointer_at(l.plot.left, l.plot.top, 2), Some(Pointer { bar: 0, y: l.plot.top, x: l.plot.left, t: None }));
         assert_eq!(l.pointer_at(l.plot.left - 1, 70, 2), None);
         assert_eq!(l.pointer_at(l.plot.right - 1, l.plot.bottom - 1, 2).map(|p| p.bar), Some(39));
         assert_eq!(l.pointer_at(l.plot.right, 70, 2), None);
