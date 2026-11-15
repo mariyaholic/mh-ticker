@@ -112,8 +112,9 @@ pub const FAST_MAX_GAP_POLLS: f64 = 3.0;
 /// How far the price has moved over the last `window_s`, in percent, if the window is covered: the
 /// samples (oldest first, `(utc seconds, price)`) must reach back to the window's start, and no two
 /// neighbours, from that first one to `now`, may be more than `max_gap_s` apart. `price` is the quote
-/// being judged and counts as the sample at `now`. `None` for an uncovered window, a gap, a price that
-/// is not finite, or a start price that is not positive.
+/// being judged and counts as the sample at `now`. `None` for an uncovered window, a gap, a sample
+/// stamped after `now` (the clock was set back), a price that is not finite, or a start price that is
+/// not positive.
 pub fn fast_move(samples: &[(f64, f64)], now: f64, price: f64, window_s: f64, max_gap_s: f64) -> Option<f64> {
     if !(price.is_finite() && window_s > 0.0 && max_gap_s > 0.0 && now.is_finite()) {
         return None;
@@ -121,6 +122,11 @@ pub fn fast_move(samples: &[(f64, f64)], now: f64, price: f64, window_s: f64, ma
     let start = now - window_s;
     let good = |s: &&(f64, f64)| s.0.is_finite() && s.1.is_finite();
     let held: Vec<&(f64, f64)> = samples.iter().filter(good).collect();
+    // A sample stamped after `now` came from a clock that has been set back since. The window would
+    // start on a sample from before the step and cover far more than `window_s`.
+    if held.iter().any(|s| s.0 > now) {
+        return None;
+    }
     let i = held.iter().rposition(|s| s.0 <= start)?;
     let mut prev = held[i].0;
     for s in &held[i + 1..] {
@@ -1619,6 +1625,19 @@ mod tests {
         assert_eq!(fast_move(&asleep, now, 110.0, 300.0, 9.0), None);
         assert_eq!(fast_move(&s, now, f64::NAN, 300.0, 9.0), None);
         assert_eq!(fast_move(&[], now, 101.0, 300.0, 9.0), None);
+    }
+
+    #[test]
+    fn a_fast_move_is_not_judged_from_samples_stamped_after_now() {
+        // The clock was set back an hour: the held samples run up to an hour past `now`. The window
+        // start lands on a sample from before the step, so the move would cover far more than 5 min.
+        let now = 10_000.0;
+        let ramp = |t: f64| 100.0 + (t - (now - 600.0)) / 36.0;
+        let s = samples(now - 600.0, now + 3_600.0, 3.0, ramp);
+        assert_eq!(fast_move(&s, now, 101.0, 300.0, 9.0), None);
+        // A sample stamped exactly now is the present, not the future.
+        let upto = samples(now - 600.0, now, 3.0, |_| 100.0);
+        assert!(fast_move(&upto, now, 101.0, 300.0, 9.0).is_some());
     }
 
     fn fast_alert(k: u8) -> Alert {
