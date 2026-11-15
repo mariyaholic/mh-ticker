@@ -157,13 +157,14 @@ pub const STALE_GRACE_S: f64 = RETRY_AFTER_S;
 
 /// `as of 14:05` when the series on screen was fetched more than its time to live (plus
 /// [`STALE_GRACE_S`]) ago, on the clock `tz_offset_s` east of UTC; `as of Nov 12 14:05` when that is a
-/// day or more back; `None` while it is fresh or when a time is not a number.
+/// day or more away; `None` while it is fresh or when a time is not a number. A series stamped after
+/// `now` (the clock was set back) is due again (`Book::want`), so it carries the note too.
 pub fn age_label(now: f64, fetched: f64, ttl_s: f64, tz_offset_s: i32) -> Option<String> {
-    if !(now.is_finite() && fetched.is_finite() && ttl_s.is_finite()) || now - fetched <= ttl_s + STALE_GRACE_S {
+    if !(now.is_finite() && fetched.is_finite() && ttl_s.is_finite()) || (now >= fetched && now - fetched <= ttl_s + STALE_GRACE_S) {
         return None;
     }
     let clock = crate::chartview::clock(fetched, tz_offset_s);
-    Some(if now - fetched >= DAY_S * 0.9 {
+    Some(if (now - fetched).abs() >= DAY_S * 0.9 {
         format!("as of {} {clock}", crate::chartview::date_label(fetched, tz_offset_s, crate::chartview::DateStyle::DayMonth))
     } else {
         format!("as of {clock}")
@@ -417,17 +418,21 @@ impl Book {
     /// did not fail within the last [`RETRY_AFTER_S`]. Generations start at 1 and only grow.
     pub fn want(&mut self, key: &Key, now: f64) -> Option<Request> {
         let ttl_s = ttl_of(key.file);
-        self.flying.retain(|f| now - f.since < LOST_AFTER_S);
+        // Every time here is on the wall clock, which can be set back. A stamp in the future (`now`
+        // earlier than it) is expired, the way `alerts::cooled` treats a cooldown: waiting for the clock
+        // to catch up would freeze the key for the size of the step plus its time to live.
+        let within = |stamp: f64, limit: f64| now >= stamp && now - stamp < limit;
+        self.flying.retain(|f| within(f.since, LOST_AFTER_S));
         if self.flying.iter().any(|f| &f.key == key) {
             return None;
         }
         if let Some((_, at)) = self.failed.iter().find(|(k, _)| k == key) {
-            if now - at < RETRY_AFTER_S {
+            if within(*at, RETRY_AFTER_S) {
                 return None;
             }
         }
         if let Some(c) = self.cache.iter().find(|c| &c.key == key) {
-            if now - c.series.fetched < ttl_s {
+            if within(c.series.fetched, ttl_s) {
                 return None;
             }
         }
@@ -957,6 +962,49 @@ mod tests {
         let old = age_label(fetched + 2.0 * DAY_S, fetched, ttl, 0).unwrap();
         assert!(old.starts_with("as of Jan ") && old.ends_with(" 14:05"), "{old}");
         assert_eq!(age_label(f64::NAN, fetched, ttl, 0), None);
+    }
+
+    /// Audit 2026-11, book-clock-set-back-freezes-range: a clock set back must not freeze a key. A
+    /// cached series stamped after `now` is due again, so is a failure, and an in-flight request.
+    #[test]
+    fn a_clock_set_back_makes_a_cached_series_due_again() {
+        let mut b = Book::new();
+        let k = key("@SP.1", "5D.json");
+        let r = b.want(&k, 1_000.0).unwrap();
+        assert!(b.arrived(r.generation, &k, Ok(series(1_000.0, 3)), 1_000.0));
+        assert!(b.want(&k, 1_300.0).is_none(), "inside the time to live, as before");
+        // The clock steps back an hour: the stamp is in the future, so the key is not "fresh".
+        let again = b.want(&k, 1_000.0 - 3_600.0).expect("due at once, not after the clock catches up");
+        assert_eq!(b.status(&k), Status::Ready, "the old bars stay up while it refreshes");
+        assert!(b.arrived(again.generation, &k, Ok(series(-2_600.0, 4)), -2_600.0));
+        assert!(b.want(&k, -2_500.0).is_none(), "the new stamp counts from the new clock");
+    }
+
+    #[test]
+    fn a_clock_set_back_lifts_a_failures_back_off_and_a_lost_requests_hold() {
+        let k = key("A", "5Y.json");
+        // Failure recorded at 10_000; the clock then reads 5_000.
+        let mut b = Book::new();
+        let r = b.want(&k, 9_990.0).unwrap();
+        assert!(b.arrived(r.generation, &k, Err("network".into()), 10_000.0));
+        assert!(b.want(&k, 10_010.0).is_none(), "inside the back-off, as before");
+        assert!(b.want(&k, 5_000.0).is_some(), "a failure from the future does not block the retry");
+        // In flight since 10_000; the clock reads 5_000 and no answer has come.
+        let mut b = Book::new();
+        assert!(b.want(&k, 10_000.0).is_some());
+        assert!(b.want(&k, 10_050.0).is_none(), "in flight, as before");
+        let again = b.want(&k, 5_000.0).expect("a request from the future is presumed lost");
+        assert_eq!(again.generation, 2);
+    }
+
+    #[test]
+    fn the_age_label_shows_for_a_series_stamped_after_now() {
+        let fetched = 14.0 * 3_600.0 + 5.0 * 60.0;
+        let ttl = 600.0;
+        assert_eq!(age_label(fetched - 3_600.0, fetched, ttl, 0).as_deref(), Some("as of 14:05"));
+        let far = age_label(fetched - 3.0 * DAY_S, fetched, ttl, 0).unwrap();
+        assert!(far.starts_with("as of Jan ") && far.ends_with(" 14:05"), "{far}");
+        assert_eq!(age_label(fetched, fetched, ttl, 0), None, "stamped now is fresh");
     }
 
     #[test]
