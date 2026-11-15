@@ -889,20 +889,71 @@ impl Feed {
     }
 }
 
-pub fn spawn(cfg: Config, shared: Arc<Mutex<Board>>, notify: Box<dyn Fn() + Send + Sync>) {
-    let client = match Client::new() {
-        Ok(c) => c,
-        Err(e) => {
-            if let Ok(mut b) = shared.lock() {
-                b.link = Link::Down;
-                b.note = format!("TLS: {e}");
-            }
-            notify();
+/// How long to wait before the next try at building the TLS client, `attempt` counting from 0 after
+/// the start-up failure: 5 s, 10 s, 20 s, 40 s, then 60 s every time.
+fn tls_retry_delay(attempt: u32) -> Duration {
+    Duration::from_secs((5u64 << attempt.min(4)).min(60))
+}
+
+/// Sleep up to `d`, waking early when `Board::kick` differs from `acted` (*Refresh now*, a resume, a
+/// wake). The same polling as `Feed::wait`, for a thread that has no `Feed` yet.
+fn wait_for_kick(shared: &Mutex<Board>, d: Duration, acted: u64) {
+    let until = Instant::now() + d;
+    while Instant::now() < until {
+        thread::sleep(ROWS_CHECK.min(until.saturating_duration_since(Instant::now())));
+        if shared.lock().map(|b| b.kick != acted).unwrap_or(false) {
             return;
         }
-    };
-    let (rows, rows_gen) = shared.lock().map(|b| (b.rows.clone(), b.rows_gen)).unwrap_or_else(|_| (cfg.rows.clone(), 0));
+    }
+}
+
+/// The board says why nothing is being fetched: Down, with the TLS error.
+fn publish_tls_down(shared: &Mutex<Board>, error: &str) {
+    if let Ok(mut b) = shared.lock() {
+        b.link = Link::Down;
+        b.note = format!("TLS: {error}");
+    }
+}
+
+pub fn spawn(cfg: Config, shared: Arc<Mutex<Board>>, notify: Box<dyn Fn() + Send + Sync>) {
     let notify: Arc<dyn Fn() + Send + Sync> = Arc::from(notify);
+    match Client::new() {
+        Ok(client) => start_workers(client, cfg, shared, notify),
+        Err(e) => {
+            publish_tls_down(&shared, &e);
+            notify();
+            // The TLS stack can be late at start-up (autostart before the credential service is ready).
+            // One thread keeps trying, and starts the workers the first time it succeeds; until then the
+            // board stays Down with the reason, and *Refresh now* ends the wait at once.
+            thread::Builder::new()
+                .name("tls-retry".into())
+                .spawn(move || {
+                    let mut attempt = 0;
+                    loop {
+                        let acted = shared.lock().map(|b| b.kick).unwrap_or(0);
+                        wait_for_kick(&shared, tls_retry_delay(attempt), acted);
+                        match Client::new() {
+                            Ok(client) => {
+                                start_workers(client, cfg, shared, notify);
+                                return;
+                            }
+                            Err(e) => {
+                                publish_tls_down(&shared, &e);
+                                notify();
+                                attempt = attempt.saturating_add(1);
+                            }
+                        }
+                    }
+                })
+                .expect("spawn tls retry thread");
+        }
+    }
+}
+
+/// Everything that needs a working HTTP client: the fallback expiry and the three fallback workers, the
+/// chart thread and the quote feed. Called once, by `spawn` or by its retry thread, never both.
+fn start_workers(client: Client, cfg: Config, shared: Arc<Mutex<Board>>, notify: Arc<dyn Fn() + Send + Sync>) {
+    let (rows, rows_gen) = shared.lock().map(|b| (b.rows.clone(), b.rows_gen)).unwrap_or_else(|_| (cfg.rows.clone(), 0));
     // Expiry must progress even when every HTTP worker is blocked.
     {
         let board = shared.clone();
@@ -2019,5 +2070,46 @@ mod tests {
         let (_t0, bars) = parse_chart(&v, 1_793_664_900.0);
         let vols: Vec<f32> = bars.iter().map(|b| b.v).collect();
         assert_eq!(vols, [3443.0, 1026.0, 0.0]);
+    }
+
+    /// Audit 2026-11, feed-never-starts-after-tls-failure: the TLS client is tried again after 5 s,
+    /// 10 s and 20 s, then every minute at most.
+    #[test]
+    fn the_tls_retry_delay_grows_and_stops_at_a_minute() {
+        let secs: Vec<u64> = (0..8).map(|n| tls_retry_delay(n).as_secs()).collect();
+        assert_eq!(secs, [5, 10, 20, 40, 60, 60, 60, 60]);
+        assert_eq!(tls_retry_delay(u32::MAX).as_secs(), 60, "no overflow at any count");
+    }
+
+    /// The wait the retry thread sleeps in ends at once on a kick, and not before.
+    #[test]
+    fn the_tls_retry_wait_ends_on_a_kick() {
+        let shared = Arc::new(Mutex::new(Board::new(&[])));
+        let acted = shared.lock().unwrap().kick;
+        let waker = shared.clone();
+        let t = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(300));
+            let mut b = waker.lock().unwrap();
+            b.kick = b.kick.wrapping_add(1);
+        });
+        let started = Instant::now();
+        wait_for_kick(&shared, Duration::from_secs(30), acted);
+        assert!(started.elapsed() < Duration::from_secs(5), "the wait ignored the kick: {:?}", started.elapsed());
+        assert!(started.elapsed() >= Duration::from_millis(250), "it returned before the kick");
+        t.join().unwrap();
+        // With no kick it sleeps the whole time.
+        let acted = shared.lock().unwrap().kick;
+        let started = Instant::now();
+        wait_for_kick(&shared, Duration::from_millis(300), acted);
+        assert!(started.elapsed() >= Duration::from_millis(290));
+    }
+
+    #[test]
+    fn a_tls_failure_is_published_as_down_with_its_reason() {
+        let shared = Mutex::new(Board::new(&[]));
+        publish_tls_down(&shared, "no credentials");
+        let b = shared.lock().unwrap();
+        assert_eq!(b.link, Link::Down);
+        assert_eq!(b.note, "TLS: no credentials");
     }
 }
