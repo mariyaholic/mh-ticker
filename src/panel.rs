@@ -161,6 +161,12 @@ impl History {
                     self.backfilled = true;
                 }
             }
+            // The wall clock stepped back: samples stamped after `now` belong to a clock that is gone.
+            // Left in place they would be overwritten in turn (their age is negative) and no new
+            // sample would be added until the clock caught up with them.
+            while row.back().is_some_and(|p| p.0 > now) {
+                row.pop_back();
+            }
             if let (Some(q), false) = (&c.quote, c.stale) {
                 match row.back_mut() {
                     Some(last) if now - last.0 < SAMPLE_S => last.1 = q.price,
@@ -1835,6 +1841,21 @@ mod tests {
         // an hour later everything has rolled out
         h.record(&b, now + 3700.0);
         assert!(h.row(0).unwrap().iter().all(|p| p.0 >= now + 100.0));
+    }
+
+    #[test]
+    fn a_clock_set_back_drops_the_samples_stamped_after_now() {
+        let c = Cell { label: "XAU".into(), digits: 2, quote: Some(crate::model::Quote { price: 5.0, ..Default::default() }), stale: false };
+        let mut b = Board::new(&[]);
+        b.cells = vec![c];
+        let mut h = History::new();
+        h.labels = vec!["XAU".into()];
+        h.rows = vec![VecDeque::from(vec![(1_000.0, 1.0), (3_000.0, 2.0), (4_600.0, 3.0)])];
+        h.record(&b, 1_500.0);
+        let row = h.row(0).unwrap();
+        assert!(row.iter().all(|p| p.0 <= 1_500.0), "nothing from the future stays: {row:?}");
+        assert_eq!(row.back(), Some(&(1_500.0, 5.0)), "the new price is held at the new time");
+        assert_eq!(row.front(), Some(&(1_000.0, 1.0)), "what came before the step is kept");
     }
 
     #[test]
