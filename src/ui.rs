@@ -1892,6 +1892,25 @@ fn wake_feed() {
     };
 }
 
+/// End the feed's wait at once and have it publish, whatever the governor says. `wake_feed` is this
+/// for a user who is back, and only while a governor tick is on; a resume or a new interval needs it
+/// in both builds.
+fn kick_feed() {
+    let Some(board) = with_ui(|u| u.board.clone()) else { return };
+    if let Ok(mut b) = board.lock() {
+        b.kick = b.kick.wrapping_add(1);
+    };
+}
+
+/// `WM_POWERBROADCAST` wParam values after which the clock and the network have moved on: the machine
+/// resumed from sleep, with or without a person present. The same resume can send both.
+const PBT_APMRESUMESUSPEND: usize = 0x0007;
+const PBT_APMRESUMEAUTOMATIC: usize = 0x0012;
+
+fn is_resume(power_event: usize) -> bool {
+    power_event == PBT_APMRESUMESUSPEND || power_event == PBT_APMRESUMEAUTOMATIC
+}
+
 /// `WM_WTSSESSION_CHANGE`: record the lock in the board (state only), then wake the feed on an unlock.
 fn session_changed(locked: bool) {
     let Some(board) = with_ui(|u| u.board.clone()) else { return };
@@ -4611,6 +4630,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             0
         }
+        // After a resume every quote and the link colour are as old as the sleep. The feed publishes
+        // at once, which runs the stale pass against the new clock.
+        WM_POWERBROADCAST => {
+            if is_resume(wp) {
+                kick_feed();
+            }
+            1
+        }
         WM_WTSSESSION_CHANGE => {
             match wp {
                 WTS_SESSION_LOCK => session_changed(true),
@@ -5324,6 +5351,18 @@ mod tests {
         assert_eq!(toggle_step(dragging, Mode::Panel), None);
         assert_eq!(toggle_step(dragging, Mode::Strip), None);
         assert!(!free.blocked());
+    }
+
+    /// Audit 2026-11, view-freshness-only-on-wm-feed: both resume notices end the feed's wait; the
+    /// suspend and the battery notices do not.
+    #[test]
+    fn only_a_resume_wakes_the_feed() {
+        assert!(is_resume(0x0007), "PBT_APMRESUMESUSPEND");
+        assert!(is_resume(0x0012), "PBT_APMRESUMEAUTOMATIC");
+        for other in [0x0004usize /* suspend */, 0x000A /* power status */, 0x8013 /* setting */, 0] {
+            assert!(!is_resume(other), "{other:#x}");
+        }
+        assert_eq!(WM_POWERBROADCAST, 0x0218);
     }
 
     /// Audit 2026-11, maximise-state-not-handled: the panel keeps its resize edges and has no maximise box.
