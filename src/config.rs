@@ -458,7 +458,8 @@ pub fn clean_symbol(raw: &str) -> Option<String> {
 /// The strip label for a newly added `symbol` (already cleaned): the symbol without a leading `@`,
 /// `.` or `^`, without a trailing `=`, and without a trailing `.1` (a front-month future: `@GC.1` is
 /// `GC`); cut to [`MAX_LABEL`] characters; `SYM` if nothing is left. Then made unique against every
-/// label in `catalog` and `rows`, compared ignoring ASCII case, by appending `2`, `3`, ... and cutting
+/// label in `catalog` and `rows` and every alert's label (an alert no card owns keeps its label, so a new
+/// card must not pick it up), compared ignoring ASCII case, by appending `2`, `3`, ... and cutting
 /// the base so the whole stays within [`MAX_LABEL`] (`GOLD` taken gives `GOLD2`).
 pub fn label_for(cfg: &Config, symbol: &str) -> String {
     let base = symbol.trim_start_matches(['@', '.', '^']);
@@ -466,7 +467,7 @@ pub fn label_for(cfg: &Config, symbol: &str) -> String {
     let base = base.strip_suffix(".1").unwrap_or(base);
     let base: String = base.chars().take(MAX_LABEL).collect();
     let base = if base.is_empty() { "SYM".to_string() } else { base };
-    unique_label(&base, |label| cfg.catalog.iter().chain(cfg.rows.iter()).any(|r| r.label.eq_ignore_ascii_case(label)))
+    unique_label(&base, |label| label_taken_by_another(cfg, symbol, label))
 }
 
 /// `base` if `taken` does not know it, else `base` with `2`, `3`, ... appended, the base cut so the
@@ -1807,6 +1808,16 @@ mod tests {
         c.restore(snap);
         assert!(c.alerts.is_empty(), "no card carries SI, so the level has nowhere to go");
         assert_eq!(label_for(&c, "SI"), "SI", "and the label is free for a new symbol");
+    }
+
+    #[test]
+    fn a_new_symbol_does_not_take_the_label_of_an_alert_no_card_owns() {
+        let mut c = Config::default();
+        c.alerts.push(Alert { label: "SI".into(), below: Some(25.0), ..Default::default() });
+        assert_eq!(label_for(&c, "SI"), "SI2", "the orphaned level stays out of the new card's reach");
+        assert_eq!(add_custom(&mut c, "SI", "Some stock", 30.0), Added::Shown);
+        assert_eq!(c.rows.last().unwrap().label, "SI2");
+        assert_eq!(c.alerts.len(), 1);
     }
 
     #[test]
