@@ -10,7 +10,7 @@
 //! per symbol (`panel.rs`); the minimise button or Esc morphs it back. The morph stretches and
 //! crossfades snapshots of both states while the window glides, paced by `DwmFlush` (vsync).
 //!
-//! Placements (right-click -> Position, `config::Placement`):
+//! Placements (Settings -> Display -> Position, `config::Placement`):
 //! - **Auto** (default): a compact grid in a taskbar gap. The gap left of the Start button while
 //!   it is roomy (centred icons), else the gap between the app icons and the tray (left-aligned
 //!   icons, a crowded centre), else the bottom-right corner above the taskbar (auto-hide or
@@ -20,7 +20,13 @@
 //! - **Floating**: one row anywhere on screen, dragged by hand, position saved.
 //!
 //! On the taskbar the strip re-raises itself when the taskbar comes on top. Every placement hides
-//! while a fullscreen app (a game) is in front. With several displays, *Position* also picks one.
+//! while a fullscreen app (a game) is in front. With several displays, the Display page of the
+//! settings window also picks one.
+//!
+//! The right-click menu is short: *Settings...*, expand or collapse, refresh, copy all prices, undo, show
+//! strip and quit, and on a card the entries for that card (copy, open, pin, rename, decimals, and in
+//! Ultra move and remove). Every other option lives in the settings window (`ui/settings_win.rs`), which
+//! runs the same commands the old long menu ran.
 //!
 //! Re-entrancy: TrackPopupMenu, SetWindowPos and ShowWindow pump or send messages back into
 //! `wndproc`, so the `UI` RefCell is never borrowed across those calls.
@@ -44,7 +50,7 @@ use crate::dock;
 use crate::panel;
 use crate::ranges::{self, Range};
 use crate::theme::{self, Gradient, Theme};
-use crate::model::{fmt_change, fmt_price, Board, Cell, Link};
+use crate::model::{fmt_change, fmt_price, Board, Calm, Cell, Link};
 use std::cell::RefCell;
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicIsize, Ordering};
@@ -82,6 +88,16 @@ const TIMER_ANIM: usize = 2;
 /// One-shot re-check soon after a foreground change: a taskbar click raises the taskbar a moment
 /// after the foreground event, so the immediate check can miss it.
 const TIMER_RECHECK: usize = 3;
+mod settings_view;
+mod settings_win;
+
+/// A page of the settings window from a fixed fixture (no window, no registry, no network), for the
+/// still renderer. `theme` names the palette in force for an Ultra build.
+#[cfg(feature = "shots")]
+pub(crate) fn settings_still(ultra: bool, theme: &str, section: crate::settings::Section) -> Vec<crate::settings::Control> {
+    settings_view::fixture(ultra, theme, section)
+}
+
 const CMD_STRIP: usize = 1001;
 const CMD_TOP: usize = 1002;
 const CMD_STATUS: usize = 1003;
@@ -90,7 +106,7 @@ const CMD_EXIT: usize = 1005;
 const CMD_PANEL: usize = 1007;
 const CMD_RESET: usize = 1008;
 const CMD_FALLBACK: usize = 1009;
-/// Position submenu: CMD_POS + index into `Placement::ALL`.
+/// Position choice on the Display page: CMD_POS + index into `Placement::ALL`.
 const CMD_POS: usize = 4000;
 /// Poll interval: CMD_POLL + index into `POLL_CHOICES`.
 const CMD_POLL: usize = 5000;
@@ -100,7 +116,7 @@ const CMD_THEME: usize = 5100;
 const CMD_FONT: usize = 5150;
 /// The Ultra symbol picker open/closed toggle.
 const CMD_PICK: usize = 5800;
-/// Alerts submenu, fixed entries (Ultra only): 5200..=5299 is this range's whole allotment.
+/// Alerts page, fixed options (Ultra only): 5200..=5299 is this range's whole allotment.
 /// The per-symbol presets are dynamic (`Action::Alert`), indexing `alerts::PRESETS`.
 const CMD_ALERT_ONCE: usize = 5200;
 const CMD_MUTE_1H: usize = 5201;
@@ -110,7 +126,6 @@ const CMD_UNMUTE: usize = 5204;
 const CMD_QUIET_OFF: usize = 5205;
 /// Quiet hours: CMD_QUIET + index into `alerts::QUIET_CHOICES`.
 const CMD_QUIET: usize = 5206;
-const CMD_HOOK_HOST: usize = 5210;
 const CMD_HOOK_PASTE: usize = 5211;
 const CMD_HOOK_TEST: usize = 5212;
 const CMD_HOOK_REMOVE: usize = 5213;
@@ -124,7 +139,7 @@ const CMD_GAP_NOTICE: usize = 5217;
 const CMD_LOG_COPY: usize = 5218;
 /// Clear every alert, after asking.
 const CMD_ALERTS_CLEAR_ALL: usize = 5219;
-/// The last fixed entry of the Alerts submenu (the dispatch range ends here).
+/// The last fixed option of the Alerts page (the dispatch range ends here).
 const CMD_ALERT_LAST: usize = CMD_ALERTS_CLEAR_ALL;
 /// A second "Send a test alert" inside this many seconds is refused (one request in flight).
 const TEST_ALERT_GAP_S: u64 = 15;
@@ -165,13 +180,10 @@ const HOTKEY_ID: i32 = 1;
 const CMD_REFRESH: usize = 5400;
 const CMD_COPY_ALL: usize = 5401;
 const CMD_AUTOSTART: usize = 5402;
-const CMD_VERSION: usize = 5403;
 const CMD_UPDATE: usize = 5404;
 const CMD_SAVE_STATUS: usize = 5405;
 /// The greyed line that says a settings file that would not parse was kept under another name.
 const CMD_KEPT_STATUS: usize = 5406;
-/// The greyed data meter line.
-const CMD_METER: usize = 5407;
 /// *Copy diagnostics report* (W1): the probe's checks on a click, as text on the clipboard.
 const CMD_REPORT: usize = 5408;
 /// The report's checks finished off-thread (the text is in `Ui::report_result`). `WM_APP + 16` is
@@ -179,15 +191,15 @@ const CMD_REPORT: usize = 5408;
 const WM_REPORT: u32 = WM_APP + 16;
 /// The window's name should be re-read (the lock moved): `sync_title` compares and sets it. `WM_APP + 17`.
 const WM_TITLE: u32 = WM_APP + 17;
-/// Hotkey submenu: Off, `hotkey::PRESETS` at `CMD_HOTKEY + 1 + i`, and `CMD_HOTKEY_CUSTOM` for a
+/// Hotkey choice on the Startup & system page: Off, `hotkey::PRESETS` at `CMD_HOTKEY + 1 + i`, and `CMD_HOTKEY_CUSTOM` for a
 /// configured combo that is none of them.
 const CMD_HOTKEY: usize = 5410;
 const CMD_HOTKEY_CUSTOM: usize = 5415;
-/// Strip submenu: rows, text size and opacity, index into `STRIP_ROWS` / `TEXT_STEPS` / `OPACITY_STEPS`.
+/// Strip choices on the Display page: rows, text size and opacity, index into `STRIP_ROWS` / `TEXT_STEPS` / `OPACITY_STEPS`.
 const CMD_STRIP_ROWS: usize = 5420;
 const CMD_STRIP_TEXT: usize = 5430;
 const CMD_STRIP_OPACITY: usize = 5440;
-/// The poll governor's two ticks (W2), in the Poll every submenu.
+/// The poll governor's two ticks (W2), in the Poll every choice.
 const CMD_SLOW_QUIET: usize = 5450;
 const CMD_REST_LOCKED: usize = 5451;
 /// Symbols > Order the cards (W3 D5): once, by day move, by name, or back to the default order.
@@ -198,7 +210,7 @@ const CMD_ORDER_DEFAULT: usize = 5462;
 const CMD_PIN_ALL: usize = 5463;
 /// Edit > Undo the last removal, move, sort, pin change or alert clear (W3 J2).
 const CMD_UNDO: usize = 5464;
-/// Accessibility submenu (W4): up and down colours (3), hollow up candles, follow the Windows contrast
+/// Accessibility options (W4), on the Display and Chart pages: up and down colours (3), hollow up candles, follow the Windows contrast
 /// theme, follow the Windows animation setting, and panel zoom (`zoom::STEPS`).
 const CMD_UPDOWN: usize = 5470;
 const CMD_HOLLOW: usize = 5473;
@@ -215,7 +227,7 @@ const WM_WTSSESSION_CHANGE: u32 = 0x02B1;
 const WTS_SESSION_LOCK: usize = 7;
 const WTS_SESSION_UNLOCK: usize = 8;
 
-/// Rows in the taskbar grid offered by the Strip submenu (`cfg.dock_rows`).
+/// Rows in the taskbar grid offered by the Rows in the taskbar choice (`cfg.dock_rows`).
 const STRIP_ROWS: [u32; 3] = [1, 2, 3];
 /// Text sizes: `(dock_font_pt, font_pt, label)`. The second step is today's default (9, 10).
 const TEXT_STEPS: [(i32, i32, &str); 4] = [(8, 9, "Small"), (9, 10, "Default"), (10, 11, "Large"), (11, 12, "Larger")];
@@ -228,6 +240,8 @@ const OPACITY_STEPS: [(u8, &str); 5] = [(255, "100 %"), (235, "92 %"), (205, "80
 const WM_LOOKUP: u32 = WM_APP + 14;
 /// Symbols > *Add symbol...* (both builds).
 const CMD_ADD_SYMBOL: usize = 6000;
+/// The short menu's first entry: opens the settings window. Not a setting itself.
+const CMD_SETTINGS: usize = 6020;
 /// The candle pane's own right-click menu (Ultra): alert at the price under the pointer, clear the
 /// symbol's alerts, and the main menu.
 const CMD_PANE_ALERT: usize = 6010;
@@ -368,7 +382,7 @@ struct Ui {
     grad: Gradient,
     icon: HICON,
     /// What the current tray icon was drawn for: the link colour and the alert marker.
-    icon_link: Option<(Link, bool)>,
+    icon_link: Option<(Link, Calm, bool)>,
     dpi: u32,
     cfg: Config,
     board: Arc<Mutex<Board>>,
@@ -462,6 +476,9 @@ struct Ui {
     /// refused. Time-based on purpose: no result message can leave it stuck.
     test_alert_at: Option<Instant>,
     tracking: bool,
+    /// What keeps the hotkey and the tray from opening or closing the panel: a prompt or message box
+    /// of this window is up (`modal`), or the system's move/size loop is running.
+    block: InputBlock,
     /// Foreground window before the panel opened; it gets focus back on collapse.
     prev_fg: HWND,
     /// Last tray tooltip refresh.
@@ -806,19 +823,24 @@ fn make_icon(color: COLORREF, pending: bool) -> HICON {
     }
 }
 
-/// (label, price, price colour, change + colour) for one row of the board.
-fn cell_texts(c: &Cell, t: &Theme) -> (String, String, COLORREF, Option<(String, COLORREF)>) {
+/// (label, price, price colour, change + colour) for one row of the board. A stale cell that is calm
+/// (`model::calm_stale`: a quiet or closed market) dims to the grey of the theme's secondary text. A stale
+/// cell that is a fault (no known age, a fallback quote, a dead link) takes the amber of the theme
+/// and loses its change colours, so the two read differently on the strip.
+fn cell_texts(c: &Cell, t: &Theme, link: Link, now: f64) -> (String, String, COLORREF, Option<(String, COLORREF)>) {
     let label = match &c.quote {
         Some(q) if !q.source.is_empty() => format!("{} ({} ?)", c.label, q.source),
         _ => c.label.clone(),
     };
+    let fault = c.stale && !crate::model::calm_stale(c, link, now);
     match &c.quote {
         Some(q) => {
             let change = q.change_pct.map(|p| {
                 let col = if c.stale { t.dim } else if p >= 0.0 { t.up } else { t.down };
                 (fmt_change(p), col)
             });
-            (label, fmt_price(q.price, c.digits), if c.stale { t.dim } else { t.price }, change)
+            let price = if fault { t.amber } else if c.stale { t.dim } else { t.price };
+            (label, fmt_price(q.price, c.digits), price, change)
         }
         None => (label, "--".into(), t.dim, None),
     }
@@ -836,7 +858,7 @@ fn text_run(x: i32, y: i32, s: &str, color: COLORREF) -> Run {
 }
 
 /// Free mode: everything on one row.
-fn layout_row(dc: HDC, cells: &[Cell], dpi: u32, t: &Theme) -> Frame {
+fn layout_row(dc: HDC, cells: &[Cell], dpi: u32, t: &Theme, link: Link, now: f64) -> Frame {
     let s = |v: i32| v * dpi as i32 / 96;
     let (px, py) = (s(10), s(5));
     let (_, line_h) = text_size(dc, "Xg");
@@ -844,7 +866,7 @@ fn layout_row(dc: HDC, cells: &[Cell], dpi: u32, t: &Theme) -> Frame {
     let mut slots = Vec::new();
     let mut x = px;
     for (i, c) in cells.iter().enumerate() {
-        let (label, price, pc, change) = cell_texts(c, t);
+        let (label, price, pc, change) = cell_texts(c, t, link, now);
         // The symbol's own extent starts after the gap that separates it from the one before.
         let left = x + if i > 0 { text_size(dc, "    ").0 } else { 0 };
         let mut push = |t: String, col: COLORREF| {
@@ -872,7 +894,8 @@ fn layout_row(dc: HDC, cells: &[Cell], dpi: u32, t: &Theme) -> Frame {
 
 /// Dock mode: the first `k` rows of the board as a column-major grid with `rows` lines,
 /// label | right-aligned price | right-aligned change.
-fn layout_grid(dc: HDC, cells: &[Cell], dpi: u32, rows: usize, show_change: bool, t: &Theme) -> Frame {
+#[allow(clippy::too_many_arguments)] // a frame needs the device, cells, size, grid, look, link and clock; a bundling struct would be used once
+fn layout_grid(dc: HDC, cells: &[Cell], dpi: u32, rows: usize, show_change: bool, t: &Theme, link: Link, now: f64) -> Frame {
     let s = |v: i32| v * dpi as i32 / 96;
     let (px, py, gap_s, gap_l) = (s(7), s(3), s(5), s(12));
     let (_, line_h) = text_size(dc, "Xg");
@@ -883,7 +906,7 @@ fn layout_grid(dc: HDC, cells: &[Cell], dpi: u32, rows: usize, show_change: bool
         if ci > 0 {
             x += gap_l;
         }
-        let texts: Vec<_> = col.iter().map(|c| cell_texts(c, t)).collect();
+        let texts: Vec<_> = col.iter().map(|c| cell_texts(c, t, link, now)).collect();
         let lw = texts.iter().map(|t| text_size(dc, &t.0).0).max().unwrap_or(0);
         let pw = texts.iter().map(|t| text_size(dc, &t.1).0).max().unwrap_or(0);
         let cw = if show_change {
@@ -933,20 +956,20 @@ fn layout(u: &Ui, avail: Option<i32>) -> Frame {
         let cells = &shown;
         let t = u.theme;
         let mut frame = match avail {
-            None => layout_row(dc, cells, u.dpi, t),
+            None => layout_row(dc, cells, u.dpi, t, u.view.link, crate::source::now_s()),
             Some(avail) => {
                 let rows = u.cfg.dock_rows.max(1) as usize;
                 let mut pick = None;
                 'fit: for k in (1..=cells.len()).rev() {
                     for show_change in [true, false] {
-                        let f = layout_grid(dc, &cells[..k], u.dpi, rows, show_change, t);
+                        let f = layout_grid(dc, &cells[..k], u.dpi, rows, show_change, t, u.view.link, crate::source::now_s());
                         if f.w <= avail {
                             pick = Some(f);
                             break 'fit;
                         }
                     }
                 }
-                pick.unwrap_or_else(|| layout_grid(dc, &cells[..cells.len().min(1)], u.dpi, rows, false, t))
+                pick.unwrap_or_else(|| layout_grid(dc, &cells[..cells.len().min(1)], u.dpi, rows, false, t, u.view.link, crate::source::now_s()))
             }
         };
         SelectObject(dc, old);
@@ -968,7 +991,7 @@ fn draw_strip(u: &Ui, dc: HDC) {
             TextOutW(dc, r.x, r.y, r.text.as_ptr(), r.text.len() as i32);
         }
         let (dx, dy, d) = u.frame.dot;
-        let brush = CreateSolidBrush(theme::link_color(u.theme, u.view.link));
+        let brush = CreateSolidBrush(theme::calm_color(u.theme, u.view.link, u.view.calm(crate::source::now_s())));
         let old_brush = SelectObject(dc, brush);
         let old_pen = SelectObject(dc, GetStockObject(NULL_PEN));
         Ellipse(dc, dx, dy, dx + d, dy + d);
@@ -984,7 +1007,7 @@ fn draw_strip(u: &Ui, dc: HDC) {
 /// symbol without the change column, else the leading symbols), painted as `draw_strip` paints it, in
 /// the theme's background and the default strip font. Off-screen; only the `shots` feature has it.
 #[cfg(feature = "shots")]
-pub(crate) fn strip_still(cells: &[Cell], t: &Theme, dpi: u32, rows: usize, avail: i32) -> (u32, u32, Vec<u8>) {
+pub(crate) fn strip_still(cells: &[Cell], link: Link, now: f64, t: &Theme, dpi: u32, rows: usize, avail: i32) -> (u32, u32, Vec<u8>) {
     let cfg = Config::default();
     let font = make_font(&Config { placement: Some(Placement::TaskbarRight), ..cfg }, dpi);
     let frame = unsafe {
@@ -994,14 +1017,14 @@ pub(crate) fn strip_still(cells: &[Cell], t: &Theme, dpi: u32, rows: usize, avai
         let mut pick = None;
         'fit: for k in (1..=cells.len()).rev() {
             for show_change in [true, false] {
-                let f = layout_grid(dc, &cells[..k], dpi, rows, show_change, t);
+                let f = layout_grid(dc, &cells[..k], dpi, rows, show_change, t, link, now);
                 if f.w <= avail {
                     pick = Some(f);
                     break 'fit;
                 }
             }
         }
-        let frame = pick.unwrap_or_else(|| layout_grid(dc, &cells[..cells.len().min(1)], dpi, rows, false, t));
+        let frame = pick.unwrap_or_else(|| layout_grid(dc, &cells[..cells.len().min(1)], dpi, rows, false, t, link, now));
         SelectObject(dc, old);
         DeleteDC(dc);
         ReleaseDC(null_mut(), screen);
@@ -1019,7 +1042,7 @@ pub(crate) fn strip_still(cells: &[Cell], t: &Theme, dpi: u32, rows: usize, avai
             TextOutW(dc, r.x, r.y, r.text.as_ptr(), r.text.len() as i32);
         }
         let (dx, dy, d) = frame.dot;
-        let brush = CreateSolidBrush(theme::link_color(t, Link::Live));
+        let brush = CreateSolidBrush(theme::calm_color(t, link, crate::model::calm_of(cells, link, now)));
         let old_brush = SelectObject(dc, brush);
         let old_pen = SelectObject(dc, GetStockObject(NULL_PEN));
         Ellipse(dc, dx, dy, dx + d, dy + d);
@@ -1085,6 +1108,7 @@ fn draw_panel(u: &mut Ui, dc: HDC, w: i32, h: i32) {
         grad: &u.grad,
         dpi: pdpi(u),
         now,
+        offset_at: &local_offset_at,
         btn_hover: u.hover,
         pick_hover: u.pick_hover,
         chart_hover: u.chart_hover,
@@ -1187,6 +1211,16 @@ fn draw_panel(u: &mut Ui, dc: HDC, w: i32, h: i32) {
         phase,
     };
     panel::draw(dc, w, h, &scene);
+    // The painter answered the crosshair again with this frame's candles. Taking that over keeps the
+    // stored pointer from outliving the layout it was answered from (a refold between two mouse moves).
+    if u.chart {
+        if let Some(l) = u.chart_layout.get() {
+            u.chart_at = l.aim;
+            if l.aim.is_none() {
+                u.chart_key = false;
+            }
+        }
+    }
 }
 
 /// Seconds east of UTC the machine's clock runs on right now (daylight time included): the pane's
@@ -1349,20 +1383,75 @@ fn tooltip(view: &Board, pending: Option<&str>) -> String {
 /// [`tooltip`] with one more line while alerts cannot be checked, just under the title so the tray's
 /// length limit cuts prices rather than the warning.
 fn tooltip_with(view: &Board, pending: Option<&str>, blind: Option<&str>) -> String {
+    tooltip_at(view, pending, blind, crate::source::now_s())
+}
+
+/// The tray tooltip holds this many UTF-16 units; the shell cuts the rest.
+const TIP_UNITS: usize = 127;
+
+/// [`tooltip_with`] at a given clock (UTC seconds), so a test can say what time it is.
+fn tooltip_at(view: &Board, pending: Option<&str>, blind: Option<&str>, now: f64) -> String {
+    tooltip_in(view, pending, blind, now, &local_offset_at)
+}
+
+/// [`tooltip_at`] with the zone given (`offset_at(t)` is seconds east of UTC at `t`). A row of a closed
+/// market says `closed since Fri 17:00` when the whole tooltip still fits the tray's limit with it,
+/// else `closed`; a calm row that is not yet closed shows its source and age (`CNBC 3m`). The tray
+/// holds [`TIP_UNITS`] units: when the short form is already over that, the closed rows drop their
+/// suffix (the title counts them) so the shell cuts fewer rows.
+fn tooltip_in(view: &Board, pending: Option<&str>, blind: Option<&str>, now: f64, offset_at: &dyn Fn(f64) -> i32) -> String {
     let mut s = String::new();
     if let Some(title) = pending {
         s.push_str(&format!("Alert: {title}\n"));
     }
-    s.push_str(&format!("{} - {}", config::profile().title(), theme::link_name(view.link)));
+    s.push_str(&format!("{} - {}", config::profile().title(), theme::calm_name(view.link, view.calm(now))));
     if let Some(line) = blind {
         s.push('\n');
         s.push_str(line);
     }
-    for c in &view.cells {
+    // Each row is its short form, whether its market reads closed, and, for a closed market with a
+    // since-time, a longer form.
+    let mut rows: Vec<(String, Option<String>, bool)> = Vec::new();
+    for (i, c) in view.cells.iter().enumerate() {
         if let Some(q) = &c.quote {
-            s.push_str(&format!("\n{} {}", c.label, fmt_price(q.price, c.digits)));
-            if !q.source.is_empty() { s.push_str(&format!(" ({}; age unknown)", q.source)); }
-            else if c.stale { s.push_str(" (stale)"); }
+            let mut row = format!("\n{} {}", c.label, fmt_price(q.price, c.digits));
+            let mut long = None;
+            let mut closed = false;
+            if !q.source.is_empty() { row.push_str(&format!(" ({}; age unknown)", q.source)); }
+            else if crate::model::reads_closed(c, view.link, now) {
+                closed = true;
+                row.push_str(" (closed)");
+                long = crate::model::closed_since_shown(q, now, view.last_bar_at(i))
+                    .map(|t| format!("\n{} {} (closed since {})", c.label, fmt_price(q.price, c.digits), crate::model::fmt_since(offset_at, now, t)));
+            }
+            else if crate::model::calm_stale(c, view.link, now) {
+                let src = if q.realtime { "CNBC" } else { "CNBC delayed" };
+                row.push_str(&format!(" ({src} {})", crate::panel::fmt_age(now - q.ts.unwrap_or(now))));
+            }
+            else if c.stale { row.push_str(" (stale)"); }
+            rows.push((row, long, closed));
+        }
+    }
+    let units = |t: &str| t.encode_utf16().count();
+    // A board whose short form is already over the limit drops the ` (closed)` suffix of every closed
+    // row, whether or not it has a since-time: the title counts them, and the shell would otherwise
+    // cut the last rows. One rule for all closed rows keeps the tooltip from mixing the two.
+    if units(&s) + rows.iter().map(|(r, _, _)| units(r)).sum::<usize>() > TIP_UNITS {
+        for (row, long, closed) in rows.iter_mut() {
+            if *closed {
+                *row = row.replace(" (closed)", "");
+                *long = None;
+            }
+        }
+    }
+    let mut total = units(&s) + rows.iter().map(|(r, _, _)| units(r)).sum::<usize>();
+    for (row, long, _) in rows {
+        match long {
+            Some(l) if total - units(&row) + units(&l) <= TIP_UNITS => {
+                total = total - units(&row) + units(&l);
+                s.push_str(&l);
+            }
+            _ => s.push_str(&row),
         }
     }
     s
@@ -1381,6 +1470,136 @@ mod tooltip_tests {
         assert_eq!(lit.lines().next(), Some("Alert: XAU above 4,100.00"));
         assert_eq!(lit.strip_prefix("Alert: XAU above 4,100.00\n"), Some(plain.as_str()));
     }
+
+    fn cell(label: &str, ts: Option<f64>, stale: bool) -> Cell {
+        let quote = crate::model::Quote { symbol: label.into(), price: 10.0, ts, realtime: true, ..Default::default() };
+        Cell { label: label.into(), digits: 0, quote: Some(quote), stale }
+    }
+
+    #[test]
+    fn every_surface_agrees_on_closed_at_every_age() {
+        use crate::alerts::overview;
+        use crate::config::{Alert, Config, Row};
+        let now = 1_000_000.0;
+        let est = |_: f64| -5 * 3600;
+        let rows = vec![Row { label: "XAU".into(), symbol: "XAU=".into(), digits: 2, name: String::new(), strip: true }];
+        let alert = Alert { label: "XAU".into(), above: Some(4200.0), ..Alert::default() };
+        let cfg = Config { alerts: vec![alert], rows, stale_after_s: 90.0, ..Config::default() };
+        // The stale limit is 90 s: a fresh card at 30 s, a calm age with no `closed` from 91 s to 899 s,
+        // and `closed` on every surface from 901 s.
+        for (age, closed) in [(30.0, false), (91.0, false), (300.0, false), (899.0, false), (901.0, true)] {
+            let c = cell("XAU", Some(now - age), age > 90.0);
+            let mut b = Board::new(&[]);
+            b.link = Link::Partial;
+            b.cells = vec![c.clone()];
+            let said = |text: &str| text.contains("closed");
+            let header = theme::calm_name(b.link, b.calm(now));
+            let tip = tooltip_at(&b, None, None, now);
+            let row = tip.lines().find(|l| l.starts_with("XAU")).unwrap().to_string();
+            let spoken = crate::spoken::spoken_line(&c, b.link, now);
+            let summary = crate::spoken::summary_line(&b.cells, b.link, now);
+            let over = overview(&cfg, &b, now)[0].text.clone();
+            let probe = crate::source::probe_state(&c, now);
+            let tag = crate::model::closed_card_words(&c, b.link, now, None, &est);
+            let ctx = format!("age {age}");
+            assert_eq!(said(&header), closed, "header {header}, {ctx}");
+            assert_eq!(said(&row), closed, "tooltip row {row}, {ctx}");
+            assert_eq!(said(&spoken), closed, "spoken {spoken}, {ctx}");
+            assert_eq!(said(&summary), closed, "summary {summary}, {ctx}");
+            assert_eq!(said(&over), closed, "overview {over}, {ctx}");
+            assert_eq!(probe == " CLOSED", closed, "probe {probe}, {ctx}");
+            assert_eq!(tag.as_ref().is_some_and(|w| w.last().map(String::as_str) == Some("closed")), closed, "card tag {tag:?}, {ctx}");
+            if age > 90.0 {
+                assert!(!tip.contains("stale") && !spoken.contains("stale") && !summary.contains("stale"), "{ctx}");
+                assert!(!probe.contains("STALE"), "{ctx}");
+                assert_ne!(header, theme::link_name(b.link), "the header stays calm, {ctx}");
+            }
+            if (91.0..=899.0).contains(&age) {
+                assert!(row.contains(&format!("CNBC {}", crate::panel::fmt_age(age))), "the calm age with its source: {row}, {ctx}");
+                assert!(header.contains("quiet"), "{header}, {ctx}");
+                assert_eq!(probe, " QUIET", "{ctx}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_board_with_closed_and_quiet_rows_gives_the_same_counts_everywhere() {
+        let now = 1_000_000.0;
+        let mut b = Board::new(&[]);
+        b.link = Link::Partial;
+        b.cells = vec![cell("S&P", Some(now - 5.0 * 3600.0), true), cell("XAU", Some(now - 300.0), true), cell("BTC", Some(now - 2.0), false)];
+        let header = theme::calm_name(b.link, b.calm(now));
+        let tip = tooltip_at(&b, None, None, now);
+        let summary = crate::spoken::summary_line(&b.cells, b.link, now);
+        assert_eq!(header, "CNBC live, 1 closed, 1 quiet");
+        assert!(tip.contains(&header), "{tip}");
+        assert!(summary.contains("1 closed, 1 quiet"), "{summary}");
+    }
+
+    #[test]
+    fn a_long_closed_board_drops_the_closed_suffix_to_fit_the_tray() {
+        let now = 1_000_000.0;
+        let mut b = Board::new(&[]);
+        b.link = Link::Partial;
+        b.cells = (0..6).map(|i| cell(&format!("MARKET{i}"), Some(now - 5.0 * 3600.0), true)).collect();
+        let tip = tooltip_in(&b, None, None, now, &|_| 0);
+        assert!(tip.encode_utf16().count() <= TIP_UNITS, "{tip}");
+        assert!(tip.contains("MARKET5 10"), "the last row is kept: {tip}");
+        assert!(tip.contains("markets closed"), "the title says it: {tip}");
+    }
+
+    #[test]
+    fn a_long_board_drops_the_closed_suffix_from_every_closed_row_including_one_with_no_since_time() {
+        let now = 1_000_000.0;
+        let mut b = Board::new(&[]);
+        b.link = Link::Partial;
+        // Five markets stopped on a weekday (a since-time exists); one carries a Saturday stamp and no
+        // 1D bar, so it has none.
+        b.cells = (0..5).map(|i| cell(&format!("MARKET{i}"), Some(now - 5.0 * 3600.0), true)).collect();
+        b.cells.push(cell("NEWSYM", Some(800_000.0), true));
+        let tip = tooltip_in(&b, None, None, now, &|_| 0);
+        assert!(tip.contains("NEWSYM 10"), "{tip}");
+        assert!(!tip.contains("(closed"), "no row keeps the word while the others lose it: {tip}");
+        assert!(tip.encode_utf16().count() <= TIP_UNITS + 24, "the rows are the short ones: {tip}");
+    }
+
+    #[test]
+    fn the_tooltip_adds_the_since_time_when_it_fits_the_tray() {
+        let now = crate::probe::parse_time("2026-11-14T17:18:36.000+0000").unwrap();
+        let fri = crate::probe::parse_time("2026-11-13T17:00:00.000-0500").unwrap();
+        let est = |_: f64| -5 * 3600;
+        let mut b = Board::new(&[]);
+        b.link = Link::Partial;
+        b.cells = vec![cell("S&P", Some(fri), true)];
+        let tip = tooltip_in(&b, None, None, now, &est);
+        assert!(tip.contains("S&P 10 (closed since Fri 17:00)"), "{tip}");
+        // Three long rows would pass the tray's limit, so the last one keeps the short word.
+        b.cells = (0..3).map(|i| cell(&format!("MARKET{i}"), Some(fri), true)).collect();
+        let tip = tooltip_in(&b, None, None, now, &est);
+        assert!(tip.encode_utf16().count() <= TIP_UNITS, "{tip}");
+        assert!(tip.contains("(closed)") && tip.contains("(closed since"), "the first rows that fit get the time: {tip}");
+        // A calm row that is not yet closed has its source and age and no since-time.
+        b.cells = vec![cell("XAU", Some(now - 300.0), true)];
+        let tip = tooltip_in(&b, None, None, now, &est);
+        assert!(tip.contains("XAU 10 (CNBC 5m)"), "{tip}");
+    }
+
+    #[test]
+    fn a_closed_market_reads_closed_in_the_tooltip_and_a_fault_reads_stale() {
+        let now = 1_000_000.0;
+        let mut b = Board::new(&[]);
+        b.link = Link::Partial;
+        b.cells = vec![cell("S&P", Some(now - 20.0 * 3600.0), true), cell("BTC", Some(now - 2.0), false)];
+        let tip = tooltip_at(&b, None, None, now);
+        assert!(tip.contains("CNBC live, 1 closed"), "{tip}");
+        assert!(tip.contains("S&P 10 (closed)") && !tip.contains("stale"), "{tip}");
+        b.cells.push(cell("NAS", None, true));
+        let tip = tooltip_at(&b, None, None, now);
+        assert!(tip.contains("NAS 10 (stale)") && tip.contains("S&P 10 (closed)"), "{tip}");
+        assert!(!tip.contains("live, 1 closed"), "a fault keeps the link's own words: {tip}");
+        b.link = Link::Down;
+        assert!(tooltip_at(&b, None, None, now).contains("S&P 10 (stale)"), "a dead feed is not a closed market");
+    }
 }
 
 /// The tray tooltip as the window shows it now: a pending alert, and the gap line while one lasts.
@@ -1395,11 +1614,12 @@ fn tooltip_for(u: &Ui) -> String {
 /// Rebuild the tray icon when the link colour or the alert marker differs from what it was drawn
 /// for. True when it was rebuilt (the caller then pushes it to the tray).
 fn sync_icon(u: &mut Ui) -> bool {
-    let key = (u.view.link, u.alert_pending.is_some());
+    // The key drops the closed count: the icon colour is the same for any count.
+    let key = (u.view.link, u.view.calm(crate::source::now_s()).look(), u.alert_pending.is_some());
     if u.icon_link == Some(key) {
         return false;
     }
-    let fresh = make_icon(theme::link_color(u.theme, key.0), key.1);
+    let fresh = make_icon(theme::calm_color(u.theme, key.0, key.1), key.2);
     if !u.icon.is_null() {
         unsafe { DestroyIcon(u.icon) };
     }
@@ -1672,6 +1892,32 @@ fn wake_feed() {
     };
 }
 
+/// End the feed's wait at once and have it publish, whatever the governor says. `wake_feed` is this
+/// for a user who is back, and only while a governor tick is on; a resume or a new interval needs it
+/// in both builds.
+fn kick_feed() {
+    let Some(board) = with_ui(|u| u.board.clone()) else { return };
+    if let Ok(mut b) = board.lock() {
+        b.kick = b.kick.wrapping_add(1);
+    };
+}
+
+/// Whether a new "Poll every" choice ends the feed's current wait. A longer interval can wait for the
+/// old one to run out; a shorter one would otherwise be served only after it (up to 60 s, or 120 s
+/// while backing off).
+fn poll_choice_wakes(old_s: f64, new_s: f64) -> bool {
+    new_s < old_s
+}
+
+/// `WM_POWERBROADCAST` wParam values after which the clock and the network have moved on: the machine
+/// resumed from sleep, with or without a person present. The same resume can send both.
+const PBT_APMRESUMESUSPEND: usize = 0x0007;
+const PBT_APMRESUMEAUTOMATIC: usize = 0x0012;
+
+fn is_resume(power_event: usize) -> bool {
+    power_event == PBT_APMRESUMESUSPEND || power_event == PBT_APMRESUMEAUTOMATIC
+}
+
 /// `WM_WTSSESSION_CHANGE`: record the lock in the board (state only), then wake the feed on an unlock.
 fn session_changed(locked: bool) {
     let Some(board) = with_ui(|u| u.board.clone()) else { return };
@@ -1759,7 +2005,7 @@ fn on_feed(hwnd: HWND) {
         // could not be checked (`watch`), and what a mute or quiet hours swallowed (`hush`).
         let mut notices = FeedNotices::default();
         if u.profile.ultra {
-            let (armed, fresh) = alerts::checkable(&u.cfg, &u.view);
+            let (armed, fresh) = alerts::checkable(&u.cfg, &u.view, now);
             let interval = if u.view.governed_s > 0.0 { u.view.governed_s } else { u.cfg.poll_s };
             match u.watch.step(now, fresh, armed, watch::threshold(interval)) {
                 Some(watch::Event::Back { from, to, jump }) => {
@@ -1839,6 +2085,20 @@ fn apply_visibility(hwnd: HWND) {
     }
 }
 
+/// The window's style. WS_THICKFRAME is what makes the panel resizable (and what lets Windows run its
+/// own sizing loop on wm_nchittest's HTLEFT/HTRIGHT/... edges). WM_NCCALCSIZE then returns 0, so the
+/// frame costs no visible border and no client-area offset: the look is still ours. There is no
+/// WS_MAXIMIZEBOX, so Win+Up and a drag to the top edge cannot maximise the panel (nothing here saves
+/// or restores a maximised frame).
+const WINDOW_STYLE: u32 = WS_POPUP | WS_THICKFRAME;
+
+/// Whether the strip sits in the topmost band: the Always on top setting, and always on the taskbar,
+/// where it has to stay above the taskbar. The open panel is topmost whatever this says, so every
+/// return to the strip puts this back.
+fn wants_topmost(topmost: bool, placement: Placement) -> bool {
+    topmost || placement.on_taskbar()
+}
+
 fn set_topmost(hwnd: HWND, on: bool) {
     unsafe {
         SetWindowPos(hwnd, if on { HWND_TOPMOST } else { HWND_NOTOPMOST }, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
@@ -1885,7 +2145,7 @@ fn own_by_taskbar(hwnd: HWND, dock: bool) {
     unsafe {
         if GetWindowLongPtrW(hwnd, GWLP_HWNDPARENT) as HWND != want {
             SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, want as isize);
-            let top = with_ui(|u| u.cfg.topmost || u.cfg.placement().on_taskbar()).unwrap_or(true);
+            let top = with_ui(|u| wants_topmost(u.cfg.topmost, u.cfg.placement())).unwrap_or(true);
             set_topmost(hwnd, top);
         }
     }
@@ -1992,32 +2252,54 @@ fn motion_now(u: &Ui) -> bool {
     u.motion || !u.cfg.follows_animation(u.profile.ultra)
 }
 
-/// The panel's rect: centred in the work area of the monitor the strip is on.
-fn panel_rect(near: &RECT, w: i32, h: i32) -> RECT {
+/// The work area of the monitor `near` is on.
+fn work_of(near: &RECT) -> RECT {
     unsafe {
         let mut mi: MONITORINFO = std::mem::zeroed();
         mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
         GetMonitorInfoW(MonitorFromRect(near, MONITOR_DEFAULTTONEAREST), &mut mi);
-        let wa = mi.rcWork;
-        let w = w.min(wa.right - wa.left).max(1);
-        let h = h.min(wa.bottom - wa.top).max(1);
-        let x = wa.left + (wa.right - wa.left - w) / 2;
-        let y = wa.top + (wa.bottom - wa.top - h) / 2;
-        RECT { left: x, top: y, right: x + w, bottom: y + h }
+        mi.rcWork
     }
+}
+
+/// A `w` by `h` rect centred in the work area `wa`, trimmed to it.
+fn centred_in(wa: RECT, w: i32, h: i32) -> RECT {
+    let w = w.min(wa.right - wa.left).max(1);
+    let h = h.min(wa.bottom - wa.top).max(1);
+    let x = wa.left + (wa.right - wa.left - w) / 2;
+    let y = wa.top + (wa.bottom - wa.top - h) / 2;
+    RECT { left: x, top: y, right: x + w, bottom: y + h }
+}
+
+/// The panel's rect: centred in the work area of the monitor the strip is on.
+fn panel_rect(near: &RECT, w: i32, h: i32) -> RECT {
+    centred_in(work_of(near), w, h)
+}
+
+/// How much wider than the cards' natural grid the window is when the chart pane is open: a full pane
+/// and the gap beside it, at `dpi`. The pane takes what is left over, so this is the one width where
+/// both panes are whole.
+fn chart_room(dpi: u32) -> i32 {
+    let s = |v: i32| v * dpi as i32 / 96;
+    s(720) + s(10)
+}
+
+/// The frame a panel opens at when nothing remembers one: the cards' natural size (`natural`, width and
+/// height) centred in the work area, and with the chart open (`room` is `chart_room`) also the wider
+/// frame the pane needs, which grows out from the compact one the way `grow_target` does it. The pair
+/// is what `Ui::chart_grew` records, so closing the pane later gives the width back.
+fn content_frame(work: RECT, natural: (i32, i32), room: Option<i32>) -> (RECT, Option<RECT>) {
+    let compact = centred_in(work, natural.0, natural.1);
+    (compact, room.map(|room| grown_rect(compact, natural.0 + room, work)))
 }
 
 /// Where the window goes when the chart opens, if it has to widen at all. Both panes need room: a frame
 /// that cannot hold them is widened to the two-pane size rather than squeezing the cards into one
 /// column. Records the move so closing the chart can undo exactly it.
 fn grow_target(hwnd: HWND, cur: RECT) -> Option<RECT> {
-    let (natural, chart_max, gap) = with_ui(|u| {
-        let s = |v: i32| v * pdpi(u) as i32 / 96;
-        (panel::geometry(u.view.cells.len(), catalog_len(u), pdpi(u), false), s(720), s(10))
-    })?;
-    // Wide enough for the cards' natural grid plus a full chart pane; the pane takes what is left
-    // over, so this is the one width where both are whole.
-    let want = natural.w + chart_max + gap;
+    let (natural, room) = with_ui(|u| (panel::geometry(u.view.cells.len(), catalog_len(u), pdpi(u), false), chart_room(pdpi(u))))?;
+    // Wide enough for the cards' natural grid plus a full chart pane.
+    let want = natural.w + room;
     if cur.right - cur.left >= want {
         with_ui(|u| u.chart_grew = None);
         return None;
@@ -2042,6 +2324,31 @@ fn grow_target(hwnd: HWND, cur: RECT) -> Option<RECT> {
 fn shrink_target(cur: RECT) -> Option<RECT> {
     let (before, grown) = with_ui(|u| u.chart_grew.take()).flatten()?;
     rect_after_chart(cur, grown, before).map(fit_panel)
+}
+
+/// The state the chart flag changes. The pane takes or gives back width, so the card columns refold
+/// and the header buttons move: every stored pointer position names the old layout and is dropped.
+fn chart_state(u: &mut Ui, on: bool) {
+    u.chart = on;
+    u.hover = false;
+    u.pick_hover = false;
+    u.chart_hover = false;
+    u.gear_hover = false;
+    u.open_hover = false;
+    u.hover_at = None;
+    u.chart_at = None;
+    u.chart_layout.set(None);
+    // The pane reopens on the range last used (`chart_range`), so the range is not reset here; the
+    // cache keeps what was fetched.
+    if on {
+        u.pick_open = false;
+        // Nothing locked yet: lock the first card, so the pane opens on a chart instead of an
+        // instruction. A second click on the locked card unlocks it again.
+        if u.profile.ultra && selected_row(u).is_none() {
+            u.selected = u.view.cells.first().map(|c| c.label.clone());
+        }
+        want_range(u);
+    }
 }
 
 /// Open or close the candle pane, with the window gliding to match: opening widens it (centred on where
@@ -2085,24 +2392,7 @@ fn set_chart(hwnd: HWND, on: bool) {
         let (w, h) = size(cur);
         with_ui(|u| (snapshot(hwnd, w, h, |dc| draw_panel(u, dc, w, h)), (w, h)))
     });
-    with_ui(|u| {
-        u.chart = on;
-        u.open_hover = false;
-        u.chart_hover = false;
-        u.chart_at = None;
-        u.chart_layout.set(None);
-        // The pane reopens on the range last used (`chart_range`), so the range is not reset here; the
-        // cache keeps what was fetched.
-        if on {
-            u.pick_open = false;
-            // Nothing locked yet: lock the first card, so the pane opens on a chart instead of an
-            // instruction. A second click on the locked card unlocks it again.
-            if u.profile.ultra && selected_row(u).is_none() {
-                u.selected = u.view.cells.first().map(|c| c.label.clone());
-            }
-            want_range(u);
-        }
-    });
+    with_ui(|u| chart_state(u, on));
     if let Some(to_rect) = target {
         let (w, h) = size(to_rect);
         let to = with_ui(|u| (snapshot(hwnd, w, h, |dc| draw_panel(u, dc, w, h)), (w, h)));
@@ -2175,7 +2465,14 @@ fn expand(hwnd: HWND) {
             fit_panel(last)
         } else { match u.cfg.panel {
             Some(p) => fit_panel(RECT { left: p[0], top: p[1], right: p[0] + p[2], bottom: p[1] + p[3] }),
-            None => panel_rect(&a, natural.w, natural.h),
+            // The chart flag can be on while the strip shows (a zoom change dropped the frame): the
+            // panel then opens wide enough for the pane, or the cards would lose columns to it.
+            None => {
+                let room = u.chart.then(|| chart_room(pdpi(u)));
+                let (compact, grown) = content_frame(work_of(&a), (natural.w, natural.h), room);
+                u.chart_grew = grown.map(|g| (compact, g));
+                grown.unwrap_or(compact)
+            }
         }};
         // The content is laid out for the frame it is about to be drawn in, not for the one it would
         // have had if the window were still content-sized.
@@ -2254,6 +2551,9 @@ fn collapse(hwnd: HWND) {
     })
     .unwrap_or(b);
     sync_anim(hwnd);
+    // `expand` made the window topmost for the panel; the strip goes back to what the settings say.
+    let top = with_ui(|u| wants_topmost(u.cfg.topmost, u.cfg.placement())).unwrap_or(true);
+    set_topmost(hwnd, top);
     unsafe {
         SetWindowPos(hwnd, null_mut(), b.left, b.top, b.right - b.left, b.bottom - b.top, SWP_NOZORDER | SWP_NOACTIVATE);
         InvalidateRect(hwnd, null(), 0);
@@ -2271,56 +2571,17 @@ fn menu(hwnd: HWND, at: Option<(i32, i32)>) {
     menu_at(hwnd, at, None)
 }
 
-/// The panel's settings button: the same menu the tray icon opens, dropped from under the button
-/// (left edges aligned; Windows slides it back on screen if it would not fit) instead of wherever
-/// the cursor happened to be.
-fn settings_menu(hwnd: HWND) {
-    let Some((x, y)) = with_ui(|u| {
-        let g = panel_geo(u);
-        (g.gear_btn.left, g.gear_btn.bottom + 4 * pdpi(u) as i32 / 96)
-    }) else {
-        return;
-    };
-    let mut pt = POINT { x, y };
-    unsafe { ClientToScreen(hwnd, &mut pt) };
-    menu_at(hwnd, None, Some((pt.x, pt.y)));
-    // The menu ran its own message loop, so the pointer's departure from the button was never seen.
-    with_ui(|u| u.gear_hover = false);
-    unsafe { InvalidateRect(hwnd, null(), 0) };
-}
-
 /// `anchor` is a screen point to drop the menu from; `None` drops it at the cursor.
 fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
     clear_pending(hwnd);
-    #[allow(clippy::type_complexity)]
-    let Some((visible, top, docked, status, open, list, shown, theme_name, theme_font, poll_s, ultra, picked, alerted)) = with_ui(|u| {
-        let list = config::menu_list(&u.cfg);
-        let shown: Vec<bool> = list.iter().map(|r| config::is_shown(&u.cfg, &r.symbol)).collect();
-        let note = if u.view.note.is_empty() { theme::link_name(u.view.link).to_string() } else { u.view.note.clone() };
-        let shown_labels: Vec<&str> = list.iter().zip(&shown).filter(|(_, on)| **on).map(|(r, _)| r.label.as_str()).collect();
-        let alerted = armed_labels(&u.cfg.alerts, &shown_labels);
-        (
-            u.cfg.strip_visible,
-            u.cfg.topmost,
-            u.cfg.placement().on_taskbar(),
-            note,
-            u.mode != Mode::Strip,
-            list,
-            shown,
-            u.cfg.theme.clone(),
-            u.cfg.theme_font.clone(),
-            u.cfg.poll_s,
-            u.profile.ultra,
-            u.pick_open,
-            alerted,
-        )
+    let Some((visible, top, status, open, ultra, picked)) = with_ui(|u| {
+        let note = if u.view.note.is_empty() { theme::calm_name(u.view.link, u.view.calm(crate::source::now_s())) } else { u.view.note.clone() };
+        (u.cfg.strip_visible, u.cfg.topmost, note, u.mode != Mode::Strip, u.profile.ultra, u.pick_open)
     }) else {
         return;
     };
-    let (placement, cur_mon) = with_ui(|u| (u.cfg.placement(), u.cfg.monitor.clone())).unwrap_or((Placement::Auto, None));
-    let mons = dock::monitors();
     let mut commands = crate::menu_commands::MenuCommands::default();
-    let cmd = unsafe {
+    let (cmd, before) = unsafe {
         let m = CreatePopupMenu();
         let add = |menu: HMENU, flags: u32, id: usize, text: &str| {
             let t = wide(text);
@@ -2399,372 +2660,25 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
             if let Some((symbol, pos, count)) = place {
                 AppendMenuW(m, MF_SEPARATOR, 0, null());
                 let grey = |off: bool| MF_STRING | if off { MF_GRAYED } else { 0 };
-                dynamic(m, grey(pos == 0), &mut commands, Action::Move(symbol.clone(), -1), "Move left");
-                dynamic(m, grey(pos + 1 >= count), &mut commands, Action::Move(symbol.clone(), 1), "Move right");
-                dynamic(m, grey(pos == 0), &mut commands, Action::MoveFirst(symbol.clone()), "Move first");
+                let [left, right, first] = move_enabled(pos, count);
+                dynamic(m, grey(!left), &mut commands, Action::Move(symbol.clone(), -1), "Move left");
+                dynamic(m, grey(!right), &mut commands, Action::Move(symbol.clone(), 1), "Move right");
+                dynamic(m, grey(!first), &mut commands, Action::MoveFirst(symbol.clone()), "Move first");
                 dynamic(m, grey(count <= 1), &mut commands, Action::Remove(symbol), "Remove from strip");
             }
             AppendMenuW(m, MF_SEPARATOR, 0, null());
         }
-        // Symbols: tick to show, untick to hide. The last one cannot go; at most MAX_ROWS show.
-        let n_shown = shown.iter().filter(|s| **s).count();
-        let full = n_shown >= config::MAX_ROWS;
-        let syms = CreatePopupMenu();
-        for (i, r) in list.iter().enumerate() {
-            let on = shown[i];
-            let locked = if on { n_shown <= 1 } else { full };
-            let flags = MF_STRING | if on { MF_CHECKED } else { 0 } | if locked { MF_GRAYED } else { 0 };
-            let text = if r.name.is_empty() { r.label.clone() } else { format!("{}\t{}", r.label, r.name) };
-            dynamic(syms, flags, &mut commands, crate::menu_commands::Action::Symbol(r.symbol.clone()), &text);
-        }
-        AppendMenuW(syms, MF_SEPARATOR, 0, null());
-        // Add and remove by hand (both builds). Read in a call of its own: the big tuple is not extended.
-        let (adding, custom) = with_ui(|u| (u.adding.clone(), config::custom_entries(&u.cfg))).unwrap_or((None, Vec::new()));
-        match &adding {
-            Some(symbol) => add(syms, MF_STRING | MF_GRAYED, CMD_ADD_SYMBOL, &format!("Adding {symbol}...")),
-            None => add(syms, MF_STRING, CMD_ADD_SYMBOL, "Add symbol..."),
-        }
-        let forget = CreatePopupMenu();
-        for r in &custom {
-            // The only symbol shown cannot go, here as everywhere.
-            let last = n_shown <= 1 && list.iter().zip(&shown).any(|(l, on)| *on && l.symbol == r.symbol);
-            let text = format!("{}\t{}", r.label, r.symbol);
-            dynamic(forget, MF_STRING | if last { MF_GRAYED } else { 0 }, &mut commands, crate::menu_commands::Action::Forget(r.symbol.clone()), &text);
-        }
-        add(syms, MF_POPUP | if custom.is_empty() { MF_GRAYED } else { 0 }, forget as usize, "Remove a symbol I added");
-        let order = CreatePopupMenu();
-        add(order, MF_STRING, CMD_ORDER_MOVE, "By day move, biggest first");
-        add(order, MF_STRING, CMD_ORDER_NAME, "By name, A to Z");
-        add(order, MF_STRING, CMD_ORDER_DEFAULT, "Default order");
-        add(syms, MF_POPUP | if n_shown <= 1 { MF_GRAYED } else { 0 }, order as usize, "Order the cards (once)");
-        let unpinned = with_ui(|u| u.cfg.rows.iter().any(|r| !r.strip)).unwrap_or(false);
-        add(syms, MF_STRING | if unpinned { 0 } else { MF_GRAYED }, CMD_PIN_ALL, "Show all on strip");
-        add(syms, MF_STRING, CMD_RESET, "Reset to default");
+        item(MF_STRING, CMD_SETTINGS, "Settings...");
         item(MF_STRING, CMD_PANEL, if open { "Back to taskbar" } else { "Expand view" });
         SetMenuDefaultItem(m, CMD_PANEL as u32, 0);
-        add(m, MF_POPUP, syms as usize, &format!("Symbols ({n_shown})"));
+        item(MF_STRING, CMD_REFRESH, "Refresh now");
+        item(MF_STRING, CMD_COPY_ALL, "Copy all prices");
         // Undo (W3 J2): one snapshot, so one line; it says what it would undo.
         match with_ui(|u| u.undo.kind()).flatten() {
             Some(kind) => item(MF_STRING, CMD_UNDO, &format!("Undo the last {}{}", kind.label(), if ultra { "\tCtrl+Z" } else { "" })),
             None => item(MF_STRING | MF_GRAYED, CMD_UNDO, "Undo"),
         }
-        // Poll interval: `poll_s` has always been in the config; nothing exposed it until now.
-        let poll = CreatePopupMenu();
-        for (i, secs) in POLL_CHOICES.iter().enumerate() {
-            add(poll, MF_STRING, CMD_POLL + i, &format!("{secs} s"));
-        }
-        let cur_poll = POLL_CHOICES.iter().position(|secs| (secs - poll_s).abs() < 0.01).unwrap_or(2);
-        CheckMenuRadioItem(
-            poll,
-            CMD_POLL as u32,
-            (CMD_POLL + POLL_CHOICES.len() - 1) as u32,
-            (CMD_POLL + cur_poll) as u32,
-            MF_BYCOMMAND,
-        );
-        // The governor (W2): the choice above is the pace while prices move; these two only ever slow it,
-        // and never below one poll in 15 s while an alert is armed.
-        let gov = with_ui(|u| u.cfg.governor(u.profile.ultra)).unwrap_or_default();
-        AppendMenuW(poll, MF_SEPARATOR, 0, null());
-        add(poll, MF_STRING | if gov.slow_when_quiet { MF_CHECKED } else { 0 }, CMD_SLOW_QUIET, "Slow down when nothing moves");
-        add(poll, MF_STRING | if gov.rest_when_locked { MF_CHECKED } else { 0 }, CMD_REST_LOCKED, "Rest while the PC is locked");
-        add(m, MF_POPUP, poll as usize, &format!("Poll every {poll_s} s"));
-        let sources = CreatePopupMenu();
-        let fallback = with_ui(|u| u.cfg.fallback_enabled).unwrap_or(false);
-        add(sources, MF_STRING | if fallback { MF_CHECKED } else { 0 }, CMD_FALLBACK, "Allow fallback sources");
-        add(m, MF_POPUP, sources as usize, "Data sources");
-        item(MF_STRING, CMD_REFRESH, "Refresh now");
-        item(MF_STRING, CMD_COPY_ALL, "Copy all prices");
-        let reach = reach_view();
-        {
-            let acc = CreatePopupMenu();
-            let on = |b: bool| MF_STRING | if b { MF_CHECKED } else { 0 };
-            if ultra {
-                for (i, mode) in crate::updown::UpDown::ALL.iter().enumerate() {
-                    add(acc, on(reach.updown == *mode), CMD_UPDOWN + i, mode.label());
-                }
-                add(acc, on(reach.hollow), CMD_HOLLOW, "Hollow up candles");
-                AppendMenuW(acc, MF_SEPARATOR, 0, null());
-            }
-            add(acc, on(reach.contrast), CMD_CONTRAST, "Follow the Windows contrast theme");
-            add(acc, on(reach.animate), CMD_ANIMATE, "Follow the Windows animation setting");
-            if ultra {
-                AppendMenuW(acc, MF_SEPARATOR, 0, null());
-                for (i, z) in crate::zoom::STEPS.iter().enumerate() {
-                    add(acc, on(reach.zoom == *z), CMD_ZOOM + i, &format!("Panel size {z} %"));
-                }
-            }
-            add(m, MF_POPUP, acc as usize, "Accessibility");
-        }
-        if ultra {
-            // Theme: four tier submenus, because 25 entries in one popup is a wall. The tier is a
-            // rendering rule (`theme::Kind`), so the menu cannot disagree with the painter.
-            let th = CreatePopupMenu();
-            let cur = theme::index_of(&theme_name);
-            for kind in theme::Kind::ALL {
-                let sub = CreatePopupMenu();
-                // The tier explains itself, so "Animated" and "Retro" do not need a README.
-                add(sub, MF_STRING | MF_GRAYED, 0, kind.note());
-                AppendMenuW(sub, MF_SEPARATOR, 0, null());
-                for i in theme::tier(kind) {
-                    let t = &theme::ALL[i];
-                    let flags = MF_STRING | if i == cur { MF_CHECKED } else { 0 };
-                    add(sub, flags, CMD_THEME + i, &format!("{}\t{}", t.name, t.note));
-                }
-                add(th, MF_POPUP, sub as usize, kind.label());
-            }
-            add(m, MF_POPUP, th as usize, &format!("Theme \u{b7} {}", theme::ALL[cur].name));
-            // Font: the same idea one axis over — grouped by family, not one list of 13 names.
-            let face = theme::font_of(&theme::ALL[cur], theme_font.as_deref());
-            let ft = CreatePopupMenu();
-            for group in theme::FACE_GROUPS {
-                let sub = CreatePopupMenu();
-                for (i, f) in theme::FACES.iter().enumerate().filter(|(_, f)| f.group == group) {
-                    // A face this machine cannot draw is greyed rather than hidden: the menu is a
-                    // catalogue of what the app can do, and "installed on other machines" is
-                    // information, not noise.
-                    let missing = !theme::face_available(f.name);
-                    let flags = MF_STRING
-                        | if f.name == face { MF_CHECKED } else { 0 }
-                        | if missing { MF_GRAYED } else { 0 };
-                    add(sub, flags, CMD_FONT + i, &format!("{}\t{}", f.name, f.note));
-                }
-                add(ft, MF_POPUP, sub as usize, group);
-            }
-            add(m, MF_POPUP, ft as usize, &format!("Font \u{b7} {face}"));
-            item(MF_STRING | if picked { MF_CHECKED } else { 0 }, CMD_PICK, "Symbol picker");
-            // Alerts: per symbol the presets, what is set and Clear; then the settings that apply
-            // to every alert. The state is read in one separate `with_ui` call (`alerts_view`).
-            let av = alerts_view(&list, &shown).unwrap_or_default();
-            let al = CreatePopupMenu();
-            for row in &av.rows {
-                let sub = CreatePopupMenu();
-                let mut group = None;
-                for (k, p) in alerts::PRESETS.iter().enumerate() {
-                    if group.is_some_and(|g| g != p.group) {
-                        AppendMenuW(sub, MF_SEPARATOR, 0, null());
-                    }
-                    group = Some(p.group);
-                    let on = row.enabled.get(k).copied().unwrap_or(false);
-                    dynamic(sub, MF_STRING | if on { 0 } else { MF_GRAYED }, &mut commands, crate::menu_commands::Action::Alert(row.label.clone(), k), p.label);
-                }
-                // The fast move: from the hour of samples held, so it needs no fresh price to be set.
-                AppendMenuW(sub, MF_SEPARATOR, 0, null());
-                let cur_fast = row.alert.as_ref().map_or(0, |a| a.fast as usize);
-                for k in 0..alerts::FAST_MOVES.len() {
-                    let text = format!("fast move {}", alerts::fast_label(k));
-                    dynamic(sub, MF_STRING | if cur_fast == k + 1 { MF_CHECKED } else { 0 }, &mut commands, crate::menu_commands::Action::Fast(row.label.clone(), k), &text);
-                }
-                // A level typed by hand: greyed without a fresh price, like the presets.
-                AppendMenuW(sub, MF_SEPARATOR, 0, null());
-                dynamic(sub, MF_STRING | if row.fresh { 0 } else { MF_GRAYED }, &mut commands, crate::menu_commands::Action::AlertAt(row.label.clone()), "at a price...");
-                // How long this symbol's alert waits before it can fire again, typed.
-                let cooldown = row.alert.as_ref().map(|a| a.cooldown_s);
-                let text = match cooldown {
-                    Some(c) => format!("cooldown {}...", crate::typed::cooldown_text(c)),
-                    None => "cooldown...".to_string(),
-                };
-                dynamic(sub, MF_STRING | if cooldown.is_some() { 0 } else { MF_GRAYED }, &mut commands, crate::menu_commands::Action::Cooldown(row.label.clone()), &text);
-                AppendMenuW(sub, MF_SEPARATOR, 0, null());
-                let line = row.alert.as_ref().map(|a| alerts::describe(a, row.digits)).filter(|d| !d.is_empty());
-                add(sub, MF_STRING | MF_GRAYED, 0, &line.unwrap_or_else(|| "nothing set".into()));
-                if alerted.contains(&row.label) {
-                    dynamic(sub, MF_STRING, &mut commands, crate::menu_commands::Action::ClearAlert(row.label.clone()), "Clear this symbol's alerts");
-                }
-                add(al, MF_POPUP, sub as usize, &row.label);
-            }
-            if av.rows.is_empty() {
-                add(al, MF_GRAYED, 0, "(no symbols shown)");
-            }
-            AppendMenuW(al, MF_SEPARATOR, 0, null());
-            // At a glance: everything that is set, how far each level is, and Clear all.
-            let glance = CreatePopupMenu();
-            if av.overview.is_empty() {
-                add(glance, MF_STRING | MF_GRAYED, 0, "(nothing set)");
-            }
-            for line in &av.overview {
-                add(glance, MF_STRING | MF_GRAYED, 0, &line.text.replace('&', "&&"));
-            }
-            AppendMenuW(glance, MF_SEPARATOR, 0, null());
-            add(glance, MF_STRING | if av.overview.is_empty() { MF_GRAYED } else { 0 }, CMD_ALERTS_CLEAR_ALL, "Clear all alerts...");
-            let cannot_fire = av.overview.iter().filter(|l| l.warn).count();
-            let glance_title = if cannot_fire > 0 {
-                format!("At a glance ({}, {cannot_fire} cannot fire)", av.overview.len())
-            } else {
-                format!("At a glance ({})", av.overview.len())
-            };
-            add(al, MF_POPUP, glance as usize, &glance_title);
-            // Repeat: how an alert comes back after it has fired. Every cooldown is 1.8's rule.
-            let repeat = CreatePopupMenu();
-            add(repeat, MF_STRING, CMD_REPEAT_COOLDOWN, "Every cooldown");
-            add(repeat, MF_STRING, CMD_ALERT_ONCE, "Fire once, then clear");
-            add(repeat, MF_STRING, CMD_REPEAT_CROSSING, "Each crossing");
-            let (cur_repeat, repeat_word) = if av.once {
-                (CMD_ALERT_ONCE, "once")
-            } else if av.crossing {
-                (CMD_REPEAT_CROSSING, "each crossing")
-            } else {
-                (CMD_REPEAT_COOLDOWN, "every cooldown")
-            };
-            CheckMenuRadioItem(repeat, CMD_REPEAT_COOLDOWN as u32, CMD_REPEAT_CROSSING as u32, cur_repeat as u32, MF_BYCOMMAND);
-            add(al, MF_POPUP, repeat as usize, &format!("Repeat \u{b7} {repeat_word}"));
-            // Mute. A timed mute ends by the clock; the label says when, in this PC's local time.
-            let mute = CreatePopupMenu();
-            add(mute, MF_STRING, CMD_MUTE_1H, "For 1 hour");
-            add(mute, MF_STRING, CMD_MUTE_8H, "For 8 hours");
-            add(mute, MF_STRING, CMD_MUTE_UNTIL, "Until a time...");
-            add(mute, MF_STRING, CMD_MUTE_INDEF, "Until I turn it back on");
-            AppendMenuW(mute, MF_SEPARATOR, 0, null());
-            let (mute_title, is_muted) = match av.silence {
-                Some(alerts::Silence::Muted) => ("Muted".to_string(), true),
-                Some(alerts::Silence::MutedUntil(t)) => (format!("Muted until {}", alerts::local_hhmm(&local_offset_at, av.now, t)), true),
-                _ => ("Mute".to_string(), false),
-            };
-            add(mute, MF_STRING | if is_muted { 0 } else { MF_GRAYED }, CMD_UNMUTE, "Unmute");
-            add(al, MF_POPUP, mute as usize, &mute_title);
-            // Quiet hours (local time).
-            let quiet = CreatePopupMenu();
-            add(quiet, MF_STRING, CMD_QUIET_OFF, "Off");
-            for (i, [from, to]) in alerts::QUIET_CHOICES.iter().enumerate() {
-                add(quiet, MF_STRING, CMD_QUIET + i, &format!("{} to {}", alerts::hhmm(*from), alerts::hhmm(*to)));
-            }
-            let custom_quiet = av.quiet.filter(|w| w[0] != w[1] && !alerts::QUIET_CHOICES.contains(w));
-            let typed_text = custom_quiet.map_or("Type hours...".to_string(), |w| format!("{}...", crate::typed::span_text(w)));
-            add(quiet, MF_STRING | if custom_quiet.is_some() { MF_CHECKED } else { 0 }, CMD_QUIET_TYPE, &typed_text);
-            let cur_quiet = match av.quiet {
-                None => Some(CMD_QUIET_OFF),
-                Some(w) => alerts::QUIET_CHOICES.iter().position(|c| *c == w).map(|i| CMD_QUIET + i),
-            };
-            if let Some(c) = cur_quiet {
-                CheckMenuRadioItem(quiet, CMD_QUIET_OFF as u32, (CMD_QUIET + alerts::QUIET_CHOICES.len() - 1) as u32, c as u32, MF_BYCOMMAND);
-            }
-            let quiet_title = match av.quiet {
-                Some([f, t]) if f != t => format!("Quiet hours \u{b7} {} to {}", alerts::hhmm(f), alerts::hhmm(t)),
-                _ => "Quiet hours".to_string(),
-            };
-            add(al, MF_POPUP, quiet as usize, &quiet_title);
-            // Webhook: only the host is ever shown.
-            let hook = CreatePopupMenu();
-            let hook_text = av.host.as_ref().map_or("(no webhook set)".to_string(), |h| format!("Sends to {h}"));
-            add(hook, MF_STRING | MF_GRAYED, CMD_HOOK_HOST, &hook_text);
-            AppendMenuW(hook, MF_SEPARATOR, 0, null());
-            add(hook, MF_STRING, CMD_HOOK_PASTE, "Paste URL from clipboard");
-            let has_hook = av.host.is_some();
-            add(hook, MF_STRING | if has_hook { 0 } else { MF_GRAYED }, CMD_HOOK_TEST, "Send a test alert");
-            add(hook, MF_STRING | if has_hook { 0 } else { MF_GRAYED }, CMD_HOOK_REMOVE, "Remove");
-            AppendMenuW(hook, MF_SEPARATOR, 0, null());
-            add(
-                hook,
-                MF_STRING | if has_hook { 0 } else { MF_GRAYED } | if av.gap_notice { MF_CHECKED } else { 0 },
-                CMD_GAP_NOTICE,
-                "Say when alerts could not be checked",
-            );
-            add(al, MF_POPUP, hook as usize, "Webhook");
-            // Recent alerts, newest first.
-            let recent = CreatePopupMenu();
-            if av.log.is_empty() {
-                add(recent, MF_STRING | MF_GRAYED, 0, "(nothing yet)");
-            }
-            for e in &av.log {
-                add(recent, MF_STRING | MF_GRAYED, 0, &alerts::entry_line(e, &local_offset_at, av.now).replace('&', "&&"));
-            }
-            AppendMenuW(recent, MF_SEPARATOR, 0, null());
-            add(recent, MF_STRING | if av.log.is_empty() { MF_GRAYED } else { 0 }, CMD_LOG_COPY, "Copy list");
-            add(recent, MF_STRING | if av.log.is_empty() { MF_GRAYED } else { 0 }, CMD_LOG_CLEAR, "Clear list");
-            add(al, MF_POPUP, recent as usize, &format!("Recent ({})", av.log.len()));
-            add(m, MF_POPUP, al as usize, &format!("Alerts ({})", alerted.len()));
-        }
-        AppendMenuW(m, MF_SEPARATOR, 0, null());
         item(MF_STRING | if visible { MF_CHECKED } else { 0 }, CMD_STRIP, "Show strip");
-        // Position: where the strip sits (and on which display, when there are several).
-        let pos = CreatePopupMenu();
-        for (i, p) in Placement::ALL.iter().enumerate() {
-            add(pos, MF_STRING, CMD_POS + i, p.label());
-        }
-        let cur = Placement::ALL.iter().position(|p| *p == placement).unwrap_or(0);
-        let last = CMD_POS + Placement::ALL.len() - 1;
-        CheckMenuRadioItem(pos, CMD_POS as u32, last as u32, (CMD_POS + cur) as u32, MF_BYCOMMAND);
-        if mons.len() > 1 {
-            AppendMenuW(pos, MF_SEPARATOR, 0, null());
-            let primary = mons.iter().position(|d| d.primary).unwrap_or(0);
-            let active = mons.iter().position(|d| Some(&d.device) == cur_mon.as_ref()).unwrap_or(primary);
-            let mut monitor_ids = Vec::with_capacity(mons.len());
-            for (i, d) in mons.iter().enumerate() {
-                let (w, h) = (d.bounds.right - d.bounds.left, d.bounds.bottom - d.bounds.top);
-                let main = if d.primary { ", main" } else { "" };
-                let id = dynamic(pos, MF_STRING, &mut commands,
-                    crate::menu_commands::Action::Monitor((!d.primary).then(|| d.device.clone())),
-                    &format!("Display {}{main}\t{w} x {h}", i + 1));
-                monitor_ids.push(id);
-            }
-            if let (Some(first), Some(last), Some(selected)) = (
-                monitor_ids.iter().flatten().next(), monitor_ids.iter().flatten().next_back(), monitor_ids[active]
-            ) {
-                CheckMenuRadioItem(pos, *first as u32, *last as u32, selected as u32, MF_BYCOMMAND);
-            }
-        }
-        add(m, MF_POPUP | if open { MF_GRAYED } else { 0 }, pos as usize, "Position");
-        item(MF_STRING | if top || docked { MF_CHECKED } else { 0 } | if docked { MF_GRAYED } else { 0 }, CMD_TOP, "Always on top");
-        // Strip: rows, text size and opacity, applied live. Radio marks show the nearest step.
-        {
-            let (rows, dock_pt, pt, opacity) =
-                with_ui(|u| (u.cfg.dock_rows, u.cfg.dock_font_pt, u.cfg.font_pt, u.cfg.opacity)).unwrap_or((2, 9, 10, 235));
-            let st = CreatePopupMenu();
-            let sub_rows = CreatePopupMenu();
-            for (i, n) in STRIP_ROWS.iter().enumerate() {
-                add(sub_rows, MF_STRING, CMD_STRIP_ROWS + i, &format!("{n} row{}", if *n == 1 { "" } else { "s" }));
-            }
-            CheckMenuRadioItem(sub_rows, CMD_STRIP_ROWS as u32, (CMD_STRIP_ROWS + STRIP_ROWS.len() - 1) as u32,
-                (CMD_STRIP_ROWS + nearest_rows(rows)) as u32, MF_BYCOMMAND);
-            add(st, MF_POPUP | if docked { 0 } else { MF_GRAYED }, sub_rows as usize, "Rows in the taskbar");
-            let sub_text = CreatePopupMenu();
-            for (i, (_, _, label)) in TEXT_STEPS.iter().enumerate() {
-                add(sub_text, MF_STRING, CMD_STRIP_TEXT + i, label);
-            }
-            CheckMenuRadioItem(sub_text, CMD_STRIP_TEXT as u32, (CMD_STRIP_TEXT + TEXT_STEPS.len() - 1) as u32,
-                (CMD_STRIP_TEXT + nearest_text(dock_pt, pt)) as u32, MF_BYCOMMAND);
-            add(st, MF_POPUP, sub_text as usize, "Text size");
-            let sub_op = CreatePopupMenu();
-            for (i, (_, label)) in OPACITY_STEPS.iter().enumerate() {
-                add(sub_op, MF_STRING, CMD_STRIP_OPACITY + i, label);
-            }
-            CheckMenuRadioItem(sub_op, CMD_STRIP_OPACITY as u32, (CMD_STRIP_OPACITY + OPACITY_STEPS.len() - 1) as u32,
-                (CMD_STRIP_OPACITY + nearest_opacity(opacity)) as u32, MF_BYCOMMAND);
-            add(st, MF_POPUP, sub_op as usize, "Opacity");
-            add(m, MF_POPUP, st as usize, "Strip");
-        }
-        // Start with Windows: the registry is the source of truth, read each time the menu opens.
-        item(MF_STRING | if autostart::enabled(config::profile().id) { MF_CHECKED } else { 0 }, CMD_AUTOSTART, "Start with Windows");
-        // Hotkey: Off, the presets, and the configured combo when it is none of them.
-        {
-            let (cfg_key, failed) = with_ui(|u| (u.cfg.hotkey.clone(), u.hotkey_failed)).unwrap_or((None, false));
-            let hk = CreatePopupMenu();
-            let parsed = cfg_key.as_deref().and_then(hotkey::parse);
-            let preset = cfg_key.as_deref().and_then(hotkey::preset_index);
-            let custom = cfg_key.as_ref().filter(|_| preset.is_none());
-            let note = if !failed { "" } else if parsed.is_some() { " (in use by another app)" } else { " (not a valid hotkey)" };
-            add(hk, MF_STRING, CMD_HOTKEY, "Off");
-            for (i, p) in hotkey::PRESETS.iter().enumerate() {
-                let tail = if preset == Some(i) { note } else { "" };
-                add(hk, MF_STRING, CMD_HOTKEY + 1 + i, &format!("{p}{tail}"));
-            }
-            if let Some(text) = custom {
-                let shown = parsed.map(|c| hotkey::label(&c)).unwrap_or_else(|| text.chars().take(24).collect());
-                add(hk, MF_STRING, CMD_HOTKEY_CUSTOM, &format!("{shown}{note}"));
-            }
-            AppendMenuW(hk, MF_SEPARATOR, 0, null());
-            add(hk, MF_STRING, CMD_HOTKEY_TYPE, "Type a hotkey...");
-            let selected = match (&cfg_key, preset) {
-                (None, _) => CMD_HOTKEY,
-                (Some(_), Some(i)) => CMD_HOTKEY + 1 + i,
-                (Some(_), None) => CMD_HOTKEY_CUSTOM,
-            };
-            CheckMenuRadioItem(hk, CMD_HOTKEY as u32, CMD_HOTKEY_CUSTOM as u32, selected as u32, MF_BYCOMMAND);
-            let head = match &cfg_key {
-                None => "Hotkey \u{b7} off".to_string(),
-                Some(text) => format!("Hotkey \u{b7} {}{note}", parsed.map(|c| hotkey::label(&c)).unwrap_or_else(|| text.chars().take(24).collect())),
-            };
-            add(m, MF_POPUP, hk as usize, &head);
-        }
         AppendMenuW(m, MF_SEPARATOR, 0, null());
         let status: String = status.chars().take(90).collect();
         item(MF_STRING | MF_GRAYED, CMD_STATUS, &status);
@@ -2774,19 +2688,6 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
         if let Some(name) = config::kept_bad_config() {
             item(MF_STRING | MF_GRAYED, CMD_KEPT_STATUS, &format!("Settings were unreadable; kept as {name}, defaults loaded"));
         }
-        item(MF_STRING | MF_GRAYED, CMD_METER, &crate::source::meter_line());
-        item(MF_STRING | MF_GRAYED, CMD_VERSION, &format!("{} {}", config::profile().title(), env!("CARGO_PKG_VERSION")));
-        if with_ui(|u| u.update_running).unwrap_or(false) {
-            item(MF_STRING | MF_GRAYED, CMD_UPDATE, "Checking...");
-        } else {
-            item(MF_STRING, CMD_UPDATE, "Check for updates");
-        }
-        if with_ui(|u| u.report_running).unwrap_or(false) {
-            item(MF_STRING | MF_GRAYED, CMD_REPORT, "Diagnostics report: checking...");
-        } else {
-            item(MF_STRING, CMD_REPORT, "Copy diagnostics report");
-        }
-        item(MF_STRING, CMD_FOLDER, "Open config folder");
         AppendMenuW(m, MF_SEPARATOR, 0, null());
         item(MF_STRING, CMD_EXIT, "Quit");
         let mut pt = POINT { x: 0, y: 0 };
@@ -2796,15 +2697,51 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
                 GetCursorPos(&mut pt);
             }
         }
+        // A menu only closes on a click outside it when its owner is the foreground window, so the
+        // strip takes the foreground for the menu; the window that had it gets it back afterwards.
+        let before = GetForegroundWindow();
         SetForegroundWindow(hwnd);
         let cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, null());
         PostMessageW(hwnd, WM_NULL, 0, 0);
         DestroyMenu(m);
-        cmd as usize
+        (cmd as usize, before)
     };
     // Dynamic actions are assigned unique IDs when this particular menu is built. They retain
     // their row identity even if an event changes the catalogue during the modal menu loop.
     if let Some(action) = commands.get(cmd) {
+        run_action(hwnd, action);
+    } else {
+        run_command(hwnd, cmd, Listed { open, visible, top, picked, ultra });
+    }
+    release_foreground(hwnd, before);
+}
+
+/// After a menu and the command it chose: if the strip is still a strip and still the foreground window,
+/// the window that was in front before the menu gets the foreground back (`foreground_after_menu`).
+/// Read now, so a command that opened a window or expanded the panel is left as it left things.
+fn release_foreground(hwnd: HWND, before: HWND) {
+    let Some(mode) = with_ui(|u| u.mode) else { return };
+    unsafe {
+        if let Some(window) = foreground_after_menu(mode, hwnd, before, IsWindow(before) != 0, GetForegroundWindow() == hwnd) {
+            SetForegroundWindow(window);
+        }
+    }
+}
+
+/// What the menu (or the settings window) knew about the window when the command was listed: the mode,
+/// the strip flag, always-on-top and the picker. `run_command` reads the live mode itself.
+#[derive(Clone, Copy)]
+struct Listed {
+    open: bool,
+    visible: bool,
+    top: bool,
+    picked: bool,
+    ultra: bool,
+}
+
+/// A command that carries its own identity (a symbol, a label, a display). Shared by the menu and the
+/// settings window, so a control and its former menu entry run the same code.
+fn run_action(hwnd: HWND, action: &crate::menu_commands::Action) {
         use crate::menu_commands::Action;
         match action {
             Action::Symbol(symbol) => {
@@ -2896,8 +2833,11 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
                 }
             }
         }
-        return;
-    }
+}
+
+/// A fixed command id. Shared by the menu and the settings window.
+fn run_command(hwnd: HWND, cmd: usize, listed: Listed) {
+    let Listed { open, visible, top, picked, ultra } = listed;
     // The menu's own message loop ran the hotkey and the tray: what is chosen acts on the mode now,
     // not the one the menu was opened in (audit 1.8, finding 8).
     let now = with_ui(|u| u.mode).unwrap_or(if open { Mode::Panel } else { Mode::Strip });
@@ -2912,7 +2852,7 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
             if enabling {
                 let message = wide("If CNBC is unavailable or a quote is stale, MH Ticker may request prices from Gold API or Kraken. Prices and update times can differ; Bitcoin may come from a different exchange. Some symbols have no fallback.\n\nYour device connects directly to these providers. Check the source and freshness shown before relying on a quote. Disabling stops new requests from being scheduled and clears fallback prices. Already-authorized requests may still connect or finish; their results are discarded. Kraken requires permission for non-personal commercial use of its data.\n\nAllow fallback sources?");
                 let title = wide("Allow fallback sources?");
-                let yes = unsafe { MessageBoxW(hwnd, message.as_ptr(), title.as_ptr(), MB_YESNO | MB_DEFBUTTON2 | MB_ICONWARNING) } == IDYES;
+                let yes = message_box(hwnd, &message, &title, MB_YESNO | MB_DEFBUTTON2 | MB_ICONWARNING) == IDYES;
                 if !yes { return; }
             }
             // The settings to write are read now, after the confirmation box: its modal loop runs the
@@ -2944,7 +2884,7 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
                         else { "Fallback is off for this session, but settings could not be saved. It may be enabled again after restart." };
                     let text = wide(msg);
                     let title = wide("Could not save settings");
-                    unsafe { MessageBoxW(hwnd, text.as_ptr(), title.as_ptr(), MB_OK | MB_ICONERROR); }
+                    message_box(hwnd, &text, &title, MB_OK | MB_ICONERROR);
                 }
             }
         }
@@ -2986,14 +2926,20 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
         CMD_ORDER_DEFAULT => order_cards(hwnd, config::OrderKey::Default),
         c if (CMD_POLL..CMD_POLL + POLL_CHOICES.len()).contains(&c) => {
             let secs = POLL_CHOICES[c - CMD_POLL];
-            with_ui(|u| {
+            let was = with_ui(|u| {
+                let was = u.cfg.poll_s;
                 u.cfg.poll_s = secs;
-                // The feed reads the cadence from the board, so this applies on the next tick.
+                // The feed reads the cadence from the board when it plans its next wait.
                 if let Ok(mut b) = u.board.lock() {
                     b.poll_s = secs;
                 }
+                was
             });
             save_cfg();
+            // The wait the feed is in was planned under the old interval: a shorter one ends it now.
+            if was.is_some_and(|was| poll_choice_wakes(was, secs)) {
+                kick_feed();
+            }
         }
         c if ultra && (CMD_UPDOWN..CMD_UPDOWN + crate::updown::UpDown::ALL.len()).contains(&c) => {
             with_ui(|u| u.cfg.updown = crate::updown::UpDown::ALL[c - CMD_UPDOWN].to_saved());
@@ -3024,6 +2970,7 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
             with_ui(|u| u.cfg.theme_font = Some(theme::FACES[c - CMD_FONT].name.to_string()));
             apply_theme(hwnd);
         }
+        CMD_SETTINGS => settings_win::open_settings(hwnd),
         CMD_REFRESH => {
             // Wakes the quote loop and makes chart rows with no bars due now. The backoff counter
             // is untouched: a still-failing source backs off again after this one attempt.
@@ -3048,7 +2995,7 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
             if autostart::set(id, !autostart::enabled(id)).is_err() {
                 let text = wide("Could not change the Start with Windows setting.");
                 let title = wide("Start with Windows");
-                unsafe { MessageBoxW(hwnd, text.as_ptr(), title.as_ptr(), MB_OK | MB_ICONWARNING) };
+                message_box(hwnd, &text, &title, MB_OK | MB_ICONWARNING);
             }
         }
         CMD_UPDATE => start_update_check(hwnd),
@@ -3094,9 +3041,9 @@ fn menu_at(hwnd: HWND, at: Option<(i32, i32)>, anchor: Option<(i32, i32)>) {
     }
 }
 
-/// The labels with an alert set, among the symbols the Alerts submenu lists (the shown ones). The
-/// submenu's title counts these: an alert on a hidden symbol is kept (it fires again once the symbol
-/// is shown) but is not listed, so counting it promised an entry the menu did not have.
+/// The labels with an alert set, among the symbols the Alerts page lists (the shown ones). The
+/// page's title counts these: an alert on a hidden symbol is kept (it fires again once the symbol
+/// is shown) but is not listed, so counting it promised a control the page did not have.
 fn armed_labels(alerts: &[config::Alert], shown_labels: &[&str]) -> Vec<String> {
     alerts
         .iter()
@@ -3135,6 +3082,79 @@ fn panel_step(listed_open: bool, now: Mode) -> Option<PanelStep> {
     }
 }
 
+/// The window to hand the foreground back to once a menu opened on the strip has closed. The strip
+/// never keeps the keyboard from the app being typed in, so while it is still a strip and still the
+/// foreground window, the window that had the foreground before the menu gets it again. Nothing when
+/// that window is gone, was the strip itself, or the foreground already moved on (a command that opened
+/// its own window, or the user clicking elsewhere).
+fn foreground_after_menu(mode: Mode, strip: HWND, before: HWND, before_is_window: bool, strip_is_foreground: bool) -> Option<HWND> {
+    (mode == Mode::Strip && strip_is_foreground && before_is_window && !before.is_null() && before != strip).then_some(before)
+}
+
+/// Whether a header point is on a button the build draws. `buttons` is minimise, picker, chart and
+/// settings, in `Geo`'s order; Classic draws only the first, so the other three rectangles are plain
+/// header there and drag the panel like the rest of it.
+fn on_header_button(buttons: &[RECT; 4], ultra: bool, x: i32, y: i32) -> bool {
+    let live = if ultra { &buttons[..] } else { &buttons[..1] };
+    live.iter().any(|r| panel::in_rect(r, x, y))
+}
+
+/// What holds the hotkey and the tray click back. A prompt or message box runs its own message loop
+/// with this window disabled, and the system's move/size loop of the panel keeps applying the rectangle
+/// it tracks; a mode change inside either one leaves the dialog owned by a strip, a disabled panel, or a
+/// strip drawn panel-sized at the drag position.
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
+struct InputBlock {
+    /// Prompts and message boxes of this window that are open (they can nest).
+    modals: u32,
+    /// Between `WM_ENTERSIZEMOVE` and `WM_EXITSIZEMOVE`.
+    sizing: bool,
+}
+
+impl InputBlock {
+    fn blocked(self) -> bool {
+        self.modals > 0 || self.sizing
+    }
+}
+
+/// What the hotkey or a tray click does: open the strip, close the panel, and nothing while blocked
+/// or while a morph runs.
+fn toggle_step(block: InputBlock, mode: Mode) -> Option<PanelStep> {
+    if block.blocked() {
+        return None;
+    }
+    match mode {
+        Mode::Strip => Some(PanelStep::Expand),
+        Mode::Panel => Some(PanelStep::Collapse),
+        Mode::Morph => None,
+    }
+}
+
+/// Run a call that opens a modal loop on this window (a prompt, a message box) with the hotkey and the
+/// tray held back until it returns. Called outside `with_ui`, like the dialogs it wraps.
+fn modal<R>(f: impl FnOnce() -> R) -> R {
+    with_ui(|u| u.block.modals += 1);
+    let r = f();
+    with_ui(|u| u.block.modals = u.block.modals.saturating_sub(1));
+    r
+}
+
+/// `prompt::ask` as a modal call (see `modal`).
+fn ask_text(hwnd: HWND, title: &str, label: &str, initial: &str, max_len: usize) -> Option<String> {
+    modal(|| prompt::ask(hwnd, title, label, initial, max_len))
+}
+
+/// `MessageBoxW` as a modal call (see `modal`).
+fn message_box(hwnd: HWND, text: &[u16], title: &[u16], flags: u32) -> i32 {
+    modal(|| unsafe { MessageBoxW(hwnd, text.as_ptr(), title.as_ptr(), flags) })
+}
+
+/// Which of Move left, Move right and Move first a card at `pos` of `count` cards may use. The card menu
+/// and the Position control of the settings window both ask this, so they enable the same entries.
+fn move_enabled(pos: usize, count: usize) -> [bool; 3] {
+    [pos > 0, pos + 1 < count, pos > 0]
+}
+
 /// Whether a Position entry (listed only for a strip) may still be applied: the strip must still be the
 /// window's mode, or the placement would be applied to an open panel.
 fn position_applies(listed_open: bool, now: Mode) -> bool {
@@ -3168,7 +3188,7 @@ fn fallback_settings(current: &Config, enabling: bool) -> Config {
     next
 }
 
-/// What the Alerts submenu needs, read in one `with_ui` call so the menu build never nests.
+/// What the Alerts page needs, read in one `with_ui` call so the menu build never nests.
 #[derive(Default)]
 struct AlertsView {
     /// UTC seconds now.
@@ -3190,6 +3210,8 @@ struct AlertsView {
 }
 
 struct AlertsRow {
+    /// The symbol of the card. Two cards can carry the same label after a rename; the symbol cannot repeat.
+    symbol: String,
     label: String,
     digits: u32,
     /// Per `alerts::PRESETS` entry: can it be set now?
@@ -3217,6 +3239,7 @@ fn alerts_view(list: &[config::Row], shown: &[bool]) -> Option<AlertsView> {
                     })
                     .collect();
                 AlertsRow {
+                    symbol: r.symbol.clone(),
                     label: r.label.clone(),
                     digits: r.digits,
                     enabled,
@@ -3241,7 +3264,7 @@ fn alerts_view(list: &[config::Row], shown: &[bool]) -> Option<AlertsView> {
 }
 
 /// Write the config as it now stands. Kept out of `with_ui` closures: no I/O inside them.
-/// What the Accessibility submenu shows, read in one borrow.
+/// What the Accessibility options show, read in one borrow.
 #[derive(Clone, Copy)]
 struct ReachView {
     updown: crate::updown::UpDown,
@@ -3276,10 +3299,10 @@ fn save_cfg() {
 
 fn alert_box(hwnd: HWND, title: &str, text: &str, flags: u32) -> i32 {
     let (t, x) = (wide(title), wide(text));
-    unsafe { MessageBoxW(hwnd, x.as_ptr(), t.as_ptr(), flags) }
+    message_box(hwnd, &x, &t, flags)
 }
 
-/// The fixed entries of the Alerts submenu (`CMD_ALERT_ONCE..=CMD_LOG_CLEAR`). No text here may
+/// The fixed options of the Alerts page (`CMD_ALERT_ONCE..=CMD_LOG_CLEAR`). No text here may
 /// contain the webhook URL: messages name the host (`redact`) or nothing.
 fn alert_command(hwnd: HWND, cmd: usize) {
     let now = crate::source::now_s();
@@ -3332,6 +3355,7 @@ fn alert_command(hwnd: HWND, cmd: usize) {
                     let ask = format!("Send alerts to {host}?\n\nOnly the host is shown here; the rest of the address stays private.");
                     if alert_box(hwnd, "Use this webhook?", &ask, MB_YESNO | MB_ICONQUESTION) == IDYES {
                         with_ui(|u| u.cfg.webhook = Some(url));
+                        alerts::webhook_changed();
                         save_cfg();
                     }
                 }
@@ -3364,6 +3388,7 @@ fn alert_command(hwnd: HWND, cmd: usize) {
         }
         CMD_HOOK_REMOVE => {
             with_ui(|u| u.cfg.webhook = None);
+            alerts::webhook_changed();
             save_cfg();
         }
         CMD_LOG_CLEAR => {
@@ -3419,7 +3444,7 @@ fn register_hotkey(hwnd: HWND) {
     with_ui(|u| u.hotkey_failed = failed);
 }
 
-/// The Hotkey submenu changed the combo: store it, save, register it.
+/// The Hotkey choice changed the combo: store it, save, register it.
 fn set_hotkey(hwnd: HWND, combo: Option<String>) {
     let cfg = with_ui(|u| {
         u.cfg.hotkey = combo;
@@ -3431,7 +3456,7 @@ fn set_hotkey(hwnd: HWND, combo: Option<String>) {
     register_hotkey(hwnd);
 }
 
-/// The Strip submenu changed `dock_rows`, the text size or the opacity (already in `cfg`): save,
+/// The Strip choices changed `dock_rows`, the text size or the opacity (already in `cfg`): save,
 /// rebuild the strip font and re-lay-out like `apply_placement` does.
 ///
 /// Opacity: `expand` fades the window from `cfg.opacity` up to 255, and `collapse` reads
@@ -3501,12 +3526,12 @@ fn on_update(hwnd: HWND) {
         match outcome {
             update::Outcome::UpToDate => {
                 let text = wide(&format!("MH Ticker {current} is the latest version."));
-                MessageBoxW(hwnd, text.as_ptr(), title.as_ptr(), MB_OK | MB_ICONINFORMATION);
+                message_box(hwnd, &text, &title, MB_OK | MB_ICONINFORMATION);
             }
             update::Outcome::Newer(tag) => {
                 let tag: String = tag.chars().filter(|c| !c.is_control()).take(40).collect();
                 let text = wide(&format!("Version {tag} is available. You have {current}.\n\nOpen the download page?"));
-                if MessageBoxW(hwnd, text.as_ptr(), title.as_ptr(), MB_YESNO | MB_ICONINFORMATION) == IDYES {
+                if message_box(hwnd, &text, &title, MB_YESNO | MB_ICONINFORMATION) == IDYES {
                     let url = wide(update::RELEASES_URL);
                     let op = wide("open");
                     ShellExecuteW(hwnd, op.as_ptr(), url.as_ptr(), null(), null(), SW_SHOWNORMAL);
@@ -3515,7 +3540,7 @@ fn on_update(hwnd: HWND) {
             update::Outcome::Failed(why) => {
                 let why: String = why.chars().filter(|c| !c.is_control()).take(40).collect();
                 let text = wide(&format!("Could not check for updates ({why}). Try again later."));
-                MessageBoxW(hwnd, text.as_ptr(), title.as_ptr(), MB_OK | MB_ICONWARNING);
+                message_box(hwnd, &text, &title, MB_OK | MB_ICONWARNING);
             }
         }
     }
@@ -3631,7 +3656,7 @@ fn add_symbol(hwnd: HWND) {
         return;
     }
     let title = "Add symbol";
-    let Some(text) = prompt::ask(hwnd, title, "CNBC symbol to add (for example AAPL, @GC.1 or EUR=):", "", SYMBOL_PROMPT_LEN) else {
+    let Some(text) = ask_text(hwnd, title, "CNBC symbol to add (for example AAPL, @GC.1 or EUR=):", "", SYMBOL_PROMPT_LEN) else {
         return;
     };
     let Some(symbol) = config::clean_symbol(&text) else {
@@ -3776,7 +3801,7 @@ fn refuse(hwnd: HWND, title: &str, sentence: &str) {
 fn type_quiet_hours(hwnd: HWND) {
     let initial = with_ui(|u| u.cfg.quiet_hours.filter(|w| w[0] != w[1]).map(crate::typed::span_text)).flatten().unwrap_or_else(|| "22:30-06:45".into());
     let title = "Quiet hours";
-    let Some(typed) = prompt::ask(hwnd, title, "Quiet hours, start-end in 24-hour time (same start and end is off):", &initial, 16) else { return };
+    let Some(typed) = ask_text(hwnd, title, "Quiet hours, start-end in 24-hour time (same start and end is off):", &initial, 16) else { return };
     match crate::typed::parse_span(&typed) {
         Ok(span) => {
             with_ui(|u| u.cfg.quiet_hours = span);
@@ -3788,7 +3813,7 @@ fn type_quiet_hours(hwnd: HWND) {
 
 fn type_mute_until(hwnd: HWND) {
     let title = "Mute until";
-    let Some(typed) = prompt::ask(hwnd, title, "Mute alerts until this time (24-hour, next time the clock reads it):", "", 8) else { return };
+    let Some(typed) = ask_text(hwnd, title, "Mute alerts until this time (24-hour, next time the clock reads it):", "", 8) else { return };
     match crate::typed::parse_time(&typed) {
         Ok(minute) => {
             let now = crate::source::now_s();
@@ -3809,7 +3834,7 @@ fn type_mute_until(hwnd: HWND) {
 fn type_cooldown(hwnd: HWND, label: &str) {
     let Some(current) = with_ui(|u| u.cfg.alerts.iter().find(|a| a.label == label).map(|a| a.cooldown_s)).flatten() else { return };
     let title = format!("Cooldown for {label}");
-    let Some(typed) = prompt::ask(hwnd, &title, "Wait this long before the alert can fire again (90s, 15m, 2h):", &crate::typed::cooldown_text(current), 8) else { return };
+    let Some(typed) = ask_text(hwnd, &title, "Wait this long before the alert can fire again (90s, 15m, 2h):", &crate::typed::cooldown_text(current), 8) else { return };
     match crate::typed::parse_cooldown(&typed) {
         Ok(secs) => {
             with_ui(|u| {
@@ -3826,7 +3851,7 @@ fn type_cooldown(hwnd: HWND, label: &str) {
 fn type_hotkey(hwnd: HWND) {
     let initial = with_ui(|u| u.cfg.hotkey.clone()).flatten().unwrap_or_else(|| hotkey::PRESETS[0].to_string());
     let title = "Hotkey";
-    let Some(typed) = prompt::ask(hwnd, title, "Hotkey that opens and closes the panel (such as Ctrl+Alt+M):", &initial, 32) else { return };
+    let Some(typed) = ask_text(hwnd, title, "Hotkey that opens and closes the panel (such as Ctrl+Alt+M):", &initial, 32) else { return };
     match hotkey::parse(&typed) {
         // Stored in the canonical spelling, so the menu matches it against the presets.
         Some(combo) => set_hotkey(hwnd, Some(hotkey::label(&combo))),
@@ -3842,7 +3867,7 @@ fn alert_at_price(hwnd: HWND, label: &str, suggest: Option<f64>) {
     let initial = suggest.map_or_else(|| now.clone(), |v| fmt_price(v, digits));
     let title = format!("Alert for {label}");
     let text = format!("Alert when {label} reaches this price (now {now}):");
-    let Some(typed) = prompt::ask(hwnd, &title, &text, &initial, LEVEL_PROMPT_LEN) else { return };
+    let Some(typed) = ask_text(hwnd, &title, &text, &initial, LEVEL_PROMPT_LEN) else { return };
     match alerts::parse_level_why(&typed) {
         Ok(level) => {
             // A level far from the price is read back in the symbol's digits and asked about first.
@@ -3922,7 +3947,7 @@ fn pane_menu(hwnd: HWND, at: (i32, i32)) -> bool {
     true
 }
 
-/// The Position menu moved the strip: new font (the taskbar grid uses `dock_font_pt`), topmost
+/// The Position choice moved the strip: new font (the taskbar grid uses `dock_font_pt`), topmost
 /// state (forced on the taskbar), place, show.
 fn apply_placement(hwnd: HWND) {
     let top = with_ui(|u| {
@@ -3930,7 +3955,7 @@ fn apply_placement(hwnd: HWND) {
         u.font = make_font(&u.cfg, u.dpi);
         u.placed = false;
         u.suppressed = false;
-        u.cfg.topmost || u.cfg.placement().on_taskbar()
+        wants_topmost(u.cfg.topmost, u.cfg.placement())
     })
     .unwrap_or(true);
     save_cfg();
@@ -3987,7 +4012,7 @@ fn rename_card(hwnd: HWND, symbol: &str) {
         return;
     };
     let ask = format!("Name for {symbol} (up to {} characters, a taken name gets a number):", config::MAX_LABEL);
-    let Some(text) = prompt::ask(hwnd, "Rename card", &ask, &current, config::MAX_LABEL) else {
+    let Some(text) = ask_text(hwnd, "Rename card", &ask, &current, config::MAX_LABEL) else {
         return;
     };
     relabel_card(hwnd, symbol, Some(text));
@@ -4137,10 +4162,15 @@ fn lock_edge(hwnd: HWND, last: bool) {
 /// Cancel, empty text and a text nothing matches change nothing. The prompt runs outside `with_ui`.
 /// What the system does with the keyboard focus once the prompt closes is not verified.
 fn find_card(hwnd: HWND) {
-    let Some(text) = prompt::ask(hwnd, "Find a card", "Find a card by label or name:", "", config::MAX_NAME) else {
+    let Some(text) = ask_text(hwnd, "Find a card", "Find a card by label or name:", "", config::MAX_NAME) else {
         return;
     };
     let found = with_ui(|u| {
+        // A menu opened during the prompt can still close the panel; a lock set on the strip would
+        // come back off screen.
+        if u.mode != Mode::Panel {
+            return None;
+        }
         let cards: Vec<(&str, &str)> = u
             .view
             .cells
@@ -4297,7 +4327,7 @@ fn on_key(hwnd: HWND, vk: u32) -> bool {
 fn sync_title(hwnd: HWND) {
     let next = with_ui(|u| {
         let locked = selected_row(u).and_then(|i| u.view.cells.get(i));
-        let name = spoken::window_name(u.profile.ultra, u.profile.title(), locked, &u.view.cells)?;
+        let name = spoken::window_name(u.profile.ultra, u.profile.title(), locked, &u.view.cells, u.view.link, crate::source::now_s())?;
         (name != u.title_set).then(|| {
             u.title_set = name.clone();
             name
@@ -4406,12 +4436,13 @@ fn apply_theme(hwnd: HWND) {
         u.font = make_font(&u.cfg, u.dpi);
         u.grad = Gradient::new(t);
         u.fonts = u.fonts.take().map(|_| panel::Fonts::new(face, pdpi(u), t.is_pixel()));
-        let fresh = make_icon(theme::link_color(t, u.view.link), u.alert_pending.is_some());
+        let calm = u.view.calm(crate::source::now_s());
+        let fresh = make_icon(theme::calm_color(t, u.view.link, calm), u.alert_pending.is_some());
         if !u.icon.is_null() {
             unsafe { DestroyIcon(u.icon) };
         }
         u.icon = fresh;
-        u.icon_link = Some((u.view.link, u.alert_pending.is_some()));
+        u.icon_link = Some((u.view.link, calm.look(), u.alert_pending.is_some()));
         Some((u.icon, tooltip_for(u)))
     })
     .flatten()
@@ -4427,7 +4458,10 @@ fn apply_theme(hwnd: HWND) {
 /// Panel zoom changed (Accessibility > Panel size). Everything the open panel is laid out from changes,
 /// so nothing is repainted in part: fonts are rebuilt at the new effective DPI, the remembered and the
 /// saved frames (in the old scale's pixels) are dropped so the panel is content-sized again, and the
-/// whole window is invalidated.
+/// whole window is invalidated. An open panel is sized from the cards' natural size at the new zoom
+/// (its current client size is in the old scale), plus the pane when the chart is open, and the chart's
+/// width record is made again for that frame so closing the chart still gives the width back. With the
+/// strip showing, `expand` does the same on its next open.
 fn apply_zoom(hwnd: HWND, pct: u32) {
     let open = with_ui(|u| {
         if u.cfg.zoom(u.profile.ultra) == pct {
@@ -4442,16 +4476,21 @@ fn apply_zoom(hwnd: HWND, pct: u32) {
         u.chart_layout.set(None);
         u.hover_at = None;
         u.picker_scroll = 0;
-        Some((u.mode == Mode::Panel).then(|| panel_geo(u)))
+        Some((u.mode == Mode::Panel).then(|| {
+            let natural = panel::geometry(u.view.cells.len(), catalog_len(u), pdpi(u), picker_open(u));
+            ((natural.w, natural.h), u.chart.then(|| chart_room(pdpi(u))))
+        }))
     })
     .flatten();
     let Some(open) = open else { return };
     save_cfg();
-    if let Some(g) = open {
+    if let Some((natural, room)) = open {
         unsafe {
             let mut r: RECT = std::mem::zeroed();
             GetWindowRect(hwnd, &mut r);
-            let b = panel_rect(&r, g.w, g.h);
+            let (compact, grown) = content_frame(work_of(&r), natural, room);
+            with_ui(|u| u.chart_grew = grown.map(|g| (compact, g)));
+            let b = grown.unwrap_or(compact);
             SetWindowPos(hwnd, null_mut(), b.left, b.top, b.right - b.left, b.bottom - b.top, SWP_NOZORDER | SWP_NOACTIVATE);
         }
     }
@@ -4676,13 +4715,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         m if m == hotkey::WM_HOTKEY => {
             if wp as i32 == HOTKEY_ID {
                 wake_feed();
-                match with_ui(|u| u.mode) {
-                    Some(Mode::Strip) => expand(hwnd),
-                    Some(Mode::Panel) => collapse(hwnd),
-                    _ => {}
+                match with_ui(|u| toggle_step(u.block, u.mode)).flatten() {
+                    Some(PanelStep::Expand) => expand(hwnd),
+                    Some(PanelStep::Collapse) => collapse(hwnd),
+                    None => {}
                 }
             }
             0
+        }
+        // After a resume every quote and the link colour are as old as the sleep. The feed publishes
+        // at once, which runs the stale pass against the new clock.
+        WM_POWERBROADCAST => {
+            if is_resume(wp) {
+                kick_feed();
+            }
+            1
         }
         WM_WTSSESSION_CHANGE => {
             match wp {
@@ -4776,9 +4823,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     return h as LRESULT;
                 }
             }
-            let Some((mode, dock, header, btn, pick_btn, chart_btn, gear_btn)) = with_ui(|u| {
+            let Some((mode, dock, ultra, header, btn, pick_btn, chart_btn, gear_btn)) = with_ui(|u| {
                 let g = panel_geo(u);
-                (u.mode, u.cfg.placement() != Placement::Floating, g.header, g.btn, g.pick_btn, g.chart_btn, g.gear_btn)
+                (u.mode, u.cfg.placement() != Placement::Floating, u.profile.ultra, g.header, g.btn, g.pick_btn, g.chart_btn, g.gear_btn)
             }) else {
                 return HTCLIENT as LRESULT;
             };
@@ -4787,10 +4834,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 Mode::Panel => {
                     let mut pt = POINT { x: (lp & 0xffff) as i16 as i32, y: ((lp >> 16) & 0xffff) as i16 as i32 };
                     ScreenToClient(hwnd, &mut pt);
-                    let on_button = panel::in_rect(&btn, pt.x, pt.y)
-                        || panel::in_rect(&pick_btn, pt.x, pt.y)
-                        || panel::in_rect(&chart_btn, pt.x, pt.y)
-                        || panel::in_rect(&gear_btn, pt.x, pt.y);
+                    let on_button = on_header_button(&[btn, pick_btn, chart_btn, gear_btn], ultra, pt.x, pt.y);
                     if pt.y < header && !on_button {
                         HTCAPTION as LRESULT
                     } else {
@@ -4913,7 +4957,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     expand(hwnd);
                 }
                 Some(Act::Collapse) => collapse(hwnd),
-                Some(Act::Settings) => settings_menu(hwnd),
+                Some(Act::Settings) => settings_win::open_settings(hwnd),
                 // `apply_picker` closes the chart when the picker opens, and hands its width back.
                 Some(Act::TogglePicker) => {
                     let open = !with_ui(|u| u.pick_open).unwrap_or(false);
@@ -5089,7 +5133,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             0
         }
+        // The system's move/size loop dispatches the hotkey and the tray; see `InputBlock`.
+        WM_ENTERSIZEMOVE => {
+            with_ui(|u| u.block.sizing = true);
+            0
+        }
         WM_EXITSIZEMOVE => {
+            with_ui(|u| u.block.sizing = false);
             let mut r: RECT = std::mem::zeroed();
             GetWindowRect(hwnd, &mut r);
             let moved = with_ui(|u| match u.mode {
@@ -5148,16 +5198,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_TRAY => {
             match (lp as u32) & 0xffff {
                 WM_LBUTTONUP => {
-                    let mode = with_ui(|u| {
+                    let step = with_ui(|u| {
                         let recent = u.tray_click_at.is_some_and(|t| t.elapsed() < TRAY_DEBOUNCE);
                         u.tray_click_at = Some(Instant::now());
-                        (!recent).then_some(u.mode)
+                        if recent { None } else { toggle_step(u.block, u.mode) }
                     })
                     .flatten();
-                    match mode {
-                        Some(Mode::Panel) => collapse(hwnd),
-                        Some(Mode::Strip) => expand(hwnd),
-                        _ => {}
+                    match step {
+                        Some(PanelStep::Collapse) => collapse(hwnd),
+                        Some(PanelStep::Expand) => expand(hwnd),
+                        None => {}
                     }
                 }
                 // The tray has no cards, so there is nothing for a contextual entry to point at.
@@ -5167,6 +5217,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_DESTROY => {
+            settings_win::close();
             STRIP.store(0, Ordering::Relaxed);
             UnregisterHotKey(hwnd, HOTKEY_ID);
             WTSUnRegisterSessionNotification(hwnd);
@@ -5214,12 +5265,8 @@ pub fn run(cfg: Config, board: Arc<Mutex<Board>>) {
         };
         RegisterClassW(&wc);
         let title = wide(profile.title());
-        let ex = WS_EX_TOOLWINDOW | WS_EX_LAYERED | if cfg.topmost || cfg.placement().on_taskbar() { WS_EX_TOPMOST } else { 0 };
-        // WS_THICKFRAME is what makes the panel resizable (and what lets Windows run its own sizing
-        // loop on wm_nchittest's HTLEFT/HTRIGHT/... edges). WM_NCCALCSIZE then returns 0, so the
-        // frame costs no visible border and no client-area offset: the look is still ours.
-        let style = WS_POPUP | WS_THICKFRAME | WS_MAXIMIZEBOX;
-        let hwnd = CreateWindowExW(ex, class.as_ptr(), title.as_ptr(), style, 0, 0, 10, 10, null_mut(), null_mut(), inst, null());
+        let ex = WS_EX_TOOLWINDOW | WS_EX_LAYERED | if wants_topmost(cfg.topmost, cfg.placement()) { WS_EX_TOPMOST } else { 0 };
+        let hwnd = CreateWindowExW(ex, class.as_ptr(), title.as_ptr(), WINDOW_STYLE, 0, 0, 10, 10, null_mut(), null_mut(), inst, null());
         if hwnd.is_null() {
             return;
         }
@@ -5249,7 +5296,7 @@ pub fn run(cfg: Config, board: Arc<Mutex<Board>>) {
             face: face_of(theme, &cfg, profile.ultra),
             grad: Gradient::new(theme),
             icon: make_icon(theme::link_color(theme, Link::Down), false),
-            icon_link: Some((Link::Down, false)),
+            icon_link: Some((Link::Down, Calm::No, false)),
             dpi,
             cfg: cfg.clone(),
             board: board.clone(),
@@ -5291,6 +5338,7 @@ pub fn run(cfg: Config, board: Arc<Mutex<Board>>) {
             hush: watch::Hush::default(),
             test_alert_at: None,
             tracking: false,
+            block: InputBlock::default(),
             prev_fg: null_mut(),
             tip_at: None,
             tray_click_at: None,
@@ -5360,6 +5408,167 @@ mod tests {
         assert_eq!(selected_look(&cfg, true).1, "Consolas", "an explicit face still wins");
     }
 
+    /// Audit 2026-11, strip-stays-topmost-after-panel: `expand` makes the window topmost, so the
+    /// strip's z-order is worked out again from the settings on the way back.
+    #[test]
+    fn the_strip_is_topmost_only_when_the_setting_or_the_taskbar_says_so() {
+        for p in Placement::ALL {
+            assert!(wants_topmost(true, p), "{p:?} with Always on top");
+            assert_eq!(wants_topmost(false, p), p.on_taskbar(), "{p:?} without it");
+        }
+        assert!(!wants_topmost(false, Placement::Floating), "a floating strip is not forced up");
+        assert!(wants_topmost(false, Placement::Auto), "the taskbar strip always is");
+    }
+
+    /// Audit 2026-11, hotkey-and-tray-under-modal, find-applies-after-collapse and
+    /// hotkey-inside-move-size-loop: the hotkey and a tray click change the mode only when no
+    /// prompt, message box or move/size loop of this window is running.
+    #[test]
+    fn the_hotkey_and_the_tray_wait_for_a_modal_box_and_for_the_size_loop() {
+        let free = InputBlock::default();
+        assert_eq!(toggle_step(free, Mode::Strip), Some(PanelStep::Expand));
+        assert_eq!(toggle_step(free, Mode::Panel), Some(PanelStep::Collapse));
+        assert_eq!(toggle_step(free, Mode::Morph), None, "nothing during a morph");
+        // The Find prompt (or any message box) is up: the panel stays as it is.
+        let prompt_up = InputBlock { modals: 1, sizing: false };
+        assert_eq!(toggle_step(prompt_up, Mode::Panel), None);
+        assert_eq!(toggle_step(prompt_up, Mode::Strip), None);
+        // A box opened from inside another box: still held until both return.
+        let nested = InputBlock { modals: 2, sizing: false };
+        assert!(nested.blocked());
+        // A dragged edge or a dragged header: the loop owns the window until it exits.
+        let dragging = InputBlock { modals: 0, sizing: true };
+        assert_eq!(toggle_step(dragging, Mode::Panel), None);
+        assert_eq!(toggle_step(dragging, Mode::Strip), None);
+        assert!(!free.blocked());
+    }
+
+    /// Audit 2026-11, view-freshness-only-on-wm-feed: both resume notices end the feed's wait; the
+    /// suspend and the battery notices do not.
+    #[test]
+    fn only_a_resume_wakes_the_feed() {
+        assert!(is_resume(0x0007), "PBT_APMRESUMESUSPEND");
+        assert!(is_resume(0x0012), "PBT_APMRESUMEAUTOMATIC");
+        for other in [0x0004usize /* suspend */, 0x000A /* power status */, 0x8013 /* setting */, 0] {
+            assert!(!is_resume(other), "{other:#x}");
+        }
+        assert_eq!(WM_POWERBROADCAST, 0x0218);
+    }
+
+    /// Audit 2026-11, zoom-change-keeps-old-frame: an open panel's new frame comes from the cards'
+    /// natural size at the new zoom, so it shrinks with the zoom as well as growing.
+    #[test]
+    fn a_zoom_change_sizes_the_open_panel_from_its_content_not_its_old_frame() {
+        let work = rect(0, 0, 3_000, 1_400);
+        let (n, catalog) = (6, 20);
+        let big = panel::geometry(n, catalog, 144, false); // 150 %
+        let small = panel::geometry(n, catalog, 72, false); // 75 %
+        assert!(small.w < big.w && small.h < big.h);
+        // The old code took the current client size, so the frame stayed `big`; now it is `small`.
+        let (compact, grown) = content_frame(work, (small.w, small.h), None);
+        assert_eq!((compact.right - compact.left, compact.bottom - compact.top), (small.w, small.h));
+        assert!(grown.is_none(), "no chart, no wide frame");
+        assert_eq!((compact.left, compact.top), ((3_000 - small.w) / 2, (1_400 - small.h) / 2), "centred in the work area");
+        // A monitor smaller than the content trims it.
+        let tight = content_frame(rect(0, 0, 1_000, 500), (big.w, big.h), None).0;
+        assert_eq!((tight.right - tight.left, tight.bottom - tight.top), (1_000, 500));
+    }
+
+    /// Audit 2026-11, zoom-drops-chart-width-record: with the chart open the new frame holds both panes
+    /// and records the pair `chart_grew` keeps, so closing the chart gives the pane's width back.
+    #[test]
+    fn a_zoom_change_with_the_chart_open_keeps_the_width_record() {
+        let work = rect(0, 0, 3_000, 1_400);
+        let (n, catalog, dpi) = (6, 20, 72);
+        let natural = panel::geometry(n, catalog, dpi, false);
+        let (compact, grown) = content_frame(work, (natural.w, natural.h), Some(chart_room(dpi)));
+        let grown = grown.expect("the chart needs the wider frame");
+        assert_eq!(grown.right - grown.left, natural.w + chart_room(dpi));
+        assert_eq!((grown.left + grown.right) / 2, (compact.left + compact.right) / 2, "it opens out from the same centre");
+        // Both panes whole: the cards keep every column they had without the chart.
+        assert_eq!(panel::geometry_in(grown.right - grown.left, n, catalog, dpi, false, true).cols, natural.cols);
+        // Closing the chart: the recorded pair brings the window back to the compact frame.
+        let back = rect_after_chart(grown, grown, compact).expect("the width is still the chart's");
+        assert_eq!((back.left, back.right), (compact.left, compact.right));
+        assert_eq!(compact_frame(grown, Some((compact, grown))).right - compact_frame(grown, Some((compact, grown))).left, natural.w);
+    }
+
+    /// Audit 2026-11, zoom-drops-chart-width-record (b): the strip is showing, the chart flag is on and
+    /// no frame is remembered. The compact width gives the pane 360 px of its own, and the cards lose
+    /// columns to it; the frame `expand` now picks holds both.
+    #[test]
+    fn opening_with_the_chart_flag_on_and_no_saved_frame_does_not_cost_the_cards_a_column() {
+        let work = rect(0, 0, 3_000, 1_400);
+        let (n, catalog, dpi) = (6, 20, 120);
+        let natural = panel::geometry(n, catalog, dpi, false);
+        assert!(natural.cols > 1);
+        // What the old expand did: the compact frame with the pane squeezed into it.
+        let squeezed = panel::geometry_in(natural.w, n, catalog, dpi, false, true);
+        assert!(squeezed.cols < natural.cols, "the defect: {} columns of {}", squeezed.cols, natural.cols);
+        let (compact, grown) = content_frame(work, (natural.w, natural.h), Some(chart_room(dpi)));
+        let opened = grown.unwrap_or(compact);
+        let held = panel::geometry_in(opened.right - opened.left, n, catalog, dpi, false, true);
+        assert_eq!(held.cols, natural.cols);
+        assert!(held.chart.is_some(), "and the pane is there");
+    }
+
+    /// Audit 2026-11, strip-keeps-foreground-after-menu.
+    #[test]
+    fn the_strip_gives_the_foreground_back_after_its_menu() {
+        let (strip, notepad) = (1usize as HWND, 2usize as HWND);
+        assert_eq!(foreground_after_menu(Mode::Strip, strip, notepad, true, true), Some(notepad));
+        assert_eq!(foreground_after_menu(Mode::Panel, strip, notepad, true, true), None, "the panel keeps focus for Esc");
+        assert_eq!(foreground_after_menu(Mode::Morph, strip, notepad, true, true), None);
+        assert_eq!(foreground_after_menu(Mode::Strip, strip, notepad, false, true), None, "the window closed");
+        assert_eq!(foreground_after_menu(Mode::Strip, strip, null_mut(), true, true), None, "nothing was in front");
+        assert_eq!(foreground_after_menu(Mode::Strip, strip, strip, true, true), None, "it was already the strip");
+        assert_eq!(foreground_after_menu(Mode::Strip, strip, notepad, true, false), None, "a command took the foreground");
+    }
+
+    /// Audit 2026-11, classic-header-dead-zone: Classic draws only the minimise button, so the header
+    /// left of it drags the panel; Ultra keeps its three extra buttons.
+    #[test]
+    fn classic_header_drags_where_ultra_has_buttons() {
+        let g = panel::geometry(6, 0, 96, false);
+        let buttons = [g.btn, g.pick_btn, g.chart_btn, g.gear_btn];
+        let centre = |r: &RECT| ((r.left + r.right) / 2, (r.top + r.bottom) / 2);
+        let (x, y) = centre(&g.btn);
+        assert!(on_header_button(&buttons, false, x, y), "minimise in Classic");
+        assert!(on_header_button(&buttons, true, x, y), "minimise in Ultra");
+        for (name, r) in [("picker", &g.pick_btn), ("chart", &g.chart_btn), ("settings", &g.gear_btn)] {
+            let (x, y) = centre(r);
+            assert!(!on_header_button(&buttons, false, x, y), "{name} area is header in Classic");
+            assert!(on_header_button(&buttons, true, x, y), "{name} is a button in Ultra");
+        }
+        let (x, y) = (g.gear_btn.left - 20, g.gear_btn.top + 5);
+        assert!(!on_header_button(&buttons, true, x, y), "left of every button is header in both");
+    }
+
+    /// Audit 2026-11, poll-choice-waits-out-old-interval.
+    #[test]
+    fn a_shorter_poll_interval_ends_the_current_wait() {
+        assert!(poll_choice_wakes(60.0, 1.0));
+        assert!(poll_choice_wakes(3.0, 2.0));
+        assert!(!poll_choice_wakes(3.0, 3.0), "the same choice again changes nothing");
+        assert!(!poll_choice_wakes(3.0, 60.0), "a longer one can wait out the old wait");
+    }
+
+    /// Audit 2026-11, maximise-state-not-handled: the panel keeps its resize edges and has no maximise box.
+    #[test]
+    fn the_window_style_cannot_be_maximised_but_can_be_resized() {
+        assert_eq!(WINDOW_STYLE & WS_MAXIMIZEBOX, 0);
+        assert_eq!(WINDOW_STYLE & WS_THICKFRAME, WS_THICKFRAME);
+        assert_eq!(WINDOW_STYLE & WS_POPUP, WS_POPUP);
+    }
+
+    #[test]
+    fn a_modal_call_counts_itself_in_and_out() {
+        // No window exists in a unit test, so `with_ui` finds no `Ui` and the counter is not reached;
+        // the wrapper still returns what the dialog returned.
+        assert_eq!(modal(|| 7), 7);
+        assert_eq!(modal(|| modal(|| "inner")), "inner");
+    }
+
     #[test]
     fn a_click_locks_a_card_and_the_same_click_again_unlocks_it() {
         assert_eq!(toggle_lock(None, "XAU".into()).as_deref(), Some("XAU"));
@@ -5370,6 +5579,101 @@ mod tests {
 
     fn rect(l: i32, t: i32, r: i32, b: i32) -> RECT {
         RECT { left: l, top: t, right: r, bottom: b }
+    }
+
+    /// A `Ui` with no window behind it: null handles, the classic theme, no cards. Enough for the
+    /// functions that only move state (`chart_state`, `apply_zoom_state`).
+    fn test_ui(ultra: bool) -> Ui {
+        let cfg = Config::default();
+        let theme = theme::classic();
+        Ui {
+            hwnd: null_mut(),
+            profile: if ultra { Profile::ultra() } else { Profile::classic() },
+            font: null_mut(),
+            bg: null_mut(),
+            theme,
+            face: theme.font,
+            grad: Gradient::new(theme),
+            icon: null_mut(),
+            icon_link: None,
+            dpi: 96,
+            cfg: cfg.clone(),
+            board: Arc::new(Mutex::new(Board::new(&[]))),
+            view: Board::new(&[]),
+            frame: Frame::default(),
+            placed: false,
+            suppressed: false,
+            taskbar_created: 0,
+            mode: Mode::Panel,
+            morph: None,
+            strip_rect: rect(0, 0, 0, 0),
+            last_panel: None,
+            fonts: None,
+            hist: panel::History::new(),
+            hover: false,
+            pick_hover: false,
+            chart_hover: false,
+            gear_hover: false,
+            open_hover: false,
+            chart_at: None,
+            chart_key: false,
+            title_set: String::new(),
+            chart_layout: std::cell::Cell::new(None),
+            range: Range::D1,
+            book: ranges::Book::new(),
+            undo: undo::Undo::default(),
+            range_slots: Arc::new(Mutex::new(ranges::Slots::default())),
+            pick_open: false,
+            picker_scroll: 0,
+            wheel_remainder: 0,
+            chart: false,
+            selected: None,
+            chart_grew: None,
+            hover_at: None,
+            alert_note: None,
+            alert_pending: None,
+            alert_log: alerts::Log::default(),
+            watch: watch::Watch::default(),
+            hush: watch::Hush::default(),
+            test_alert_at: None,
+            tracking: false,
+            block: InputBlock::default(),
+            prev_fg: null_mut(),
+            tip_at: None,
+            tray_click_at: None,
+            hotkey_failed: false,
+            update_running: false,
+            update_result: Arc::new(Mutex::new(None)),
+            report_running: false,
+            report_result: Arc::new(Mutex::new(None)),
+            adding: None,
+            lookup_result: Arc::new(Mutex::new(None)),
+            back: None,
+            anim: None,
+            motion: true,
+            system: None,
+        }
+    }
+
+    /// Audit 2026-11, chart-toggle-keeps-card-hover: opening or closing the pane refolds the cards, so
+    /// the card the pointer was on is no longer under it and nothing stays lit.
+    #[test]
+    fn toggling_the_chart_forgets_every_hover() {
+        for on in [true, false] {
+            let mut u = test_ui(true);
+            u.chart = !on;
+            u.hover_at = Some(panel::Hover { row: 2, t: 0.0 });
+            u.hover = true;
+            u.pick_hover = true;
+            u.chart_hover = true;
+            u.gear_hover = true;
+            u.open_hover = true;
+            chart_state(&mut u, on);
+            assert_eq!(u.chart, on);
+            assert!(u.hover_at.is_none(), "the card hover (chart {on})");
+            assert!(!(u.hover || u.pick_hover || u.chart_hover || u.gear_hover || u.open_hover), "the button hovers (chart {on})");
+            assert!(u.chart_at.is_none());
+        }
     }
 
     #[test]
@@ -5496,7 +5800,7 @@ mod tests {
         assert!(!log.set_outcome(seq, alerts::Outcome::Sent), "the line is gone");
     }
 
-    /// Audit 1.8, finding 4: the Alerts submenu's count is of the symbols it lists. An alert on a hidden
+    /// Audit 1.8, finding 4: the Alerts page's count is of the symbols it lists. An alert on a hidden
     /// symbol is kept in the settings but not counted.
     #[test]
     fn the_alerts_count_is_of_listed_symbols_only() {

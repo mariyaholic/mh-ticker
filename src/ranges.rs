@@ -157,13 +157,14 @@ pub const STALE_GRACE_S: f64 = RETRY_AFTER_S;
 
 /// `as of 14:05` when the series on screen was fetched more than its time to live (plus
 /// [`STALE_GRACE_S`]) ago, on the clock `tz_offset_s` east of UTC; `as of Nov 12 14:05` when that is a
-/// day or more back; `None` while it is fresh or when a time is not a number.
+/// day or more away; `None` while it is fresh or when a time is not a number. A series stamped after
+/// `now` (the clock was set back) is due again (`Book::want`), so it carries the note too.
 pub fn age_label(now: f64, fetched: f64, ttl_s: f64, tz_offset_s: i32) -> Option<String> {
-    if !(now.is_finite() && fetched.is_finite() && ttl_s.is_finite()) || now - fetched <= ttl_s + STALE_GRACE_S {
+    if !(now.is_finite() && fetched.is_finite() && ttl_s.is_finite()) || (now >= fetched && now - fetched <= ttl_s + STALE_GRACE_S) {
         return None;
     }
     let clock = crate::chartview::clock(fetched, tz_offset_s);
-    Some(if now - fetched >= DAY_S * 0.9 {
+    Some(if (now - fetched).abs() >= DAY_S * 0.9 {
         format!("as of {} {clock}", crate::chartview::date_label(fetched, tz_offset_s, crate::chartview::DateStyle::DayMonth))
     } else {
         format!("as of {clock}")
@@ -252,6 +253,74 @@ pub(crate) fn median_spacing(bars: &[Bar]) -> f64 {
     } else {
         (gaps[n / 2 - 1] + gaps[n / 2]) / 2.0
     }
+}
+
+/// A bar with no price range: open, high, low and close are one number.
+fn flat(b: &Bar) -> bool {
+    b.o == b.h && b.h == b.l && b.l == b.c
+}
+
+/// The fewest bars `drop_idle` will judge.
+const MIN_FOR_SPACING: usize = 5;
+
+/// A break is a time gap of more than this many bars. A hole of a minute or two in sampled 1D ticks
+/// stays below it, so repeats after such a hole remain real quotes.
+const BREAK_BARS: f64 = 10.0;
+
+/// Drops the bars of a closed market from `(start time, bar)` pairs in time order.
+///
+/// Spot metals keep a feed running through weekends and holidays, and CNBC fills those hours with
+/// bars that carry no trading (measured on XAU and XAG, 2026-11: volume is 0 on every bar of every
+/// range for these symbols, so volume cannot tell). Two shapes are detected from the data alone, with
+/// no exchange calendar:
+///
+/// * Daily or longer bars (median spacing of 0.95 day or more): a bar with no price range. A day
+///   that traded has a high above its low; the Saturday, Sunday and holiday bars have
+///   `o == h == l == c` and repeat the last close to within a few basis points. They are dropped
+///   while fewer than half of the bars are flat, so a series that carries closes alone (every bar
+///   flat by construction) is kept whole.
+/// * Shorter bars: the flat bars that repeat the close before them from the first break onward,
+///   where a break is a gap of more than ten bars. The in-session part of such a run stays. Repeated closes inside a session, however many in a row,
+///   are real quotes that did not move (CNBC's 1D files are sampled ticks, so a slow quote repeats
+///   for minutes) and stay.
+///
+/// Fewer than five bars come back as they are. A series without a break that precedes a repeat, such
+/// as BTC around the clock or a session with no closed hours, comes back unchanged. A series of
+/// closes alone is kept whole at daily spacing only; at intraday spacing the bars after a break that
+/// repeat the close before it are dropped.
+pub(crate) fn drop_idle(pts: Vec<(f64, Bar)>) -> Vec<(f64, Bar)> {
+    // A handful of bars has no spacing worth the name: one overnight gap would be its median.
+    if pts.len() < MIN_FOR_SPACING {
+        return pts;
+    }
+    let mut steps: Vec<f64> = pts.windows(2).map(|w| w[1].0 - w[0].0).filter(|g| *g > 0.0).collect();
+    if steps.is_empty() {
+        return pts;
+    }
+    steps.sort_by(|a, b| a.total_cmp(b));
+    let spacing = steps[steps.len() / 2];
+    if spacing >= DAY_S * 0.95 {
+        let flats = pts.iter().filter(|p| flat(&p.1)).count();
+        if flats * 2 >= pts.len() {
+            return pts;
+        }
+        return pts.into_iter().filter(|p| !flat(&p.1)).collect();
+    }
+    let mut keep = vec![true; pts.len()];
+    let mut i = 1;
+    while i < pts.len() {
+        let before = pts[i - 1].1.c;
+        let mut j = i;
+        while j < pts.len() && flat(&pts[j].1) && pts[j].1.c == before {
+            j += 1;
+        }
+        // The first break inside the run ends the session part; the repeats from there on are idle.
+        if let Some(k) = (i..j).find(|&k| pts[k].0 - pts[k - 1].0 > BREAK_BARS * spacing) {
+            keep[k..j].iter_mut().for_each(|x| *x = false);
+        }
+        i = j.max(i + 1);
+    }
+    pts.into_iter().zip(keep).filter_map(|(p, k)| k.then_some(p)).collect()
 }
 
 /// What the pane should say about one key.
@@ -349,17 +418,21 @@ impl Book {
     /// did not fail within the last [`RETRY_AFTER_S`]. Generations start at 1 and only grow.
     pub fn want(&mut self, key: &Key, now: f64) -> Option<Request> {
         let ttl_s = ttl_of(key.file);
-        self.flying.retain(|f| now - f.since < LOST_AFTER_S);
+        // Every time here is on the wall clock, which can be set back. A stamp in the future (`now`
+        // earlier than it) is expired, the way `alerts::cooled` treats a cooldown: waiting for the clock
+        // to catch up would freeze the key for the size of the step plus its time to live.
+        let within = |stamp: f64, limit: f64| now >= stamp && now - stamp < limit;
+        self.flying.retain(|f| within(f.since, LOST_AFTER_S));
         if self.flying.iter().any(|f| &f.key == key) {
             return None;
         }
         if let Some((_, at)) = self.failed.iter().find(|(k, _)| k == key) {
-            if now - at < RETRY_AFTER_S {
+            if within(*at, RETRY_AFTER_S) {
                 return None;
             }
         }
         if let Some(c) = self.cache.iter().find(|c| &c.key == key) {
-            if now - c.series.fetched < ttl_s {
+            if within(c.series.fetched, ttl_s) {
                 return None;
             }
         }
@@ -891,6 +964,49 @@ mod tests {
         assert_eq!(age_label(f64::NAN, fetched, ttl, 0), None);
     }
 
+    /// Audit 2026-11, book-clock-set-back-freezes-range: a clock set back must not freeze a key. A
+    /// cached series stamped after `now` is due again, so is a failure, and an in-flight request.
+    #[test]
+    fn a_clock_set_back_makes_a_cached_series_due_again() {
+        let mut b = Book::new();
+        let k = key("@SP.1", "5D.json");
+        let r = b.want(&k, 1_000.0).unwrap();
+        assert!(b.arrived(r.generation, &k, Ok(series(1_000.0, 3)), 1_000.0));
+        assert!(b.want(&k, 1_300.0).is_none(), "inside the time to live, as before");
+        // The clock steps back an hour: the stamp is in the future, so the key is not "fresh".
+        let again = b.want(&k, 1_000.0 - 3_600.0).expect("due at once, not after the clock catches up");
+        assert_eq!(b.status(&k), Status::Ready, "the old bars stay up while it refreshes");
+        assert!(b.arrived(again.generation, &k, Ok(series(-2_600.0, 4)), -2_600.0));
+        assert!(b.want(&k, -2_500.0).is_none(), "the new stamp counts from the new clock");
+    }
+
+    #[test]
+    fn a_clock_set_back_lifts_a_failures_back_off_and_a_lost_requests_hold() {
+        let k = key("A", "5Y.json");
+        // Failure recorded at 10_000; the clock then reads 5_000.
+        let mut b = Book::new();
+        let r = b.want(&k, 9_990.0).unwrap();
+        assert!(b.arrived(r.generation, &k, Err("network".into()), 10_000.0));
+        assert!(b.want(&k, 10_010.0).is_none(), "inside the back-off, as before");
+        assert!(b.want(&k, 5_000.0).is_some(), "a failure from the future does not block the retry");
+        // In flight since 10_000; the clock reads 5_000 and no answer has come.
+        let mut b = Book::new();
+        assert!(b.want(&k, 10_000.0).is_some());
+        assert!(b.want(&k, 10_050.0).is_none(), "in flight, as before");
+        let again = b.want(&k, 5_000.0).expect("a request from the future is presumed lost");
+        assert_eq!(again.generation, 2);
+    }
+
+    #[test]
+    fn the_age_label_shows_for_a_series_stamped_after_now() {
+        let fetched = 14.0 * 3_600.0 + 5.0 * 60.0;
+        let ttl = 600.0;
+        assert_eq!(age_label(fetched - 3_600.0, fetched, ttl, 0).as_deref(), Some("as of 14:05"));
+        let far = age_label(fetched - 3.0 * DAY_S, fetched, ttl, 0).unwrap();
+        assert!(far.starts_with("as of Jan ") && far.ends_with(" 14:05"), "{far}");
+        assert_eq!(age_label(fetched, fetched, ttl, 0), None, "stamped now is fresh");
+    }
+
     #[test]
     fn the_note_joins_what_is_suspect() {
         let s = daily_at(13.0 * 3_600.0 + 420.0, 30);
@@ -898,5 +1014,152 @@ mod tests {
         let both = s.note(s.fetched + 9_000.0, 3_600.0, 0);
         assert!(both.starts_with("as of ") && both.ends_with(" \u{b7} check dates"), "{both}");
         assert_eq!(daily_at(0.0, 30).note(1_000_001.0, 3_600.0, 0), "");
+    }
+    /// `(time, o, h, l, c)` rows as `(time, Bar)` pairs; `dt` is not used by `drop_idle`.
+    fn pairs(rows: &[(f64, f32, f32, f32, f32)]) -> Vec<(f64, Bar)> {
+        rows.iter().map(|&(t, o, h, l, c)| (t, Bar { dt: 0.0, o, h, l, c, v: 0.0 })).collect()
+    }
+
+    fn times(p: &[(f64, Bar)]) -> Vec<f64> {
+        p.iter().map(|x| x.0).collect()
+    }
+
+    #[test]
+    fn daily_bars_without_a_range_are_dropped() {
+        // Fri 2026-11-06 .. Tue 2026-11-10 of XAU 1M: Saturday and Sunday repeat Friday's close.
+        let d = 86_400.0;
+        let fri = 1_793_941_200.0;
+        let rows = [
+            (fri - d, 4062.06, 4144.89, 4058.79, 4088.4177),
+            (fri, 4088.9, 4104.61, 4031.0557, 4066.28),
+            (fri + d, 4066.28, 4066.28, 4066.28, 4066.28),
+            (fri + 2.0 * d, 4066.28, 4066.28, 4066.28, 4066.28),
+            (fri + 3.0 * d, 4066.09, 4147.29, 4054.4886, 4140.91),
+            (fri + 4.0 * d, 4140.5075, 4145.45, 4013.89, 4032.275),
+        ];
+        let kept = drop_idle(pairs(&rows));
+        assert_eq!(times(&kept), [fri - d, fri, fri + 3.0 * d, fri + 4.0 * d]);
+        // A flat first bar goes too, and so does a midweek holiday.
+        let rows = [
+            (0.0, 50.5486, 50.5486, 50.5486, 50.5486),
+            (d, 50.5, 51.0, 50.1, 50.9),
+            (2.0 * d, 50.9, 51.2, 50.4, 50.6),
+            (3.0 * d, 50.6, 50.6, 50.6, 50.6),
+            (4.0 * d, 50.6, 51.2, 50.2, 50.8),
+        ];
+        assert_eq!(times(&drop_idle(pairs(&rows))), [d, 2.0 * d, 4.0 * d]);
+    }
+
+    #[test]
+    fn a_series_of_closes_alone_is_kept_whole() {
+        let d = 86_400.0;
+        let rows: Vec<_> = (0..6).map(|i| (i as f64 * d, 10.0 + i as f32, 10.0 + i as f32, 10.0 + i as f32, 10.0 + i as f32)).collect();
+        assert_eq!(drop_idle(pairs(&rows)).len(), 6, "every bar is flat by construction");
+        let half: Vec<_> = rows.iter().enumerate().map(|(i, r)| if i % 2 == 0 { (r.0, 9.0, 12.0, 8.0, r.4) } else { *r }).collect();
+        assert_eq!(drop_idle(pairs(&half)).len(), 6, "half flat is still a feed of closes");
+    }
+
+    #[test]
+    fn repeats_after_a_break_are_dropped_and_repeats_in_a_session_stay() {
+        // XAU 5D around the 2026-11-06 close: real bars every 5 minutes, then Saturday 00:03 and
+        // Sunday 03:48 repeating Friday's last close, then the reopening.
+        let fri = 1_793_998_200.0; // Fri 21:48 UTC
+        let mut rows: Vec<(f64, f32, f32, f32, f32)> =
+            (0..6).map(|i| (fri - 300.0 * (5 - i) as f64, 4065.0, 4066.0 + i as f32, 4064.0, 4065.5 + i as f32)).collect();
+        let last = rows[5].4;
+        rows.push((fri + 8_100.0, last, last, last, last));
+        rows.push((fri + 8_100.0 + 99_900.0, last, last, last, last));
+        rows.push((fri + 180_600.0, 4066.09, 4066.09, 4060.09, 4062.78));
+        let kept = drop_idle(pairs(&rows));
+        assert_eq!(kept.len(), 7);
+        assert_eq!(kept[5].0, fri);
+        assert_eq!(kept[6].0, fri + 180_600.0, "the reopening follows the last real bar");
+
+        // One unchanged minute inside a busy session is a quote that did not move.
+        let busy = [
+            (0.0, 1.0, 2.0, 0.5, 1.5),
+            (60.0, 1.5, 2.5, 1.0, 2.0),
+            (120.0, 2.0, 2.0, 2.0, 2.0),
+            (180.0, 2.0, 3.0, 1.5, 2.5),
+            (240.0, 2.5, 3.0, 2.0, 2.2),
+        ];
+        assert_eq!(drop_idle(pairs(&busy)).len(), 5);
+        // Several of them in a row with no break are still quotes: slow quotes repeat for minutes.
+        let stuck = [
+            (0.0, 1.0, 2.0, 0.5, 1.5),
+            (60.0, 1.5, 2.5, 1.0, 2.0),
+            (120.0, 2.0, 2.0, 2.0, 2.0),
+            (180.0, 2.0, 2.0, 2.0, 2.0),
+            (240.0, 2.0, 2.0, 2.0, 2.0),
+            (300.0, 2.0, 3.0, 1.5, 2.5),
+        ];
+        assert_eq!(drop_idle(pairs(&stuck)).len(), 6);
+        // A flat bar at a different price than the close before it is a quote, even after a break.
+        let moved = [(0.0, 1.0, 2.0, 0.5, 1.5), (60.0, 1.5, 2.5, 1.0, 2.0), (120.0, 1.0, 2.0, 0.5, 1.5), (3_000.0, 3.0, 3.0, 3.0, 3.0)];
+        assert_eq!(drop_idle(pairs(&moved)).len(), 4);
+    }
+
+    #[test]
+    fn a_friday_close_that_repeats_keeps_its_session_part_and_drops_the_weekend() {
+        // US10Y 1D ends with flat repeats of the last close; the weekend repeats follow the same run.
+        let fri = 1_793_998_200.0;
+        let mut rows: Vec<(f64, f32, f32, f32, f32)> =
+            (0..6).map(|i| (fri - 300.0 * (6 - i) as f64, 4065.0, 4066.0 + i as f32, 4064.0, 4065.5 + i as f32)).collect();
+        let last = rows[5].4;
+        rows.push((fri, last, last, last, last));
+        rows.push((fri + 8_100.0, last, last, last, last));
+        rows.push((fri + 108_000.0, last, last, last, last));
+        rows.push((fri + 180_600.0, 4066.09, 4066.09, 4060.09, 4062.78));
+        let kept = drop_idle(pairs(&rows));
+        assert_eq!(kept.len(), 8);
+        assert_eq!(kept[6].0, fri, "the in-session repeat stays");
+        assert_eq!(kept[7].0, fri + 180_600.0, "the reopening follows the last session bar");
+    }
+
+    #[test]
+    fn repeats_after_a_short_hole_in_sampled_ticks_stay() {
+        // A two-minute hole at one-minute spacing is a missing sample, not a closure.
+        let rows = [
+            (0.0, 1.0, 2.0, 0.5, 1.5),
+            (60.0, 1.5, 2.5, 1.0, 2.0),
+            (120.0, 2.0, 2.0, 2.0, 2.0),
+            (180.0, 2.0, 3.0, 1.5, 2.5),
+            (300.0, 2.5, 2.5, 2.5, 2.5),
+            (360.0, 2.5, 2.5, 2.5, 2.5),
+            (420.0, 2.5, 3.0, 2.0, 2.6),
+        ];
+        assert_eq!(drop_idle(pairs(&rows)).len(), rows.len());
+    }
+
+    #[test]
+    fn a_slow_quote_repeating_through_a_session_keeps_every_bar() {
+        // US10Y 1D, Thu 2026-11-12 17:01 to 17:07: one-minute sampled ticks where the close stays at
+        // 5.109 for five minutes with no time gap. Every one of them is a trading minute.
+        let t0 = 1_794_070_860.0;
+        let mut rows = vec![(t0 - 120.0, 5.101, 5.101, 5.101, 5.101), (t0 - 60.0, 5.105, 5.105, 5.105, 5.105)];
+        rows.extend((0..5).map(|i| (t0 + 60.0 * i as f64, 5.109, 5.109, 5.109, 5.109)));
+        rows.push((t0 + 300.0, 5.11, 5.11, 5.11, 5.11));
+        assert_eq!(drop_idle(pairs(&rows)).len(), rows.len());
+    }
+
+    #[test]
+    fn a_flat_newest_daily_bar_is_dropped() {
+        // A Monday bar with a single print has no range yet and is removed until it grows one.
+        let d = 86_400.0;
+        let mut rows: Vec<_> = (0..5).map(|i| (i as f64 * d, 10.0, 11.0, 9.0, 10.5)).collect();
+        rows.push((5.0 * d, 10.5, 10.5, 10.5, 10.5));
+        let kept = drop_idle(pairs(&rows));
+        assert_eq!(kept.len(), 5);
+        assert_eq!(kept[4].0, 4.0 * d);
+    }
+
+    #[test]
+    fn drop_idle_leaves_short_and_continuous_series_alone() {
+        assert!(drop_idle(Vec::new()).is_empty());
+        let one = pairs(&[(5.0, 1.0, 1.0, 1.0, 1.0)]);
+        assert_eq!(drop_idle(one).len(), 1);
+        // Around the clock, as BTC does: every five minutes, none of it flat.
+        let btc: Vec<_> = (0..300).map(|i| (i as f64 * 300.0, 100.0 + i as f32, 102.0 + i as f32, 99.0 + i as f32, 101.0 + i as f32)).collect();
+        assert_eq!(drop_idle(pairs(&btc)).len(), 300);
     }
 }

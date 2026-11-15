@@ -161,6 +161,12 @@ impl History {
                     self.backfilled = true;
                 }
             }
+            // The wall clock stepped back: samples stamped after `now` belong to a clock that is gone.
+            // Left in place they would be overwritten in turn (their age is negative) and no new
+            // sample would be added until the clock caught up with them.
+            while row.back().is_some_and(|p| p.0 > now) {
+                row.pop_back();
+            }
             if let (Some(q), false) = (&c.quote, c.stale) {
                 match row.back_mut() {
                     Some(last) if now - last.0 < SAMPLE_S => last.1 = q.price,
@@ -495,7 +501,7 @@ pub(crate) mod trace {
 }
 
 /// Draw `s` with its top-left at (x, y); returns its width.
-fn text(dc: HDC, font: HFONT, x: i32, y: i32, s: &str, color: COLORREF) -> i32 {
+pub(crate) fn text(dc: HDC, font: HFONT, x: i32, y: i32, s: &str, color: COLORREF) -> i32 {
     unsafe {
         let old = SelectObject(dc, font);
         SetTextColor(dc, color);
@@ -547,7 +553,7 @@ fn line_height(dc: HDC, font: HFONT) -> i32 {
     }
 }
 
-fn fill_round(dc: HDC, r: RECT, radius: i32, color: COLORREF) {
+pub(crate) fn fill_round(dc: HDC, r: RECT, radius: i32, color: COLORREF) {
     unsafe {
         let brush = CreateSolidBrush(color);
         let old_b = SelectObject(dc, brush);
@@ -560,7 +566,7 @@ fn fill_round(dc: HDC, r: RECT, radius: i32, color: COLORREF) {
     }
 }
 
-fn fill_ellipse(dc: HDC, x: i32, y: i32, d: i32, color: COLORREF) {
+pub(crate) fn fill_ellipse(dc: HDC, x: i32, y: i32, d: i32, color: COLORREF) {
     unsafe {
         let brush = CreateSolidBrush(color);
         let old_b = SelectObject(dc, brush);
@@ -572,7 +578,7 @@ fn fill_ellipse(dc: HDC, x: i32, y: i32, d: i32, color: COLORREF) {
     }
 }
 
-fn fill_rect(dc: HDC, r: RECT, color: COLORREF) {
+pub(crate) fn fill_rect(dc: HDC, r: RECT, color: COLORREF) {
     unsafe {
         let brush = CreateSolidBrush(color);
         FillRect(dc, &r, brush);
@@ -657,6 +663,8 @@ pub struct Scene<'a> {
     pub grad: &'a Gradient,
     pub dpi: u32,
     pub now: f64,
+    /// Seconds east of UTC at a UTC instant: the local clock a card names when its market closed.
+    pub offset_at: &'a dyn Fn(f64) -> i32,
     /// The minimise button is under the pointer.
     pub btn_hover: bool,
     /// The picker toggle is under the pointer.
@@ -916,11 +924,25 @@ fn card(dc: HDC, sc: &Scene, r: RECT, i: usize, c: &Cell) {
             // label. Volume is the first thing to go, because it is the least load-bearing number
             // on the card and "CNBC delayed" already uses the width.
             let src = if !q.source.is_empty() { q.source } else if q.realtime { "CNBC" } else { "CNBC delayed" };
-            let tag = if !q.source.is_empty() { format!("{src} \u{b7} age unknown") } else { match q.ts {
-                Some(ts) => format!("{src} \u{b7} {}", fmt_age(sc.now - ts)),
-                None => src.to_string(),
-            }};
+            // Stale and calm (`calm_stale`): a CNBC quote with a known time that went quiet while the
+            // service answers. It shows its age in the grey of the dim text from the stale limit on, and
+            // the tag says `closed` only once `market_closed` holds. Only a stale price that is not calm
+            // (feed down, fallback quote, unknown time) takes the amber of a fault.
+            let calm = crate::model::calm_stale(c, sc.board.link, sc.now);
             let room = rx - ix - text_width(dc, sc.fonts.mid, &c.label) - s(10);
+            // A closed market is a calm state with its own words ("CNBC · closed since Fri 17:40",
+            // then shorter ones when the card is narrow); before that the tag is the source and age,
+            // and a quote time ahead of the clock has no age to show.
+            let tag = if !q.source.is_empty() {
+                format!("{src} \u{b7} age unknown")
+            } else if let Some(words) = crate::model::closed_card_words(c, sc.board.link, sc.now, sc.board.last_bar_at(i), sc.offset_at) {
+                crate::model::first_fitting(&words, &|w| text_width(dc, sc.fonts.small, w) <= room)
+            } else {
+                match q.ts {
+                    Some(ts) if sc.now - ts >= -crate::model::FUTURE_SKEW_S => format!("{src} \u{b7} {}", fmt_age(sc.now - ts)),
+                    _ => src.to_string(),
+                }
+            };
             let tag = match q.volume {
                 Some(v) => {
                     let with = format!("{tag} \u{b7} {}", fmt_vol(v));
@@ -931,7 +953,7 @@ fn card(dc: HDC, sc: &Scene, r: RECT, i: usize, c: &Cell) {
             // The Open button takes the tag's corner on a locked card; the tag is the first thing to
             // give way, as it already is for the volume.
             if !locked {
-                text_right(dc, sc.fonts.small, rx, r.top + s(10), &tag, if c.stale { t.amber } else { t.dim });
+                text_right(dc, sc.fonts.small, rx, r.top + s(10), &tag, if c.stale && !calm { t.amber } else { t.dim });
             }
             let pw = text(dc, sc.fonts.big, ix, r.top + s(26), &fmt_price(q.price, c.digits), if c.stale { t.dim } else { t.price });
             if !q.currency.is_empty() {
@@ -1093,6 +1115,20 @@ fn picker(dc: HDC, sc: &Scene, g: &Geo, p: &Picker) {
     }
 }
 
+/// The left edge of the leftmost button the header draws: the gear, else the chart button, else the
+/// picker toggle, else the minimise button. The link name has to end before it.
+fn header_buttons_left(g: &Geo, settings_btn: bool, chart_btn: bool, picker_btn: bool) -> i32 {
+    if settings_btn {
+        g.gear_btn.left
+    } else if chart_btn {
+        g.chart_btn.left
+    } else if picker_btn {
+        g.pick_btn.left
+    } else {
+        g.btn.left
+    }
+}
+
 /// Paint the whole panel into `dc` (w × h is the panel's size from `geometry`).
 pub fn draw(dc: HDC, w: i32, h: i32, sc: &Scene) {
     let t = sc.theme;
@@ -1112,9 +1148,16 @@ pub fn draw(dc: HDC, w: i32, h: i32, sc: &Scene) {
     let lh = line_height(dc, sc.fonts.mid);
     let d = s(8);
     let dx = g.pad + s(2) + tw + s(14);
-    fill_ellipse(dc, dx, ty + (lh - d) / 2, d, crate::theme::link_color(t, sc.board.link));
+    let calm = sc.board.calm(sc.now);
+    fill_ellipse(dc, dx, ty + (lh - d) / 2, d, crate::theme::calm_color(t, sc.board.link, calm));
     let sh = line_height(dc, sc.fonts.small);
-    text(dc, sc.fonts.small, dx + d + s(7), ty + (lh - sh) / 2, crate::theme::link_name(sc.board.link), t.label);
+    let nx = dx + d + s(7);
+    let room = header_buttons_left(&g, sc.settings_btn, sc.chart_btn, sc.picker_btn) - s(6) - nx;
+    let mut name = crate::theme::calm_name(sc.board.link, calm);
+    if text_width(dc, sc.fonts.small, &name) > room {
+        name = crate::theme::calm_name_short(sc.board.link, calm);
+    }
+    text(dc, sc.fonts.small, nx, ty + (lh - sh) / 2, &name, t.label);
 
     if sc.picker_btn {
         if sc.pick_hover {
@@ -1244,6 +1287,7 @@ fn candles(dc: HDC, sc: &Scene, r: RECT, c: &Chart) {
             tabs,
             vol: None,
             cross: None,
+            aim: None,
         }));
     }
     if c.bars.is_empty() {
@@ -1362,6 +1406,7 @@ fn candles(dc: HDC, sc: &Scene, r: RECT, c: &Chart) {
         tabs,
         vol,
         cross: None,
+        aim: None,
     };
     // Coloured by the day's direction, the same one the header and the card report. Only when the
     // day's change is unknown does it fall back to the bars: the last close against the first open.
@@ -1571,18 +1616,22 @@ fn candles(dc: HDC, sc: &Scene, r: RECT, c: &Chart) {
     }
 
     // The crosshair, when the pointer is on a candle: a vertical line through it and a horizontal at
-    // the pointer's row. `bar` is clamped because the pointer was taken from the previous frame and
-    // a resize can have refolded the bars since.
+    // the pointer's row. The stored pointer comes from the previous frame and a feed tick, a range
+    // arriving or a resize can have refolded the candles since, so the candle is answered again from
+    // the pointer's x (or, for a key, from its candle's time) with this frame's layout.
     // A crosshair set by key (`aim_snap`) sits on its candle's close; one set by the pointer stays where
     // the pointer is.
-    let hover = sc
+    let start_of = |i: usize| (c.t0 + bars[i].dt as f64).round() as i64;
+    let aimed = sc
         .chart_at
+        .and_then(|p| chartview::settle_aim(p, sc.aim_snap, &lay, start_of))
         .map(|p| {
-            let bar = p.bar.min(n - 1);
-            let y = if sc.aim_snap { lay.y_of(bars[bar].c as f64).clamp(plot.top, plot.bottom - 1) } else { p.y };
-            (bar, y)
+            let y = if sc.aim_snap { lay.y_of(bars[p.bar].c as f64).clamp(plot.top, plot.bottom - 1) } else { p.y };
+            (p, y)
         })
         .filter(|&(_, y)| y >= plot.top && y < plot.bottom);
+    lay.aim = aimed.map(|(p, _)| p);
+    let hover = aimed.map(|(p, y)| (p.bar, y));
     lay.cross = hover.and_then(|(bar, y)| lay.price_at(y).map(|price| (bar, price)));
     if let Some((bar, y)) = hover {
         let x = lay.x_of(bar);
@@ -1809,6 +1858,21 @@ mod tests {
     }
 
     #[test]
+    fn a_clock_set_back_drops_the_samples_stamped_after_now() {
+        let c = Cell { label: "XAU".into(), digits: 2, quote: Some(crate::model::Quote { price: 5.0, ..Default::default() }), stale: false };
+        let mut b = Board::new(&[]);
+        b.cells = vec![c];
+        let mut h = History::new();
+        h.labels = vec!["XAU".into()];
+        h.rows = vec![VecDeque::from(vec![(1_000.0, 1.0), (3_000.0, 2.0), (4_600.0, 3.0)])];
+        h.record(&b, 1_500.0);
+        let row = h.row(0).unwrap();
+        assert!(row.iter().all(|p| p.0 <= 1_500.0), "nothing from the future stays: {row:?}");
+        assert_eq!(row.back(), Some(&(1_500.0, 5.0)), "the new price is held at the new time");
+        assert_eq!(row.front(), Some(&(1_000.0, 1.0)), "what came before the step is kept");
+    }
+
+    #[test]
     fn sample_answers_the_newest_point_at_or_before_the_crosshair() {
         let mut h = History::new();
         h.labels = vec!["X".into()];
@@ -1831,6 +1895,21 @@ mod tests {
         assert!(g.pick_btn.right < g.btn.left, "the picker toggle sits left of the cross");
         assert!(g.gear_btn.right < g.chart_btn.left, "settings sits at the left end of the group");
         assert_eq!(geometry(2, 0, 96, false).w, 2 * 16 + 2 * 236 + 10);
+    }
+
+    #[test]
+    fn the_header_name_ends_before_the_leftmost_button_that_is_drawn() {
+        for dpi in [96, 144] {
+            let g = geometry(6, 0, dpi, false);
+            // Ultra draws the gear, the chart button and the picker toggle left of the minimise button.
+            assert_eq!(header_buttons_left(&g, true, true, true), g.gear_btn.left);
+            assert!(g.gear_btn.left < g.pick_btn.left, "the old edge, the picker, sat right of the gear");
+            assert_eq!(header_buttons_left(&g, false, true, true), g.chart_btn.left);
+            assert_eq!(header_buttons_left(&g, false, false, true), g.pick_btn.left);
+            // Classic draws only the minimise button; the old edge, the panel's right margin, was under it.
+            assert_eq!(header_buttons_left(&g, false, false, false), g.btn.left);
+            assert!(g.btn.left < g.w - g.pad);
+        }
     }
 
     #[test]

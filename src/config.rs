@@ -2,8 +2,8 @@
 //! Every market source is public, so nothing here is a credential — except `webhook`, which is a
 //! bearer secret (see `Alert`).
 //!
-//! `rows` are the symbols on the strip; `catalog` is the pick list behind the menu's *Symbols*
-//! submenu and the Ultra symbol picker. Ticking a catalog entry shows it, unticking hides it; the
+//! `rows` are the symbols on the strip; `catalog` is the pick list behind the settings window's *Symbols*
+//! page and the Ultra symbol picker. Ticking a catalog entry shows it, unticking hides it; the
 //! strip keeps catalog order. Any other CNBC symbol can be added to `catalog` (or `rows`) by hand.
 
 use serde::{Deserialize, Serialize};
@@ -23,7 +23,7 @@ pub struct Profile {
     pub id: &'static str,
     /// Config file inside the data folder (`classic.json`, `ultra.json`).
     pub config_file: &'static str,
-    /// The Ultra build: theme menu, symbol picker, alerts and webhooks.
+    /// The Ultra build: theme choices, symbol picker, alerts and webhooks.
     pub ultra: bool,
 }
 
@@ -60,7 +60,7 @@ pub fn profile() -> Profile {
     *PROFILE.get_or_init(Profile::classic)
 }
 
-/// Where the strip sits (the menu's Position submenu).
+/// Where the strip sits (the Position choice on the settings window's Display page).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Placement {
@@ -115,7 +115,7 @@ pub struct Row {
     /// CNBC quote symbol (`XAU=` gold spot, `@DJ.1` front Dow future, `BTC.CB=` Coinbase bitcoin).
     pub symbol: String,
     pub digits: u32,
-    /// What it is, shown beside the label in the Symbols menu.
+    /// What it is, shown beside the label on the Symbols page.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub name: String,
     /// Shown on the taskbar strip. Absent means shown, so a 1.8 file and every Classic config are
@@ -146,7 +146,7 @@ pub struct Config {
     pub stale_after_s: f64,
     pub delayed_grace_s: f64,
     pub rows: Vec<Row>,
-    /// The Symbols menu's pick list (rows not in it are listed too).
+    /// The Symbols page's pick list (rows not in it are listed too).
     pub catalog: Vec<Row>,
     pub font: String,
     pub font_pt: i32,
@@ -156,7 +156,7 @@ pub struct Config {
     /// Global hotkey that opens and closes the panel, in `hotkey::parse` grammar
     /// (`Ctrl+Alt+M`). None = no hotkey.
     pub hotkey: Option<String>,
-    /// Where the strip sits. Unset in configs from before the Position menu: then `dock`
+    /// Where the strip sits. Unset in configs from before the Position choice: then `dock`
     /// decides (true = Auto, false = Floating).
     pub placement: Option<Placement>,
     /// Display for the strip (`\\.\DISPLAY2`); unset or unplugged = the primary one.
@@ -192,7 +192,7 @@ pub struct Config {
     /// This is a bearer secret: anyone with the URL can post to that channel. It is never printed
     /// in a note, tooltip or `--probe` line.
     pub webhook: Option<String>,
-    /// New alerts clear the level that fired (*Fire once, then clear*). The menu toggle also
+    /// New alerts clear the level that fired (*Fire once, then clear*). The settings toggle also
     /// rewrites `once` on every existing alert.
     pub alert_once: bool,
     /// Alerts are evaluated and logged but not shown or posted, until switched off.
@@ -203,7 +203,7 @@ pub struct Config {
     /// `from == to` is off.
     pub quiet_hours: Option<[u16; 2]>,
     /// New alerts fire on each crossing of their level instead of every cooldown (*Each crossing*).
-    /// The menu choice also rewrites `crossing` on every existing alert. Off is 1.8's behaviour.
+    /// The settings choice also rewrites `crossing` on every existing alert. Off is 1.8's behaviour.
     #[serde(skip_serializing_if = "is_false")]
     pub alert_crossing: bool,
     /// Poll less often while no shown price has changed (`governor`). Unset = the build's default:
@@ -426,7 +426,7 @@ impl Config {
     }
 }
 
-/// The Symbols menu: the catalog, then any row that is not in it (hand-added to `rows`).
+/// The Symbols page's list: the catalog, then any row that is not in it (hand-added to `rows`).
 pub fn menu_list(cfg: &Config) -> Vec<Row> {
     let mut list = cfg.catalog.clone();
     for r in &cfg.rows {
@@ -458,7 +458,8 @@ pub fn clean_symbol(raw: &str) -> Option<String> {
 /// The strip label for a newly added `symbol` (already cleaned): the symbol without a leading `@`,
 /// `.` or `^`, without a trailing `=`, and without a trailing `.1` (a front-month future: `@GC.1` is
 /// `GC`); cut to [`MAX_LABEL`] characters; `SYM` if nothing is left. Then made unique against every
-/// label in `catalog` and `rows`, compared ignoring ASCII case, by appending `2`, `3`, ... and cutting
+/// label in `catalog` and `rows` and every alert's label (an alert no card owns keeps its label, so a new
+/// card must not pick it up), compared ignoring ASCII case, by appending `2`, `3`, ... and cutting
 /// the base so the whole stays within [`MAX_LABEL`] (`GOLD` taken gives `GOLD2`).
 pub fn label_for(cfg: &Config, symbol: &str) -> String {
     let base = symbol.trim_start_matches(['@', '.', '^']);
@@ -466,7 +467,7 @@ pub fn label_for(cfg: &Config, symbol: &str) -> String {
     let base = base.strip_suffix(".1").unwrap_or(base);
     let base: String = base.chars().take(MAX_LABEL).collect();
     let base = if base.is_empty() { "SYM".to_string() } else { base };
-    unique_label(&base, |label| cfg.catalog.iter().chain(cfg.rows.iter()).any(|r| r.label.eq_ignore_ascii_case(label)))
+    unique_label(&base, |label| label_taken_by_another(cfg, symbol, label))
 }
 
 /// `base` if `taken` does not know it, else `base` with `2`, `3`, ... appended, the base cut so the
@@ -617,7 +618,7 @@ pub fn clean_name(raw: &str) -> String {
 pub enum Added {
     /// The symbol is on the strip now (newly listed, or listed already and now ticked).
     Shown,
-    /// Listed in the Symbols menu, but the strip already shows [`MAX_ROWS`]: not ticked.
+    /// Listed on the Symbols page, but the strip already shows [`MAX_ROWS`]: not ticked.
     Listed,
     /// It was on the strip already; nothing changed.
     AlreadyShown,
@@ -625,7 +626,7 @@ pub enum Added {
 
 /// Add a symbol CNBC knows to the catalogue and tick it when there is room. `symbol` is already
 /// cleaned ([`clean_symbol`]), `name` is CNBC's and `price` its first price. A symbol already in the
-/// Symbols menu (`menu_list`) is not added twice: it is ticked if it is not shown. A new entry is
+/// Symbols page (`menu_list`) is not added twice: it is ticked if it is not shown. A new entry is
 /// appended to `catalog` with [`label_for`], [`digits_for`] and [`clean_name`], so it shows last.
 pub fn add_custom(cfg: &mut Config, symbol: &str, name: &str, price: f64) -> Added {
     if is_shown(cfg, symbol) {
@@ -672,8 +673,19 @@ pub fn forget_custom(cfg: &mut Config, symbol: &str) -> bool {
 pub enum Snapshot {
     /// The shown rows, their order and pins, and the catalogue (labels, decimals and order live there too).
     Rows { rows: Vec<Row>, catalog: Vec<Row> },
-    /// The alerts as they were.
-    Alerts(Vec<Alert>),
+    /// The alerts as they were, each with the symbol its label named then (`None` for an alert no card
+    /// owned), so a restore can follow the symbol when the label has moved since.
+    Alerts(Vec<(Alert, Option<String>)>),
+}
+
+/// The symbol whose card or catalogue entry carries `label`, rows first.
+fn symbol_of_label(cfg: &Config, label: &str) -> Option<String> {
+    cfg.rows.iter().chain(cfg.catalog.iter()).find(|r| r.label == label).map(|r| r.symbol.clone())
+}
+
+/// The label `symbol` carries now, rows first (the order `set_label` reads the old one in).
+fn label_of_symbol(cfg: &Config, symbol: &str) -> Option<String> {
+    cfg.rows.iter().chain(cfg.catalog.iter()).find(|r| r.symbol == symbol).map(|r| r.label.clone())
 }
 
 impl Config {
@@ -684,12 +696,14 @@ impl Config {
 
     /// The alerts as they are now.
     pub fn snapshot_alerts(&self) -> Snapshot {
-        Snapshot::Alerts(self.alerts.clone())
+        Snapshot::Alerts(self.alerts.iter().map(|a| (a.clone(), symbol_of_label(self, &a.label))).collect())
     }
 
     /// Put a snapshot back. Cards replace the cards. Alerts are merged: every alert in the snapshot
     /// whose label has none now comes back, in its old place; one set since (same label) stays as it is
-    /// now, and alerts made since stay, after the others. Nothing else in the
+    /// now, and alerts made since stay, after the others. An alert comes back under the label its
+    /// symbol carries now, and is left out when that symbol has no card or entry any more, or when it
+    /// had no symbol and its label belongs to a card since. Nothing else in the
     /// config is touched; the webhook least of all.
     pub fn restore(&mut self, snap: Snapshot) {
         match snap {
@@ -699,6 +713,17 @@ impl Config {
                 normalize_pins(self);
             }
             Snapshot::Alerts(old) => {
+                let old: Vec<Alert> = old
+                    .into_iter()
+                    .filter_map(|(mut a, symbol)| {
+                        match symbol {
+                            Some(s) => a.label = label_of_symbol(self, &s)?,
+                            None if symbol_of_label(self, &a.label).is_some() => return None,
+                            None => {}
+                        }
+                        Some(a)
+                    })
+                    .collect();
                 let now = std::mem::take(&mut self.alerts);
                 let mut merged: Vec<Alert> = old
                     .into_iter()
@@ -1740,6 +1765,59 @@ mod tests {
         assert_eq!(labels, ["XAU", "XAG", "BTC"]);
         assert_eq!(c.alerts[0].above, Some(5000.0), "what was set since stays");
         assert_eq!(c.alerts[1].below, Some(30.0));
+    }
+
+    #[test]
+    fn restoring_alerts_after_the_label_moved_to_another_symbol_does_not_follow_the_label() {
+        let mut c = Config::default();
+        c.alerts.push(Alert { label: "XAU".into(), below: Some(4000.0), ..Default::default() });
+        let snap = c.snapshot_alerts();
+        c.alerts.clear();
+        assert_eq!(rename(&mut c, "XAU=", "GOLD").as_deref(), Some("GOLD"));
+        assert_eq!(rename(&mut c, "XAG=", "XAU").as_deref(), Some("XAU"), "nothing holds XAU now");
+        c.restore(snap);
+        assert!(c.alerts.iter().all(|a| a.label != "XAU"), "the silver card does not get the gold level");
+        assert_eq!(c.alerts.len(), 1);
+        assert_eq!(c.alerts[0].label, "GOLD", "the level goes back to the symbol it was set on");
+        assert_eq!(c.alerts[0].below, Some(4000.0));
+    }
+
+    #[test]
+    fn restoring_alerts_after_a_rename_puts_them_under_the_new_label() {
+        let mut c = Config::default();
+        c.alerts.push(Alert { label: "XAU".into(), above: Some(2500.0), ..Default::default() });
+        let snap = c.snapshot_alerts();
+        c.alerts.clear();
+        assert_eq!(rename(&mut c, "XAU=", "Bullion").as_deref(), Some("Bullion"));
+        c.restore(snap);
+        assert_eq!(c.alerts.len(), 1);
+        assert_eq!(c.alerts[0].label, "Bullion", "a card that carries the level, not a label nobody has");
+        // Another card taking the old label afterwards gets nothing.
+        assert_eq!(rename(&mut c, "XAG=", "XAU").as_deref(), Some("XAU"));
+        assert!(c.alerts.iter().all(|a| a.label != "XAU"));
+    }
+
+    #[test]
+    fn restoring_alerts_of_a_forgotten_symbol_brings_back_no_orphan() {
+        let mut c = Config::default();
+        assert_eq!(add_custom(&mut c, "@SI.1", "Silver", 25.0), Added::Shown);
+        c.alerts.push(Alert { label: "SI".into(), below: Some(25.0), ..Default::default() });
+        let snap = c.snapshot_alerts();
+        c.alerts.clear();
+        assert!(forget_custom(&mut c, "@SI.1"));
+        c.restore(snap);
+        assert!(c.alerts.is_empty(), "no card carries SI, so the level has nowhere to go");
+        assert_eq!(label_for(&c, "SI"), "SI", "and the label is free for a new symbol");
+    }
+
+    #[test]
+    fn a_new_symbol_does_not_take_the_label_of_an_alert_no_card_owns() {
+        let mut c = Config::default();
+        c.alerts.push(Alert { label: "SI".into(), below: Some(25.0), ..Default::default() });
+        assert_eq!(label_for(&c, "SI"), "SI2", "the orphaned level stays out of the new card's reach");
+        assert_eq!(add_custom(&mut c, "SI", "Some stock", 30.0), Added::Shown);
+        assert_eq!(c.rows.last().unwrap().label, "SI2");
+        assert_eq!(c.alerts.len(), 1);
     }
 
     #[test]

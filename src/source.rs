@@ -108,8 +108,52 @@ fn flag(v: Option<&Value>) -> bool {
 
 pub use crate::probe::parse_time;
 
+/// The instant of a quote's `last_time`, read against `now`. After a futures session ends, CNBC
+/// keeps printing thin re-stamps and writes today's date in front of the clock of the last one:
+/// on Saturday 14 Nov 2026 `@SP.1` read `2026-11-14T17:40:14.000-0500` while its last print was
+/// Friday 17:40 (the 1D chart has a bar at `20261113174000`, and `settleDate` is `2026-11-13`).
+/// The wrong date lies ahead of the clock in the early hours and behind it later in the day, so a
+/// futures stamp (one with a `settleDate`) is read on its `settleDate` whenever the date written in
+/// it is a Saturday, or a Sunday before 18:00 (the clock of the stamp, which is Eastern time), when
+/// no session runs. Any other stamp is read as sent unless it is more than
+/// [`crate::model::FUTURE_SKEW_S`] ahead of `now`, and then it is read with the `settleDate` as
+/// well. When the `settleDate` reading is not in the past, the time is unknown.
+///
+/// A weekday holiday (Friday 2026-12-25, Good Friday) has no weekend break to recognise, so its
+/// re-stamp is read as sent once the written clock has passed. For the delayed grace (about 16
+/// minutes) after that, the stamp reads as fresh, until `Quote::moved_at` holds 15 minutes of an
+/// unchanged price and `model::restamped` takes over.
+pub fn quote_time(last_time: &str, settle_date: Option<&str>, now: f64) -> Option<f64> {
+    let ts = parse_time(last_time)?;
+    let settle = settle_date.map(str::trim).filter(|s| !s.is_empty());
+    if !(settle.is_some() && written_in_weekend_break(last_time)) && ts <= now + crate::model::FUTURE_SKEW_S {
+        return Some(ts);
+    }
+    let clock = last_time.get(10..).filter(|c| c.starts_with('T'))?;
+    let fixed = parse_time(&format!("{}{clock}", settle?))?;
+    (fixed <= ts && fixed <= now + crate::model::FUTURE_SKEW_S && ts - fixed < 7.0 * 86_400.0).then_some(fixed)
+}
+
+/// Does the date and clock written in a `last_time` string fall in the weekend break of the US
+/// futures: all of Saturday, and Sunday before 18:00? The written clock is the exchange's, so no
+/// offset is applied.
+fn written_in_weekend_break(last_time: &str) -> bool {
+    let num = |r: std::ops::Range<usize>| last_time.get(r).and_then(|s| s.parse::<u32>().ok());
+    let (Some(y), Some(m), Some(d), Some(h)) = (num(0..4), num(5..7), num(8..10), num(11..13)) else { return false };
+    match (crate::chartview::days_from_civil(y as i64, m, d) + 4).rem_euclid(7) {
+        6 => true,
+        0 => h < 18,
+        _ => false,
+    }
+}
+
 /// `restQuote` body -> quotes.
 pub fn parse_quotes(v: &Value) -> Vec<Quote> {
+    parse_quotes_at(v, now_s())
+}
+
+/// [`parse_quotes`] with the clock given, for the probe and for tests.
+pub fn parse_quotes_at(v: &Value, now: f64) -> Vec<Quote> {
     let rows = v.pointer("/FormattedQuoteResult/FormattedQuote").and_then(Value::as_array);
     rows.map(|rows| {
         rows.iter()
@@ -124,7 +168,8 @@ pub fn parse_quotes(v: &Value) -> Vec<Quote> {
                     price,
                     change_pct: r.get("change_pct").and_then(number),
                     prev_close: r.get("previous_day_closing").and_then(number),
-                    ts: r.get("last_time").and_then(Value::as_str).and_then(parse_time),
+                    ts: r.get("last_time").and_then(Value::as_str).and_then(|t| quote_time(t, r.get("settleDate").and_then(Value::as_str), now)),
+                    moved_at: None,
                     realtime: flag(r.get("realTime")),
                     open: positive(r.get("open")),
                     high: positive(r.get("high")),
@@ -181,6 +226,8 @@ pub fn parse_chart(v: &Value, now: f64) -> (f64, Vec<Bar>) {
         }
     }
     pts.sort_by(|a, b| a.0.total_cmp(&b.0));
+    // Bars of a closed market (a feed repeating its last close) are not candles.
+    let mut pts = crate::ranges::drop_idle(pts);
     // A day of 1-minute bars is ~1,400; anything longer is a different endpoint, not a chart.
     let keep = pts.len().saturating_sub(MAX_BARS);
     pts.drain(..keep);
@@ -226,6 +273,8 @@ pub fn parse_series(v: &Value, now: f64) -> Series {
             _ => kept.push(p),
         }
     }
+    // Bars of a closed market (weekend and holiday days, a feed repeating its last close).
+    let mut kept = crate::ranges::drop_idle(kept);
     let drop = kept.len().saturating_sub(SERIES_BARS);
     kept.drain(..drop);
     let Some(t0) = kept.first().map(|p| p.0) else { return Series::new(now, Vec::new(), now) };
@@ -582,6 +631,10 @@ impl Feed {
                 }).collect();
                 self.rows = b.rows.clone();
                 self.rows_gen = b.rows_gen;
+                // A quote of a symbol that left the strip would otherwise survive for the life of the
+                // process: its `moved_at` would count for the symbol when it is shown again, and a
+                // failed first poll would put its old price back on the card.
+                self.quotes.retain(|symbol, _| self.rows.iter().any(|r| &r.symbol == symbol));
                 // Board::set_rows has already remapped these vectors by identity. Reuse that
                 // cache so a failed fetch after the change cannot wipe a surviving symbol's bars.
                 self.chart = self.rows.iter().enumerate().map(|(i, _)| {
@@ -621,6 +674,7 @@ impl Feed {
                 }
             }
             b.cells = cells;
+            b.apply_bar_restamps(now);
             b.link = link;
             b.note = note;
         }
@@ -636,6 +690,7 @@ impl Feed {
                 b.bars = self.chart.iter().map(|(_, bars)| bars.clone().into()).collect();
                 b.bars_t0 = self.chart.iter().map(|(t0, _)| *t0).collect();
                 b.bars_gen = self.backfill_gen;
+                b.apply_bar_restamps(now_s());
             }
         }
         (self.notify)();
@@ -741,13 +796,13 @@ impl Feed {
     /// What the governor says now: `(interval to wait, stale limit's interval)`. The second is 0 while
     /// no governor tick is on, which keeps the configured stale limit and the plain cadence exactly
     /// as 1.8 had them. Reads the board once; `quiet_for` comes from the caller's `Quiet`.
-    fn governed(&self, quiet_for: f64) -> (f64, f64) {
+    fn governed(&self, quiet_for: f64, closed: bool) -> (f64, f64) {
         let cadence = self.cadence();
         let Ok(b) = self.shared.lock() else { return (cadence, 0.0) };
         if !b.gov.any() {
             return (cadence, 0.0);
         }
-        let iv = crate::governor::interval(cadence, quiet_for, b.locked, b.armed, b.gov);
+        let iv = crate::governor::interval(cadence, crate::governor::with_closed(quiet_for, closed), b.locked, b.armed, b.gov);
         (iv, iv)
     }
 
@@ -763,6 +818,8 @@ impl Feed {
         let started = Instant::now();
         let mut quiet = crate::governor::Quiet::default();
         let mut seen_kick = self.shared.lock().map(|b| b.kick).unwrap_or(0);
+        // Every shown market was closed at the last answer (`governor::with_closed`).
+        let mut closed = false;
         loop {
             self.sync_rows();
             // Read before the request: a kick that lands while it is in flight ends the wait below.
@@ -781,29 +838,44 @@ impl Feed {
                     for row in &self.rows {
                         if !returned.contains(row.symbol.as_str()) { self.quotes.remove(&row.symbol); }
                     }
-                    for q in qs {
+                    let seen = now_s();
+                    for mut q in qs {
+                        q.moved_at = match self.quotes.get(&q.symbol) {
+                            Some(old) if old.price == q.price && old.moved_at.is_some() => old.moved_at,
+                            _ => Some(seen),
+                        };
                         self.quotes.insert(q.symbol.clone(), q);
                     }
                     let prices: Vec<f64> = self.rows.iter()
                         .map(|r| self.quotes.get(&r.symbol).map_or(f64::NAN, |q| q.price))
                         .collect();
                     let quiet_for = quiet.observe(started.elapsed().as_secs_f64(), &prices);
-                    governed_s = self.governed(quiet_for).1;
+                    // `closed` is the previous answer's: this answer's cells are resolved below with
+                    // the limit this line sets. The governed interval reported to the board
+                    // therefore changes one poll after the board becomes fully closed or open.
+                    governed_s = self.governed(quiet_for, closed).1;
                     let stale_after = crate::governor::stale_after(self.cfg.stale_after_s, governed_s);
-                    let cells = resolve(&self.rows, &self.quotes, now_s(), stale_after, self.cfg.delayed_grace_s);
-                    let lagging: Vec<&str> = cells.iter().filter(|c| c.stale).map(|c| c.label.as_str()).collect();
-                    if lagging.is_empty() {
-                        (Link::Live, String::new())
-                    } else {
-                        (Link::Partial, format!("no fresh price: {} (market closed?)", lagging.join(", ")))
+                    let now = now_s();
+                    let cells = resolve(&self.rows, &self.quotes, now, stale_after, self.cfg.delayed_grace_s);
+                    let stale = cells.iter().filter(|c| c.stale);
+                    let (shut, lagging): (Vec<_>, Vec<_>) = stale.partition(|c| crate::model::calm_stale(c, Link::Partial, now));
+                    // The governor's closed board needs every row closed for the full age, not only calm.
+                    closed = !cells.is_empty() && cells.iter().all(|c| crate::model::market_closed(c, Link::Partial, now));
+                    let names = |cs: &[&crate::model::Cell]| cs.iter().map(|c| c.label.as_str()).collect::<Vec<_>>().join(", ");
+                    match (shut.is_empty(), lagging.is_empty()) {
+                        (true, true) => (Link::Live, String::new()),
+                        (false, true) => (Link::Partial, format!("closed: {}", names(&shut))),
+                        (true, false) => (Link::Partial, format!("no fresh price: {}", names(&lagging))),
+                        (false, false) => (Link::Partial, format!("no fresh price: {}; closed: {}", names(&lagging), names(&shut))),
                     }
                 }
                 Err(e) => {
                     self.fails = self.fails.saturating_add(1);
+                    closed = false;
                     (Link::Down, format!("CNBC: {e}"))
                 }
             };
-            let (iv, _) = self.governed(quiet.quiet_for(started.elapsed().as_secs_f64()));
+            let (iv, _) = self.governed(quiet.quiet_for(started.elapsed().as_secs_f64()), closed);
             self.note_governed(governed_s, self.cadence());
             self.publish(link, note.clone());
             let cadence = self.cadence();
@@ -817,20 +889,71 @@ impl Feed {
     }
 }
 
-pub fn spawn(cfg: Config, shared: Arc<Mutex<Board>>, notify: Box<dyn Fn() + Send + Sync>) {
-    let client = match Client::new() {
-        Ok(c) => c,
-        Err(e) => {
-            if let Ok(mut b) = shared.lock() {
-                b.link = Link::Down;
-                b.note = format!("TLS: {e}");
-            }
-            notify();
+/// How long to wait before the next try at building the TLS client, `attempt` counting from 0 after
+/// the start-up failure: 5 s, 10 s, 20 s, 40 s, then 60 s every time.
+fn tls_retry_delay(attempt: u32) -> Duration {
+    Duration::from_secs((5u64 << attempt.min(4)).min(60))
+}
+
+/// Sleep up to `d`, waking early when `Board::kick` differs from `acted` (*Refresh now*, a resume, a
+/// wake). The same polling as `Feed::wait`, for a thread that has no `Feed` yet.
+fn wait_for_kick(shared: &Mutex<Board>, d: Duration, acted: u64) {
+    let until = Instant::now() + d;
+    while Instant::now() < until {
+        thread::sleep(ROWS_CHECK.min(until.saturating_duration_since(Instant::now())));
+        if shared.lock().map(|b| b.kick != acted).unwrap_or(false) {
             return;
         }
-    };
-    let (rows, rows_gen) = shared.lock().map(|b| (b.rows.clone(), b.rows_gen)).unwrap_or_else(|_| (cfg.rows.clone(), 0));
+    }
+}
+
+/// The board says why nothing is being fetched: Down, with the TLS error.
+fn publish_tls_down(shared: &Mutex<Board>, error: &str) {
+    if let Ok(mut b) = shared.lock() {
+        b.link = Link::Down;
+        b.note = format!("TLS: {error}");
+    }
+}
+
+pub fn spawn(cfg: Config, shared: Arc<Mutex<Board>>, notify: Box<dyn Fn() + Send + Sync>) {
     let notify: Arc<dyn Fn() + Send + Sync> = Arc::from(notify);
+    match Client::new() {
+        Ok(client) => start_workers(client, cfg, shared, notify),
+        Err(e) => {
+            publish_tls_down(&shared, &e);
+            notify();
+            // The TLS stack can be late at start-up (autostart before the credential service is ready).
+            // One thread keeps trying, and starts the workers the first time it succeeds; until then the
+            // board stays Down with the reason, and *Refresh now* ends the wait at once.
+            thread::Builder::new()
+                .name("tls-retry".into())
+                .spawn(move || {
+                    let mut attempt = 0;
+                    loop {
+                        let acted = shared.lock().map(|b| b.kick).unwrap_or(0);
+                        wait_for_kick(&shared, tls_retry_delay(attempt), acted);
+                        match Client::new() {
+                            Ok(client) => {
+                                start_workers(client, cfg, shared, notify);
+                                return;
+                            }
+                            Err(e) => {
+                                publish_tls_down(&shared, &e);
+                                notify();
+                                attempt = attempt.saturating_add(1);
+                            }
+                        }
+                    }
+                })
+                .expect("spawn tls retry thread");
+        }
+    }
+}
+
+/// Everything that needs a working HTTP client: the fallback expiry and the three fallback workers, the
+/// chart thread and the quote feed. Called once, by `spawn` or by its retry thread, never both.
+fn start_workers(client: Client, cfg: Config, shared: Arc<Mutex<Board>>, notify: Arc<dyn Fn() + Send + Sync>) {
+    let (rows, rows_gen) = shared.lock().map(|b| (b.rows.clone(), b.rows_gen)).unwrap_or_else(|_| (cfg.rows.clone(), 0));
     // Expiry must progress even when every HTTP worker is blocked.
     {
         let board = shared.clone();
@@ -959,6 +1082,23 @@ pub fn collect_bodies(rows: &[Row], day_rows: usize, current: &str) -> crate::pr
     b
 }
 
+/// The word the probe prints after a quote: ` CLOSED` for a market that has stopped, ` QUIET` for a
+/// calm quote that is not yet closed, ` STALE` for a price that is old for any other reason, nothing
+/// for a fresh one. The probe only reaches here when the service answered, so the link counts as live.
+/// The caller applies [`crate::model::Board::apply_bar_restamps`] first, so a quote the 1D bars show
+/// to be a re-stamp is stale here, as it is in the app.
+pub(crate) fn probe_state(c: &crate::model::Cell, now: f64) -> &'static str {
+    if crate::model::reads_closed(c, Link::Live, now) {
+        " CLOSED"
+    } else if crate::model::calm_stale(c, Link::Live, now) {
+        " QUIET"
+    } else if c.stale {
+        " STALE"
+    } else {
+        ""
+    }
+}
+
 /// `--probe`: one pass over the quotes and the bars, then the findings; with `dump` the raw answers
 /// are also saved in that folder (and nothing else is written). Returns true when any finding is a
 /// `WARN`, for a non-zero exit. Command line only: `lib::launch` never calls it for the running app.
@@ -968,8 +1108,24 @@ pub fn probe(cfg: &Config, dump: Option<&std::path::Path>) -> bool {
     match &b.quotes {
         Some(Ok(body)) => match serde_json::from_str::<Value>(body) {
             Ok(v) => {
-                let map: HashMap<_, _> = parse_quotes(&v).into_iter().map(|q| (q.symbol.clone(), q)).collect();
-                for c in resolve(&cfg.rows, &map, now, cfg.stale_after_s, cfg.delayed_grace_s) {
+                let map: HashMap<_, _> = parse_quotes_at(&v, now).into_iter().map(|q| (q.symbol.clone(), q)).collect();
+                // The cells go through the board's re-stamp rule with the 1D bars this pass fetched, so
+                // the label matches what the app shows.
+                let mut board = crate::model::Board::new(&cfg.rows);
+                board.link = Link::Live;
+                board.cells = resolve(&cfg.rows, &map, now, cfg.stale_after_s, cfg.delayed_grace_s);
+                board.bars = vec![Vec::new().into(); cfg.rows.len()];
+                board.bars_t0 = vec![0.0; cfg.rows.len()];
+                for (i, r) in cfg.rows.iter().enumerate() {
+                    let chart = b.day.iter().find(|(s, _)| s == &r.symbol).and_then(|(_, a)| a.as_ref().ok()).and_then(|t| serde_json::from_str::<Value>(t).ok());
+                    if let (Some(v), Some(slot)) = (chart, board.bars.get_mut(i)) {
+                        let (t0, bars) = parse_chart(&v, now);
+                        *slot = bars.into();
+                        board.bars_t0[i] = t0;
+                    }
+                }
+                board.apply_bar_restamps(now);
+                for c in board.cells.iter().cloned() {
                     match &c.quote {
                         Some(q) => println!(
                             "{:<5} {:>12} {:>8}  {}{}{} age={}",
@@ -978,7 +1134,7 @@ pub fn probe(cfg: &Config, dump: Option<&std::path::Path>) -> bool {
                             q.change_pct.map(crate::model::fmt_change).unwrap_or_default(),
                             q.name,
                             if q.realtime { "" } else { " DELAYED" },
-                            if c.stale { " STALE" } else { "" },
+                            probe_state(&c, now),
                             q.ts.map(|t| format!("{:.0}s", now - t)).unwrap_or_else(|| "?".into()),
                         ),
                         None => println!("{:<5} {:>12}  no quote", c.label, "-"),
@@ -1265,6 +1421,93 @@ mod tests {
         // `0.00` is how CNBC says "this symbol has no such value"; it must not draw as a price.
         assert_eq!((qs[1].high, qs[1].yr_lo, qs[1].volume), (None, None, None));
         assert_eq!(qs[1].currency, "");
+    }
+
+    /// The raw answer CNBC gave on Saturday 14 Nov 2026 at 17:18:36 UTC (an abridged copy: the
+    /// fields that carry a time, plus the price). The 1D charts of the same minute show the last
+    /// real prints on Friday 13 Nov at 16:59 (`@SP.1`, `@DJ.1`). The stamps at 17:40 are re-stamps with
+    /// no trade behind them (the bars after 17:00 are thin and `ranges::drop_idle` removes them), so
+    /// `model::closed_since_shown` caps the time a card shows at the end of the last kept bar.
+    const SATURDAY: &str = r#"{"FormattedQuoteResult":{"FormattedQuote":[
+      {"symbol":"@SP.1","last":"7,561.00","last_timedate":"5:40 PM EST","last_time":"2026-11-14T17:40:14.000-0500","realTime":"false","settleDate":"2026-11-13","timeZone":"EST"},
+      {"symbol":"@DJ.1","last":"52,347.00","last_timedate":"5:40 PM EST","last_time":"2026-11-14T17:40:32.000-0500","realTime":"false","settleDate":"2026-11-13","timeZone":"EST"},
+      {"symbol":"@ND.1","last":"27,927.25","last_timedate":"5:39 PM EST","last_time":"2026-11-14T17:39:07.000-0500","realTime":"false","settleDate":"2026-11-13","timeZone":"EST"},
+      {"symbol":"@CL.1","last":"88.92","last_timedate":"6:13 PM EST","last_time":"2026-11-14T18:13:44.000-0500","realTime":"false","settleDate":"2026-11-13","timeZone":"EST"},
+      {"symbol":"XAU=","last":"3,880.04","last_timedate":"9:19 AM EST","last_time":"2026-11-14T09:19:58.806-0500","realTime":"true","timeZone":"EST"},
+      {"symbol":"BTC.CB=","last":"65,161","last_timedate":"12:18 PM EST","last_time":"2026-11-14T12:18:28.000-0500","realTime":"true","timeZone":"EST"},
+      {"symbol":"EUR=","last":"1.0600","last_timedate":"4:59 PM EST","last_time":"2026-11-13T16:59:00.000-0500","realTime":"true","timeZone":"EST"}]}}"#;
+
+    #[test]
+    fn a_saturday_futures_stamp_is_read_with_its_settle_date() {
+        let now = parse_time("2026-11-14T17:18:36.000+0000").unwrap();
+        let qs = parse_quotes_at(&serde_json::from_str(SATURDAY).unwrap(), now);
+        let age = |sym: &str| now - qs.iter().find(|q| q.symbol == sym).unwrap().ts.unwrap();
+        // Friday 17:40:14 EST is 22:40:14 UTC, 18 h 38 min 22 s before the answer.
+        assert_eq!(age("@SP.1"), 18.0 * 3600.0 + 38.0 * 60.0 + 22.0);
+        assert_eq!(age("@DJ.1"), 18.0 * 3600.0 + 38.0 * 60.0 + 4.0);
+        assert_eq!(age("@ND.1"), 18.0 * 3600.0 + 39.0 * 60.0 + 29.0);
+        assert_eq!(age("@CL.1"), 18.0 * 3600.0 + 4.0 * 60.0 + 52.0);
+        // Stamps with no `settleDate` are read as sent. The Saturday XAU stamp is not a trade time:
+        // gold stopped on Friday, and `model::closed_since_shown` takes the day from the 1D bars.
+        assert!((age("XAU=") - (2.0 * 3600.0 + 58.0 * 60.0 + 37.194)).abs() < 1e-3);
+        assert_eq!(age("BTC.CB="), 8.0);
+        assert_eq!(age("EUR="), 19.0 * 3600.0 + 19.0 * 60.0 + 36.0);
+        assert!(qs.iter().all(|q| q.ts.is_some_and(|t| t <= now + crate::model::FUTURE_SKEW_S)));
+    }
+
+    #[test]
+    fn a_saturday_futures_stamp_is_a_friday_stamp_whether_it_lies_ahead_or_behind_the_clock() {
+        let fri = parse_time("2026-11-13T17:40:14.000-0500").unwrap();
+        // 23:00 UTC is 18:00 ET Saturday: the written time is already in the past.
+        for at in ["2026-11-14T23:00:00.000+0000", "2026-11-15T03:00:00.000+0000", "2026-11-14T17:18:36.000+0000"] {
+            let now = parse_time(at).unwrap();
+            let qs = parse_quotes_at(&serde_json::from_str(SATURDAY).unwrap(), now);
+            let sp = qs.iter().find(|q| q.symbol == "@SP.1").unwrap();
+            assert_eq!(sp.ts, Some(fri), "now {at}");
+            assert_eq!(parse_time("2026-11-13T22:40:14.000+0000"), sp.ts);
+        }
+        // Sunday before 18:00 is still the break; from 18:00 the stamp is a real print.
+        let now = parse_time("2026-11-15T22:30:00.000+0000").unwrap();
+        let sun_early = "2026-11-15T17:40:14.000-0500";
+        assert_eq!(quote_time(sun_early, Some("2026-11-13"), now), parse_time("2026-11-13T17:40:14.000-0500"));
+        let sun_open = "2026-11-15T18:00:30.000-0500";
+        let now = parse_time("2026-11-15T23:01:00.000+0000").unwrap();
+        assert_eq!(quote_time(sun_open, Some("2026-11-13"), now), parse_time(sun_open));
+        // A stamp with no settleDate is read as sent, on any day.
+        let now = parse_time("2026-11-14T23:00:00.000+0000").unwrap();
+        assert_eq!(quote_time("2026-11-14T09:19:58.806-0500", None, now), parse_time("2026-11-14T09:19:58.806-0500"));
+    }
+
+    #[test]
+    fn the_probe_names_a_closed_market_and_a_fault_apart() {
+        let now = parse_time("2026-11-14T17:18:36.000+0000").unwrap();
+        let qs = parse_quotes_at(&serde_json::from_str(SATURDAY).unwrap(), now);
+        let map: HashMap<_, _> = qs.into_iter().map(|q| (q.symbol.clone(), q)).collect();
+        let rows: Vec<Row> = ["@SP.1", "BTC.CB="].iter().map(|s| Row { label: (*s).into(), symbol: (*s).into(), digits: 0, name: String::new(), strip: true }).collect();
+        let cells = resolve(&rows, &map, now, 90.0, 900.0);
+        assert_eq!(probe_state(&cells[0], now), " CLOSED");
+        assert_eq!(probe_state(&cells[1], now), "");
+        let mut stuck = cells[0].clone();
+        stuck.quote.as_mut().unwrap().ts = None;
+        assert_eq!(probe_state(&stuck, now), " STALE");
+        let mut quiet = cells[0].clone();
+        quiet.quote.as_mut().unwrap().ts = Some(now - 300.0);
+        quiet.stale = true;
+        assert_eq!(probe_state(&quiet, now), " QUIET");
+    }
+
+    #[test]
+    fn a_future_stamp_with_no_usable_settle_date_has_no_age() {
+        let now = parse_time("2026-11-14T17:18:36.000+0000").unwrap();
+        let future = "2026-11-14T17:40:14.000-0500";
+        assert_eq!(quote_time(future, None, now), None, "no settle date");
+        assert_eq!(quote_time(future, Some("2026-11-14"), now), None, "a settle date that is in the future too");
+        assert_eq!(quote_time(future, Some("junk"), now), None);
+        assert_eq!(quote_time(future, Some("2026-10-01"), now), None, "a settle date weeks away from the stamp");
+        // A few minutes ahead is clock skew and is read as sent.
+        let skew = "2026-11-14T12:21:36.000-0500";
+        assert_eq!(quote_time(skew, None, now), parse_time(skew));
+        assert_eq!(quote_time("2026-11-14", Some("2026-11-13"), now), None, "a bare date has no clock");
     }
 
     #[test]
@@ -1621,19 +1864,21 @@ mod tests {
         let shared = Arc::new(Mutex::new(Board::new(&rows)));
         let feed = test_feed(&shared, rows);
         for quiet in [0.0, 700.0, 4_000.0] {
-            assert_eq!(feed.governed(quiet), (3.0, 0.0), "off: the plain cadence, stale limit untouched");
+            assert_eq!(feed.governed(quiet, false), (3.0, 0.0), "off: the plain cadence, stale limit untouched");
         }
         {
             let mut b = shared.lock().unwrap();
             b.gov = crate::governor::Settings { slow_when_quiet: true, rest_when_locked: true };
         }
-        assert_eq!(feed.governed(0.0), (3.0, 3.0));
-        assert_eq!(feed.governed(700.0), (15.0, 15.0));
-        assert_eq!(feed.governed(2_000.0), (60.0, 60.0));
+        assert_eq!(feed.governed(0.0, false), (3.0, 3.0));
+        assert_eq!(feed.governed(700.0, false), (15.0, 15.0));
+        assert_eq!(feed.governed(2_000.0, false), (60.0, 60.0));
+        assert_eq!(feed.governed(0.0, true), (60.0, 60.0), "every market closed: slow from the first poll");
         shared.lock().unwrap().locked = true;
-        assert_eq!(feed.governed(0.0), (300.0, 300.0));
+        assert_eq!(feed.governed(0.0, false), (300.0, 300.0));
         shared.lock().unwrap().armed = true;
-        assert_eq!(feed.governed(2_000.0), (15.0, 15.0), "armed: never slower than 15 s, locked or not");
+        assert_eq!(feed.governed(2_000.0, false), (15.0, 15.0), "armed: never slower than 15 s, locked or not");
+        assert_eq!(feed.governed(0.0, true), (15.0, 15.0), "armed and closed: still looked at every 15 s");
         // The feed tells the board what it waits, and the board says when a wake is worth a kick.
         feed.note_governed(300.0, 3.0);
         let b = shared.lock().unwrap();
@@ -1642,6 +1887,26 @@ mod tests {
         feed.note_governed(0.0, 3.0);
         let b = shared.lock().unwrap();
         assert_eq!((b.governed_s, b.slowed), (0.0, false));
+    }
+
+    #[test]
+    fn quotes_of_a_row_taken_off_the_strip_are_forgotten_and_a_re_added_row_starts_clean() {
+        let rows = Config::default().rows[..3].to_vec();
+        let shared = Arc::new(Mutex::new(Board::new(&rows)));
+        let mut feed = test_feed(&shared, rows.clone());
+        for (i, r) in rows.iter().enumerate() {
+            let q = Quote { symbol: r.symbol.clone(), price: 4.25, ts: Some(now_s()), moved_at: Some(1_000.0 + i as f64), realtime: true, ..Quote::default() };
+            feed.quotes.insert(q.symbol.clone(), q);
+        }
+        shared.lock().unwrap().set_rows(&rows[..2]);
+        feed.sync_rows();
+        assert!(!feed.quotes.contains_key(&rows[2].symbol), "the removed row's quote must not outlive it");
+        assert!(feed.quotes.contains_key(&rows[0].symbol) && feed.quotes.contains_key(&rows[1].symbol), "the rows that stay keep theirs");
+        // Added back, with the first poll failing: nothing from before the removal comes back.
+        shared.lock().unwrap().set_rows(&rows);
+        feed.sync_rows();
+        feed.publish(Link::Down, "CNBC: down".into());
+        assert!(shared.lock().unwrap().cells[2].quote.is_none(), "the pre-removal price stays gone");
     }
 
     /// A quote one slow poll old is not stale in the cells the feed publishes; ungoverned it is.
@@ -1805,5 +2070,46 @@ mod tests {
         let (_t0, bars) = parse_chart(&v, 1_793_664_900.0);
         let vols: Vec<f32> = bars.iter().map(|b| b.v).collect();
         assert_eq!(vols, [3443.0, 1026.0, 0.0]);
+    }
+
+    /// Audit 2026-11, feed-never-starts-after-tls-failure: the TLS client is tried again after 5 s,
+    /// 10 s and 20 s, then every minute at most.
+    #[test]
+    fn the_tls_retry_delay_grows_and_stops_at_a_minute() {
+        let secs: Vec<u64> = (0..8).map(|n| tls_retry_delay(n).as_secs()).collect();
+        assert_eq!(secs, [5, 10, 20, 40, 60, 60, 60, 60]);
+        assert_eq!(tls_retry_delay(u32::MAX).as_secs(), 60, "no overflow at any count");
+    }
+
+    /// The wait the retry thread sleeps in ends at once on a kick, and not before.
+    #[test]
+    fn the_tls_retry_wait_ends_on_a_kick() {
+        let shared = Arc::new(Mutex::new(Board::new(&[])));
+        let acted = shared.lock().unwrap().kick;
+        let waker = shared.clone();
+        let t = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(300));
+            let mut b = waker.lock().unwrap();
+            b.kick = b.kick.wrapping_add(1);
+        });
+        let started = Instant::now();
+        wait_for_kick(&shared, Duration::from_secs(30), acted);
+        assert!(started.elapsed() < Duration::from_secs(5), "the wait ignored the kick: {:?}", started.elapsed());
+        assert!(started.elapsed() >= Duration::from_millis(250), "it returned before the kick");
+        t.join().unwrap();
+        // With no kick it sleeps the whole time.
+        let acted = shared.lock().unwrap().kick;
+        let started = Instant::now();
+        wait_for_kick(&shared, Duration::from_millis(300), acted);
+        assert!(started.elapsed() >= Duration::from_millis(290));
+    }
+
+    #[test]
+    fn a_tls_failure_is_published_as_down_with_its_reason() {
+        let shared = Mutex::new(Board::new(&[]));
+        publish_tls_down(&shared, "no credentials");
+        let b = shared.lock().unwrap();
+        assert_eq!(b.link, Link::Down);
+        assert_eq!(b.note, "TLS: no credentials");
     }
 }
