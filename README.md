@@ -2,9 +2,11 @@
 
 _made with love by [maria](https://github.com/mariyaholic)_
 
-A little, extremely resource efficient (~5 MB RAM, and any potato CPU won't feel it) price ticker that sits in the empty part of ur windows taskbar. Click it and it glides out into a
-bigger window in the middle of the screen, hit minimize and it glides right back into the taskbar. Prices
-come from CNBC's public quotes. You don't need any login, code, payment, whatever. Just click the .exe file!
+This is my little price ticker. It sits in the empty part of ur windows taskbar and asks for almost nothing,
+about 5 MB of RAM, and a potato of a CPU won't feel it either. Click the strip and it glides out into a bigger
+window in the middle of the screen. Hit minimize and it glides right back into the taskbar. The prices come
+from CNBC's public quotes. There's no login, no code, no payment, whatever. Just click the .exe file and it's
+urs. This one is close to my heart, and I hope it keeps u good company on ur taskbar, like it does for me.
 ```
 XAU 4,153.73   BTC 81,219   S&P 7,743.75
 XAG    56.590  DOW 52,048   NAS 29,801.50  ●
@@ -12,14 +14,14 @@ XAG    56.590  DOW 52,048   NAS 29,801.50  ●
 
 ![MH Ticker in the gap next to the tray](docs/strip_next_to_tray.png)
 
-And the panel, in `aurora` (every theme is in [shots/](shots/) — rendered by the app itself):
+And here's the panel in `aurora`. Every theme lives in [shots/](shots/), rendered by the app itself:
 
 ![The panel in the aurora theme](shots/aurora.png)
 
 ## Two builds, one engine
 
-Same source, same network code, same everything that makes it correct. What differs is where the
-effort went:
+Same source, same network code, same everything that makes it correct. The only difference is where I put
+the effort:
 
 | | `MH_Ticker.exe` | `MH_Ticker_Ultra.exe` |
 |---|---|---|
@@ -29,17 +31,19 @@ effort went:
 | Chart | — | a candle pane with ranges from 1D to 5Y, volume and alert levels |
 | Memory after a minute | ~5.7 MB (measured on 1.7.1, not yet on 1.8) | ~5.8 MB (measured on 1.7.1, not yet on 1.8) |
 
-They run side by side (separate settings files, separate tray icons). The classic exe keeps its name
-and its look on purpose: if you just want the little ticker, nothing about it changed except the bugs.
-Everything in the "whats new" list below that isn't a theme, a picker or an alert is in **both**.
+They run side by side (separate settings files, separate tray icons). I kept the classic exe's name and its
+look on purpose. If u just want the little ticker, nothing about it changed except the bugs. Everything in
+the "whats new" list below that isn't a theme, a picker or an alert is in **both**.
 
 ## Download
 
-Grab `MH_Ticker.exe` (or `MH_Ticker_Ultra.exe` if you want the themes and alerts) from the
-[latest release](https://github.com/mariyaholic/mh-ticker/releases/latest) and
-Double click it. If prompted, simply select Run anyway. 
+Grab `MH_Ticker.exe` (or `MH_Ticker_Ultra.exe` if u want the themes and alerts) from the
+[latest release](https://github.com/mariyaholic/mh-ticker/releases/latest) and double click it. If Windows
+prompts u, simply select Run anyway. That's the whole install.
 
 ## How to use it
+
+Here is everything it does, written down so u never have to guess where something lives.
 
 - **Run it:** Double click `MH_Ticker.exe` and it docks itself into whatever free space ur taskbar has - left of
   the start button if ur icons are centred, or between ur app icons and the tray if they're on the left. It moves
@@ -248,17 +252,17 @@ Double click it. If prompted, simply select Run anyway.
   key. a pointer move takes the crosshair back
 - **Save failures:** if the settings can't be written (a read-only folder, say), the menu shows a greyed line saying
   so. it clears when a later save works
-- **Right-click menu:** right click the strip or the tray icon. It is short: *Settings...*, *Expand view*, *Refresh now*, *Copy all prices*, *Undo the last ...*, *Show strip*, a status line, and *Quit*, so no more going to Task Manager every time u need it killed. A card's right-click menu adds that card's entries. Everything else is in the settings window, and *Open config folder* is on its *About* page.
+- **Right-click menu:** right click the strip or the tray icon. I kept it short: *Settings...*, *Expand view*, *Refresh now*, *Copy all prices*, *Undo the last ...*, *Show strip*, a status line, and *Quit*, so no more going to Task Manager every time u need it killed. A card's right-click menu adds that card's entries. Everything else is in the settings window, and *Open config folder* is on its *About* page.
 - **Tray only:** Untick *Show strip* if u just want the tray icon. hovering it still shows every price and clicking
   it still opens the panel
-- **Games/fullscreen stuff:** it hides itself while something fullscreen is in front so it wont sit on top of ur game
+- **Games/fullscreen stuff:** it hides itself while something fullscreen is in front, so it wont sit on top of ur game either
 
-**The tray icon** - Green means live, amber means some prices aren' t fresh, red means offline.
+**The tray icon** - Green means live, amber means some prices aren't fresh, red means offline. My little traffic light.
 
 ## Closed markets
 
 Gold, silver and some other markets stop trading at weekends and on holidays. CNBC's quotes for them stop
-moving then, and the app handles both the candles and the quotes.
+moving then. I wanted the app to be honest about that, so it handles both the candles and the quotes.
 
 **Candles.** The app drops the bars of closed days when the data arrives. On a daily or longer chart it drops
 each bar whose open, high, low and close are the same price, unless half or more of the bars have that shape,
@@ -287,7 +291,7 @@ with its age. After 15 minutes it reads `closed`. The app cannot tell those case
 ## Settings
 
 `%LOCALAPPDATA%\MH_Ticker\config.json` gets made with the defaults the first time u run it (*Open config folder*, on the *About* page of the settings window, takes u there). **Ultra keeps its own `config_ultra.json`** in the same folder, so the two builds
-never overwrite each other. if u edit it by hand, restart the app after. anything the menus and the settings window change (symbols, poll, theme, font, alerts, strip,
+never overwrite each other. I didn't want them fighting over one file. if u edit it by hand, restart the app after. anything the menus and the settings window change (symbols, poll, theme, font, alerts, strip,
 hotkey, position, chart time zone) takes effect at once, with no restart.
 
 If the settings file is there but won't load (it isn't UTF-8 text, or it isn't valid JSON), the app doesn't overwrite
@@ -346,9 +350,9 @@ quotes, the unknown-symbol answer, the day files, the range files and the releas
 the folder is created if it's missing. it never writes the settings or the webhook. it only works from the command
 line, and it needs both the folder and `--probe`; without them it exits with 2 and says why
 
-## Building it Yourself
+## Building it yourself
 
-You only need Windows 10 onwards and Rust (most recent stable release).
+U only need Windows 10 onwards and Rust, the most recent stable release.
 
 ```sh
 cargo test
@@ -361,7 +365,7 @@ copy whichever u want next to this readme if u want to double click it from here
 `.cargo/config.toml` with `[build] target-dir = "..."` - mine goes to `D:/mariyaholic-build/mh-ticker/target`
 
 It's plain win32/gdi - no GUI toolkit, no webview, no GPU stuff - so it only uses about 5.7 MB of memory and like
-~0.4% of one cpu core.
+~0.4% of one cpu core. I'm fond of how little it asks for.
 
 Want to see every theme before picking one? They are rendered by the app's own painter:
 
@@ -376,3 +380,5 @@ sits behind the `shots` feature, so neither shipped exe links it - the binaries 
 
 [MIT](LICENSE) © 2026 mariyaholic - Use it, change it, share it, just keep the copyright notice and the license
 text with it. And if u build something on top of it please credit this repo as the original source!
+
+Thank you for stopping by. ♡
