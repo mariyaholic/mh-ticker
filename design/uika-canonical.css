@@ -1,0 +1,100 @@
+/* uika:bridge: design/uika-canonical.css — copy of the Uika canon sheet (ADR-0043); edit the estate source, not this file */
+/* ============================================================
+   UIKA — the estate's canonical design tokens (ADR-0011)
+   Grounded in Misumi Uika canon (image color, eyes, hair, mask,
+   red lining, lunar mare/Enter-your-Latin vocabulary).
+   Every estate surface imports from here; never re-invent.
+   ============================================================ */
+:root {
+  /* The night stage (Doloris face, default) */
+  --bg-deepest: #060509;
+  --bg-ground: #0b0913;
+  --bg-panel: #14101c;
+  --bg-panel-2: #1a1424;
+  --bg-input: #0e0b16;
+
+  /* Lines */
+  --line: #2e2440;
+  --line-subtle: #221a30;
+  --line-strong: #3c2f52;
+
+  /* Uika gold — official image color #BB9955 (canon) */
+  --gold: #bb9955;
+  --gold-bright: #d8b878;
+  --gold-dim: #7d6738;
+  --gold-glow: rgba(187, 153, 85, 0.16);
+
+  /* Lavender eyes — informational */
+  --lavender: #a497d6;
+  --lavender-dim: rgba(164, 151, 214, 0.16);
+
+  /* Platinum hair — emphasis/bright text */
+  --platinum: #e9e4da;
+
+  /* Marigold (mask flower) — ornament/callout trim */
+  --marigold: #e08d3c;
+
+  /* Red inner lining (Doloris dress) — warnings/negative */
+  --lining: #a2434d;
+  --lining-dim: rgba(162, 67, 77, 0.16);
+
+  /* Sage bullish survives from the Argonaut bone (functional green) */
+  --sage: #6e9c7e;
+  --sage-dim: rgba(110, 156, 126, 0.15);
+
+  /* ADR-0012: the score — Ave Mujica band color #881144 as the stage curtain;
+     sumimi's official #BBFF77/#FFFF66 belong to the light face only */
+  --wine: #881144;
+  --wine-dim: rgba(136, 17, 68, 0.18);
+  --sumimi-lime: #bbff77;
+
+  /* Text */
+  --text: #d8d4ce;
+  --text-bright: var(--platinum);
+  --muted: #97908f;
+  --slate: #6d6676;
+
+  /* Type bones (kept from the estate's existing convention) */
+  --font-display: 'Cinzel', serif;      /* Trajan-inscription Latin */
+  --font-brand: 'Outfit', sans-serif;   /* estate brand voice */
+  --font-mono: 'JetBrains Mono', monospace; /* lunar coordinates */
+
+  /* Radii / motion (unchanged bones) */
+  --radius-sm: 4px; --radius-md: 6px; --radius-lg: 12px;
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --duration-fast: 150ms; --duration-normal: 300ms; --duration-slow: 500ms;
+
+  /* The face coin (sumimi mode overrides) */
+  --face: "doloris";
+}
+[data-face="sumimi"] {
+  --face: "sumimi";
+  --bg-deepest: #f2ede2;
+  --bg-ground: #f7f3ea;
+  --bg-panel: #fffdf8;
+  --bg-panel-2: #f6f1e6;
+  --bg-input: #efe9db;
+  --line: #d9cfae;
+  --line-subtle: #e8dfc8;
+  --line-strong: #c2b184;
+  --gold: #a37f2e;
+  --gold-bright: #8a6a20;
+  --gold-dim: #bfa467;
+  --gold-glow: rgba(187, 153, 85, 0.22);
+  --lavender: #6f5faa;
+  --lavender-dim: rgba(111, 95, 170, 0.12);
+  --platinum: #241f18;
+  --marigold: #c4712a;
+  --lining: #9c3f47;
+  --lining-dim: rgba(156, 63, 71, 0.10);
+  --sage: #48785e;
+  --sage-dim: rgba(72, 120, 94, 0.14);
+  --text: #37302a;
+  --text-bright: #241f18;
+  --muted: #6f665b;
+  --slate: #8b8275;
+  /* ADR-0012: sumimi-face accents (canon band colors) */
+  --wine: #6b2a3d;
+  --wine-dim: rgba(107, 34, 61, 0.08);
+  --sumimi-lime: #6fa61d;
+}

@@ -8,3 +8,11 @@
 - Run delegated workers one at a time unless told otherwise. When a usage limit hits, parallel workers all stop at once.
 - Squash-merge work branches so checkpoint commits stay out of the main history.
 - Files and commit messages name roles as builder, finisher, orchestrator or reviewer. No committed file or commit message names an AI model or vendor.
+
+<!-- uika:claude:begin -->
+@AGENTS.md
+
+The estate law block is generated inside `AGENTS.md` (markers `uika:law`).
+<!-- uika:generated from estate.json; edit the source, not this file --> (rendered CLAUDE adapter)
+<!-- uika:docs v1 · sha256:b388347e5b22 -->
+<!-- uika:claude:end -->
